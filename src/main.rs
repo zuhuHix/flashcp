@@ -153,11 +153,17 @@ enum Cmd {
         #[arg(long)]
         from: Option<String>,
         /// Leave files that already exist in DEST alone
-        #[arg(long, conflicts_with = "overwrite")]
+        #[arg(long, conflicts_with_all = ["overwrite", "update"])]
         skip_existing: bool,
         /// Replace files that already exist in DEST
-        #[arg(long)]
+        #[arg(long, conflicts_with = "update")]
         overwrite: bool,
+        /// Copy only files that are new or whose size or modification time differ; replace changed ones safely
+        #[arg(long, conflicts_with_all = ["skip_existing", "overwrite"])]
+        update: bool,
+        /// With --update: delete files and directories in DEST that are not on the volume
+        #[arg(long, requires = "update")]
+        delete_extraneous: bool,
         /// Largest device read in KB (default: chosen per device)
         #[arg(long, hide = true)]
         chunk_kb: Option<usize>,
@@ -425,6 +431,8 @@ fn run(cmd: Cmd) -> Result<()> {
             from,
             skip_existing,
             overwrite,
+            update,
+            delete_extraneous,
             chunk_kb,
             gap_kb,
             inflight,
@@ -445,6 +453,8 @@ fn run(cmd: Cmd) -> Result<()> {
                 from,
                 skip_existing,
                 overwrite,
+                update,
+                delete_extraneous,
                 chunk: chunk_kb.map(|c| c << 10),
                 gap: gap_kb.map(|g| g << 10),
                 buffered,
@@ -453,12 +463,19 @@ fn run(cmd: Cmd) -> Result<()> {
             };
             let s = pull::pull_from(&target, &dest, &o, &mut sink(json))?;
             if !json {
+                let kept = if update {
+                    format!(", {} up to date", s.skipped)
+                } else if s.skipped > 0 {
+                    format!(", skipped {} existing", s.skipped)
+                } else {
+                    String::new()
+                };
+                let deleted = if s.deleted > 0 { format!(", deleted {} extraneous", s.deleted) } else { String::new() };
                 println!(
-                    "pulled: {} files, {} dirs, {} data{} in {:.2}s ({:.0} files/s, {:.1} MB/s of data; read {} in {} requests)",
+                    "pulled: {} files, {} dirs, {} data{kept}{deleted} in {:.2}s ({:.0} files/s, {:.1} MB/s of data; read {} in {} requests)",
                     s.files,
                     s.dirs,
                     util::human_bytes(s.data_bytes as f64),
-                    if s.skipped > 0 { format!(", skipped {} existing", s.skipped) } else { String::new() },
                     s.secs,
                     s.files as f64 / s.secs,
                     s.data_bytes as f64 / 1e6 / s.secs,
