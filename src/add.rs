@@ -362,7 +362,7 @@ fn write_micro_probe(dev: &File, at: u64) -> Option<crate::devprofile::DevProfil
 /// The gap policy for this target: the cached device profile, else a micro-probe now (block
 /// devices only, never in a dry run), else the fallback. Image files always use the fallback:
 /// they have no device of their own to measure (their cost is the page cache's).
-fn choose_gap_policy(dev: &File, direct: bool, v: &Vol, free: &[(u64, u64)], dev_off: u64, dry_run: bool) -> GapPolicy {
+fn choose_gap_policy(dev: &File, direct: bool, v: &Vol, dev_off: u64, dry_run: bool) -> GapPolicy {
     use crate::devprofile as dp;
     if let Some(max_fill) = std::env::var(GAP_FILL_ENV).ok().and_then(|v| v.parse().ok()) {
         return GapPolicy { max_fill, free_too: true, qd: dp::DEFAULT_WRITE_QD, source: "test override" };
@@ -374,7 +374,8 @@ fn choose_gap_policy(dev: &File, direct: bool, v: &Vol, free: &[(u64, u64)], dev
     if dry_run {
         return GapPolicy::fallback("default; not measured in a dry run");
     }
-    let Some(at) = probe_region(free, v.heap_off, v.cs, dev_off).filter(|_| direct) else {
+    // Only now: listing free extents walks the whole bitmap (~35 ms on a 1 TB volume).
+    let Some(at) = probe_region(&free_extents(&v.bitmap, v.cc), v.heap_off, v.cs, dev_off).filter(|_| direct) else {
         return GapPolicy::fallback("default; no 16 MB free run to measure in");
     };
     if !set_direct(dev, true) {
@@ -829,7 +830,7 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
     let pol = if segs.is_empty() {
         GapPolicy::fallback("nothing to write")
     } else {
-        choose_gap_policy(&excl, tgt.direct, &v, &free_extents(&v.bitmap, v.cc), tgt.part_off * 512, o.dry_run)
+        choose_gap_policy(&excl, tgt.direct, &v, tgt.part_off * 512, o.dry_run)
     };
     let detail = format!(
         "plan: add {files} files, {dirs} dirs, {} data │ cluster {} │ {} free │ {} new objects fragmented │ will write {}{} │ {} │ verified {verified} objects in {:.0} ms",
