@@ -66,6 +66,9 @@ fn last_index(req: &Request) -> usize {
 }
 
 fn run(app: &AppHandle, req: &Request) {
+    if let Action::Pull { .. } = req.action {
+        return run_pull(app, req);
+    }
     let started = Instant::now();
     let fake = udisks::fake_mode();
     let was_mounted = !fake && req.drive.mount_point.is_some();
@@ -103,6 +106,8 @@ fn run(app: &AppHandle, req: &Request) {
                         secs: agg.secs(),
                         wall_secs: started.elapsed().as_secs_f64(),
                         mount_point,
+                        dest: None,
+                        warning: None,
                     });
                     emit(app, update);
                 }
@@ -125,6 +130,66 @@ fn run(app: &AppHandle, req: &Request) {
                     message = format!("{message} (remounting also failed: {e})");
                 }
             }
+            emit(app, plain(req, Stage::Error, last_index(req), Some(message)));
+        }
+    }
+}
+
+/// Pull: unmount if mounted, copy off the drive, remount if it was mounted, open the destination.
+/// A copy that succeeded is Done even when the remount failed (the summary carries a warning).
+fn run_pull(app: &AppHandle, req: &Request) {
+    let Action::Pull { dest, .. } = &req.action else { return };
+    let started = Instant::now();
+    let fake = udisks::fake_mode();
+    let was_mounted = !fake && req.drive.mount_point.is_some();
+
+    if was_mounted {
+        emit(app, plain(req, Stage::Unmounting, 0, None));
+        if let Err(e) = udisks::unmount(&req.drive.id) {
+            emit(app, plain(req, Stage::Error, 0, Some(format!("Could not unmount {}: {e}", req.drive.device))));
+            return;
+        }
+    }
+
+    let outcome = run_flashcp(app, req);
+    let remounted = if was_mounted {
+        let stage_update = match &outcome {
+            Ok(agg) => agg.update(Stage::Remounting, req.op, last_index(req), req.total, None),
+            Err(_) => plain(req, Stage::Remounting, last_index(req), None),
+        };
+        emit(app, stage_update);
+        Some(remount(req, fake))
+    } else {
+        None
+    };
+
+    match outcome {
+        Ok(agg) => {
+            let (mount_point, warning) = match remounted {
+                Some(Err(e)) => (None, Some(format!("Copied, but the drive could not be remounted: {e}"))),
+                Some(Ok(point)) => (point, None),
+                None => (None, None),
+            };
+            if !fake {
+                open_folder(dest);
+            }
+            let mut update = agg.update(Stage::Done, req.op, last_index(req), req.total, None);
+            update.summary = Some(JobSummary {
+                files: agg.finished_files(),
+                bytes: agg.finished_bytes(),
+                secs: agg.secs(),
+                wall_secs: started.elapsed().as_secs_f64(),
+                mount_point,
+                dest: Some(dest.clone()),
+                warning,
+            });
+            emit(app, update);
+        }
+        Err(message) => {
+            let message = match remounted {
+                Some(Err(e)) => format!("{message} (remounting also failed: {e})"),
+                _ => message,
+            };
             emit(app, plain(req, Stage::Error, last_index(req), Some(message)));
         }
     }

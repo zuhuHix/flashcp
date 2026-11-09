@@ -3,6 +3,7 @@
 mod drives;
 mod events;
 mod job;
+mod pull;
 mod runner;
 mod settings;
 mod trust;
@@ -13,6 +14,7 @@ mod weak;
 
 use drives::{expected_confirm, require_trusted, Drive};
 use job::{JobLock, Request};
+use pull::{DestStatus, PullDefaults, PullRequest};
 use runner::{Action, Source};
 use settings::{Paths, Settings};
 use std::collections::HashSet;
@@ -34,6 +36,8 @@ const NOTIFY_DELAY: Duration = Duration::from_secs(1);
 pub struct AppState {
     job_running: Arc<AtomicBool>,
     pending: Mutex<Vec<String>>,
+    /// A folder to copy from, from `--pull <path>` or a second instance, until the window takes it.
+    pending_pull: Mutex<Option<PullRequest>>,
     /// Drive ids seen at the last refresh, used to notify only for newly plugged drives.
     known: Mutex<HashSet<String>>,
 }
@@ -43,6 +47,7 @@ impl Default for AppState {
         AppState {
             job_running: Arc::new(AtomicBool::new(false)),
             pending: Mutex::new(Vec::new()),
+            pending_pull: Mutex::new(None),
             known: Mutex::new(HashSet::new()),
         }
     }
@@ -52,24 +57,41 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Absolute, existing paths from command-line arguments (flags are skipped).
-fn paths_from_args<I>(args: I, cwd: &Path) -> Vec<String>
+/// What the command line asks for: existing files to copy, and the folder of `--pull <path>`.
+#[derive(Debug, Default, PartialEq)]
+struct Argv {
+    files: Vec<String>,
+    pull: Option<String>,
+}
+
+fn absolute(arg: &str, cwd: &Path) -> PathBuf {
+    let p = Path::new(arg);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
+}
+
+/// Splits arguments into files to copy (absolute, existing; flags skipped) and the folder that
+/// follows `--pull`. The value after `--pull` is never treated as a file.
+fn split_args<I>(args: I, cwd: &Path) -> Argv
 where
     I: IntoIterator<Item = String>,
 {
-    args.into_iter()
-        .filter(|a| !a.is_empty() && !a.starts_with('-'))
-        .map(|a| {
-            let p = Path::new(&a);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                cwd.join(p)
+    let mut out = Argv::default();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--pull" {
+            out.pull = args.next().filter(|p| !p.is_empty()).map(|p| absolute(&p, cwd).to_string_lossy().into_owned());
+        } else if !arg.is_empty() && !arg.starts_with('-') {
+            let p = absolute(&arg, cwd);
+            if p.exists() {
+                out.files.push(p.to_string_lossy().into_owned());
             }
-        })
-        .filter(|p| p.exists())
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect()
+        }
+    }
+    out
 }
 
 fn show_main(app: &AppHandle) {
@@ -82,6 +104,17 @@ fn show_main(app: &AppHandle) {
 
 fn find_drive(drives: Vec<Drive>, id: &str) -> Result<Drive, String> {
     drives.into_iter().find(|d| d.id == id).ok_or_else(|| "Drive not found. Is it still plugged in?".to_string())
+}
+
+fn require_exfat(drive: &Drive) -> Result<(), String> {
+    if drive.is_exfat {
+        return Ok(());
+    }
+    Err(format!(
+        "{} is not exFAT ({}). Use erase to format it.",
+        drive.device,
+        if drive.fs_type.is_empty() { "no filesystem" } else { &drive.fs_type }
+    ))
 }
 
 async fn drives_now() -> Result<Vec<Drive>, String> {
@@ -124,13 +157,7 @@ async fn start_copy(
     }
     let sources = sources.iter().map(|s| Source::probe(s)).collect::<Result<Vec<_>, _>>()?;
     let drive = find_drive(drives_now().await?, &drive_id)?;
-    if !drive.is_exfat {
-        return Err(format!(
-            "{} is not exFAT ({}). Use erase to format it.",
-            drive.device,
-            if drive.fs_type.is_empty() { "no filesystem" } else { &drive.fs_type }
-        ));
-    }
+    require_exfat(&drive)?;
     require_trusted(&drive)?;
     let stage_dir = if sources.iter().any(|s| !s.is_dir) { runner::new_stage_dir()? } else { PathBuf::new() };
     let plan = runner::plan_items(&sources, &dest_dir, &stage_dir)?;
@@ -179,6 +206,72 @@ async fn start_erase(
     job::spawn(app, request, lock)
 }
 
+/// Copies files off a drive into a local folder (flashcp pull, through the helper or directly).
+#[tauri::command]
+async fn start_pull(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    drive_id: String,
+    from: String,
+    dest: String,
+    existing: String,
+) -> Result<(), String> {
+    let lock = JobLock::acquire(&state.job_running)?;
+    let from = pull::normalize_from(&from)?;
+    let dest = pull::local_dest(&dest)?;
+    let existing = pull::Existing::parse(&existing)?;
+    let drive = find_drive(drives_now().await?, &drive_id)?;
+    require_exfat(&drive)?;
+    require_trusted(&drive)?;
+    if pull::is_on_drive(&dest, &drive) {
+        return Err("The destination is on the USB drive itself. Choose a folder on this computer.".to_string());
+    }
+    let request = Request {
+        op: events::Op::Pull,
+        drive,
+        action: Action::Pull { from, existing, dest },
+        total: 1,
+        stage_dir: PathBuf::new(),
+        staged: Vec::new(),
+    };
+    job::spawn(app, request, lock)
+}
+
+/// Sub-folders of `rel` on a mounted drive, for the folder browser.
+#[tauri::command]
+async fn list_drive_folders(drive_id: String, rel: String) -> Result<Vec<String>, String> {
+    let rel = pull::normalize_from(&rel)?;
+    if udisks::fake_mode() {
+        return Ok(pull::fake_folders(&rel));
+    }
+    let drive = find_drive(drives_now().await?, &drive_id)?;
+    let mount = drive.mount_point.ok_or("The drive is not mounted, type a folder name instead")?;
+    tauri::async_runtime::spawn_blocking(move || pull::list_subdirs(&Path::new(&mount).join(&rel)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The default "Copy to" root: the user's Downloads folder.
+#[tauri::command]
+fn pull_defaults() -> Result<PullDefaults, String> {
+    let home = std::env::var("HOME").ok().filter(|h| Path::new(h).is_absolute());
+    let user_dirs =
+        home.as_ref().and_then(|h| std::fs::read_to_string(Path::new(h).join(".config").join("user-dirs.dirs")).ok());
+    Ok(PullDefaults { downloads: pull::downloads_from(user_dirs.as_deref(), home.as_deref())? })
+}
+
+/// Whether a destination folder exists, is a folder, and is empty.
+#[tauri::command]
+fn dest_status(path: String) -> Result<DestStatus, String> {
+    pull::dest_status(Path::new(&path))
+}
+
+/// The pull request from `--pull <path>` at start-up, taken once.
+#[tauri::command]
+fn take_pending_pull(state: State<'_, AppState>) -> Option<PullRequest> {
+    lock(&state.pending_pull).take()
+}
+
 /// Trusts a drive after admin authentication (flashcp-trust). Dev mode marks the fake drive.
 #[tauri::command]
 async fn trust_drive(app: AppHandle, drive_id: String) -> Result<(), String> {
@@ -206,6 +299,16 @@ fn receive_files(app: &AppHandle, files: Vec<String>) {
     }
     lock(&app.state::<AppState>().pending).extend(files.iter().cloned());
     let _ = app.emit("files-received", files);
+}
+
+/// Resolves a folder from a second instance (a file manager) and tells the window.
+fn receive_pull(app: &AppHandle, path: String) {
+    let app = app.clone();
+    thread::spawn(move || {
+        let request = pull::request_for_path(&udisks::list_drives(), Path::new(&path));
+        *lock(&app.state::<AppState>().pending_pull) = Some(request.clone());
+        let _ = app.emit("pull-requested", request);
+    });
 }
 
 /// Refreshes the known-drive set. Drives that were not known before are reported
@@ -298,7 +401,12 @@ fn setup_app(app: &mut App) -> Result<(), Box<dyn Error>> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let start_hidden = argv.iter().any(|a| a == "--tray");
     let cwd = std::env::current_dir().unwrap_or_default();
-    *lock(&app.state::<AppState>().pending) = paths_from_args(argv, &cwd);
+    let parsed = split_args(argv, &cwd);
+    *lock(&app.state::<AppState>().pending) = parsed.files;
+    if let Some(path) = parsed.pull {
+        let request = pull::request_for_path(&udisks::list_drives(), Path::new(&path));
+        *lock(&app.state::<AppState>().pending_pull) = Some(request);
+    }
 
     setup_tray(app)?;
 
@@ -330,8 +438,11 @@ fn setup_app(app: &mut App) -> Result<(), Box<dyn Error>> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
-            let files = paths_from_args(args.into_iter().skip(1), Path::new(&cwd));
-            receive_files(app, files);
+            let parsed = split_args(args.into_iter().skip(1), Path::new(&cwd));
+            receive_files(app, parsed.files);
+            if let Some(path) = parsed.pull {
+                receive_pull(app, path);
+            }
             show_main(app);
         }))
         .plugin(tauri_plugin_dialog::init())
@@ -343,7 +454,12 @@ pub fn run() {
             take_pending_files,
             start_copy,
             start_erase,
-            trust_drive
+            trust_drive,
+            start_pull,
+            list_drive_folders,
+            pull_defaults,
+            dest_status,
+            take_pending_pull
         ])
         .setup(setup_app)
         .run(tauri::generate_context!())
@@ -362,17 +478,35 @@ mod tests {
         let file_s = file.to_string_lossy().into_owned();
         let missing = dir.path().join("missing").to_string_lossy().into_owned();
 
-        let got = paths_from_args(vec!["--tray".to_string(), file_s.clone(), missing, String::new()], Path::new("/"));
-        assert_eq!(got, vec![file_s]);
+        let got = split_args(vec!["--tray".to_string(), file_s.clone(), missing, String::new()], Path::new("/"));
+        assert_eq!(got, Argv { files: vec![file_s], pull: None });
     }
 
     #[test]
     fn relative_args_resolve_against_cwd() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("Photos")).unwrap();
-        let got = paths_from_args(vec!["Photos".to_string()], dir.path());
+        let got = split_args(vec!["Photos".to_string()], dir.path()).files;
         assert_eq!(got.len(), 1);
         assert!(got[0].ends_with("Photos"));
         assert!(Path::new(&got[0]).is_absolute());
+    }
+
+    #[test]
+    fn pull_value_is_not_a_file_to_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let stick = dir.path().join("STICK");
+        std::fs::create_dir(&stick).unwrap();
+        let stick_s = stick.to_string_lossy().into_owned();
+        let got = split_args(vec!["--pull".to_string(), stick_s.clone()], Path::new("/"));
+        assert_eq!(got, Argv { files: Vec::new(), pull: Some(stick_s) });
+    }
+
+    #[test]
+    fn relative_pull_path_resolves_against_cwd() {
+        let got = split_args(vec!["--pull".to_string(), "Photos/2026".to_string()], Path::new("/media/u"));
+        assert_eq!(got.pull.as_deref(), Some("/media/u/Photos/2026"));
+        assert!(got.files.is_empty());
+        assert_eq!(split_args(vec!["--pull".to_string()], Path::new("/")).pull, None);
     }
 }

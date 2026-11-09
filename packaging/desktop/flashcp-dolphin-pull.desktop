@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Service
+Name=flashcp pull
+ServiceTypes=KonqPopupMenu/Plugin
+MimeType=inode/directory;
+Actions=flashcpPull;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-Priority=TopLevel
+X-KDE-Protocols=file
+X-KDE-RequiredNumberOfUrls=1
+
+[Desktop Action flashcpPull]
+Name=Fast copy from USB (flashcp)
+Icon=flashcp-gui
+Exec=flashcp-gui --pull %f

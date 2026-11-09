@@ -12,6 +12,8 @@ small programs run as root via pkexec. Source for both: `gui/helper/`.
 
 flashcp only writes to drives that an administrator explicitly trusted (by stable identity),
 that are currently attached over USB, that are idle, and that do not carry the running system.
+It only reads (`pull`, `info`) drives that pass the same checks. Files copied off a drive land
+only where the invoking user could write anyway.
 
 What this does not claim: that internal disks are unreachable. "Attached over USB" is a
 property of the kernel's device topology, not proof that a drive is external. An internal
@@ -33,6 +35,8 @@ checks below, not by the USB check. See "Residual risks".
   can call pkexec with any argv and environment it likes, and can signal (including SIGKILL)
   the helper, because pkexec keeps the caller's real uid.
 - Hostile file names in the copy source (spaces, newlines, leading `-`).
+- A user-chosen `pull` destination that points somewhere the user cannot write (`/etc`,
+  another user's home), directly or through symlinks swapped in during the copy.
 - A malicious USB device: odd descriptors, a crafted exFAT volume, a forged serial number.
 
 Out of scope: someone who already has root, physical attacks beyond plugging in a USB device.
@@ -133,20 +137,29 @@ password, so a cached authorization from a recent copy can never be used to add 
 flashcp-helper add   <dev> --expect <key> [--skip-existing] --item <src-dir> <to-dir> ...   (1-256 items)
 flashcp-helper build <dev> --expect <key> --confirm <text> [--label <L>] <src-dir>
 flashcp-helper info  <dev> --expect <key>
+flashcp-helper pull  <dev> --expect <key> [--from <rel>] [--skip-existing | --overwrite] <dest>
 ```
 
 1. **Fixed argv shapes only.** Unknown ops and flags, duplicate flags, `--flag=value`, missing
    `--expect`, `build` without `--confirm`, zero or more than 256 items, and non-UTF-8 argv
-   are refused. The helper builds every flashcp argv itself from the parsed values. Nothing is
-   forwarded verbatim.
+   are refused, and so are `pull` with both `--skip-existing` and `--overwrite`, or without a
+   destination. The helper builds every flashcp argv itself from the parsed values. Nothing is
+   forwarded verbatim. `pull` always becomes `flashcp pull --target-fd 3 <dest> [--from <rel>]
+   [--skip-existing|--overwrite] --json`.
 2. **Value checks.** Sources must be absolute (so they never parse as a flag), at most 4096
    bytes, no NUL. Destinations start with `/`, have no `..` component and no control
    characters, and are at most 1024 bytes. `--label` is 1-15 characters with no control
    characters, no `/` and no leading `-`. `--expect` and `--confirm` are 1-128 characters with
-   no control characters. They are only compared, never forwarded. `<dev>` is matched exactly,
+   no control characters. They are only compared, never forwarded. `pull --from` is a folder
+   inside the volume in canonical relative form: non-empty components separated by single
+   `/`, none `.` or `..`, no leading `/` or `-` (so it can't be read as a flag), no control
+   characters, at most 1024 bytes. flashcp resolves it inside the volume it parses, never on
+   the local file system. The `pull` destination must be absolute, at most 4096 bytes, no NUL;
+   see "The pull destination" below for why nothing else is checked. `<dev>` is matched exactly,
    with no normalisation, so `/dev/../dev/sda`, `/dev/disk/by-id/...` and trailing spaces fail.
 3. **Open once.** `<dev>` is opened once per job: `O_RDWR|O_EXCL|O_NOFOLLOW|O_CLOEXEC` for
-   `add`/`build`, `O_RDONLY|O_NOFOLLOW|O_CLOEXEC` for `info`. With `O_EXCL` the kernel refuses
+   `add`/`build`, `O_RDONLY|O_EXCL|O_NOFOLLOW|O_CLOEXEC` for `pull`, `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`
+   for `info`. With `O_EXCL` the kernel refuses
    a device that is mounted or claimed exclusively (by LVM, md, dm), and keeps others from
    claiming it while the helper holds it. Every check below runs on this fd, and flashcp gets
    this fd. Unplugging and replugging after the open cannot redirect the job to another device:
@@ -198,6 +211,46 @@ can SIGKILL the helper (pkexec keeps their real uid), and this is now harmless: 
 outcome is that the current flashcp run continues or stops, holding an fd to that one trusted
 drive until it exits.
 
+### pull: read-only, but exclusive
+
+`pull` never writes the drive, so the fd flashcp gets is `O_RDONLY`: a bug in flashcp's pull
+code, or a process that takes the fd over, cannot modify the stick. It is still opened with
+`O_EXCL`, which on a block device is an exclusive claim independent of the access mode:
+
+- The idle check (not mounted, no holders) stays true for the whole copy instead of being a
+  snapshot. Without the claim, udisks could automount the stick mid-copy and the kernel's exFAT
+  driver would start writing metadata (at least the dirty flag) under a reader that assumes a
+  quiescent volume. The copy would then be inconsistent, not unsafe, since flashcp already
+  treats the volume as untrusted, but there is no reason to allow it.
+- The cost is that the user can't mount the drive while a pull runs. The app unmounts it before
+  the job and remounts it afterwards, exactly as for `add`.
+- A read-only open does not make udev re-probe the device on close (that follows
+  `IN_CLOSE_WRITE`), so a pull leaves no trace on the drive or in udev.
+
+### The pull destination
+
+The destination is chosen by the user and is the only path in a helper request that points at
+the local file system. The helper, running as root, **never looks at it**: no `stat`, no
+ownership or permission check, no `realpath`, no `mkdir`. Every such check would be a root-side
+check of a user-controlled path, open to symlink swaps between check and use, and would also
+require the helper to reproduce the kernel's permission rules (ACLs, groups, mount options,
+LSMs) for another user. Instead:
+
+- The helper only requires an absolute path (so it can't parse as a flag and doesn't depend on
+  the cwd) and passes it as one argv element.
+- flashcp runs as the invoking user (dropped uid, gid and groups, no new privileges, see step
+  7), and it is flashcp that creates and opens the destination. So the kernel enforces "a
+  directory the user owns or can write", with the user's real credentials, at the moment of
+  use. `pull` into `/etc` or `/root` fails with EACCES like it would for the user in a shell.
+- Inside the destination flashcp writes only through directory fds (`openat2` with
+  `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, `O_NOFOLLOW`), and `--overwrite` renames a temp file
+  over the old one instead of truncating it. A symlink planted in the destination during the
+  copy can't redirect a write, and the worst case of a hostile volume is files the user could
+  have created themselves.
+
+The GUI refuses a destination inside the drive's own mount point, and runs the
+not-empty/skip/overwrite dialog as the user, but none of that is a security boundary.
+
 ## Why flashcp runs as the user
 
 Root's only jobs are to open one validated, trusted device and to vouch for its identity.
@@ -229,7 +282,11 @@ the process that holds the device.
   (for example with `ptrace`, if the kernel's Yama setting allows it). The scope is that one
   trusted drive, which the user had admin consent to write anyway. Raw SCSI passthrough via
   the fd is limited by the kernel's SG_IO command filter for non-root callers.
-- `add`, `info` and the confirmation run parse an existing, untrusted exFAT volume. A malicious
+- **Reading a trusted drive gives the user its raw contents.** During a `pull` (and `info`) the
+  user's flashcp holds a read-only fd to the whole device, so it can read deleted-but-not-
+  overwritten data on that drive too. The drive is one an administrator trusted and the user
+  could usually mount anyway; the polkit authentication is the same as for a copy to it.
+- `add`, `pull`, `info` and the confirmation run parse an existing, untrusted exFAT volume. A malicious
   stick could exploit a flashcp parser bug, but only as the unprivileged user, with no new
   privileges.
 - Opening a device read-write (even one that is then refused) makes udev re-probe it when the
