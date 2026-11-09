@@ -26,7 +26,7 @@
    git push origin vX.Y.Z
    ```
 
-The tag push starts the Release workflow. It checks that the tag matches the Cargo version, builds static musl binaries for x86_64 and aarch64, smoke-tests each one (builds an exFAT image and runs `fsck.exfat`), installs the `.deb` and checks it, then publishes the GitHub release with the assets and `SHA256SUMS`.
+The tag push starts the Release workflow. It checks that the tag matches the Cargo version and that the tagged commit is reachable from `origin/main` (tags on unmerged branches are rejected), builds static musl binaries for x86_64 and aarch64, smoke-tests each one (builds an exFAT image and runs `fsck.exfat`), installs the `.deb` and checks it, then publishes the GitHub release with the assets and `SHA256SUMS`.
 
 ## Verify
 

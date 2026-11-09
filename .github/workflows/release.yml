@@ -28,7 +28,9 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
       - name: Read crate version and check tag
         id: version
         run: |
@@ -37,6 +39,14 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$VERSION" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $VERSION (expected tag v$VERSION)"
             exit 1
+          fi
+          # Only commits already on main may be released.
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            git fetch --no-tags origin main
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::tag $GITHUB_REF_NAME ($GITHUB_SHA) is not reachable from origin/main"
+              exit 1
+            fi
           fi
           echo "Crate version: $VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -61,24 +71,26 @@ jobs:
       DEB_ARCH: ${{ matrix.deb_arch }}
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned toolchain so release builds are reproducible; bump deliberately.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-11-09
         with:
+          toolchain: 1.99.1
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
 
       # zig is the C cross-compiler for the zstd C code (zstdmt) on musl.
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.13.0
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          tool: cargo-zigbuild,cargo-deb
+          tool: cargo-zigbuild@0.24.1,cargo-deb@3.8.0
 
       - name: Build static binary
         run: cargo zigbuild --release --locked --target "$TARGET"
@@ -134,20 +146,20 @@ jobs:
           /usr/bin/flashcp --help
           sudo apt-get remove -y flashcp
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
-  release:
-    name: publish
+  # Read-only: runs for every event (tag, dispatch, PR) and produces the
+  # final asset set. Nothing here can write to the repository.
+  checksums:
+    name: checksums
     needs: [version, build]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: dist-*
           merge-multiple: true
@@ -161,7 +173,7 @@ jobs:
           cat SHA256SUMS
           ls -l .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-assets
           path: dist/*
@@ -178,12 +190,26 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # The only job with write access, and it exists only on v* tag pushes.
+  publish:
+    name: publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [version, checksums]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets
+          path: dist
+
       - name: Create GitHub release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eux
+          (cd dist && sha256sum -c SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "flashcp $GITHUB_REF_NAME" \
             --generate-notes \
