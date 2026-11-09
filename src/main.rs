@@ -283,7 +283,7 @@ fn run(cmd: Cmd) -> Result<()> {
         Cmd::Build { src, target, target_fd, cluster, label, fat, readers, dry_run, yes_erase, json } => {
             let target = spec(target, target_fd);
             anyhow::ensure!(dry_run || yes_erase, "this ERASES {}; pass --yes-erase to confirm", target.describe());
-            let o = exfat::BuildOpts { cluster, label, fat, readers, dry_run };
+            let o = exfat::BuildOpts { cluster, label, fat, readers, dry_run, serial: None };
             let s = exfat::build_to(&src, &target, &o, &mut sink(json))?;
             if !dry_run && !json {
                 println!(
