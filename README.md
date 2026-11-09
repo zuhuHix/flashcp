@@ -2,7 +2,7 @@
 
 # flashcp
 
-**Copy thousands of small files to a USB drive up to 10× faster, and still get normal loose files.**
+**Copy thousands of small files to a USB drive as normal loose files, measured up to 10.3× faster than `mkfs` + `cp` on a USB SSD under Linux.** Results vary by drive and OS; see the [benchmarks](#benchmarks).
 
 [![CI](https://github.com/zuhuHix/flashcp/actions/workflows/ci.yml/badge.svg)](https://github.com/zuhuHix/flashcp/actions/workflows/ci.yml)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
@@ -82,8 +82,9 @@ raw bandwidth is the limit for both methods, so the gap shrinks.
    the current one.
 3. **Done.** There is no step 3. The drive mounts anywhere exFAT mounts, with normal loose files.
 
-Flash storage loves this pattern: large aligned writes fill whole erase blocks, and a handful of
-big USB commands replace hundreds of thousands of tiny ones.
+The drive sees one ascending run of large, aligned writes instead of many small scattered ones,
+and a handful of big USB commands replace hundreds of thousands of tiny ones. Our measurements show
+the gap: the test SSD wrote 999 MB/s in 8 MB chunks but only 97 MB/s in 4 KB chunks.
 
 ## The journey (what didn't work)
 
