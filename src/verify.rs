@@ -565,6 +565,46 @@ pub(crate) fn hash_volume(dev: &File, t: &VolTree, s: &Strategy, prog: &Progress
     Ok(m)
 }
 
+/// The content hashes of a chosen set of volume files (as `(FirstCluster, NoFatChain,
+/// DataLength, ValidDataLength)`, already checked by the allocation walk), read in physical
+/// order with the same planner and reader as [`hash_volume`]. Used by `sync --checksum`.
+pub(crate) fn hash_vol_files(v: &mut Vol, files: &[(u32, bool, u64, u64)]) -> Result<Vec<u128>> {
+    let max = CHUNK as u64 - 2 * ALIGN;
+    let mut t = VolTree {
+        dirs: vec![VDir {
+            path: String::new(),
+            name: Vec::new(),
+            first: 0,
+            len: 0,
+            no_fat_chain: false,
+            mtime: None,
+            dirs: Vec::new(),
+            files: Vec::new(),
+        }],
+        files: Vec::new(),
+        root_clusters: Vec::new(),
+        exts: Vec::new(),
+    };
+    for (i, &(first, nfc, len, valid)) in files.iter().enumerate() {
+        let fi = u32::try_from(i).context("too many files")?;
+        let mut foff = 0u64;
+        for (s, n) in v.runs(first, nfc, len, "file")? {
+            if foff >= valid {
+                break;
+            }
+            let bytes = (n * v.cs).min(valid - foff);
+            push_run(&mut t.exts, fi, v.cluster_off(s as u32), foff, bytes, max);
+            foff += bytes;
+        }
+        let path = i.to_string();
+        t.files.push(VFile { path, name: Vec::new(), len, valid, first, no_fat_chain: nfc, mtime: None });
+    }
+    let dev = v.dev.try_clone().context("dup target fd")?;
+    let s = crate::pull::read_strategy(&dev, v);
+    let m = hash_volume(&dev, &t, &s, &Progress::default())?;
+    Ok((0..files.len()).map(|i| m.files[&i.to_string()].hash).collect())
+}
+
 // ───────────────────────── the local side ─────────────────────────
 
 fn mtime_of(md: &fs::Metadata) -> Option<(i64, u32)> {
@@ -633,7 +673,7 @@ pub(crate) fn hash_tree(root: &Path, prog: &Progress) -> Result<Manifest> {
 }
 
 /// (bytes read, hash) of one local file, read front to back in whole blocks.
-fn hash_file(p: &Path, buf: &mut [u8], prog: &Progress) -> Result<(u64, u128)> {
+pub(crate) fn hash_file(p: &Path, buf: &mut [u8], prog: &Progress) -> Result<(u64, u128)> {
     let mut f = File::open(p).with_context(|| format!("open {}", p.display()))?;
     crate::util::fadvise_sequential(&f);
     let (mut off, mut h) = (0u64, 0u128);

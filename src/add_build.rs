@@ -113,6 +113,7 @@ pub(crate) fn empty_as_build(
                 old >> 10
             ),
             strategy: strategy.clone(),
+            sync: None,
         }),
         e => sink(e),
     };

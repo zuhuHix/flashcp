@@ -1377,6 +1377,7 @@ pub(crate) fn build_target_guarded(
         write_bytes: p.write_bytes,
         detail,
         strategy: None,
+        sync: None,
     });
     if o.dry_run {
         tick.emit(Event::Done { files: files as u64, bytes: data, secs: t0.elapsed().as_secs_f64() });
