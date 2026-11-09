@@ -118,6 +118,10 @@ pub struct PullStats {
     /// Entries removed by --delete-extraneous: every file, symlink and directory removed, the
     /// top-level ones and everything inside removed directories alike.
     pub deleted: u64,
+    /// Planned deletions left in place because DEST changed since planning (an entry that is
+    /// now something else, or a directory that holds an entry the plan did not have). Each is
+    /// named in a warning on stderr; the run still succeeds.
+    pub skipped_deletions: u64,
     /// File bytes written to the destination (DataLength, zeros past ValidDataLength included).
     pub data_bytes: u64,
     /// Bytes read from the volume in the data phase (gaps and alignment included).
@@ -693,11 +697,13 @@ struct Plan {
 struct Extraneous {
     /// Index of the directory that holds it (into [`Plan::dirs`]).
     dir: u32,
-    name: CString,
     /// Path relative to the destination.
     rel: String,
     is_dir: bool,
-    /// The entry and everything inside it (symlinks count once, never followed).
+    /// The entry as it is at plan time, with everything inside it: what the deletion removes,
+    /// and nothing else (see [`dirfd::remove_planned_at`]).
+    tree: dirfd::Planned,
+    /// The entries of `tree` (itself included, symlinks counted once, never followed).
     entries: u64,
 }
 
@@ -874,15 +880,16 @@ fn plan(v: &mut Vol, start: Vec<Child>, seen: &mut [u8], root: Option<&OwnedFd>,
                 if here.contains(name.as_bytes()) {
                     continue;
                 }
-                let st = dirfd::stat_at(fd.as_fd(), &name)?;
-                let entries = dirfd::count_tree_at(fd.as_fd(), &name)?;
+                // Gone since the listing: nothing to plan.
+                let Some(tree) = dirfd::plan_tree_at(fd.as_fd(), &name)? else { continue };
+                let entries = tree.count();
                 let rel = dest_rel(&p.dirs, di).join(std::ffi::OsStr::from_bytes(name.as_bytes()));
                 p.extra_total += entries;
                 p.extraneous.push(Extraneous {
                     dir: di,
-                    name,
                     rel: rel.display().to_string(),
-                    is_dir: st.is_some_and(|st| dirfd::is_dir(&st)),
+                    is_dir: tree.is_dir(),
+                    tree,
                     entries,
                 });
             }
@@ -924,17 +931,101 @@ fn dest_rel(dirs: &[DirNode], mut i: u32) -> PathBuf {
     parts.iter().rev().collect()
 }
 
-/// --delete-extraneous: removes the entries planned by [`plan`] (and only those). Returns the
-/// entries removed (see [`PullStats::deleted`]).
-fn delete_extraneous(d: &Dest, extra: &[Extraneous]) -> Result<u64> {
+/// --delete-extraneous: removes the trees planned by [`plan`], and only what was planned (see
+/// [`dirfd::remove_planned_at`]). Returns what was removed and what was left in place.
+fn delete_extraneous(d: &Dest, extra: &[Extraneous]) -> Result<dirfd::Removal> {
     let mut cache = DirCache::default();
-    let mut deleted = 0;
+    let mut out = dirfd::Removal::default();
     for e in extra {
         let dir = cache.get(d, e.dir)?;
-        deleted +=
-            dirfd::remove_tree_at(dir, &e.name).with_context(|| format!("delete {} (not on the volume)", e.rel))?;
+        dirfd::remove_planned_at(dir, &e.tree, Path::new(&e.rel), &mut out)
+            .with_context(|| format!("delete {} (not on the volume)", e.rel))?;
     }
-    Ok(deleted)
+    Ok(out)
+}
+
+/// Warns about the deletions that were left in place because DEST changed since planning.
+fn report_skipped_deletions(d: &Dest, out: &dirfd::Removal) {
+    for p in &out.unplanned {
+        eprintln!(
+            "warning: not deleting {}: it is not in the plan (it appeared after planning); \
+             the planned directories holding it are kept",
+            d.path.join(p).display()
+        );
+    }
+    if !out.kept.is_empty() {
+        let paths: Vec<String> =
+            out.kept.iter().map(|(p, why)| format!("{} ({why})", d.path.join(p).display())).collect();
+        eprintln!(
+            "warning: {} planned deletions skipped because DEST changed since planning: {}",
+            out.kept.len(),
+            paths.join(", ")
+        );
+    }
+}
+
+/// The identity layer of the broad-root guard, on the open destination `root` (see
+/// [`identity_refusal`]). Refused before anything is planned or written.
+fn check_dest_identity(root: BorrowedFd<'_>, dest: &Path, home: Option<&Path>) -> Result<()> {
+    let (protected, home_chain) = protected_idents(home)?;
+    let chain = dirfd::ancestor_idents(root).with_context(|| format!("walk the parents of {}", dest.display()))?;
+    let empty = dirfd::list_at(root)?.is_empty();
+    if let Some(why) = identity_refusal(&chain, empty, &protected, &home_chain) {
+        bail!("refusing --delete-extraneous into {}: it is {why}; nothing was changed", dest.display());
+    }
+    Ok(())
+}
+
+/// The identities the broad-root guard compares the destination with, and $HOME's chain of
+/// identities up to the root (empty without HOME). Each protected place is paired with its
+/// reason. A place that does not exist is not protected.
+type Protected = Vec<(dirfd::Ident, &'static str)>;
+
+fn protected_idents(home: Option<&Path>) -> Result<(Protected, Vec<dirfd::Ident>)> {
+    let mut prot = Vec::new();
+    let tops = [("/", "the filesystem root")]
+        .into_iter()
+        .chain(["/home", "/usr", "/etc", "/var", "/root", "/boot"].map(|p| (p, "a top-level system directory")));
+    for (path, why) in tops {
+        if let Some(fd) = dirfd::open_path_dir(Path::new(path))? {
+            prot.push((dirfd::ident_of(fd.as_fd())?, why));
+        }
+    }
+    let mut home_chain = Vec::new();
+    if let Some(h) = home
+        && let Some(fd) = dirfd::open_path_dir(h)?
+    {
+        home_chain = dirfd::ancestor_idents(fd.as_fd())?;
+        prot.push((home_chain[0], "your home directory"));
+    }
+    Ok((prot, home_chain))
+}
+
+/// The pure part of the identity layer. `chain` holds the destination's identity, then those of
+/// its parents up to the filesystem root (see [`dirfd::ancestor_idents`]); `home_chain` the same
+/// for $HOME. Refuses (returning why) when the destination is one of the `protected` places, an
+/// ancestor of $HOME, or a mount point that is not empty. Protected places are matched by
+/// identity, so a bind mount of $HOME or of /usr is caught wherever it is mounted.
+pub(crate) fn identity_refusal(
+    chain: &[dirfd::Ident],
+    empty: bool,
+    protected: &[(dirfd::Ident, &'static str)],
+    home_chain: &[dirfd::Ident],
+) -> Option<&'static str> {
+    let Some(&dest) = chain.first() else { return Some("a directory whose identity is unknown") };
+    if let Some(&(_, why)) = protected.iter().find(|(id, _)| *id == dest) {
+        return Some(why);
+    }
+    if home_chain.iter().skip(1).any(|id| *id == dest) {
+        return Some("an ancestor of your home directory");
+    }
+    // A parent on another device means a mount point; a parent with the same identity, or none,
+    // means the filesystem root.
+    let Some(&parent) = chain.get(1).filter(|p| **p != dest) else { return Some("the filesystem root") };
+    if parent.0 != dest.0 && !empty {
+        return Some("a mount point that is not empty");
+    }
+    None
 }
 
 /// The itemized deletion list: one line per top-level entry (directories with their entry count).
@@ -1103,6 +1194,11 @@ fn pull_inner(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("stat {}", dest.display())),
     };
+    // Refused before anything is planned or written, even with --yes.
+    if let (Some(r), true) = (&root, o.delete_extraneous) {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        check_dest_identity(r.as_fd(), dest, home.as_deref())?;
+    }
     // flashcp sync's own journal (root only) is not a user file: never copied.
     let at_root = cur.entry.is_none();
     let start: Vec<Child> = std::mem::take(&mut cur.children)
@@ -1222,11 +1318,15 @@ fn pull_inner(
             return Err(e.context("pull failed; the destination holds a partial copy"));
         }
     };
-    // Only now that every file is in place: whatever the volume does not have goes.
-    let deleted = if o.delete_extraneous {
-        delete_extraneous(&d, &extra).context("--delete-extraneous failed; the destination is partly cleaned")?
+    // Only now that every file is in place: whatever the volume does not have goes, and only
+    // what was planned (a planned entry changed since planning is left alone and reported).
+    let (deleted, skipped_deletions) = if o.delete_extraneous {
+        let out =
+            delete_extraneous(&d, &extra).context("--delete-extraneous failed; the destination is partly cleaned")?;
+        report_skipped_deletions(&d, &out);
+        (out.removed, out.kept.len() as u64)
     } else {
-        0
+        (0, 0)
     };
     let hashes = hash.then(|| PullHashes { manifest: manifest_of(&d.dirs, &jobs), retries, strategy: strat.clone() });
     // Directory mtimes last (creating or removing entries changed them), deepest first.
@@ -1247,6 +1347,7 @@ fn pull_inner(
         dirs,
         skipped: p.skipped,
         deleted,
+        skipped_deletions,
         data_bytes,
         read_bytes,
         reads: chunks.len() as u64 + u64::from(tail_bytes > 0),
@@ -1625,5 +1726,97 @@ mod tests {
         assert_eq!(protected_dest(Path::new("/home"), Some(home)), Some("a top-level system directory"));
         assert_eq!(protected_dest(Path::new("/srv/data"), Some(deep)), Some("an ancestor of your home directory"));
         assert_eq!(protected_dest(Path::new("/home/bob"), Some(home)), Some("another user's home directory"));
+    }
+
+    // Identities are (dev, ino) pairs; these tables are made up: dev 1 is the root filesystem.
+    const PROT: [(dirfd::Ident, &str); 3] =
+        [((1, 1), "the filesystem root"), ((1, 100), "your home directory"), ((1, 50), "a top-level system directory")];
+    const HOME_CHAIN: [dirfd::Ident; 4] = [(1, 100), (1, 70), (1, 20), (1, 1)];
+
+    fn refusal(chain: &[dirfd::Ident], empty: bool) -> Option<&'static str> {
+        let prot: Vec<(dirfd::Ident, &'static str)> = PROT.iter().map(|&(i, w)| (i, w)).collect();
+        identity_refusal(chain, empty, &prot, &HOME_CHAIN)
+    }
+
+    #[test]
+    fn identity_refusal_matches_protected_places_by_identity() {
+        // The root, $HOME, and a top-level system directory, whatever path leads to them.
+        assert_eq!(refusal(&[(1, 1), (1, 1)], false), Some("the filesystem root"));
+        assert_eq!(refusal(&[(1, 100), (1, 20), (1, 1)], false), Some("your home directory"));
+        assert_eq!(refusal(&[(1, 100), (1, 20), (1, 1)], true), Some("your home directory"));
+        assert_eq!(refusal(&[(1, 50), (1, 1)], true), Some("a top-level system directory"));
+        // A bind mount of $HOME elsewhere has $HOME's identity, not its path, so it is refused.
+        assert_eq!(refusal(&[(1, 100), (1, 300), (1, 1)], false), Some("your home directory"));
+        // A place that only shares a device with a protected one is not protected.
+        assert_eq!(refusal(&[(1, 200), (1, 20), (1, 1)], false), None);
+    }
+
+    #[test]
+    fn identity_refusal_refuses_ancestors_of_home_by_identity() {
+        // /srv/data is an ancestor of $HOME (chain 100 -> 70 -> 20 -> 1); its identity matches.
+        assert_eq!(refusal(&[(1, 70), (1, 20), (1, 1)], false), Some("an ancestor of your home directory"));
+        assert_eq!(refusal(&[(1, 20), (1, 1)], false), Some("an ancestor of your home directory"));
+        // A folder inside $HOME is fine, and so is a sibling of $HOME.
+        assert_eq!(refusal(&[(1, 101), (1, 100), (1, 70), (1, 20), (1, 1)], false), None);
+        assert_eq!(refusal(&[(1, 201), (1, 70), (1, 20), (1, 1)], false), None);
+        // Without a home chain, nothing is an ancestor of it.
+        let prot: Vec<(dirfd::Ident, &'static str)> = Vec::new();
+        assert_eq!(identity_refusal(&[(1, 70), (1, 20), (1, 1)], false, &prot, &[]), None);
+    }
+
+    #[test]
+    fn identity_refusal_mount_points_only_when_empty() {
+        // A different device than the parent: a mount point (here a non-empty one is refused).
+        let mount = [(2, 7), (1, 20), (1, 1)];
+        assert_eq!(refusal(&mount, false), Some("a mount point that is not empty"));
+        assert_eq!(refusal(&mount, true), None, "an empty mount point is a valid destination");
+        // The same device as the parent: an ordinary directory, empty or not.
+        assert_eq!(refusal(&[(1, 7), (1, 20), (1, 1)], false), None);
+        assert_eq!(refusal(&[(1, 7), (1, 20), (1, 1)], true), None);
+        // A directory with its own identity as its parent is the filesystem root.
+        assert_eq!(refusal(&[(2, 1), (2, 1)], true), Some("the filesystem root"));
+        // An unknown identity is refused, not waved through.
+        assert_eq!(refusal(&[], true), Some("a directory whose identity is unknown"));
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("flashcp-pull-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn identity_check_sees_home_through_another_path() {
+        // $HOME, and the same directory reached through /proc (another path, same identity; the
+        // canonical-path check cannot see this, the identity layer does).
+        let base = scratch_dir("identity-home");
+        let home = base.join("home");
+        fs::create_dir_all(home.join("Documents")).unwrap();
+        let fd = dirfd::open_root(&home).unwrap();
+        let via = PathBuf::from(format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&fd)));
+        let err = check_dest_identity(fd.as_fd(), &home, Some(&via)).unwrap_err().to_string();
+        assert!(err.contains("refusing --delete-extraneous") && err.contains("your home directory"), "{err}");
+        // A directory that is neither $HOME nor a protected place passes.
+        let other = base.join("other");
+        fs::create_dir_all(&other).unwrap();
+        let ofd = dirfd::open_root(&other).unwrap();
+        check_dest_identity(ofd.as_fd(), &other, Some(&home)).unwrap();
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn identity_check_refuses_a_non_empty_mount_point() {
+        // /proc is a mount point of its own on Linux. Skipped where it is not one.
+        let root = dirfd::open_path_dir(Path::new("/")).unwrap().expect("/ exists");
+        let proc = dirfd::open_path_dir(Path::new("/proc")).unwrap();
+        let (Some(proc), Ok(root_id)) = (proc, dirfd::ident_of(root.as_fd())) else { return };
+        if dirfd::ident_of(proc.as_fd()).unwrap().0 == root_id.0 {
+            eprintln!("skipped: /proc is not a mount point here");
+            return;
+        }
+        let pfd = dirfd::open_root(Path::new("/proc")).unwrap();
+        let err = check_dest_identity(pfd.as_fd(), Path::new("/proc"), None).unwrap_err().to_string();
+        assert!(err.contains("a mount point that is not empty"), "{err}");
     }
 }
