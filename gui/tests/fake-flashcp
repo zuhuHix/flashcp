@@ -1,7 +1,8 @@
 #!/bin/sh
 # Fake flashcp for tests and dry runs. Speaks the JSON-lines contract and writes nothing.
 # Accepts the shapes the GUI passes: add|build <src> --target-fd N [...], pull --target-fd N <dest>
-# [--from REL] [--skip-existing|--overwrite] [--json], and info --target-fd N.
+# [--from REL] [--skip-existing|--overwrite] [--json], optimize --target-fd N --temp DIR --yes
+# [--dry-run] [--json], and info --target-fd N.
 # FAKE_FLASHCP_MODE selects the stdout stream:
 #   normal   (default) plan, progress, done; exit 0
 #   garbage  plan, progress, a non-JSON line mid-stream, progress, done; exit 0
@@ -10,6 +11,14 @@
 #   error    plan, then an error event "fake failure: device busy"; exit 2
 #   conflict (pull, and any op) without --skip-existing or --overwrite: an error event with flashcp's
 #            collision message, exit 1, before any plan. With either flag: the normal stream.
+# Optimize (op optimize, with --dry-run anywhere in argv for the check): a plan, then done for a
+# dry run. A real run is five phases (pull, verify, build, check, cleanup; step i of 5), each with a
+# few progress lines, then done. Other modes behave as normal.
+#   optimize-already    plan with write_bytes 0 and already_optimized true, temp null; done
+#   optimize-resume     plan with resume true, cluster null; real run: build 1/3, check 2/3, cleanup 3/3
+#   optimize-interrupt  real run: pull 1/5, verify 2/5, build 3/5 and progress, then an error with a
+#                       recovery text, exit 1
+#   optimize-nospace    before any plan: "no place for the temporary copy" error, exit 1
 # FAKE_FLASHCP_FAIL=1 is an alias for FAKE_FLASHCP_MODE=error.
 # FAKE_FLASHCP_LOG=<file> appends the received argv (one arg per line, then "--").
 # FAKE_FLASHCP_DELAY=<seconds> between progress lines (default 0.05).
@@ -24,7 +33,7 @@ case "$op" in
   info)
     echo '{"label":"FAKEUSB","cluster":32768,"size":32010928128,"free":30000000000,"files":12,"dirs":3,"dirty":false}'
     exit 0 ;;
-  add|build|pull) ;;
+  add|build|pull|optimize) ;;
   *) echo "{\"event\":\"error\",\"message\":\"unknown op $op\"}"; exit 2 ;;
 esac
 
@@ -60,6 +69,66 @@ collide() {
   done
   return 0
 }
+
+# ---- optimize ----
+OPT_TEMP=/home/u/.cache/flashcp/optimize/flashcp-optimize-X
+
+# phase NAME STEP STEPS
+phase() {
+  echo '{"event":"phase","op":"optimize","phase":"'"$1"'","step":'"$2"',"steps":'"$3"'}'
+}
+
+optimize_plan_line() {
+  case "$mode" in
+    optimize-already)
+      echo '{"event":"plan","op":"optimize","files":100,"dirs":5,"bytes":50000000,"write_bytes":0,"strategy":{"temp":null,"cluster":4096,"new_cluster":4096,"label":"FAKEUSB","already_optimized":true,"resume":false}}' ;;
+    optimize-resume)
+      echo '{"event":"plan","op":"optimize","files":100,"dirs":5,"bytes":50000000,"write_bytes":52000000,"strategy":{"temp":"'"$OPT_TEMP"'","cluster":null,"new_cluster":4096,"label":"FAKEUSB","already_optimized":false,"resume":true}}' ;;
+    *)
+      echo '{"event":"plan","op":"optimize","files":100,"dirs":5,"bytes":50000000,"write_bytes":52000000,"strategy":{"temp":"'"$OPT_TEMP"'","cluster":32768,"new_cluster":4096,"label":"FAKEUSB","already_optimized":false,"resume":false}}' ;;
+  esac
+}
+
+optimize_main() {
+  dry=0
+  for a in "$@"; do
+    if [ "$a" = --dry-run ]; then dry=1; fi
+  done
+  if [ "$mode" = optimize-nospace ]; then
+    echo '{"event":"error","message":"no place for the temporary copy: optimize needs 1.2 GB free in /home/u/.cache/flashcp/optimize, 300 MB are available"}'
+    return 1
+  fi
+  optimize_plan_line
+  if [ "$dry" = 1 ] || [ "$mode" = optimize-already ]; then
+    done_line
+    return 0
+  fi
+  case "$mode" in
+    optimize-resume)
+      phase build 1 3; progress 2
+      phase check 2 3; progress 2
+      phase cleanup 3 3; progress 2 ;;
+    optimize-interrupt)
+      phase pull 1 5
+      phase verify 2 5
+      phase build 3 5; progress 3
+      echo '{"event":"error","message":"optimize: the drive stopped responding","recovery":"/dev/sdb1 may be incomplete, but all your files are safe in /home/u/.cache/flashcp/optimize/flashcp-optimize-X/tree; re-run optimize to finish"}'
+      return 1 ;;
+    *)
+      phase pull 1 5; progress 2
+      phase verify 2 5; progress 2
+      phase build 3 5; progress 2
+      phase check 4 5; progress 2
+      phase cleanup 5 5; progress 2 ;;
+  esac
+  done_line
+  return 0
+}
+
+if [ "$op" = optimize ]; then
+  optimize_main "$@"
+  exit $?
+fi
 
 case "$mode" in
   normal) plan; progress 10; done_line ;;

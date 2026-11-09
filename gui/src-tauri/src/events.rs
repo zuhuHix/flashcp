@@ -9,15 +9,47 @@ use std::process::ExitStatus;
 /// A validated event from flashcp's stdout. Only the fields the GUI uses are kept.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FlashcpEvent {
-    Plan { files: u64, bytes: u64 },
-    Progress { files_done: u64, bytes_done: u64 },
-    Done { files: u64, bytes: u64, secs: f64 },
+    Plan {
+        files: u64,
+        dirs: u64,
+        bytes: u64,
+        write_bytes: u64,
+        strategy: Option<Value>,
+    },
+    /// A named step inside the current run (optimize). Progress that follows counts within it.
+    Phase {
+        phase: String,
+        step: u32,
+        steps: u32,
+    },
+    Progress {
+        files_done: u64,
+        bytes_done: u64,
+    },
+    Done {
+        files: u64,
+        bytes: u64,
+        secs: f64,
+    },
 }
 
 #[derive(Deserialize)]
 struct PlanLine {
     files: u64,
     bytes: u64,
+    #[serde(default)]
+    dirs: u64,
+    #[serde(default)]
+    write_bytes: u64,
+    #[serde(default)]
+    strategy: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct PhaseLine {
+    phase: String,
+    step: u32,
+    steps: u32,
 }
 
 #[derive(Deserialize)]
@@ -36,6 +68,9 @@ struct DoneLine {
 #[derive(Deserialize)]
 struct ErrorLine {
     message: String,
+    /// Only present once the stick may be half-written: where the data is and how to finish.
+    #[serde(default)]
+    recovery: Option<String>,
 }
 
 const SNIPPET_CHARS: usize = 120;
@@ -60,16 +95,22 @@ pub struct RunValidator {
     expected: usize,
     dones: usize,
     in_run: bool,
+    recovery: Option<String>,
 }
 
 impl RunValidator {
     pub fn new(expected: usize) -> Self {
-        RunValidator { expected, dones: 0, in_run: false }
+        RunValidator { expected, dones: 0, in_run: false, recovery: None }
     }
 
     /// Items this process has finished so far.
     pub fn dones(&self) -> usize {
         self.dones
+    }
+
+    /// The recovery text of the error event that stopped this process, if it had one.
+    pub fn recovery(&self) -> Option<&str> {
+        self.recovery.as_deref()
     }
 
     /// Checks one stdout line. Valid plan, progress and done lines come back as events.
@@ -87,7 +128,20 @@ impl RunValidator {
                     return Err("flashcp started an item before the previous one was done".to_string());
                 }
                 self.in_run = true;
-                Ok(Some(FlashcpEvent::Plan { files: p.files, bytes: p.bytes }))
+                Ok(Some(FlashcpEvent::Plan {
+                    files: p.files,
+                    dirs: p.dirs,
+                    bytes: p.bytes,
+                    write_bytes: p.write_bytes,
+                    strategy: p.strategy,
+                }))
+            }
+            "phase" => {
+                if !self.in_run {
+                    return Err("flashcp sent a phase outside a plan".to_string());
+                }
+                let p: PhaseLine = typed(text)?;
+                Ok(Some(FlashcpEvent::Phase { phase: p.phase, step: p.step, steps: p.steps }))
             }
             "progress" => {
                 if !self.in_run {
@@ -110,6 +164,7 @@ impl RunValidator {
             }
             "error" => {
                 let e: ErrorLine = typed(text)?;
+                self.recovery = e.recovery.filter(|r| !r.is_empty());
                 if e.message.is_empty() {
                     Err("flashcp reported an error".to_string())
                 } else {
@@ -152,6 +207,7 @@ pub enum Op {
     Add,
     Build,
     Pull,
+    Optimize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -166,6 +222,8 @@ pub struct JobSummary {
     pub dest: Option<String>,
     /// Pull: set when the copy succeeded but the drive could not be remounted.
     pub warning: Option<String>,
+    /// Add: the exFAT cluster size of the drive after the copy (None when unknown).
+    pub cluster_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -183,6 +241,22 @@ pub struct JobUpdate {
     /// True only on an error caused by flashcp's collision message (see `pull::is_collision`).
     pub conflict: bool,
     pub summary: Option<JobSummary>,
+    /// Optimize: the current phase name, and its step within `steps`.
+    pub phase: Option<String>,
+    pub step: u32,
+    pub steps: u32,
+    /// Optimize: where the data is and how to finish, when the stick may be half-written.
+    pub recovery: Option<String>,
+}
+
+/// The last plan flashcp reported in this job.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanInfo {
+    pub files: u64,
+    pub dirs: u64,
+    pub bytes: u64,
+    pub write_bytes: u64,
+    pub strategy: Option<Value>,
 }
 
 /// Folds validated events from the job's flashcp processes into job totals.
@@ -195,6 +269,10 @@ pub struct JobAggregate {
     run_bytes: u64,
     plan_files: u64,
     plan_bytes: u64,
+    phase: Option<String>,
+    step: u32,
+    steps: u32,
+    plan: Option<PlanInfo>,
 }
 
 impl JobAggregate {
@@ -202,13 +280,31 @@ impl JobAggregate {
     pub fn start_run(&mut self) {
         self.run_files = 0;
         self.run_bytes = 0;
+        self.phase = None;
+        self.step = 0;
+        self.steps = 0;
     }
 
     pub fn apply(&mut self, event: &FlashcpEvent) {
         match event {
-            FlashcpEvent::Plan { files, bytes } => {
+            FlashcpEvent::Plan { files, dirs, bytes, write_bytes, strategy } => {
                 self.plan_files += files;
                 self.plan_bytes += bytes;
+                self.plan = Some(PlanInfo {
+                    files: *files,
+                    dirs: *dirs,
+                    bytes: *bytes,
+                    write_bytes: *write_bytes,
+                    strategy: strategy.clone(),
+                });
+            }
+            FlashcpEvent::Phase { phase, step, steps } => {
+                // Progress counts within a phase, so each phase starts from zero.
+                self.run_files = 0;
+                self.run_bytes = 0;
+                self.phase = Some(phase.clone());
+                self.step = *step;
+                self.steps = *steps;
             }
             FlashcpEvent::Progress { files_done, bytes_done } => {
                 self.run_files = *files_done;
@@ -220,8 +316,16 @@ impl JobAggregate {
                 self.secs += secs;
                 self.run_files = 0;
                 self.run_bytes = 0;
+                self.phase = None;
+                self.step = 0;
+                self.steps = 0;
             }
         }
+    }
+
+    /// The last plan this job reported (None before the first plan).
+    pub fn plan(&self) -> Option<&PlanInfo> {
+        self.plan.as_ref()
     }
 
     pub fn files_done(&self) -> u64 {
@@ -259,6 +363,10 @@ impl JobAggregate {
             conflict: stage == Stage::Error && message.as_deref().is_some_and(is_collision),
             message,
             summary: None,
+            phase: self.phase.clone(),
+            step: self.step,
+            steps: self.steps,
+            recovery: None,
         }
     }
 }
@@ -304,7 +412,16 @@ mod tests {
     #[test]
     fn parses_plan_progress_done() {
         let mut v = RunValidator::new(1);
-        assert_eq!(v.feed(plan()), Ok(Some(FlashcpEvent::Plan { files: 100, bytes: 50_000_000 })));
+        assert_eq!(
+            v.feed(plan()),
+            Ok(Some(FlashcpEvent::Plan {
+                files: 100,
+                dirs: 5,
+                bytes: 50_000_000,
+                write_bytes: 52_000_000,
+                strategy: None
+            }))
+        );
         assert_eq!(v.feed(progress()), Ok(Some(FlashcpEvent::Progress { files_done: 10, bytes_done: 5_000_000 })));
         assert_eq!(v.feed(done()), Ok(Some(FlashcpEvent::Done { files: 100, bytes: 50_000_000, secs: 0.5 })));
     }
@@ -339,7 +456,16 @@ mod tests {
     fn extra_fields_are_tolerated() {
         let mut v = RunValidator::new(1);
         let line = r#"{"event":"progress","files_done":1,"bytes_done":2,"speed":9.5,"eta":3}"#;
-        assert_eq!(v.feed(plan()), Ok(Some(FlashcpEvent::Plan { files: 100, bytes: 50_000_000 })));
+        assert_eq!(
+            v.feed(plan()),
+            Ok(Some(FlashcpEvent::Plan {
+                files: 100,
+                dirs: 5,
+                bytes: 50_000_000,
+                write_bytes: 52_000_000,
+                strategy: None
+            }))
+        );
         assert_eq!(v.feed(line), Ok(Some(FlashcpEvent::Progress { files_done: 1, bytes_done: 2 })));
         let line = r#"{"event":"done","files":1,"bytes":2,"secs":1,"rate":4,"extra":{"a":1}}"#;
         assert_eq!(v.feed(line), Ok(Some(FlashcpEvent::Done { files: 1, bytes: 2, secs: 1.0 })));
@@ -377,7 +503,16 @@ mod tests {
     fn malformed_event_fields_are_unreadable() {
         let mut v = RunValidator::new(1);
         assert!(err(&mut v, r#"{"event":"plan"}"#).starts_with("flashcp sent unreadable output"));
-        assert_eq!(v.feed(plan()), Ok(Some(FlashcpEvent::Plan { files: 100, bytes: 50_000_000 })));
+        assert_eq!(
+            v.feed(plan()),
+            Ok(Some(FlashcpEvent::Plan {
+                files: 100,
+                dirs: 5,
+                bytes: 50_000_000,
+                write_bytes: 52_000_000,
+                strategy: None
+            }))
+        );
         assert!(err(&mut v, r#"{"event":"progress","files_done":"ten"}"#).starts_with("flashcp sent unreadable"));
         assert!(err(&mut v, r#"{"event":"done","files":1}"#).starts_with("flashcp sent unreadable"));
     }
@@ -391,7 +526,16 @@ mod tests {
     #[test]
     fn error_event_gives_its_message() {
         let mut v = RunValidator::new(1);
-        assert_eq!(v.feed(plan()), Ok(Some(FlashcpEvent::Plan { files: 100, bytes: 50_000_000 })));
+        assert_eq!(
+            v.feed(plan()),
+            Ok(Some(FlashcpEvent::Plan {
+                files: 100,
+                dirs: 5,
+                bytes: 50_000_000,
+                write_bytes: 52_000_000,
+                strategy: None
+            }))
+        );
         assert_eq!(
             err(&mut v, r#"{"event":"error","message":"fake failure: device busy"}"#),
             "fake failure: device busy"
@@ -467,14 +611,26 @@ mod tests {
     fn aggregates_across_runs() {
         let mut agg = JobAggregate::default();
         agg.start_run();
-        agg.apply(&FlashcpEvent::Plan { files: 100, bytes: 50_000_000 });
+        agg.apply(&FlashcpEvent::Plan {
+            files: 100,
+            dirs: 5,
+            bytes: 50_000_000,
+            write_bytes: 52_000_000,
+            strategy: None,
+        });
         agg.apply(&FlashcpEvent::Progress { files_done: 40, bytes_done: 20_000_000 });
         assert_eq!(agg.files_done(), 40);
         assert_eq!(agg.bytes_done(), 20_000_000);
 
         agg.apply(&FlashcpEvent::Done { files: 100, bytes: 50_000_000, secs: 0.5 });
         agg.start_run();
-        agg.apply(&FlashcpEvent::Plan { files: 100, bytes: 50_000_000 });
+        agg.apply(&FlashcpEvent::Plan {
+            files: 100,
+            dirs: 5,
+            bytes: 50_000_000,
+            write_bytes: 52_000_000,
+            strategy: None,
+        });
         agg.apply(&FlashcpEvent::Progress { files_done: 10, bytes_done: 5_000_000 });
 
         // completed run's totals plus the current run's progress
@@ -494,7 +650,7 @@ mod tests {
     fn update_carries_totals_without_summary() {
         let mut agg = JobAggregate::default();
         agg.start_run();
-        agg.apply(&FlashcpEvent::Plan { files: 3, bytes: 30 });
+        agg.apply(&FlashcpEvent::Plan { files: 3, dirs: 0, bytes: 30, write_bytes: 0, strategy: None });
         agg.apply(&FlashcpEvent::Progress { files_done: 1, bytes_done: 10 });
         let u = agg.update(Stage::Running, Op::Add, 0, 2, None);
         assert_eq!(u.files_done, 1);
@@ -509,7 +665,11 @@ mod tests {
     fn pull_plan_with_nested_strategy_is_accepted() {
         let mut v = RunValidator::new(1);
         let plan = r#"{"event":"plan","op":"pull","files":3,"dirs":1,"bytes":30,"strategy":{"transport":"uas","gap_kb":32,"inflight":32,"buffered":false}}"#;
-        assert_eq!(v.feed(plan), Ok(Some(FlashcpEvent::Plan { files: 3, bytes: 30 })));
+        let strategy = serde_json::json!({"transport":"uas","gap_kb":32,"inflight":32,"buffered":false});
+        assert_eq!(
+            v.feed(plan),
+            Ok(Some(FlashcpEvent::Plan { files: 3, dirs: 1, bytes: 30, write_bytes: 0, strategy: Some(strategy) }))
+        );
         assert_eq!(v.feed(done()), Ok(Some(FlashcpEvent::Done { files: 100, bytes: 50_000_000, secs: 0.5 })));
         assert_eq!(v.finish(ok()), Ok(()));
     }
@@ -539,5 +699,106 @@ mod tests {
     #[test]
     fn pull_op_serializes_as_pull() {
         assert_eq!(serde_json::to_string(&Op::Pull).unwrap(), "\"pull\"");
+    }
+
+    #[test]
+    fn optimize_op_serializes_as_optimize() {
+        assert_eq!(serde_json::to_string(&Op::Optimize).unwrap(), "\"optimize\"");
+    }
+
+    fn optimize_plan() -> &'static str {
+        r#"{"event":"plan","op":"optimize","files":100,"dirs":5,"bytes":50000000,"write_bytes":52000000,"strategy":{"temp":"/c/flashcp-optimize-X","cluster":32768,"new_cluster":4096,"label":"FAKEUSB","already_optimized":false,"resume":false}}"#
+    }
+
+    #[test]
+    fn optimize_plan_keeps_its_strategy() {
+        let mut v = RunValidator::new(1);
+        let Ok(Some(FlashcpEvent::Plan { dirs, write_bytes, strategy, .. })) = v.feed(optimize_plan()) else {
+            panic!("plan expected");
+        };
+        assert_eq!((dirs, write_bytes), (5, 52_000_000));
+        assert_eq!(strategy.unwrap()["new_cluster"], 4096);
+    }
+
+    #[test]
+    fn plan_without_the_new_fields_still_parses() {
+        let mut v = RunValidator::new(1);
+        assert_eq!(
+            v.feed(r#"{"event":"plan","op":"add","files":2,"bytes":9}"#),
+            Ok(Some(FlashcpEvent::Plan { files: 2, dirs: 0, bytes: 9, write_bytes: 0, strategy: None }))
+        );
+    }
+
+    #[test]
+    fn phase_inside_a_run_parses() {
+        let mut v = RunValidator::new(1);
+        assert!(matches!(v.feed(optimize_plan()), Ok(Some(_))));
+        assert_eq!(
+            v.feed(r#"{"event":"phase","op":"optimize","phase":"verify","step":2,"steps":5}"#),
+            Ok(Some(FlashcpEvent::Phase { phase: "verify".into(), step: 2, steps: 5 }))
+        );
+        assert!(matches!(v.feed(done()), Ok(Some(_))));
+        assert_eq!(v.finish(ok()), Ok(()));
+    }
+
+    #[test]
+    fn phase_before_plan_fails() {
+        let mut v = RunValidator::new(1);
+        let line = r#"{"event":"phase","op":"optimize","phase":"pull","step":1,"steps":5}"#;
+        assert_eq!(err(&mut v, line), "flashcp sent a phase outside a plan");
+    }
+
+    #[test]
+    fn phase_after_done_fails() {
+        let mut v = RunValidator::new(2);
+        feed_items(&mut v, 1);
+        let line = r#"{"event":"phase","op":"optimize","phase":"pull","step":1,"steps":5}"#;
+        assert_eq!(err(&mut v, line), "flashcp sent a phase outside a plan");
+    }
+
+    #[test]
+    fn error_with_recovery_keeps_the_recovery_text() {
+        let mut v = RunValidator::new(1);
+        assert!(matches!(v.feed(optimize_plan()), Ok(Some(_))));
+        let line = r#"{"event":"error","message":"optimize: the drive stopped responding","recovery":"/dev/sdb1 may be incomplete; re-run optimize"}"#;
+        assert_eq!(err(&mut v, line), "optimize: the drive stopped responding");
+        assert_eq!(v.recovery(), Some("/dev/sdb1 may be incomplete; re-run optimize"));
+    }
+
+    #[test]
+    fn error_without_recovery_has_none() {
+        let mut v = RunValidator::new(1);
+        assert_eq!(err(&mut v, r#"{"event":"error","message":"no place"}"#), "no place");
+        assert_eq!(v.recovery(), None);
+        let mut v = RunValidator::new(1);
+        assert_eq!(err(&mut v, r#"{"event":"error","message":"x","recovery":""}"#), "x");
+        assert_eq!(v.recovery(), None);
+    }
+
+    #[test]
+    fn phase_resets_run_progress_and_is_remembered() {
+        let mut agg = JobAggregate::default();
+        agg.start_run();
+        agg.apply(&FlashcpEvent::Plan { files: 100, dirs: 5, bytes: 50_000_000, write_bytes: 0, strategy: None });
+        agg.apply(&FlashcpEvent::Progress { files_done: 40, bytes_done: 20_000_000 });
+        agg.apply(&FlashcpEvent::Phase { phase: "build".into(), step: 3, steps: 5 });
+        assert_eq!(agg.files_done(), 0);
+        assert_eq!(agg.bytes_done(), 0);
+        let u = agg.update(Stage::Running, Op::Optimize, 0, 1, None);
+        assert_eq!((u.phase.as_deref(), u.step, u.steps), (Some("build"), 3, 5));
+        assert!(u.recovery.is_none());
+        assert_eq!(agg.plan().map(|p| (p.files, p.dirs)), Some((100, 5)));
+    }
+
+    #[test]
+    fn done_clears_the_phase_and_plan_is_kept() {
+        let mut agg = JobAggregate::default();
+        agg.start_run();
+        agg.apply(&FlashcpEvent::Plan { files: 1, dirs: 0, bytes: 2, write_bytes: 3, strategy: None });
+        agg.apply(&FlashcpEvent::Phase { phase: "pull".into(), step: 1, steps: 5 });
+        agg.apply(&FlashcpEvent::Done { files: 1, bytes: 2, secs: 0.1 });
+        let u = agg.update(Stage::Done, Op::Optimize, 0, 1, None);
+        assert_eq!((u.phase, u.step, u.steps), (None, 0, 0));
+        assert_eq!(agg.plan().map(|p| p.write_bytes), Some(3));
     }
 }
