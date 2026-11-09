@@ -181,7 +181,7 @@ impl Vol {
         ensure!(root_clusters.len() as u64 * cs <= MAX_DIR_BYTES, "root directory is larger than 256 MB");
         let data = v.read_clusters(&root_clusters, root_clusters.len() as u64 * cs)?;
         let mut extras = RootExtras::default();
-        let (end, children) = parse_dir(&data, Some(&mut extras), "/")?;
+        let (end, children) = parse_dir(&data, Some(&mut extras), "/", cs)?;
 
         ensure!(!extras.bitmaps.is_empty(), "root directory has no allocation bitmap entry");
         ensure!(
@@ -342,7 +342,7 @@ impl Vol {
         );
         let clusters = self.object_clusters(ch.first, ch.no_fat_chain, ch.len, &path)?;
         let data = self.read_clusters(&clusters, ch.len)?;
-        let (end, children) = parse_dir(&data, None, &path)?;
+        let (end, children) = parse_dir(&data, None, &path, self.cs)?;
         let children = rekey(children, &self.upc)?;
         Ok(Dir {
             clusters,
@@ -532,7 +532,15 @@ pub(crate) fn upcase(name: &[u16], upc: &[u16]) -> Vec<u16> {
 
 /// Parses a directory's entries. Returns (end-of-directory offset, children). Unknown benign
 /// entries are skipped; unknown critical ones are refused.
-pub(crate) fn parse_dir(data: &[u8], mut root: Option<&mut RootExtras>, path: &str) -> Result<(usize, Vec<Child>)> {
+/// Every file's ValidDataLength ≤ DataLength and every directory's ValidDataLength ==
+/// DataLength, a non-zero multiple of the cluster size `cs` (≤ 256 MB) is checked here, for
+/// every entry.
+pub(crate) fn parse_dir(
+    data: &[u8],
+    mut root: Option<&mut RootExtras>,
+    path: &str,
+    cs: u64,
+) -> Result<(usize, Vec<Child>)> {
     let mut kids = Vec::new();
     let mut i = 0usize;
     let at = |i: usize| format!("directory {path}, entry {}", i / 32);
@@ -591,13 +599,35 @@ pub(crate) fn parse_dir(data: &[u8], mut root: Option<&mut RootExtras>, path: &s
                     }
                 }
                 let flags = set[33];
+                let (is_dir, data_len, valid_len) = (le16(set, 4) & 0x10 != 0, le64(set, 56), le64(set, 40));
+                // Every stream entry, before anyone branches on its type or skips it.
+                let shown = || format!("{}/{}", path.trim_end_matches('/'), String::from_utf16_lossy(&name));
+                if is_dir {
+                    ensure!(
+                        valid_len == data_len,
+                        "directory {}: ValidDataLength {valid_len} differs from DataLength {data_len}; run fsck.exfat",
+                        shown()
+                    );
+                    ensure!(
+                        data_len > 0 && data_len.is_multiple_of(cs) && data_len <= MAX_DIR_BYTES,
+                        "directory {}: DataLength {data_len} is not a non-zero multiple of the cluster size \
+                         ({cs}) up to 256 MB; run fsck.exfat",
+                        shown()
+                    );
+                } else {
+                    ensure!(
+                        valid_len <= data_len,
+                        "{}: ValidDataLength {valid_len} exceeds DataLength {data_len}; run fsck.exfat",
+                        shown()
+                    );
+                }
                 kids.push(Child {
                     name,
-                    is_dir: le16(set, 4) & 0x10 != 0,
+                    is_dir,
                     first: le32(set, 52),
                     no_fat_chain: flags & 0x02 != 0,
-                    len: le64(set, 56),
-                    valid_len: le64(set, 40),
+                    len: data_len,
+                    valid_len,
                     mtime: (le32(set, 12), set[21], set[23]),
                     set_off: i,
                     set_len: len,
@@ -807,7 +837,7 @@ mod tests {
         d.extend(set("Sub Dir", true, 12, 4096, false));
         let end = d.len();
         d.resize(4096, 0);
-        let (e, kids) = parse_dir(&d, None, "/").unwrap();
+        let (e, kids) = parse_dir(&d, None, "/", 4096).unwrap();
         assert_eq!(e, end);
         assert_eq!(kids.len(), 2);
         assert_eq!(String::from_utf16_lossy(&kids[1].name), "Sub Dir");
@@ -820,9 +850,9 @@ mod tests {
         let mut d = set("a.txt", false, 10, 5, true);
         d[64 + 2] ^= 1;
         d.resize(4096, 0);
-        assert!(format!("{:#}", parse_dir(&d, None, "/").unwrap_err()).contains("checksum"));
+        assert!(format!("{:#}", parse_dir(&d, None, "/", 4096).unwrap_err()).contains("checksum"));
         let mut d = vec![0u8; 4096];
         d[0] = 0x86;
-        assert!(format!("{:#}", parse_dir(&d, None, "/").unwrap_err()).contains("unknown critical"));
+        assert!(format!("{:#}", parse_dir(&d, None, "/", 4096).unwrap_err()).contains("unknown critical"));
     }
 }

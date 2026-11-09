@@ -167,6 +167,8 @@ const BOT_GAP_MAX: u64 = 4 << 20;
 /// and the extra cost of one more request in a forward stream: 256 back-to-back 4 KB reads
 /// against one 1 MB read of the next megabyte. That cost, not random-read latency, is what
 /// reading through a gap saves. About 0.5 s on a USB 2 stick. Returns (overhead s, bytes/s).
+/// Read-only and bounded (≈ 6 MB in 259 reads); there is no wall-clock timeout, so a device
+/// that hangs on a read hangs here exactly as it would in the data phase.
 fn micro_probe(file: &File, v: &Vol) -> Option<(f64, f64)> {
     let start = v.heap_off.div_ceil(ALIGN) * ALIGN;
     let end = (v.heap_off + v.cc * v.cs) / ALIGN * ALIGN;
@@ -485,7 +487,11 @@ impl DirCache {
 fn tmp_name() -> CString {
     static N: AtomicU64 = AtomicU64::new(0);
     let mut r = 0u64;
-    unsafe { libc::getrandom(&mut r as *mut u64 as *mut libc::c_void, 8, 0) };
+    let got = unsafe { libc::getrandom(&mut r as *mut u64 as *mut libc::c_void, 8, 0) };
+    if got != 8 {
+        // No randomness: pid + counter + time is still unique enough, and O_EXCL refuses a clash.
+        r = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    }
     let n = N.fetch_add(1, Ordering::Relaxed);
     CString::new(format!(".flashcp-{:x}-{:016x}.tmp", std::process::id(), r ^ n)).unwrap()
 }
