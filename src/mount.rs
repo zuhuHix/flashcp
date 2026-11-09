@@ -37,11 +37,13 @@ pub struct MountOpts {
     /// Ask the kernel for FUSE writeback caching (bigger, fewer writes).
     pub writeback: bool,
     pub readers: usize,
+    /// FUSE session threads.
+    pub threads: usize,
 }
 
 impl Default for MountOpts {
     fn default() -> Self {
-        MountOpts { idle: Duration::from_millis(1500), ram_cap: 512 << 20, writeback: true, readers: 4 }
+        MountOpts { idle: Duration::from_millis(1500), ram_cap: 512 << 20, writeback: false, readers: 4, threads: 1 }
     }
 }
 
@@ -92,7 +94,20 @@ struct State {
     disk_dir: PathBuf,
     o: MountOpts,
     commits: u32,
+    /// Physical-order readahead: (device offset, bytes), oldest first, at most RA_CAP in total.
+    ra: std::collections::VecDeque<(u64, Vec<u8>)>,
+    ra_bytes: u64,
+    /// Debug counters: (readahead secs, read handler secs, reads, ra hits).
+    prof: (f64, f64, u64, u64),
+    /// Files of each committed directory opened for reading; the third triggers readahead.
+    dir_reads: HashMap<Key, u32>,
 }
+
+/// Readahead: files of one directory closer than RA_GAP on the device are read as one run.
+const RA_GAP: u64 = 1 << 20;
+const RA_RUN_MAX: u64 = 64 << 20;
+const RA_CAP: u64 = 256 << 20;
+const RA_TRIGGER: u32 = 3;
 
 fn open_vol(target: &Path) -> Result<Vol> {
     let f = File::open(target).with_context(|| format!("open {}", target.display()))?;
@@ -231,9 +246,7 @@ impl State {
         } else {
             self.next_stage += 1;
             let dir = if self.staged_bytes < self.o.ram_cap { &self.ram_dir } else { &self.disk_dir };
-            let p = dir.join(self.next_stage.to_string());
-            File::create(&p).map_err(|_| Errno::EIO)?;
-            p
+            dir.join(self.next_stage.to_string())
         };
         // overlay chain: parent's parents get "merge" entries (original names from the volume).
         let mut k = key.clone();
@@ -335,6 +348,9 @@ impl State {
                 self.staged.clear();
                 self.overlay.clear();
                 self.clusters.clear();
+                self.ra.clear();
+                self.ra_bytes = 0;
+                self.dir_reads.clear();
                 self.staged_bytes = 0;
                 self.dirty = false;
                 self.commits += 1;
@@ -361,6 +377,65 @@ impl State {
         }
     }
 
+    /// Reads the contiguous files of a directory in physical order, a few large reads.
+    fn readahead(&mut self, files: &[Child]) {
+        if std::env::var_os("FLASHCP_NO_RA").is_some() {
+            return;
+        }
+        let t0 = Instant::now();
+        self.readahead_inner(files);
+        self.prof.0 += t0.elapsed().as_secs_f64();
+    }
+
+    fn readahead_inner(&mut self, files: &[Child]) {
+        let mut spans: Vec<(u64, u64)> = files
+            .iter()
+            .filter(|c| !c.is_dir && c.no_fat_chain && c.valid_len > 0 && c.valid_len <= RA_RUN_MAX)
+            .map(|c| {
+                let a = self.vol.cluster_off(c.first);
+                (a, a + c.valid_len.min(c.len))
+            })
+            .filter(|&(a, _)| !self.ra.iter().any(|(o, b)| a >= *o && a < *o + b.len() as u64))
+            .collect();
+        spans.sort();
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for (a, b) in spans {
+            match runs.last_mut() {
+                Some(r) if a <= r.1 + RA_GAP && b - r.0 <= RA_RUN_MAX => r.1 = r.1.max(b),
+                _ => runs.push((a, b)),
+            }
+        }
+        for (a, b) in runs {
+            if b - a < 64 << 10 && files.len() < 4 {
+                continue; // not worth it
+            }
+            let mut buf = vec![0u8; (b - a) as usize];
+            if b > self.vol.dev_len || self.vol.dev.read_exact_at(&mut buf, a).is_err() {
+                continue;
+            }
+            if std::env::var_os("FLASHCP_RA_DEBUG").is_some() {
+                eprintln!("ra {} files -> run {a}..{b} ({} KB)", files.len(), (b - a) >> 10);
+            }
+            self.ra_bytes += buf.len() as u64;
+            self.ra.push_back((a, buf));
+            while self.ra_bytes > RA_CAP {
+                let (_, old) = self.ra.pop_front().unwrap();
+                self.ra_bytes -= old.len() as u64;
+            }
+        }
+    }
+
+    fn read_dev(&self, out: &mut [u8], dev: u64) -> std::io::Result<()> {
+        let end = dev + out.len() as u64;
+        for (o, b) in self.ra.iter().rev() {
+            if dev >= *o && end <= *o + b.len() as u64 {
+                out.copy_from_slice(&b[(dev - o) as usize..(end - o) as usize]);
+                return Ok(());
+            }
+        }
+        self.vol.dev.read_exact_at(out, dev)
+    }
+
     fn read_committed(&mut self, ino: u64, key: &Key, off: u64, size: u32) -> Result<Vec<u8>> {
         if !self.clusters.contains_key(&ino) {
             let ch = self.committed(key)?.ok_or_else(|| anyhow!("gone"))?;
@@ -384,7 +459,7 @@ impl State {
             let dev = self.vol.cluster_off(cl[ci]) + pos % cs;
             let n = (run_end - pos) as usize;
             let o = (pos - off) as usize;
-            self.vol.dev.read_exact_at(&mut out[o..o + n], dev)?;
+            self.read_dev(&mut out[o..o + n], dev)?;
             pos = run_end;
         }
         Ok(out)
@@ -429,6 +504,10 @@ impl Filesystem for DriveFs {
     fn destroy(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         let mut st = self.st.lock().unwrap();
+        if st.prof.2 > 0 {
+            let p = st.prof;
+            eprintln!("flashcp mount: readahead {:.3}s, read handlers {:.3}s for {} reads", p.0, p.1, p.2);
+        }
         if let Err(e) = st.commit("unmount") {
             eprintln!("flashcp mount: FINAL COMMIT FAILED, staged data was NOT written: {e:#}");
         }
@@ -539,7 +618,8 @@ impl Filesystem for DriveFs {
         tri!(st.stage(k.clone(), n, false), reply);
         let ino = st.ino_of(&k);
         let path = st.staged[&k].path.clone();
-        let file = tri!(OpenOptions::new().read(true).write(true).open(&path).map_err(|_| Errno::EIO), reply);
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path);
+        let file = tri!(file.map_err(|_| Errno::EIO), reply);
         st.next_fh += 1;
         let fh = st.next_fh;
         st.handles.insert(fh, Handle { ino, file: Some(file), write: true });
@@ -560,6 +640,19 @@ impl Filesystem for DriveFs {
             None => {
                 if write {
                     return reply.error(Errno::EOPNOTSUPP); // committed files are read-only (spike)
+                }
+                // Bulk read of a directory (a copy, not browsing): read the rest of its files
+                // in physical order, in a few large reads.
+                if let Some((_, parent)) = k.split_last() {
+                    let parent = parent.to_vec();
+                    let n = st.dir_reads.entry(parent.clone()).or_insert(0);
+                    *n += 1;
+                    if *n == RA_TRIGGER
+                        && let Ok(Some(d)) = st.dir_idx(&parent)
+                    {
+                        let kids: Vec<Child> = st.vol.dirs[d].children.values().cloned().collect();
+                        st.readahead(&kids);
+                    }
                 }
                 None
             }
@@ -610,7 +703,10 @@ impl Filesystem for DriveFs {
             return reply.data(&[]);
         }
         let size = size.min((len - offset) as u32);
+        let t0 = Instant::now();
         let data = tri!(io(st.read_committed(ino.0, &k, offset, size)), reply);
+        st.prof.1 += t0.elapsed().as_secs_f64();
+        st.prof.2 += 1;
         reply.data(&data);
     }
 
@@ -655,7 +751,9 @@ impl Filesystem for DriveFs {
     }
 
     fn flush(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _lock: LockOwner, reply: ReplyEmpty) {
-        reply.ok();
+        // ENOSYS makes the kernel stop sending FLUSH (one round trip per close saved); dirty
+        // pages are still written back on close. Nothing is committed on close anyway.
+        reply.error(Errno::ENOSYS);
     }
 
     fn release(
@@ -910,6 +1008,10 @@ pub fn mount(target: &Path, mountpoint: &Path, o: &MountOpts) -> Result<()> {
         disk_dir: disk_dir.clone(),
         o: o.clone(),
         commits: 0,
+        ra: Default::default(),
+        ra_bytes: 0,
+        prof: (0.0, 0.0, 0, 0),
+        dir_reads: HashMap::new(),
     };
     let st = Arc::new(Mutex::new(st));
     let stop = Arc::new(AtomicBool::new(false));
@@ -934,6 +1036,8 @@ pub fn mount(target: &Path, mountpoint: &Path, o: &MountOpts) -> Result<()> {
         });
     }
     let mut cfg = Config::default();
+    cfg.n_threads = Some(o.threads.max(1));
+    cfg.clone_fd = o.threads > 1;
     cfg.mount_options = vec![
         MountOption::FSName(target.display().to_string()),
         MountOption::Subtype("flashcp".into()),

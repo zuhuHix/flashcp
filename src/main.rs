@@ -115,9 +115,12 @@ enum Cmd {
         /// Stage up to this many MB in RAM (/dev/shm), then on the local disk
         #[arg(long, default_value_t = 512)]
         ram_mb: u64,
-        /// Disable FUSE writeback caching
+        /// Ask for FUSE writeback caching (slower for small files in the spike's measurements)
         #[arg(long)]
-        no_writeback: bool,
+        writeback: bool,
+        /// FUSE session threads
+        #[arg(long, default_value_t = 1)]
+        threads: usize,
     },
     /// Copy the files of an exFAT volume on TARGET (block device or image file, opened
     /// read-only; preferably unmounted) into DEST, reading the volume in large sequential chunks
@@ -355,11 +358,12 @@ fn run(cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Mount { target, mountpoint, idle_ms, ram_mb, no_writeback } => {
+        Cmd::Mount { target, mountpoint, idle_ms, ram_mb, writeback, threads } => {
             let o = mount::MountOpts {
                 idle: std::time::Duration::from_millis(idle_ms),
                 ram_cap: ram_mb << 20,
-                writeback: !no_writeback,
+                writeback,
+                threads,
                 ..Default::default()
             };
             mount::mount(&target, &mountpoint, &o)
