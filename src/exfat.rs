@@ -10,6 +10,7 @@
 //!
 //! Spec: Microsoft "exFAT file system specification" (2019, public).
 
+use crate::events::{Event, Op, Sink, Ticker};
 use crate::util::{AlignedBuf, human_bytes};
 use anyhow::{Context, Result, bail, ensure};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -21,12 +22,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-const SECTOR: u64 = 512;
-const UPCASE: &[u8] = include_bytes!("upcase.bin");
+pub(crate) const SECTOR: u64 = 512;
+pub(crate) const UPCASE: &[u8] = include_bytes!("upcase.bin");
 const UPCASE_CHECKSUM: u32 = 0xE619D30D;
 /// Cluster heap is aligned to this many bytes (erase-block friendly).
 const ALIGN: u64 = 4 << 20;
-const IO_CHUNK: usize = 8 << 20;
+pub(crate) const IO_CHUNK: usize = 8 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
 pub enum FatMode {
@@ -49,9 +50,14 @@ pub struct BuildOpts {
 
 // ───────────────────────── up-case table & checksums ─────────────────────────
 
-fn upcase_map() -> Vec<u16> {
+pub(crate) fn upcase_map() -> Vec<u16> {
+    upcase_from(UPCASE)
+}
+
+/// Expands an up-case table (compressed or not) into a full 65536-entry map.
+pub(crate) fn upcase_from(table: &[u8]) -> Vec<u16> {
     let mut map: Vec<u16> = (0..=0xFFFFu32).map(|c| c as u16).collect();
-    let words: Vec<u16> = UPCASE.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let words: Vec<u16> = table.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
     let (mut i, mut ch) = (0usize, 0usize);
     while i < words.len() && ch < 0x10000 {
         if words[i] == 0xFFFF && i + 1 < words.len() {
@@ -66,7 +72,7 @@ fn upcase_map() -> Vec<u16> {
     map
 }
 
-fn checksum32(data: &[u8], skip: &[usize], mut c: u32) -> u32 {
+pub(crate) fn checksum32(data: &[u8], skip: &[usize], mut c: u32) -> u32 {
     for (i, &b) in data.iter().enumerate() {
         if !skip.contains(&i) {
             c = c.rotate_right(1).wrapping_add(b as u32);
@@ -75,7 +81,7 @@ fn checksum32(data: &[u8], skip: &[usize], mut c: u32) -> u32 {
     c
 }
 
-fn checksum16(data: &[u8], skip_first_23: bool) -> u16 {
+pub(crate) fn checksum16(data: &[u8], skip_first_23: bool) -> u16 {
     let mut c: u16 = 0;
     for (i, &b) in data.iter().enumerate() {
         if skip_first_23 && (i == 2 || i == 3) {
@@ -88,18 +94,18 @@ fn checksum16(data: &[u8], skip_first_23: bool) -> u16 {
 
 // ───────────────────────── tree model ─────────────────────────
 
-struct Node {
-    name: Vec<u16>,
-    src: PathBuf,
-    is_dir: bool,
-    size: u64,
-    mtime: (i64, u32),
-    children: Vec<usize>,
-    first_cluster: u32,
-    clusters: u64,
+pub(crate) struct Node {
+    pub(crate) name: Vec<u16>,
+    pub(crate) src: PathBuf,
+    pub(crate) is_dir: bool,
+    pub(crate) size: u64,
+    pub(crate) mtime: (i64, u32),
+    pub(crate) children: Vec<usize>,
+    pub(crate) first_cluster: u32,
+    pub(crate) clusters: u64,
 }
 
-fn validate_name(name: &[u16], upc: &[u16], seen: &mut HashSet<Vec<u16>>, path: &Path) -> Result<()> {
+pub(crate) fn validate_name(name: &[u16], upc: &[u16], seen: &mut HashSet<Vec<u16>>, path: &Path) -> Result<()> {
     ensure!(!name.is_empty() && name.len() <= 255, "name too long for exFAT: {}", path.display());
     for &c in name {
         ensure!(
@@ -113,7 +119,7 @@ fn validate_name(name: &[u16], upc: &[u16], seen: &mut HashSet<Vec<u16>>, path: 
     Ok(())
 }
 
-fn scan_tree(root: &Path, upc: &[u16]) -> Result<Vec<Node>> {
+pub(crate) fn scan_tree(root: &Path, upc: &[u16]) -> Result<Vec<Node>> {
     let mut nodes = vec![Node {
         name: vec![],
         src: root.to_path_buf(),
@@ -160,7 +166,7 @@ fn scan_tree(root: &Path, upc: &[u16]) -> Result<Vec<Node>> {
     Ok(nodes)
 }
 
-fn set_bytes(n: &Node) -> u64 {
+pub(crate) fn set_bytes(n: &Node) -> u64 {
     32 * (2 + n.name.len().div_ceil(15) as u64)
 }
 
@@ -286,7 +292,7 @@ fn boot_region(g: &Geometry, part_off: u64, vol_bytes: u64, root: u32, serial: u
 }
 
 /// exFAT timestamp (UTC) + 10 ms increment.
-fn ts(secs: i64, nsec: u32) -> (u32, u8) {
+pub(crate) fn ts(secs: i64, nsec: u32) -> (u32, u8) {
     // exFAT years run 1980..=2107. Earlier times become exactly 1980-01-01 00:00:00 (what
     // the Linux driver writes); later ones become the last representable instant.
     const MIN: i64 = 315_532_800; // 1980-01-01 00:00:00
@@ -317,7 +323,7 @@ fn ts(secs: i64, nsec: u32) -> (u32, u8) {
     (t, ((s % 2) * 100 + (nsec / 10_000_000) as i64) as u8)
 }
 
-fn entry_set(n: &Node, upc: &[u16]) -> Vec<u8> {
+pub(crate) fn entry_set(n: &Node, upc: &[u16]) -> Vec<u8> {
     let names = n.name.len().div_ceil(15);
     let mut e = vec![0u8; 32 * (2 + names)];
     let (t, t10) = ts(n.mtime.0, n.mtime.1);
@@ -359,7 +365,7 @@ fn entry_set(n: &Node, upc: &[u16]) -> Vec<u8> {
     e
 }
 
-fn finish_set(mut e: Vec<u8>, valid_len: u64, data_len: u64) -> Vec<u8> {
+pub(crate) fn finish_set(mut e: Vec<u8>, valid_len: u64, data_len: u64) -> Vec<u8> {
     e[32 + 8..32 + 16].copy_from_slice(&valid_len.to_le_bytes());
     e[32 + 24..32 + 32].copy_from_slice(&data_len.to_le_bytes());
     let c = checksum16(&e, true);
@@ -403,52 +409,120 @@ fn dir_bytes(nodes: &[Node], di: usize, p: &Plan, label: &[u16], upc: &[u16]) ->
 
 /// Collects bytes into large aligned buffers and hands them to an I/O thread, so building
 /// the next chunk overlaps with the device writing the previous one.
-struct SeqWriter {
-    pos: u64,
+///
+/// The stream may skip forward ([`SeqWriter::skip_to`]) without breaking the buffer: a buffer
+/// then holds several spans for different device offsets, which the I/O side writes with
+/// several requests in flight (a scattered tail of small files is IOPS-bound, not
+/// bandwidth-bound). A purely sequential stream is one span per buffer, i.e. one big write.
+pub(crate) struct SeqWriter {
     buf: AlignedBuf,
     fill: usize,
-    tx: Option<Sender<(u64, AlignedBuf, usize)>>,
+    /// (offset in buf, device offset) where each span of the current buffer starts.
+    spans: Vec<(usize, u64)>,
+    tx: Option<Sender<Batch>>,
     back: Receiver<AlignedBuf>,
     io: Option<std::thread::JoinHandle<Result<()>>>,
     pub written: u64,
+    /// Write lengths and skips are rounded to this (4096 for O_DIRECT, 1 for buffered I/O,
+    /// where padding would overwrite bytes that are not ours).
+    align: usize,
+}
+
+/// A full buffer and its spans: (offset in buf, device offset, length).
+type Batch = (AlignedBuf, Vec<(usize, u64, usize)>);
+
+/// Concurrent writes per buffer when it holds many spans.
+const IO_WORKERS: usize = 8;
+
+fn write_batch(dev: &File, buf: &AlignedBuf, spans: &[(usize, u64, usize)]) -> Result<()> {
+    let one = |&(bo, off, len): &(usize, u64, usize)| -> Result<()> {
+        dev.write_all_at(&buf.as_ref()[bo..bo + len], off).with_context(|| format!("write at {off}"))
+    };
+    if spans.len() == 1 {
+        return one(&spans[0]);
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..IO_WORKERS.min(spans.len()) {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= spans.len() {
+                        return;
+                    }
+                    if let Err(e) = one(&spans[i]) {
+                        first_err.lock().unwrap().get_or_insert(e);
+                        next.store(spans.len(), std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    match first_err.into_inner().unwrap() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 impl SeqWriter {
-    fn new(dev: Arc<File>) -> Self {
-        let (tx, rx) = bounded::<(u64, AlignedBuf, usize)>(2);
+    pub(crate) fn new(dev: Arc<File>) -> Self {
+        Self::with_align(dev, 4096)
+    }
+    pub(crate) fn with_align(dev: Arc<File>, align: usize) -> Self {
+        let (tx, rx) = bounded::<Batch>(2);
         let (btx, back) = bounded::<AlignedBuf>(4);
         for _ in 0..2 {
             btx.send(AlignedBuf::new(IO_CHUNK)).unwrap();
         }
         let io = std::thread::spawn(move || -> Result<()> {
-            for (off, buf, len) in rx {
-                dev.write_all_at(&buf.as_ref()[..len], off).with_context(|| format!("write at {off}"))?;
+            for (buf, spans) in rx {
+                write_batch(&dev, &buf, &spans)?;
                 let _ = btx.send(buf);
             }
             dev.sync_all()?;
             Ok(())
         });
-        SeqWriter { pos: 0, buf: AlignedBuf::new(IO_CHUNK), fill: 0, tx: Some(tx), back, io: Some(io), written: 0 }
+        SeqWriter {
+            buf: AlignedBuf::new(IO_CHUNK),
+            fill: 0,
+            spans: vec![(0, 0)],
+            tx: Some(tx),
+            back,
+            io: Some(io),
+            written: 0,
+            align,
+        }
     }
     fn flush(&mut self) -> Result<()> {
         if self.fill == 0 {
             return Ok(());
         }
-        let len = self.fill.div_ceil(4096) * 4096; // O_DIRECT needs aligned lengths
+        let len = self.fill.div_ceil(self.align) * self.align; // O_DIRECT needs aligned lengths
         self.buf.as_mut()[self.fill..len].fill(0);
+        let mut spans = Vec::with_capacity(self.spans.len());
+        for (k, &(bo, off)) in self.spans.iter().enumerate() {
+            let end = self.spans.get(k + 1).map_or(len, |n| n.0);
+            if end > bo {
+                spans.push((bo, off, end - bo));
+            }
+        }
+        let end_pos = self.spans.last().map(|&(bo, off)| off + (len - bo) as u64).unwrap();
         let fresh = self.back.recv().map_err(|_| anyhow::anyhow!("I/O thread died"))?;
         let full = std::mem::replace(&mut self.buf, fresh);
-        let off = self.pos;
-        self.tx.as_ref().unwrap().send((off, full, len)).map_err(|_| anyhow::anyhow!("I/O thread died"))?;
+        self.tx.as_ref().unwrap().send((full, spans)).map_err(|_| anyhow::anyhow!("I/O thread died"))?;
         self.written += len as u64;
-        self.pos += len as u64;
         self.fill = 0;
+        self.spans.clear();
+        self.spans.push((0, end_pos));
         Ok(())
     }
-    fn cur(&self) -> u64 {
-        self.pos + self.fill as u64
+    pub(crate) fn cur(&self) -> u64 {
+        let &(bo, off) = self.spans.last().unwrap();
+        off + (self.fill - bo) as u64
     }
-    fn write(&mut self, mut d: &[u8]) -> Result<()> {
+    pub(crate) fn write(&mut self, mut d: &[u8]) -> Result<()> {
         while !d.is_empty() {
             let n = d.len().min(IO_CHUNK - self.fill);
             self.buf.as_mut()[self.fill..self.fill + n].copy_from_slice(&d[..n]);
@@ -461,7 +535,7 @@ impl SeqWriter {
         Ok(())
     }
     /// Read a file straight into the I/O buffers (no intermediate copy).
-    fn write_from(&mut self, f: &mut File, mut left: u64) -> Result<()> {
+    pub(crate) fn write_from(&mut self, f: &mut File, mut left: u64) -> Result<()> {
         while left > 0 {
             let n = (IO_CHUNK - self.fill).min(left as usize);
             let dst = &mut self.buf.as_mut()[self.fill..self.fill + n];
@@ -474,7 +548,7 @@ impl SeqWriter {
         }
         Ok(())
     }
-    fn zeros_to(&mut self, target: u64) -> Result<()> {
+    pub(crate) fn zeros_to(&mut self, target: u64) -> Result<()> {
         static Z: [u8; 65536] = [0; 65536];
         while self.cur() < target {
             let n = ((target - self.cur()) as usize).min(Z.len());
@@ -483,14 +557,20 @@ impl SeqWriter {
         Ok(())
     }
     /// Skip forward without writing (only used for regions whose contents don't matter).
-    fn skip_to(&mut self, target: u64) -> Result<()> {
-        assert!(self.cur().is_multiple_of(4096) && target.is_multiple_of(4096));
-        self.flush()?;
-        assert!(target >= self.pos);
-        self.pos = target;
+    pub(crate) fn skip_to(&mut self, target: u64) -> Result<()> {
+        let a = self.align as u64;
+        let cur = self.cur();
+        assert!(cur.is_multiple_of(a) && target.is_multiple_of(a));
+        assert!(target >= cur);
+        let last = self.spans.last_mut().unwrap();
+        if last.0 == self.fill {
+            last.1 = target; // empty span: just move it
+        } else {
+            self.spans.push((self.fill, target));
+        }
         Ok(())
     }
-    fn finish(mut self) -> Result<u64> {
+    pub(crate) fn finish(mut self) -> Result<u64> {
         self.flush()?;
         drop(self.tx.take());
         self.io.take().unwrap().join().unwrap()?;
@@ -500,16 +580,16 @@ impl SeqWriter {
 
 // ───────────────────────── ordered parallel reader ─────────────────────────
 
-enum Item {
+pub(crate) enum Item {
     Data(Vec<u8>),
     Stream,
 }
 
-type Budget = Arc<(Mutex<(usize, u64)>, Condvar)>;
+pub(crate) type Budget = Arc<(Mutex<(usize, u64)>, Condvar)>;
 
 /// Reads files in parallel; the consumer reorders by index. Budget is granted in claim
 /// order, so the next file the consumer needs is always already claimed: no deadlock.
-fn ordered_reader(
+pub(crate) fn ordered_reader(
     paths: Vec<(PathBuf, u64)>,
     readers: usize,
     budget: u64,
@@ -558,21 +638,21 @@ fn ordered_reader(
     (rx, state)
 }
 
-fn release(b: &Budget, bytes: u64) {
+pub(crate) fn release(b: &Budget, bytes: u64) {
     b.0.lock().unwrap().1 += bytes;
     b.1.notify_all();
 }
 
 // ───────────────────────── target device ─────────────────────────
 
-struct Target {
-    file: File,
-    bytes: u64,
-    part_off: u64,
-    direct: bool,
+pub(crate) struct Target {
+    pub(crate) file: File,
+    pub(crate) bytes: u64,
+    pub(crate) part_off: u64,
+    pub(crate) direct: bool,
 }
 
-fn open_target(path: &Path) -> Result<Target> {
+pub(crate) fn open_target(path: &Path) -> Result<Target> {
     // Open first, then trust only what the opened fd says (fstat), so a path that changes
     // underneath us (a file swapped for a device node, a /dev/disk/by-* link retargeted)
     // cannot make the checks below refer to a different object than the one we write.
@@ -628,6 +708,12 @@ fn open_target(path: &Path) -> Result<Target> {
             .unwrap_or(0u64);
         Ok(Target { file, bytes: size, part_off: start, direct })
     } else if ft.is_file() {
+        if let Some(dev) = crate::add::loop_device_of(&md) {
+            bail!(
+                "{} is attached to loop device {dev} (it may be mounted); unmount and detach it first",
+                path.display()
+            );
+        }
         ensure!(md.len() > 0, "image file is empty; create it first, e.g. truncate -s 8G image.img");
         Ok(Target { file, bytes: md.len(), part_off: 0, direct })
     } else {
@@ -720,8 +806,10 @@ pub struct BuildStats {
     pub secs: f64,
 }
 
-pub fn build(src: &Path, target: &Path, o: &BuildOpts) -> Result<BuildStats> {
+/// Builds a whole volume from `src` onto `target`, reporting progress through `sink`.
+pub fn build(src: &Path, target: &Path, o: &BuildOpts, sink: Sink<'_>) -> Result<BuildStats> {
     let t0 = Instant::now();
+    let mut tick = Ticker::new(sink);
     let upc = upcase_map();
     let label: Vec<u16> = o.label.encode_utf16().collect();
     ensure!(label.len() <= 11, "label is at most 11 characters");
@@ -756,7 +844,7 @@ pub fn build(src: &Path, target: &Path, o: &BuildOpts) -> Result<BuildStats> {
     let files = nodes.iter().filter(|n| !n.is_dir).count();
     let dirs = nodes.len() - files;
     let data: u64 = nodes.iter().map(|n| n.size).sum();
-    println!(
+    let detail = format!(
         "plan: {} files, {} dirs, {} data │ cluster {} │ {} clusters │ FAT {} ({:?}) │ will write {}",
         files,
         dirs,
@@ -767,7 +855,16 @@ pub fn build(src: &Path, target: &Path, o: &BuildOpts) -> Result<BuildStats> {
         o.fat,
         human_bytes(p.write_bytes as f64)
     );
+    tick.emit(Event::Plan {
+        op: Op::Build,
+        files: files as u64,
+        dirs: dirs as u64,
+        bytes: data,
+        write_bytes: p.write_bytes,
+        detail,
+    });
     if o.dry_run {
+        tick.emit(Event::Done { files: files as u64, bytes: data, secs: t0.elapsed().as_secs_f64() });
         return Ok(BuildStats {
             files,
             dirs,
@@ -841,6 +938,8 @@ pub fn build(src: &Path, target: &Path, o: &BuildOpts) -> Result<BuildStats> {
         }
     }
     // 6. File data, in the exact order the readers deliver it.
+    let mut bytes_done = 0u64;
+    let empty_files = files - file_order.len();
     for (k, &i) in file_order.iter().enumerate() {
         let n = &nodes[i];
         let at = g.heap_off * SECTOR + (n.first_cluster as u64 - 2) * cs;
@@ -863,8 +962,12 @@ pub fn build(src: &Path, target: &Path, o: &BuildOpts) -> Result<BuildStats> {
             }
         }
         w.zeros_to(at + n.clusters * cs)?;
+        bytes_done += n.size;
+        tick.progress((empty_files + k + 1) as u64, bytes_done, false);
     }
     let written = w.finish()?;
+    tick.progress(files as u64, data, true);
+    tick.emit(Event::Done { files: files as u64, bytes: data, secs: t0.elapsed().as_secs_f64() });
     if !tgt.direct {
         eprintln!("note: target does not support O_DIRECT, used buffered writes");
     }

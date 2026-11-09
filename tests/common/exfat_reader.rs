@@ -230,7 +230,9 @@ fn read_boot(file: &File, file_len: u64) -> Result<BootInfo, String> {
     // Main boot region (sectors 0..=11) followed by the backup (12..=23).
     let region = read_at(file, 0, 24 * bps)?;
     let (main, backup) = region.split_at(12 * bps as usize);
-    if main != &backup[..12 * bps as usize] {
+    // VolumeFlags (106..108) and PercentInUse (112) are volatile: the spec leaves them out of
+    // the boot checksum, and drivers update them in the main boot sector only.
+    if (0..12 * bps as usize).any(|i| !matches!(i, 106 | 107 | 112) && main[i] != backup[i]) {
         return err("backup boot region (sectors 12..=23) differs from the main boot region");
     }
     for s in 0..9usize {
