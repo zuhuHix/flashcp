@@ -1223,7 +1223,7 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
         pol.describe(),
         verify_secs * 1e3
     );
-    tick.emit(Event::Plan { op: Op::Add, files, dirs, bytes: data_bytes, write_bytes, detail, strategy: None });
+    tick.emit(Event::Plan { op: Op::Add, files, dirs, bytes: data_bytes, write_bytes, detail, strategy: None, sync: None });
     let stats = |written: u64| AddStats {
         files,
         dirs,

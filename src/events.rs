@@ -1,11 +1,20 @@
-//! Progress events for `build`, `add` and `pull`, and their JSON-lines encoding (`--json`).
+//! Progress events for `build`, `add`, `sync` and `pull`, and their JSON-lines encoding (`--json`).
 //!
 //! The JSON contract, one object per line on stdout:
 //!
 //! ```text
-//! {"event":"plan","op":"add"|"build"|"pull"|"optimize","files":N,"dirs":N,"bytes":N,"write_bytes":N}
+//! {"event":"plan","op":"add"|"build"|"pull"|"optimize"|"sync","files":N,"dirs":N,"bytes":N,"write_bytes":N}
 //!     pull adds "strategy":{"transport":"uas"|"usb-storage"|..,"gap_kb":N,"inflight":N,
 //!     "direct":B,"overhead_ms":F|null,"mbps":F|null,"chunk_kb":N,"tail":N}
+//!     sync adds "sync":{"unchanged":N,"new":N,"changed":N,"moved":N,"deleted":N,
+//!     "deleted_dirs":N,"new_dirs":N,"bytes_skipped":N,"delete":["/path",..],
+//!     "moves":[{"from":"/a","to":"/b"},..]}: files kept as they are, new, changed (rewritten or
+//!     only retimed), moved (renamed in place, or re-linked under a new path without copying),
+//!     deleted (files, including those inside deleted directories), deleted and new directories,
+//!     bytes of unchanged and moved files (not written). "delete" lists each deleted entry once
+//!     (a directory with a trailing "/", standing for its whole subtree); paths are absolute
+//!     inside the volume. For sync, "files"/"dirs" count files whose data is written (new and
+//!     changed) and new directories, "bytes" the file data written
 //! {"event":"phase","op":"optimize","phase":"pull"|..,"step":N,"steps":N}
 //!     optimize only: a new phase starts; progress events that follow count within it
 //! {"event":"progress","files_done":N,"bytes_done":N}   (at most ~10 per second)
@@ -21,6 +30,7 @@ pub enum Op {
     Add,
     Pull,
     Optimize,
+    Sync,
 }
 
 impl Op {
@@ -30,6 +40,7 @@ impl Op {
             Op::Add => "add",
             Op::Pull => "pull",
             Op::Optimize => "optimize",
+            Op::Sync => "sync",
         }
     }
 }
@@ -49,6 +60,8 @@ pub enum Event {
         detail: String,
         /// `pull` only: how the volume will be read, as a JSON object (transport, gap, depth).
         strategy: Option<String>,
+        /// `sync` only: what changes, as a JSON object (counts, deletions, moves).
+        sync: Option<String>,
     },
     /// A multi-phase operation (`optimize`) enters phase `step` of `steps` (1-based).
     Phase {
@@ -95,10 +108,11 @@ fn json_f64(v: f64) -> String {
 impl Event {
     pub fn to_json(&self) -> String {
         match self {
-            Event::Plan { op, files, dirs, bytes, write_bytes, strategy, .. } => format!(
-                r#"{{"event":"plan","op":"{}","files":{files},"dirs":{dirs},"bytes":{bytes},"write_bytes":{write_bytes}{}}}"#,
+            Event::Plan { op, files, dirs, bytes, write_bytes, strategy, sync, .. } => format!(
+                r#"{{"event":"plan","op":"{}","files":{files},"dirs":{dirs},"bytes":{bytes},"write_bytes":{write_bytes}{}{}}}"#,
                 op.as_str(),
-                strategy.as_ref().map(|s| format!(r#","strategy":{s}"#)).unwrap_or_default()
+                strategy.as_ref().map(|s| format!(r#","strategy":{s}"#)).unwrap_or_default(),
+                sync.as_ref().map(|s| format!(r#","sync":{s}"#)).unwrap_or_default()
             ),
             Event::Phase { op, phase, step, steps } => format!(
                 r#"{{"event":"phase","op":"{}","phase":{},"step":{step},"steps":{steps}}}"#,
@@ -168,8 +182,23 @@ mod tests {
             write_bytes: 4096,
             detail: "x".into(),
             strategy: None,
+            sync: None,
         };
         assert_eq!(p.to_json(), r#"{"event":"plan","op":"add","files":3,"dirs":1,"bytes":10,"write_bytes":4096}"#);
+        let s = Event::Plan {
+            op: Op::Sync,
+            files: 1,
+            dirs: 0,
+            bytes: 5,
+            write_bytes: 4096,
+            detail: "x".into(),
+            strategy: None,
+            sync: Some(r#"{"new":1}"#.into()),
+        };
+        assert_eq!(
+            s.to_json(),
+            r#"{"event":"plan","op":"sync","files":1,"dirs":0,"bytes":5,"write_bytes":4096,"sync":{"new":1}}"#
+        );
         let g = Event::Progress { files_done: 1, bytes_done: 2 };
         assert_eq!(g.to_json(), r#"{"event":"progress","files_done":1,"bytes_done":2}"#);
         let ph = Event::Phase { op: Op::Optimize, phase: "verify", step: 2, steps: 5 };

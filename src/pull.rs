@@ -1012,6 +1012,7 @@ fn pull_inner(
         write_bytes: read_bytes,
         detail,
         strategy: Some(strat.to_json()),
+        sync: None,
     });
     if let Ok(cmd) = std::env::var(AFTER_PLAN_ENV) {
         let ok = std::process::Command::new("sh").arg("-c").arg(&cmd).status().is_ok_and(|s| s.success());

@@ -1182,6 +1182,7 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
             write_bytes: 0,
             detail,
             strategy: Some(info(None, true)),
+            sync: None,
         });
         stats.secs = t0.elapsed().as_secs_f64();
         run.tick.emit(Event::Done { files, bytes: data, secs: stats.secs });
@@ -1210,6 +1211,7 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
         write_bytes: p.write_bytes,
         detail,
         strategy: Some(info(Some(&tmp), already)),
+        sync: None,
     });
     stats.temp = Some(tmp.clone());
     if o.dry_run {
@@ -1574,6 +1576,7 @@ fn resume(
             crate::events::json_str(&tmp.display().to_string()),
             crate::events::json_str(&st.label)
         )),
+        sync: None,
     });
     let mut stats = OptimizeStats {
         files,

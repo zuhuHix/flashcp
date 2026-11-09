@@ -370,6 +370,12 @@ impl Vol {
     /// Directories whose up-cased path is in `wanted` are kept in `dirs` (indexed by `kept`) for
     /// planning; the rest are dropped as soon as they are walked, so memory stays bounded.
     pub(crate) fn verify_allocation(&mut self, wanted: &HashSet<Vec<Vec<u16>>>) -> Result<u64> {
+        self.verify_allocation_with(&|k| wanted.contains(k))
+    }
+
+    /// [`Vol::verify_allocation`] keeping the directories whose up-cased path `keep` accepts
+    /// (it must accept every prefix of an accepted path).
+    pub(crate) fn verify_allocation_with(&mut self, keep: &dyn Fn(&[Vec<u16>]) -> bool) -> Result<u64> {
         let mut refd = cluster_set(self.cc);
         let mut objects = 0u64;
         let sys = [
@@ -401,7 +407,7 @@ impl Vol {
                     let grand: Vec<Child> = d.children.values().cloned().collect();
                     let dpath = d.path.clone();
                     // A wanted directory's parent is wanted too (prefixes), so kept_at is Some.
-                    let at = if kept_at.is_some() && wanted.contains(&ckey) {
+                    let at = if kept_at.is_some() && keep(&ckey) {
                         d.key = ckey.clone();
                         self.dirs.push(d);
                         let i = self.dirs.len() - 1;
@@ -447,6 +453,37 @@ impl Vol {
             }
         }
         Ok(())
+    }
+
+    /// The clusters of a file of `len` bytes as ascending-in-file-order runs (start, count),
+    /// adjacent clusters merged. Bounded by the length, like [`Vol::object_clusters`].
+    pub(crate) fn runs(&mut self, first: u32, no_fat_chain: bool, len: u64, what: &str) -> Result<Vec<(u64, u64)>> {
+        let n = len.div_ceil(self.cs);
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        if no_fat_chain {
+            let r = contiguous_run(first, n, self.cc)
+                .with_context(|| format!("{what}: contiguous extent runs past the end of the volume"))?;
+            return Ok(vec![(r.start, n)]);
+        }
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        let mut c = first;
+        for k in 0..n {
+            ensure!(self.valid(c), "{what}: FAT chain points at invalid cluster {c:#x}");
+            match out.last_mut() {
+                Some(l) if l.0 + l.1 == c as u64 => l.1 += 1,
+                _ => out.push((c as u64, 1)),
+            }
+            let next = self.fat(c)?;
+            if k + 1 == n {
+                ensure!(next == EOC, "{what}: FAT chain is longer than its DataLength");
+            } else {
+                ensure!(next != EOC, "{what}: FAT chain is shorter than its DataLength");
+                c = next;
+            }
+        }
+        Ok(out)
     }
 
     pub(crate) fn free_clusters(&self) -> u64 {
