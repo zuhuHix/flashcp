@@ -42,6 +42,12 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: xos-full-auto, path: out/full-auto, retention-days: 3, compression-level: 1 }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: xos-prefix-512, path: out/prefix-512, retention-days: 3, compression-level: 1 }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: xos-prefix-1k, path: out/prefix-1k, retention-days: 3, compression-level: 1 }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: xos-prefix-2k, path: out/prefix-2k, retention-days: 3, compression-level: 1 }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: xos-prefix-4k, path: out/prefix-4k, retention-days: 3, compression-level: 1 }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: xos-prefix-128k, path: out/prefix-128k, retention-days: 3, compression-level: 1 }
@@ -59,7 +65,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        vol: [prefix-auto, full-auto, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs]
+        vol: [prefix-auto, full-auto, prefix-512, prefix-1k, prefix-2k, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs]
     # superfloppy (no partition table) is flashcp's default output, so it gates like the others.
     # control-mkfs (the same tree written by mkfs.exfat + Linux) is a reference for attributing
     # failures to flashcp or to the OS, so it is report-only.
@@ -88,7 +94,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        vol: [prefix-auto, full-auto, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs]
+        vol: [prefix-auto, full-auto, prefix-512, prefix-1k, prefix-2k, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs]
     continue-on-error: ${{ matrix.vol == 'control-mkfs' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
