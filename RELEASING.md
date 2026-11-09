@@ -48,6 +48,10 @@ Check the checksums:
 gh release download vX.Y.Z -D /tmp/rel && cd /tmp/rel && sha256sum -c SHA256SUMS
 ```
 
+## Name clash with mtd-utils
+
+The package installs `/usr/bin/flashcp` and does not conflict with `mtd-utils`. If `mtd-utils` is installed, `flashcp` may run its unrelated MTD flash tool (`/usr/sbin/flashcp`, which comes first in PATH) instead of this one. Check with `command -v flashcp`, or `flashcp --help`: ours starts with "Fast file transfer to USB sticks and external drives". To be sure, call `/usr/bin/flashcp`. The .deb long description carries the same note.
+
 ## If something fails
 
 Fix the problem on `main` through a PR. Then remove the tag and any draft or partial release, and tag again:

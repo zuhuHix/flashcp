@@ -29,6 +29,10 @@ license-file = ["LICENSE", "0"]
 extended-description = """
 Fast file transfers to USB sticks and external drives. Builds a whole exFAT
 volume from a source directory in one sequential pass. Linux only.
+.
+Installs /usr/bin/flashcp. The unrelated MTD tool of the same name from
+mtd-utils lives in /usr/sbin, which usually comes first in PATH: if both
+are installed, run /usr/bin/flashcp (check with `command -v flashcp`).
 """
 section = "utils"
 priority = "optional"
