@@ -144,6 +144,25 @@ pub(crate) fn remove_tree_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<u64
     Ok(n + 1)
 }
 
+/// How many entries [`remove_tree_at`] would remove for `name` in `dir`, without removing any:
+/// `name` itself plus everything inside it (0 if it does not exist). Symlinks count as one
+/// entry and are never followed.
+pub(crate) fn count_tree_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<u64> {
+    let Some(st) = stat_at(dir, name)? else { return Ok(0) };
+    if !is_dir(&st) {
+        return Ok(1);
+    }
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = cvt(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) })?;
+    // SAFETY: openat returned a fresh descriptor that nothing else owns.
+    let sub = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut n = 1;
+    for child in list_at(sub.as_fd())? {
+        n += count_tree_at(sub.as_fd(), &child)?;
+    }
+    Ok(n)
+}
+
 /// Creates directory `name` in `dir`; an existing real directory is fine, anything else
 /// (a file, a symlink) is an error.
 pub(crate) fn mkdir_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<()> {
@@ -236,6 +255,26 @@ mod tests {
         assert_eq!(remove_tree_at(rfd.as_fd(), c"missing").unwrap(), 0);
         assert!(fs::symlink_metadata(root.join("tree")).is_err());
         assert!(fs::symlink_metadata(root.join("out-link")).is_err());
+        assert_eq!(fs::read(outside.join("keep/f.txt")).unwrap(), b"keep", "outside target was touched");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn count_tree_at_matches_remove_and_never_follows_symlinks() {
+        let base = std::env::temp_dir().join(format!("flashcp-dirfd-count-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let outside = base.join("outside");
+        fs::create_dir_all(outside.join("keep")).unwrap();
+        fs::write(outside.join("keep/f.txt"), b"keep").unwrap();
+        let root = base.join("root");
+        fs::create_dir_all(root.join("tree/inner")).unwrap();
+        fs::write(root.join("tree/inner/a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("tree/link")).unwrap();
+        let rfd = open_root(&root).unwrap();
+        // tree, inner, inner/a.txt and the link (counted once, not entered).
+        assert_eq!(count_tree_at(rfd.as_fd(), c"tree").unwrap(), 4);
+        assert_eq!(count_tree_at(rfd.as_fd(), c"missing").unwrap(), 0);
+        assert_eq!(remove_tree_at(rfd.as_fd(), c"tree").unwrap(), 4);
         assert_eq!(fs::read(outside.join("keep/f.txt")).unwrap(), b"keep", "outside target was touched");
         let _ = fs::remove_dir_all(&base);
     }
