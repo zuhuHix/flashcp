@@ -71,7 +71,25 @@ jobs:
             sudo diff -r src-tree /mnt/flashcp
             sudo umount /mnt/flashcp
           done
-      - name: Mount-and-diff + busy-device integration tests (as root)
+      - name: Add onto a kernel-populated volume, fsck, mount, diff
+        run: |
+          set -eux
+          rm -f add.img
+          truncate -s 256M add.img
+          mkfs.exfat add.img
+          sudo mkdir -p /mnt/flashcp
+          sudo mount -o loop add.img /mnt/flashcp
+          sudo cp -r src-tree /mnt/flashcp/kernel-copy
+          sudo umount /mnt/flashcp
+          ./target/release/flashcp add src-tree add.img --to "added/by flashcp"
+          ./target/release/flashcp add src-tree add.img --to kernel-copy --skip-existing
+          fsck.exfat -n add.img
+          ./target/release/flashcp info add.img --json
+          sudo mount -o loop,ro add.img /mnt/flashcp
+          sudo diff -r src-tree /mnt/flashcp/kernel-copy
+          sudo diff -r src-tree "/mnt/flashcp/added/by flashcp"
+          sudo umount /mnt/flashcp
+      - name: Mount-and-diff + busy-device integration tests for build and add (as root)
         env:
           # Only the test binary runs as root (it needs losetup/mount); cargo itself does not.
           # The env is passed explicitly because sudo resets it.
@@ -79,4 +97,5 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked --test build mount -- --nocapture 2>&1 | tee mount-tests.log
+          cargo test --locked --test add_kernel mount -- --nocapture --test-threads=1 2>&1 | tee -a mount-tests.log
           if grep -q SKIP mount-tests.log; then echo "::error::a gated mount test was skipped"; exit 1; fi

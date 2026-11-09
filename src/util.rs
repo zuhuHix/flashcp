@@ -80,6 +80,7 @@ pub fn human_bytes(b: f64) -> String {
 
 /// Deterministic, fast PRNG (SplitMix64) so datasets are reproducible.
 pub struct Rng(pub u64);
+#[allow(clippy::should_implement_trait)]
 impl Rng {
     pub fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
@@ -105,6 +106,7 @@ pub struct AlignedBuf {
     len: usize,
     layout: std::alloc::Layout,
 }
+#[allow(clippy::should_implement_trait)]
 impl AlignedBuf {
     pub fn new(len: usize) -> Self {
         let layout = std::alloc::Layout::from_size_align(len, 4096).unwrap();

@@ -1,13 +1,7 @@
-mod bench;
-mod copy;
-mod dataset;
-mod exfat;
-mod pack;
-mod probe;
-mod util;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use flashcp::events::{Event, error_json};
+use flashcp::{add, bench, copy, dataset, exfat, pack, probe, util};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -72,6 +66,35 @@ enum Cmd {
         /// Required unless --dry-run: confirms TARGET may be erased
         #[arg(long)]
         yes_erase: bool,
+        /// Print progress as JSON lines on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add SRC's contents to an EXISTING exFAT volume on TARGET (unmounted block device or
+    /// image file) without erasing anything
+    Add {
+        src: PathBuf,
+        target: PathBuf,
+        /// Directory inside the volume to add into, e.g. "Backups/2026" (created if missing)
+        #[arg(long)]
+        to: Option<String>,
+        /// Skip entries whose name already exists (case-insensitive) instead of failing
+        #[arg(long)]
+        skip_existing: bool,
+        #[arg(long, default_value_t = 12)]
+        readers: usize,
+        /// Only print the plan
+        #[arg(long)]
+        dry_run: bool,
+        /// Print progress as JSON lines on stdout
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show an exFAT volume's label, size, free space and file count (read-only)
+    Info {
+        target: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     /// Benchmark every method against DEST
     Bench {
@@ -85,8 +108,36 @@ enum Cmd {
     },
 }
 
-fn main() -> Result<()> {
-    match Cli::parse().cmd {
+/// Event sink: JSON lines on stdout, or the human-readable plan line.
+fn sink(json: bool) -> impl FnMut(&Event) {
+    move |e: &Event| {
+        if json {
+            use std::io::Write;
+            let mut o = std::io::stdout().lock();
+            let _ = writeln!(o, "{}", e.to_json());
+            let _ = o.flush();
+        } else if let Event::Plan { detail, .. } = e {
+            println!("{detail}");
+        }
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let json =
+        matches!(cli.cmd, Cmd::Build { json: true, .. } | Cmd::Add { json: true, .. } | Cmd::Info { json: true, .. });
+    if let Err(e) = run(cli.cmd) {
+        if json {
+            println!("{}", error_json(&format!("{e:#}")));
+        } else {
+            eprintln!("Error: {e:#}");
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run(cmd: Cmd) -> Result<()> {
+    match cmd {
         Cmd::Gen { dir, profile, seed } => dataset::generate(&dir, &profile, seed),
         Cmd::Probe { dir, size_mb } => {
             let r = probe::probe(&dir, size_mb << 20)?;
@@ -127,11 +178,11 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Build { src, target, cluster, label, fat, readers, dry_run, yes_erase } => {
+        Cmd::Build { src, target, cluster, label, fat, readers, dry_run, yes_erase, json } => {
             anyhow::ensure!(dry_run || yes_erase, "this ERASES {}; pass --yes-erase to confirm", target.display());
             let o = exfat::BuildOpts { cluster, label, fat, readers, dry_run };
-            let s = exfat::build(&src, &target, &o)?;
-            if !dry_run {
+            let s = exfat::build(&src, &target, &o, &mut sink(json))?;
+            if !dry_run && !json {
                 println!(
                     "built: {} files, {} dirs, {} data, {} written, cluster {} in {:.2}s ({:.0} files/s, {:.1} MB/s of data)",
                     s.files,
@@ -142,6 +193,43 @@ fn main() -> Result<()> {
                     s.secs,
                     s.files as f64 / s.secs,
                     s.data_bytes as f64 / 1e6 / s.secs
+                );
+            }
+            Ok(())
+        }
+        Cmd::Add { src, target, to, skip_existing, readers, dry_run, json } => {
+            let o = add::AddOpts { to, skip_existing, readers, dry_run };
+            let s = add::add(&src, &target, &o, &mut sink(json))?;
+            if !dry_run && !json {
+                println!(
+                    "added: {} files, {} dirs, {} data{}{}, cluster {} in {:.2}s ({:.0} files/s, {:.1} MB/s of data)",
+                    s.files,
+                    s.dirs,
+                    util::human_bytes(s.data_bytes as f64),
+                    if s.skipped > 0 { format!(", skipped {} existing", s.skipped) } else { String::new() },
+                    if s.fragmented > 0 { format!(", {} fragmented", s.fragmented) } else { String::new() },
+                    util::human_bytes(s.cluster as f64),
+                    s.secs,
+                    s.files as f64 / s.secs,
+                    s.data_bytes as f64 / 1e6 / s.secs
+                );
+            }
+            Ok(())
+        }
+        Cmd::Info { target, json } => {
+            let i = add::info(&target)?;
+            if json {
+                println!("{}", i.to_json());
+            } else {
+                println!(
+                    "label {:?} │ cluster {} │ size {} │ free {} │ {} files, {} dirs{}",
+                    i.label,
+                    util::human_bytes(i.cluster as f64),
+                    util::human_bytes(i.size as f64),
+                    util::human_bytes(i.free as f64),
+                    i.files,
+                    i.dirs,
+                    if i.dirty { " │ DIRTY" } else { "" }
                 );
             }
             Ok(())
