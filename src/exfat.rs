@@ -1293,8 +1293,14 @@ pub(crate) fn build_target(mut nodes: Vec<Node>, tgt: Target, o: &BuildOpts, sin
     // build that is interrupted leaves a volume every checker (and `optimize`) sees as unfinished.
     let boot = boot_region(&g, tgt.part_off, vol_bytes, p.root_cluster, serial, pct, 0);
     let dirty_boot = boot_region(&g, tgt.part_off, vol_bytes, p.root_cluster, serial, pct, FLAG_VOLUME_DIRTY);
-    w.write(&dirty_boot)?;
-    w.write(&boot)?;
+    // Written and synced BEFORE anything else, so no device write cache can store the new
+    // FAT/heap while the old (clean) boot sector still says the old volume is intact.
+    let mut head = AlignedBuf::new(2 * boot.len());
+    head.as_mut()[..boot.len()].copy_from_slice(&dirty_boot);
+    head.as_mut()[boot.len()..].copy_from_slice(&boot);
+    dev.write_all_at(head.as_ref(), 0).context("write boot regions")?;
+    dev.sync_all().context("sync boot regions")?;
+    w.skip_to(head.as_ref().len() as u64)?;
     // 2. FAT: every allocated object is one contiguous chain.
     w.zeros_to(g.fat_off * SECTOR)?;
     let mut fat = Vec::with_capacity((p.used_end * 4) as usize);
