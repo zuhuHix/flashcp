@@ -2,8 +2,10 @@
 //!
 //! `key` is what the GUI passes as `--expect` (udisks' `Drive.Serial`, derived with the same
 //! priority, checked against a real UAS SSD where both exist and udisks shows the short one):
-//! `ID_SERIAL_SHORT`, else `ID_SCSI_SERIAL`, else the WWN. A disk with none of them
-//! cannot be trusted.
+//! `ID_SERIAL_SHORT`, else `ID_SCSI_SERIAL`. If that serial is a placeholder (see
+//! [`crate::weak`]) the WWN is the key instead; with neither the drive cannot be trusted.
+//! The model is derived the way udisks shows it (decoded `ID_MODEL_ENC`, trimmed), so the
+//! tuple the GUI displays can be compared field by field.
 
 use std::fs;
 
@@ -35,12 +37,49 @@ fn first_non_empty<'a>(props: &'a [(String, String)], keys: &[&str]) -> Option<&
     keys.iter().find_map(|k| props.iter().find(|(pk, v)| pk == k && !v.is_empty()).map(|(_, v)| v.as_str()))
 }
 
+/// Shown (via the GUI) when a drive has only a placeholder serial and no usable WWN.
+pub const UNTRUSTABLE: &str = "this drive reports a placeholder serial number and no WWN, so flashcp can't \
+     remember it safely. Copy to it with the command line instead: sudo flashcp add <folder> /dev/sdX";
+
+/// udisks' `Drive.Model`: `ID_MODEL_ENC` with its `\xHH` escapes decoded and whitespace trimmed,
+/// falling back to `ID_MODEL` with `_` turned back into spaces. `-` when there is none.
+fn udisks_model(props: &[(String, String)]) -> String {
+    let decoded = first_non_empty(props, &["ID_MODEL_ENC"]).map(|enc| {
+        let b = enc.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'\\' && i + 3 < b.len() && b[i + 1] == b'x' {
+                let hex = |c: u8| (c as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (hex(b[i + 2]), hex(b[i + 3])) {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 4;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).trim().to_string()
+    });
+    let m = decoded
+        .filter(|m| !m.is_empty())
+        .or_else(|| first_non_empty(props, &["ID_MODEL"]).map(|m| m.replace('_', " ").trim().to_string()))
+        .unwrap_or_default();
+    if m.is_empty() {
+        "-".into()
+    } else {
+        m
+    }
+}
+
 /// Build the identity from udev properties (`E:` lines of the disk's db entry) and the disk's
 /// sysfs `size` (512-byte sectors).
 pub fn identity_from(props: &[(String, String)], sectors: u64) -> Result<Identity, String> {
     let serial = first_non_empty(props, &["ID_SERIAL_SHORT", "ID_SCSI_SERIAL"]);
     let wwn = first_non_empty(props, &["ID_WWN_WITH_EXTENSION", "ID_WWN"]).unwrap_or("-");
-    let model = first_non_empty(props, &["ID_MODEL"]).unwrap_or("-");
+    let model = udisks_model(props);
+    let model = model.as_str();
     for (what, v) in [("serial", serial.unwrap_or("")), ("WWN", wwn), ("model", model)] {
         if !clean(v) {
             return Err(format!("drive {what} contains control characters; refusing to trust it"));
@@ -49,11 +88,7 @@ pub fn identity_from(props: &[(String, String)], sectors: u64) -> Result<Identit
             return Err(format!("drive {what} is too long"));
         }
     }
-    let key = match serial {
-        Some(s) => s,
-        None if wwn != "-" => wwn,
-        None => return Err("drive reports no serial number or WWN, so it cannot be trusted".into()),
-    };
+    let key = crate::weak::identity_key(serial.unwrap_or(""), wwn).ok_or(UNTRUSTABLE)?;
     if key.chars().count() > MAX_KEY {
         return Err("drive serial number is too long".into());
     }
@@ -121,14 +156,49 @@ mod tests {
         assert_eq!(id, Identity { key: "0x5001".into(), wwn: "0x5001".into(), model: "-".into(), size: 1024 });
         let id = identity_from(&props(&[("ID_WWN_WITH_EXTENSION", "0x5002x"), ("ID_WWN", "0x5002")]), 2).unwrap();
         assert_eq!((id.key.as_str(), id.wwn.as_str()), ("0x5002x", "0x5002x"));
-        let id = identity_from(&props(&[("ID_SERIAL_SHORT", "S1")]), 2).unwrap();
+        let id = identity_from(&props(&[("ID_SERIAL_SHORT", "SER1")]), 2).unwrap();
         assert_eq!((id.wwn.as_str(), id.model.as_str()), ("-", "-"));
+    }
+
+    #[test]
+    fn placeholder_serial_without_wwn_refuses_persistent_trust() {
+        for serial in ["0123456789ABCDEF", "000000000000", "1234567890", "AAAAAAAA", "S1"] {
+            let p = props(&[("ID_SERIAL_SHORT", serial), ("ID_MODEL", "Cheap")]);
+            assert_eq!(identity_from(&p, 10).unwrap_err(), UNTRUSTABLE, "{serial}");
+            // A junk WWN doesn't rescue it either.
+            let p = props(&[("ID_SERIAL_SHORT", serial), ("ID_WWN", "0x0000000000000000")]);
+            assert_eq!(identity_from(&p, 10).unwrap_err(), UNTRUSTABLE, "{serial}");
+        }
+    }
+
+    #[test]
+    fn placeholder_serial_with_wwn_is_keyed_by_wwn() {
+        let p = props(&[("ID_SERIAL_SHORT", "0123456789ABCDEF"), ("ID_WWN", "0x500014a000000001")]);
+        let id = identity_from(&p, 10).unwrap();
+        assert_eq!((id.key.as_str(), id.wwn.as_str()), ("0x500014a000000001", "0x500014a000000001"));
+    }
+
+    #[test]
+    fn model_matches_udisks() {
+        // Real UAS SSD: udisks shows "DATAMAG 20Gbps" (decoded ID_MODEL_ENC, trimmed).
+        let p = props(&[
+            ("ID_SERIAL_SHORT", "500014a000000001"),
+            ("ID_MODEL", "DATAMAG_20Gbps"),
+            ("ID_MODEL_ENC", "DATAMAG\\x2020Gbps\\x20\\x20"),
+        ]);
+        assert_eq!(identity_from(&p, 1).unwrap().model, "DATAMAG 20Gbps");
+        // Without ID_MODEL_ENC, underscores in ID_MODEL become spaces.
+        let p = props(&[("ID_SERIAL_SHORT", "500014a000000001"), ("ID_MODEL", "Ultra_Fit_")]);
+        assert_eq!(identity_from(&p, 1).unwrap().model, "Ultra Fit");
+        // A bad escape is kept literally; non-ASCII after a backslash doesn't panic.
+        let p = props(&[("ID_SERIAL_SHORT", "500014a000000001"), ("ID_MODEL_ENC", "A\\xZZ\\xé")]);
+        assert_eq!(identity_from(&p, 1).unwrap().model, "A\\xZZ\\xé");
     }
 
     #[test]
     fn no_serial_no_wwn_is_untrustable() {
         for p in [props(&[]), props(&[("ID_MODEL", "X"), ("ID_SERIAL", "X_123")]), props(&[("ID_SERIAL_SHORT", "")])] {
-            assert!(identity_from(&p, 10).unwrap_err().contains("cannot be trusted"));
+            assert_eq!(identity_from(&p, 10).unwrap_err(), UNTRUSTABLE);
         }
     }
 
@@ -150,14 +220,14 @@ mod tests {
 
     #[test]
     fn limits() {
-        assert!(identity_from(&props(&[("ID_SERIAL_SHORT", "S")]), 0).is_err());
-        assert!(identity_from(&props(&[("ID_SERIAL_SHORT", "S")]), u64::MAX).is_err());
+        assert!(identity_from(&props(&[("ID_SERIAL_SHORT", "SER1")]), 0).is_err());
+        assert!(identity_from(&props(&[("ID_SERIAL_SHORT", "SER1")]), u64::MAX).is_err());
         let long = "s".repeat(MAX_KEY + 1);
         assert!(identity_from(&props(&[("ID_SERIAL_SHORT", &long)]), 1).is_err());
         let long = "m".repeat(MAX_FIELD + 1);
-        assert!(identity_from(&props(&[("ID_SERIAL_SHORT", "S"), ("ID_MODEL", &long)]), 1).is_err());
+        assert!(identity_from(&props(&[("ID_SERIAL_SHORT", "SER1"), ("ID_MODEL", &long)]), 1).is_err());
         // Spaces are fine (scsi serials often carry them); they are kept verbatim.
-        assert_eq!(identity_from(&props(&[("ID_SCSI_SERIAL", " A B ")]), 1).unwrap().key, " A B ");
+        assert_eq!(identity_from(&props(&[("ID_SCSI_SERIAL", " AB 12 ")]), 1).unwrap().key, " AB 12 ");
     }
 
     #[test]

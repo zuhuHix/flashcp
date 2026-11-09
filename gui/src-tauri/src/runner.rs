@@ -1,6 +1,7 @@
 //! Plans the copy items, stages loose files for the helper, builds the helper or flashcp command
 //! lines, runs them, and turns flashcp's JSON events into JobUpdates.
 
+use crate::drives::Drive;
 use crate::drives::NOT_TRUSTED_MESSAGE;
 use crate::events::{FlashcpEvent, JobAggregate, JobUpdate, Op, RunValidator, Stage};
 use serde_json::Value;
@@ -425,9 +426,26 @@ fn error_message(line: &str) -> Option<String> {
 }
 
 /// Runs flashcp-trust through pkexec for the drive with this identity key. Blocks until it exits.
-pub fn trust_device(device: &str, expect: &str) -> Result<(), String> {
+/// The exact argv for flashcp-trust: the full identity the user was shown, so the helper can
+/// refuse if the device it opens differs in any field.
+pub fn trust_args(drive: &Drive) -> Vec<String> {
+    vec![
+        TRUST_HELPER_PATH.to_string(),
+        drive.device.clone(),
+        "--expect".into(),
+        drive.serial.clone(),
+        "--wwn".into(),
+        drive.wwn.clone(),
+        "--model".into(),
+        drive.id_model.clone(),
+        "--size".into(),
+        drive.drive_size.to_string(),
+    ]
+}
+
+pub fn trust_device(drive: &Drive) -> Result<(), String> {
     let output = Command::new("pkexec")
-        .args([TRUST_HELPER_PATH, device, "--expect", expect])
+        .args(trust_args(drive))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -455,6 +473,29 @@ pub fn trust_device(device: &str, expect: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_args_carry_the_full_identity_tuple() {
+        let mut d = crate::drives::fake_drives().remove(0);
+        d.wwn = "0x500014a000000001".into();
+        d.id_model = "DATAMAG 20Gbps".into();
+        d.drive_size = 1_000_204_886_016;
+        assert_eq!(
+            trust_args(&d),
+            [
+                TRUST_HELPER_PATH,
+                "/dev/sdz1",
+                "--expect",
+                "FAKE0001",
+                "--wwn",
+                "0x500014a000000001",
+                "--model",
+                "DATAMAG 20Gbps",
+                "--size",
+                "1000204886016"
+            ]
+        );
+    }
 
     const FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fake-flashcp");
     const FAST: (&str, &str) = ("FAKE_FLASHCP_DELAY", "0.001");

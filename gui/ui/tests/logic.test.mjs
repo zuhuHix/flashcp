@@ -253,7 +253,7 @@ describe("drive labels and confirmation", () => {
     assert.equal(trustNotice(vfat()), "flashcp hasn't been allowed to write to this drive yet.");
     assert.equal(
       trustNotice(vfat({ serial: "" })),
-      "This drive doesn't report a serial number, so flashcp can't trust it.",
+      "This drive doesn't report a usable serial number or WWN, so flashcp can't remember it safely. You can still copy to it from the command line: sudo flashcp add <folder> /dev/sdX",
     );
   });
   test("trustDetails lists model, size, serial and device", () => {

@@ -52,13 +52,42 @@ MAJ:MIN taken from `fstat` of the opened device) and sysfs:
 
 - serial: the first non-empty of `ID_SERIAL_SHORT`, `ID_SCSI_SERIAL`
 - wwn: the first non-empty of `ID_WWN_WITH_EXTENSION`, `ID_WWN`, else `-`
-- model: `ID_MODEL`, else `-`
+- model: `ID_MODEL_ENC` with its `\xHH` escapes decoded and trimmed (exactly what udisks shows
+  as `Drive.Model`), else `ID_MODEL` with `_` turned into spaces, else `-`
 - size: sysfs `<disk>/size` times 512
 
-The key is the serial, or the wwn if there is no serial. A drive with neither cannot be
-trusted. This is the same priority udisks uses for `Drive.Serial`, which the GUI shows and
-passes as `--expect <key>`. Values containing a TAB, newline or any other control character, a
-key over 128 characters and a size of 0 are refused.
+### Identity policy
+
+The key is the serial, unless the serial is a **placeholder**. Then it is the WWN, unless that
+is a placeholder too. Then the drive has no usable identity and **cannot be trusted
+persistently**. Many cheap bridges and sticks report the same serial on every unit, and
+trusting one of those would trust every drive of that make.
+
+A serial counts as a placeholder if, after trimming, it:
+
+- is empty or shorter than 4 characters;
+- is one character repeated (`000000000000`, `FFFFFFFF`, ignoring separators); or
+- is on a short known-junk list (`0123456789ABCDEF`, `1234567890`, `12345678`, `DEADBEEF`,
+  `To Be Filled By O.E.M.`, `None`, …).
+
+A WWN is a placeholder if it is missing or its hex digits are one repeated digit.
+
+The rules live in one dependency-free file, `gui/helper/src/weak.rs`, which the GUI compiles
+too (`#[path]`). So both sides always agree on the key and on which drives can't be trusted. For
+those drives the app explains why and points to the command line (`sudo flashcp add <folder>
+/dev/sdX`). There is deliberately no "use once" path in the app.
+
+The GUI shows udisks' `Drive.Serial`/`WWN`/`Model`/`Size`, applies the same key rule and passes
+the whole tuple to `flashcp-trust`. Values containing a TAB, newline or any other control
+character, a key over 128 characters and a size of 0 are refused.
+
+**Limits.** Trust is per *identity*, not per physical unit.
+
+- Two genuinely identical drives with the same serial, WWN, model and size can't be told apart.
+  Trusting one trusts both.
+- A malicious device can clone a trusted identity (see Residual risks).
+- A drive whose bridge only reports a vendor-generated serial is identified by that value. If a
+  firmware update changes it, the drive has to be trusted again.
 
 ## The trust list
 
@@ -80,16 +109,19 @@ that is already listed is a no-op success.
 
 ## flashcp-trust
 
-`flashcp-trust <dev> --expect <key>`, nothing else.
+`flashcp-trust <dev> --expect <key> --wwn <wwn|-> --model <model|-> --size <bytes>`, nothing
+else, in that order.
 
 1. `<dev>` must match `/dev/sd[a-z]{1,3}[0-9]{0,3}` exactly. `--expect` is 1-128 characters,
    with no control characters.
 2. Opens `<dev>` with `O_RDONLY|O_NOFOLLOW|O_CLOEXEC` and runs the device checks below on the
    fd, except the idle checks. A mounted stick may be trusted. A disk carrying a system mount is
    still refused.
-3. Reads the identity and requires key == `--expect`. That ties what the administrator
-   approved (the GUI shows model, size, serial and device before asking) to the drive actually
-   found at `<dev>`.
+3. Reads the identity from the opened fd's rdev and requires **every field** of the tuple the
+   user was shown (key, WWN, model, size) to match exactly. Otherwise it refuses with "the
+   drive changed, please re-select it" and writes nothing. If the device was swapped or
+   re-enumerated between the dialog and the open, a different drive that merely shares a
+   serial can't be enrolled. A placeholder identity is refused here as well.
 4. Appends the entry and prints `{"event":"trusted","key":..,"model":..,"size":N}`.
 
 The polkit action is `auth_admin` with no `keep`. Every trust needs a fresh administrator
