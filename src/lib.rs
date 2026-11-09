@@ -12,6 +12,7 @@ pub mod devprofile;
 pub(crate) mod dirfd;
 pub mod events;
 pub mod exfat;
+pub(crate) mod journal;
 pub mod optimize;
 pub mod pack;
 pub mod probe;

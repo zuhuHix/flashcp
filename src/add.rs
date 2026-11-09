@@ -658,6 +658,10 @@ impl Patches {
     pub(crate) fn bytes(&self) -> u64 {
         self.0.iter().map(|p| p.1.len() as u64).sum()
     }
+    /// The writes, as (device offset, bytes), in the order they were added.
+    pub(crate) fn into_inner(self) -> Vec<(u64, Vec<u8>)> {
+        self.0
+    }
     pub(crate) fn commit(mut self, dev: &File) -> Result<()> {
         self.0.sort_by_key(|p| p.0);
         let mut i = 0;
