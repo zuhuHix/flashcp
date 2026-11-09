@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use flashcp::TargetSpec;
 use flashcp::events::{Event, error_json};
-use flashcp::{add, bench, copy, dataset, exfat, pack, probe, util};
+use flashcp::{add, bench, copy, dataset, exfat, pack, probe, pull, util};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -103,6 +103,42 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Copy the files of an exFAT volume on TARGET (block device or image file, opened
+    /// read-only; preferably unmounted) into DEST, reading the volume in large sequential chunks
+    Pull {
+        /// TARGET DEST: block device or image file, then the local destination directory
+        /// (created if missing). With --target-fd, only DEST.
+        #[arg(value_name = "TARGET DEST", num_args = 1..=2, required = true)]
+        paths: Vec<PathBuf>,
+        /// Use this inherited, already-open block-device fd (O_RDONLY is enough) instead of
+        /// opening TARGET, e.g. from a privileged helper
+        #[arg(long, value_name = "N")]
+        target_fd: Option<i32>,
+        /// Directory inside the volume to copy from, e.g. "Photos/2026"; its contents land in DEST
+        #[arg(long)]
+        from: Option<String>,
+        /// Leave files that already exist in DEST alone
+        #[arg(long, conflicts_with = "overwrite")]
+        skip_existing: bool,
+        /// Replace files that already exist in DEST
+        #[arg(long)]
+        overwrite: bool,
+        /// Largest device read in MB
+        #[arg(long, default_value_t = 8, hide = true)]
+        chunk_mb: usize,
+        /// Read through gaps between files up to this many KB
+        #[arg(long, default_value_t = 1024, hide = true)]
+        gap_kb: u64,
+        /// Device reads in flight
+        #[arg(long, default_value_t = 4, hide = true)]
+        inflight: usize,
+        /// Destination writer threads
+        #[arg(long, default_value_t = 4, hide = true)]
+        writers: usize,
+        /// Print progress as JSON lines on stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// Show an exFAT volume's label, size, free space and file count (read-only)
     Info {
         /// Block device or image file (or use --target-fd)
@@ -152,8 +188,13 @@ fn spec(target: Option<PathBuf>, fd: Option<i32>) -> TargetSpec {
 
 fn main() {
     let cli = Cli::parse();
-    let json =
-        matches!(cli.cmd, Cmd::Build { json: true, .. } | Cmd::Add { json: true, .. } | Cmd::Info { json: true, .. });
+    let json = matches!(
+        cli.cmd,
+        Cmd::Build { json: true, .. }
+            | Cmd::Add { json: true, .. }
+            | Cmd::Pull { json: true, .. }
+            | Cmd::Info { json: true, .. }
+    );
     if let Err(e) = run(cli.cmd) {
         if json {
             println!("{}", error_json(&format!("{e:#}")));
@@ -242,6 +283,42 @@ fn run(cmd: Cmd) -> Result<()> {
                     s.secs,
                     s.files as f64 / s.secs,
                     s.data_bytes as f64 / 1e6 / s.secs
+                );
+            }
+            Ok(())
+        }
+        Cmd::Pull { paths, target_fd, from, skip_existing, overwrite, chunk_mb, gap_kb, inflight, writers, json } => {
+            let (target, dest) = match (target_fd, <[PathBuf; 1]>::try_from(paths)) {
+                (Some(fd), Ok([dest])) => (TargetSpec::Fd(fd), dest),
+                (None, Err(p)) if p.len() == 2 => {
+                    let [t, d] = <[PathBuf; 2]>::try_from(p).unwrap();
+                    (TargetSpec::Path(t), d)
+                }
+                (Some(_), _) => anyhow::bail!("with --target-fd, give only DEST"),
+                (None, _) => anyhow::bail!("usage: flashcp pull TARGET DEST (or --target-fd N DEST)"),
+            };
+            let o = pull::PullOpts {
+                from,
+                skip_existing,
+                overwrite,
+                chunk: chunk_mb << 20,
+                gap: gap_kb << 10,
+                inflight,
+                writers,
+            };
+            let s = pull::pull_from(&target, &dest, &o, &mut sink(json))?;
+            if !json {
+                println!(
+                    "pulled: {} files, {} dirs, {} data{} in {:.2}s ({:.0} files/s, {:.1} MB/s of data; read {} in {} requests)",
+                    s.files,
+                    s.dirs,
+                    util::human_bytes(s.data_bytes as f64),
+                    if s.skipped > 0 { format!(", skipped {} existing", s.skipped) } else { String::new() },
+                    s.secs,
+                    s.files as f64 / s.secs,
+                    s.data_bytes as f64 / 1e6 / s.secs,
+                    util::human_bytes(s.read_bytes as f64),
+                    s.reads
                 );
             }
             Ok(())

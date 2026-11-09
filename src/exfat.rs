@@ -875,13 +875,13 @@ fn mount_of(path: &Path) -> Option<(String, String)> {
 /// c_int on musl, so the literal is cast at the call site (`as _`) instead of typed.
 pub(crate) const BLKGETSIZE64: u32 = 0x8008_1272;
 
-const SYS_BLOCK: &str = "/sys/dev/block";
+pub(crate) const SYS_BLOCK: &str = "/sys/dev/block";
 
 /// Every "maj:min" related to `target`: itself, its partitions and its holders, recursively
 /// (a partition's LVM PV → dm-0 → dm-crypt …), with cycle protection. `sys` is the
 /// /sys/dev/block directory (a parameter so tests can use a fake tree). Fails closed: any
 /// sysfs read error is an error, except a node that has no `holders` directory.
-fn related_devs(sys: &Path, target: &str) -> Result<Vec<String>> {
+pub(crate) fn related_devs(sys: &Path, target: &str) -> Result<Vec<String>> {
     let read_dev = |p: &Path| -> Result<String> {
         Ok(fs::read_to_string(p.join("dev"))
             .with_context(|| format!("reading {}", p.join("dev").display()))?

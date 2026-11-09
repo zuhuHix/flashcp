@@ -1,9 +1,9 @@
-//! Progress events for `build` and `add`, and their JSON-lines encoding (`--json`).
+//! Progress events for `build`, `add` and `pull`, and their JSON-lines encoding (`--json`).
 //!
 //! The JSON contract, one object per line on stdout:
 //!
 //! ```text
-//! {"event":"plan","op":"add"|"build","files":N,"dirs":N,"bytes":N,"write_bytes":N}
+//! {"event":"plan","op":"add"|"build"|"pull","files":N,"dirs":N,"bytes":N,"write_bytes":N}
 //! {"event":"progress","files_done":N,"bytes_done":N}   (at most ~10 per second)
 //! {"event":"done","files":N,"bytes":N,"secs":F}
 //! {"event":"error","message":"..."}                     (and a non-zero exit code)
@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 pub enum Op {
     Build,
     Add,
+    Pull,
 }
 
 impl Op {
@@ -22,6 +23,7 @@ impl Op {
         match self {
             Op::Build => "build",
             Op::Add => "add",
+            Op::Pull => "pull",
         }
     }
 }
@@ -29,7 +31,8 @@ impl Op {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     /// Emitted once, before anything is written. `files`/`dirs` count what will be created,
-    /// `bytes` is file data, `write_bytes` is what will physically be written to the target.
+    /// `bytes` is file data, `write_bytes` is what will physically be written to the target
+    /// (for `pull`: read from the volume, gaps and alignment included).
     /// `detail` is a human-readable summary (not part of the JSON).
     Plan {
         op: Op,
