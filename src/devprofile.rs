@@ -8,6 +8,7 @@
 //! measures. Devices without a stable key (image files, loop devices, VM disks) are never
 //! cached.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,10 @@ pub const DEFAULT_SEQ_WRITE_BPS: f64 = 20e6;
 pub const DEFAULT_WRITE_SKIP_S: f64 = 1e-3;
 /// Writes in flight for scattered spans when nothing was measured (the old fixed value).
 pub const DEFAULT_WRITE_QD: usize = 8;
+/// Unmeasured writes in flight on USB Bulk-Only Transport (usb-storage): BOT runs one command
+/// at a time, so a deeper queue only reorders the stream; keep it strictly ascending (2 and 8
+/// in flight measured no better on a USB 2 stick, see add::probe_in_situ).
+pub const BOT_WRITE_QD: usize = 1;
 /// Upper bound on any write_qd we accept from the cache or a measurement.
 pub const MAX_WRITE_QD: usize = 64;
 
@@ -39,8 +44,65 @@ pub struct DevProfile {
     pub read_cmd_s: Option<f64>,
     /// "uas", "usb-storage", or "other".
     pub transport: Option<String>,
+    /// Gap policies `add` measured in situ, per pattern class ([`pattern_key`]).
+    pub patterns: BTreeMap<String, PatternChoice>,
 }
 
+/// How `add`'s data phase treats the cluster slack and free clusters between the spans it writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GapMode {
+    /// Every gap is skipped (a new request per span).
+    Skip,
+    /// Every gap of free clusters is zero-filled: one sequential stream.
+    Fill,
+    /// Each file's write is padded to a multiple of this many bytes, the rest is skipped.
+    Pad(u64),
+}
+
+/// A gap policy measured in situ for one pattern class: the mode and the writes in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PatternChoice {
+    pub mode: GapMode,
+    pub qd: usize,
+}
+
+impl PatternChoice {
+    fn render(&self) -> String {
+        let m = match self.mode {
+            GapMode::Skip => "skip".to_string(),
+            GapMode::Fill => "fill".to_string(),
+            GapMode::Pad(p) => format!("pad{p}"),
+        };
+        format!("{m}:{}", self.qd)
+    }
+    fn parse(v: &str) -> Option<PatternChoice> {
+        let (m, q) = v.split_once(':')?;
+        let mode = match m {
+            "skip" => GapMode::Skip,
+            "fill" => GapMode::Fill,
+            _ => {
+                let p: u64 = m.strip_prefix("pad")?.parse().ok()?;
+                GapMode::Pad(Some(p).filter(|p| p.is_multiple_of(4096) && (4096..=1 << 20).contains(p))?)
+            }
+        };
+        let qd = q.parse().ok().filter(|q| (1..=MAX_WRITE_QD).contains(q))?;
+        Some(PatternChoice { mode, qd })
+    }
+}
+
+/// The pattern class of an add: cluster size and the median size of the files it writes,
+/// rounded up to a power of two (at least 4 KB), e.g. `c32k-m8k`.
+pub fn pattern_key(cluster: u64, median_file: u64) -> String {
+    let m = median_file.clamp(4096, 1 << 40).next_power_of_two();
+    let k = |b: u64| if b >= 1 << 20 { format!("{}m", b >> 20) } else { format!("{}k", b >> 10) };
+    let c = if cluster < 1024 { format!("{cluster}b") } else { k(cluster) };
+    format!("c{c}-m{}", k(m))
+}
+
+/// Whether `transport` is USB Bulk-Only Transport (the usb-storage driver).
+pub fn is_bot(transport: Option<&str>) -> bool {
+    transport == Some("usb-storage")
+}
 impl DevProfile {
     /// Fields of `newer` win; fields it lacks keep their current value.
     pub fn merge(&mut self, newer: &DevProfile) {
@@ -55,6 +117,9 @@ impl DevProfile {
         take(&mut self.seq_read_bps, &newer.seq_read_bps);
         take(&mut self.read_cmd_s, &newer.read_cmd_s);
         take(&mut self.transport, &newer.transport);
+        for (k, v) in &newer.patterns {
+            self.patterns.insert(k.clone(), *v);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -75,6 +140,9 @@ impl DevProfile {
         kv("seq_read_bps", self.seq_read_bps.map(|v| v.to_string()));
         kv("read_cmd_s", self.read_cmd_s.map(|v| v.to_string()));
         kv("transport", self.transport.clone());
+        for (k, v) in &self.patterns {
+            kv(&format!("pattern.{k}"), Some(v.render()));
+        }
         s
     }
 
@@ -101,6 +169,13 @@ impl DevProfile {
                     p.read_cmd_s = v.parse::<f64>().ok().filter(|x| x.is_finite() && (0.0..=1.0).contains(x))
                 }
                 "transport" if !v.is_empty() && v.len() <= 32 => p.transport = Some(v.to_string()),
+                k if k.starts_with("pattern.") => {
+                    let name = &k["pattern.".len()..];
+                    let ok = !name.is_empty() && name.len() <= 32 && sanitize(name) == name;
+                    if let Some(c) = PatternChoice::parse(v).filter(|_| ok) {
+                        p.patterns.insert(name.to_string(), c);
+                    }
+                }
                 _ => {}
             }
         }
@@ -250,6 +325,12 @@ mod tests {
             seq_read_bps: Some(1e9 / 3.0),
             read_cmd_s: Some(0.0),
             transport: Some("usb-storage".into()),
+            patterns: [
+                ("c32k-m8k".to_string(), PatternChoice { mode: GapMode::Pad(16384), qd: 2 }),
+                ("c4k-m4k".to_string(), PatternChoice { mode: GapMode::Skip, qd: 1 }),
+                ("c128k-m1m".to_string(), PatternChoice { mode: GapMode::Fill, qd: 8 }),
+            ]
+            .into(),
         };
         assert_eq!(DevProfile::parse(&p.render()), Some(p));
         assert_eq!(DevProfile::parse(&DevProfile::default().render()), Some(DevProfile::default()));
@@ -261,10 +342,25 @@ mod tests {
         assert_eq!(DevProfile::parse(""), None);
         let p = DevProfile::parse(
             "flashcp-devprofile 1\nseq_write_bps=-5\nwrite_skip_s=NaN\nwrite_qd=0\nseq_read_bps=inf\n\
-             read_cmd_s=7\njunk\nfuture_key=1\ntransport=uas\n",
+             read_cmd_s=7\njunk\nfuture_key=1\ntransport=uas\npattern.a=pad5:1\npattern.b=skip:0\n\
+             pattern.c=fill\npattern.d/e=skip:1\npattern.=skip:1\npattern.f=pad1048576:64\n",
         )
         .unwrap();
-        assert_eq!(p, DevProfile { transport: Some("uas".into()), ..Default::default() });
+        let f = PatternChoice { mode: GapMode::Pad(1 << 20), qd: 64 };
+        assert_eq!(
+            p,
+            DevProfile { transport: Some("uas".into()), patterns: [("f".into(), f)].into(), ..Default::default() }
+        );
+    }
+
+    #[test]
+    fn pattern_keys_bucket_cluster_and_median() {
+        assert_eq!(pattern_key(32768, 8000), "c32k-m8k");
+        assert_eq!(pattern_key(32768, 8193), "c32k-m16k");
+        assert_eq!(pattern_key(32768, 0), "c32k-m4k");
+        assert_eq!(pattern_key(512, 100), "c512b-m4k");
+        assert_eq!(pattern_key(1 << 20, 3 << 20), "c1m-m4m");
+        assert!(is_bot(Some("usb-storage")) && !is_bot(Some("uas")) && !is_bot(None));
     }
 
     #[test]
