@@ -16,19 +16,33 @@
 //!    fallocate, sized to DataLength so bytes past ValidDataLength read as zeros) and closed
 //!    with its mtime set after its last one. No per-file fsync: one `syncfs` at the end.
 //!
+//! The source volume is UNTRUSTED (any USB stick). Every directory's and file's allocation is
+//! walked and marked in one visited-cluster set, so FAT loops, cross-links and directory cycles
+//! fail at once and the planned data can never exceed the cluster heap. Entries, depth, path
+//! length and fragments have hard limits, names must be single safe components, the
+//! destination's free space is checked before anything is written, and nothing past
+//! VolumeLength is ever read. The destination is written only through directory fds
+//! ([`crate::dirfd`]: openat2 RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS, O_NOFOLLOW), so a symlink
+//! swapped in concurrently cannot redirect a write outside it, and `--overwrite` writes a temp
+//! file and renames it over the old one (never truncating through a hard link).
+//!
 //! A mounted source is read as it is on the device: fine when nothing is writing to it (the
 //! kernel driver's metadata goes through the block device's page cache, which buffered
 //! metadata reads see, and O_DIRECT data reads flush that cache first), but files written
 //! since the last `sync` may be missing or partial. An unmounted volume is preferred, and a
 //! read-write mount gets a warning.
 
+use crate::dirfd;
 use crate::events::{Event, Op, Sink, Ticker};
 use crate::exfat::{FlagGuard, SYS_BLOCK, TargetSpec, blk_size, open_target_fd, related_devs, set_direct};
 use crate::util::{AlignedBuf, human_bytes};
 use crate::volume::*;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{RecvTimeoutError, bounded};
+use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -87,73 +101,23 @@ pub struct PullStats {
     pub secs: f64,
 }
 
-/// One destination file.
-struct Job {
-    rel: PathBuf,
-    len: u64,
-    /// ValidDataLength: bytes read from the volume; the rest of `len` stays zero.
-    valid: u64,
-    mtime: Option<SystemTime>,
-    st: Mutex<JobState>,
-}
+/// Hard limits on what an untrusted volume can make pull hold in memory or create. Generous
+/// for real volumes, finite for crafted ones (memory stays about bitmap/8 + O(entries)).
+pub const MAX_ENTRIES: u64 = 8 << 20;
+pub const MAX_EXTENTS: usize = 16 << 20;
+pub const MAX_DEPTH: usize = 256;
+/// Longest relative path created under the destination (PATH_MAX).
+pub const MAX_PATH: usize = 4096;
+/// Test hook: a shell command run after planning, before anything is written.
+const AFTER_PLAN_ENV: &str = "FLASHCP_TEST_AFTER_PLAN";
+/// Test hook: print every data read ("flashcp-read OFFSET LEN") to stderr.
+const TRACE_READS_ENV: &str = "FLASHCP_TEST_TRACE_READS";
 
-struct JobState {
-    file: Option<File>,
-    /// Bytes still to write (starts at ValidDataLength).
-    left: u64,
-}
-
-/// `len` bytes at physical offset `phys` belong at offset `foff` of file `file`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Ext {
-    phys: u64,
-    foff: u64,
-    len: u32,
-    file: u32,
-}
-
-/// One device read: `len` bytes at `start` (both aligned), serving `exts`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Chunk {
-    start: u64,
-    len: usize,
-    exts: std::ops::Range<usize>,
-}
-
-/// Coalesces extents (sorted by `phys`) into aligned reads of at most `max` bytes, reading
-/// through gaps of up to `gap` bytes. Every extent must be at most `max - 2 * ALIGN` bytes.
-fn coalesce(exts: &[Ext], max: usize, gap: u64) -> Vec<Chunk> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < exts.len() {
-        let start = exts[i].phys / ALIGN * ALIGN;
-        let mut end = exts[i].phys + exts[i].len as u64;
-        let mut j = i + 1;
-        while j < exts.len() {
-            let e = exts[j];
-            let e_end = (e.phys + e.len as u64).max(end);
-            if e.phys.saturating_sub(end) > gap || e_end.div_ceil(ALIGN) * ALIGN - start > max as u64 {
-                break;
-            }
-            end = e_end;
-            j += 1;
-        }
-        let len = (end.div_ceil(ALIGN) * ALIGN - start) as usize;
-        debug_assert!(len <= max, "chunk of {len} bytes exceeds {max}");
-        out.push(Chunk { start, len, exts: i..j });
-        i = j;
-    }
-    out
-}
-
-/// Pushes the extents of `bytes` bytes at physical `phys` (file offset `foff`), split so no
-/// extent exceeds `max`.
-fn push_run(exts: &mut Vec<Ext>, file: u32, mut phys: u64, mut foff: u64, mut bytes: u64, max: u64) {
-    while bytes > 0 {
-        let n = bytes.min(max);
-        exts.push(Ext { phys, foff, len: n as u32, file });
-        (phys, foff, bytes) = (phys + n, foff + n, bytes - n);
-    }
+/// A destination directory: index 0 is the destination root itself.
+struct DirNode {
+    parent: u32,
+    name: CString,
+    mtime: Option<(i64, u32)>,
 }
 
 /// A volume name as a single, safe path component.
@@ -305,135 +269,355 @@ fn read_full(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
     Ok(got)
 }
 
+/// Coalesces extents (sorted by `phys`) into aligned reads of at most `max` bytes, reading
+/// through gaps of up to `gap` bytes. Every extent must be at most `max - 2 * ALIGN` bytes.
+fn coalesce(exts: &[Ext], max: usize, gap: u64) -> Vec<Chunk> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < exts.len() {
+        let start = exts[i].phys / ALIGN * ALIGN;
+        let mut end = exts[i].phys + exts[i].len as u64;
+        let mut j = i + 1;
+        while j < exts.len() {
+            let e = exts[j];
+            let e_end = (e.phys + e.len as u64).max(end);
+            if e.phys.saturating_sub(end) > gap || e_end.div_ceil(ALIGN) * ALIGN - start > max as u64 {
+                break;
+            }
+            end = e_end;
+            j += 1;
+        }
+        let len = (end.div_ceil(ALIGN) * ALIGN - start) as usize;
+        debug_assert!(len <= max, "chunk of {len} bytes exceeds {max}");
+        out.push(Chunk { start, len, exts: i..j });
+        i = j;
+    }
+    out
+}
+
+/// One destination file.
+struct Job {
+    parent: u32,
+    name: CString,
+    len: u64,
+    /// ValidDataLength: bytes read from the volume; the rest of `len` stays zero.
+    valid: u64,
+    mtime: Option<(i64, u32)>,
+    /// An existing file is replaced (--overwrite): written to a temp file, renamed over it.
+    replace: bool,
+    st: Mutex<JobState>,
+}
+
+struct JobState {
+    file: Option<File>,
+    /// Bytes still to write (starts at ValidDataLength).
+    left: u64,
+    /// Temp file name (in the parent) while a replacement is being written.
+    tmp: Option<CString>,
+}
+
+/// `len` bytes at physical offset `phys` belong at offset `foff` of file `file`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Ext {
+    phys: u64,
+    foff: u64,
+    len: u32,
+    file: u32,
+}
+
+/// One device read: `len` bytes at `start` (both aligned), serving `exts`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Chunk {
+    start: u64,
+    len: usize,
+    exts: std::ops::Range<usize>,
+}
+
+/// Pushes the extents of `bytes` bytes at physical `phys` (file offset `foff`), split so no
+/// extent exceeds `max` or crosses physical offset `cut`.
+fn push_run(exts: &mut Vec<Ext>, file: u32, mut phys: u64, mut foff: u64, mut bytes: u64, max: u64, cut: u64) {
+    while bytes > 0 {
+        let mut n = bytes.min(max);
+        if phys < cut && phys + n > cut {
+            n = cut - phys;
+        }
+        exts.push(Ext { phys, foff, len: n as u32, file });
+        (phys, foff, bytes) = (phys + n, foff + n, bytes - n);
+    }
+}
+
+/// The destination: the root directory fd and the planned tree under it.
+struct Dest {
+    root: OwnedFd,
+    path: PathBuf,
+    dirs: Vec<DirNode>,
+}
+
+impl Dest {
+    /// Relative path of directory `i`.
+    fn rel(&self, i: u32) -> PathBuf {
+        dest_rel(&self.dirs, i)
+    }
+
+    fn shown(&self, parent: u32, name: &CStr) -> String {
+        self.path.join(self.rel(parent)).join(std::ffi::OsStr::from_bytes(name.to_bytes())).display().to_string()
+    }
+}
+
+/// Each writer's most recent parent-directory fd (files of one directory tend to be adjacent).
+#[derive(Default)]
+struct DirCache(Option<(u32, OwnedFd)>);
+
+impl DirCache {
+    fn get<'a>(&'a mut self, d: &'a Dest, i: u32) -> Result<BorrowedFd<'a>> {
+        if i == 0 {
+            return Ok(d.root.as_fd());
+        }
+        if self.0.as_ref().is_none_or(|(c, _)| *c != i) {
+            let rel = d.rel(i);
+            let fd = dirfd::open_dir_beneath(d.root.as_fd(), &rel)
+                .with_context(|| format!("open {} (it must stay a real directory)", d.path.join(&rel).display()))?;
+            self.0 = Some((i, fd));
+        }
+        Ok(self.0.as_ref().unwrap().1.as_fd())
+    }
+}
+
+fn tmp_name() -> CString {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let mut r = 0u64;
+    unsafe { libc::getrandom(&mut r as *mut u64 as *mut libc::c_void, 8, 0) };
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    CString::new(format!(".flashcp-{:x}-{:016x}.tmp", std::process::id(), r ^ n)).unwrap()
+}
+
+/// Creates the file (preallocated, sized to DataLength) on first use.
+fn ensure_open<'a>(st: &'a mut JobState, job: &Job, d: &Dest, cache: &mut DirCache) -> Result<&'a File> {
+    if st.file.is_none() {
+        let dir = cache.get(d, job.parent)?;
+        let shown = || d.shown(job.parent, &job.name);
+        let f = if job.replace {
+            let tmp = tmp_name();
+            let f = dirfd::create_at(dir, &tmp).with_context(|| format!("create a temp file next to {}", shown()))?;
+            st.tmp = Some(tmp);
+            f
+        } else {
+            dirfd::create_at(dir, &job.name).with_context(|| format!("create {}", shown()))?
+        };
+        dirfd::preallocate(&f, job.len).with_context(|| format!("preallocate {} bytes for {}", job.len, shown()))?;
+        f.set_len(job.len).with_context(|| format!("size {}", shown()))?;
+        st.file = Some(f);
+    }
+    Ok(st.file.as_ref().unwrap())
+}
+
+/// After the last byte: mtime, close, and for a replacement the rename over the old file.
+fn finish(st: &mut JobState, job: &Job, d: &Dest, cache: &mut DirCache) -> Result<()> {
+    let f = st.file.take().ok_or_else(|| anyhow!("internal error: finishing a file that is not open"))?;
+    if let Some(t) = job.mtime.and_then(systime) {
+        f.set_modified(t).with_context(|| format!("set mtime of {}", d.shown(job.parent, &job.name)))?;
+    }
+    drop(f);
+    if let Some(tmp) = st.tmp.take() {
+        let dir = cache.get(d, job.parent)?;
+        if let Err(e) = dirfd::rename_at(dir, &tmp, &job.name) {
+            let _ = dirfd::unlink_at(dir, &tmp);
+            return Err(e).with_context(|| format!("replace {}", d.shown(job.parent, &job.name)));
+        }
+    }
+    Ok(())
+}
+
+/// Writes one extent's bytes into its file; returns true when that completed the file.
+fn write_ext(job: &Job, bytes: &[u8], foff: u64, d: &Dest, cache: &mut DirCache) -> Result<bool> {
+    let mut st = job.st.lock().unwrap();
+    let f = ensure_open(&mut st, job, d, cache)?;
+    f.write_all_at(bytes, foff).with_context(|| format!("write {}", d.shown(job.parent, &job.name)))?;
+    st.left -= bytes.len() as u64;
+    if st.left == 0 {
+        finish(&mut st, job, d, cache)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// What the tree walk produced.
 struct Plan {
-    /// Destination directories (relative), parents first, with their mtimes.
-    dirs: Vec<(PathBuf, Option<SystemTime>)>,
+    dirs: Vec<DirNode>,
     jobs: Vec<Job>,
     exts: Vec<Ext>,
     skipped: u64,
     collisions: Vec<String>,
 }
 
-/// Walks the volume from `start` and plans every directory, file and extent.
-fn plan(v: &mut Vol, start: Dir, dest: &Path, fresh_root: bool, o: &PullOpts) -> Result<Plan> {
+/// Walks the volume from `start` (whose clusters are already in `seen`) and plans every
+/// directory, file and extent. Every directory's and file's whole allocation is marked in
+/// `seen`, so a cross-link, a FAT loop or a directory cycle fails as soon as it is reached,
+/// and the planned data can never exceed the cluster heap.
+fn plan(v: &mut Vol, start: Vec<Child>, seen: &mut [u8], root: Option<&OwnedFd>, o: &PullOpts) -> Result<Plan> {
     // Aligning a chunk's start down and its end up adds less than 2 × ALIGN.
     let max = o.chunk as u64 - 2 * ALIGN;
-    let mut p = Plan { dirs: Vec::new(), jobs: Vec::new(), exts: Vec::new(), skipped: 0, collisions: Vec::new() };
-    let mut stack: Vec<(Dir, PathBuf, bool)> = vec![(start, PathBuf::new(), fresh_root)];
-    let mut ndirs = 0u64;
-    while let Some((d, rel, fresh)) = stack.pop() {
-        let shown = if d.path.is_empty() { "/" } else { d.path.as_str() };
-        for ch in d.children.values() {
-            let name = component(&ch.name, shown)?;
-            let crel = rel.join(&name);
-            let existing = if fresh { None } else { fs::symlink_metadata(dest.join(&crel)).ok() };
-            let mtime = decode_ts(ch.mtime.0, ch.mtime.1, ch.mtime.2).and_then(systime);
+    // Reads stop at the last aligned offset of the volume; the rest is read buffered.
+    let cut = v.vol_bytes / ALIGN * ALIGN;
+    let capacity = v.cc * v.cs;
+    let mut p = Plan {
+        dirs: vec![DirNode { parent: 0, name: CString::default(), mtime: None }],
+        jobs: Vec::new(),
+        exts: Vec::new(),
+        skipped: 0,
+        collisions: Vec::new(),
+    };
+    // (children, dir index, volume path, depth, relative path length, exists in the destination)
+    let mut stack: Vec<(Vec<Child>, u32, String, usize, usize, bool)> =
+        vec![(start, 0, String::new(), 0, 0, root.is_some())];
+    let mut entries = 0u64;
+    while let Some((kids, di, vpath, depth, plen, exists)) = stack.pop() {
+        let shown_dir = if vpath.is_empty() { "/".to_string() } else { vpath.clone() };
+        // The existing destination directory, to look for collisions in.
+        let dfd = match (exists, root) {
+            (true, Some(r)) => {
+                let rel = dest_rel(&p.dirs, di);
+                Some(dirfd::open_dir_beneath(r.as_fd(), &rel).with_context(|| {
+                    format!("open destination directory {} (it must be a real directory)", rel.display())
+                })?)
+            }
+            _ => None,
+        };
+        for ch in kids {
+            entries += 1;
+            ensure!(entries <= MAX_ENTRIES, "the volume has more than {MAX_ENTRIES} files and directories");
+            let name = component(&ch.name, &shown_dir)?;
+            let cname = CString::new(name.clone()).expect("component() refuses NUL");
+            let clen = plen + usize::from(plen > 0) + name.len();
+            let what = format!("{vpath}/{name}");
+            ensure!(clen <= MAX_PATH, "{what}: the path is longer than {MAX_PATH} bytes");
+            let existing = match &dfd {
+                Some(fd) => {
+                    dirfd::stat_at(fd.as_fd(), &cname).with_context(|| format!("stat {} in the destination", what))?
+                }
+                None => None,
+            };
+            let mtime = decode_ts(ch.mtime.0, ch.mtime.1, ch.mtime.2);
+            ensure!(
+                ch.len <= capacity,
+                "{what}: DataLength {} is larger than the volume's cluster heap ({capacity}); run fsck.exfat",
+                ch.len
+            );
             if ch.is_dir {
-                ndirs += 1;
-                // Every directory owns at least one cluster, so more means a cycle.
-                ensure!(ndirs <= v.cc, "directory tree has a cycle; run fsck.exfat");
-                if let Some(m) = &existing {
+                ensure!(depth < MAX_DEPTH, "{what}: directories are nested more than {MAX_DEPTH} deep");
+                if let Some(st) = &existing {
+                    ensure!(dirfd::is_dir(st), "{what} exists in the destination and is not a directory");
+                }
+                let sub = v.read_child(0, &vpath, &ch)?;
+                for &c in &sub.clusters {
                     ensure!(
-                        m.is_dir(),
-                        "{} exists in the destination and is not a directory",
-                        dest.join(&crel).display()
+                        mark(seen, c),
+                        "{what}: cluster {c} is used twice (cross-linked, or a directory cycle); run fsck.exfat"
                     );
                 }
-                let sub = v.read_child(0, &d.path, ch)?;
-                p.dirs.push((crel.clone(), mtime));
-                stack.push((sub, crel, existing.is_none()));
+                let idx = u32::try_from(p.dirs.len()).context("too many directories")?;
+                p.dirs.push(DirNode { parent: di, name: cname, mtime });
+                // Only the children are kept; the directory's raw data is dropped here.
+                stack.push((sub.children.into_values().collect(), idx, what, depth + 1, clen, existing.is_some()));
                 continue;
             }
-            let what = || format!("{}/{name}", d.path);
-            if let Some(m) = &existing {
-                ensure!(!m.is_dir(), "{} exists in the destination and is a directory", dest.join(&crel).display());
+            let mut replace = false;
+            if let Some(st) = &existing {
+                ensure!(!dirfd::is_dir(st), "{what} exists in the destination and is a directory");
                 if o.skip_existing {
                     p.skipped += 1;
                     continue;
                 }
                 if !o.overwrite {
-                    p.collisions.push(dest.join(&crel).display().to_string());
+                    p.collisions.push(what);
                     continue;
                 }
+                replace = true;
             }
             ensure!(
                 ch.valid_len <= ch.len,
-                "{}: ValidDataLength {} exceeds DataLength {}; run fsck.exfat",
-                what(),
+                "{what}: ValidDataLength {} exceeds DataLength {}; run fsck.exfat",
                 ch.valid_len,
                 ch.len
             );
             let fi = u32::try_from(p.jobs.len()).context("too many files")?;
+            // The whole allocation is walked and marked (even past ValidDataLength); only the
+            // clusters up to ValidDataLength become extents.
+            let total = ch.len.div_ceil(v.cs);
             let need = ch.valid_len.div_ceil(v.cs);
-            if need > 0 {
-                if ch.no_fat_chain {
-                    // The whole allocation must lie inside the heap, even past ValidDataLength.
-                    contiguous_run(ch.first, ch.len.div_ceil(v.cs), v.cc)
-                        .with_context(|| format!("{}: contiguous extent runs past the end of the volume", what()))?;
-                    push_run(&mut p.exts, fi, v.cluster_off(ch.first), 0, ch.valid_len, max);
-                } else {
-                    let (mut c, mut run_first, mut run_n, mut foff) = (ch.first, ch.first, 0u64, 0u64);
-                    for k in 0..need {
-                        ensure!(v.valid(c), "{}: FAT chain points at invalid cluster {c:#x}", what());
+            if total > 0 && ch.no_fat_chain {
+                contiguous_run(ch.first, total, v.cc)
+                    .with_context(|| format!("{what}: contiguous extent runs past the end of the volume"))?;
+                mark_range(seen, ch.first, total)
+                    .map_err(|c| anyhow!("{what}: cluster {c} is used twice (cross-linked); run fsck.exfat"))?;
+                push_run(&mut p.exts, fi, v.cluster_off(ch.first), 0, ch.valid_len, max, cut);
+            } else if total > 0 {
+                let (mut c, mut run_first, mut run_n, mut foff) = (ch.first, ch.first, 0u64, 0u64);
+                for k in 0..total {
+                    ensure!(v.valid(c), "{what}: FAT chain points at invalid cluster {c:#x}");
+                    ensure!(
+                        mark(seen, c),
+                        "{what}: cluster {c} is used twice (FAT loop or cross-link); run fsck.exfat"
+                    );
+                    if k < need {
                         if run_n > 0 && c as u64 != run_first as u64 + run_n {
                             let bytes = run_n * v.cs;
-                            push_run(&mut p.exts, fi, v.cluster_off(run_first), foff, bytes, max);
-                            (foff, run_first, run_n) = (foff + bytes, c, 0);
+                            push_run(&mut p.exts, fi, v.cluster_off(run_first), foff, bytes, max, cut);
+                            (foff, run_n) = (foff + bytes, 0);
                         }
                         if run_n == 0 {
                             run_first = c;
                         }
                         run_n += 1;
-                        if k + 1 < need {
-                            let next = v.fat(c)?;
-                            ensure!(next != EOC, "{}: FAT chain is shorter than its DataLength", what());
-                            c = next;
-                        }
                     }
-                    push_run(&mut p.exts, fi, v.cluster_off(run_first), foff, ch.valid_len - foff, max);
+                    let next = v.fat(c)?;
+                    if k + 1 == total {
+                        ensure!(next == EOC, "{what}: FAT chain is longer than its DataLength");
+                    } else {
+                        ensure!(next != EOC, "{what}: FAT chain is shorter than its DataLength");
+                        c = next;
+                    }
+                }
+                if need > 0 {
+                    push_run(&mut p.exts, fi, v.cluster_off(run_first), foff, ch.valid_len - foff, max, cut);
                 }
             }
+            ensure!(p.exts.len() <= MAX_EXTENTS, "the volume's files have more than {MAX_EXTENTS} fragments");
             p.jobs.push(Job {
-                rel: crel,
+                parent: di,
+                name: cname,
                 len: ch.len,
                 valid: ch.valid_len,
                 mtime,
-                st: Mutex::new(JobState { file: None, left: ch.valid_len }),
+                replace,
+                st: Mutex::new(JobState { file: None, left: ch.valid_len, tmp: None }),
             });
         }
     }
     Ok(p)
 }
 
-fn open_dest(path: &Path, overwrite: bool) -> Result<File> {
-    let mut oo = OpenOptions::new();
-    oo.write(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    if overwrite {
-        oo.create(true).truncate(true);
-    } else {
-        oo.create_new(true);
+fn dest_rel(dirs: &[DirNode], mut i: u32) -> PathBuf {
+    let mut parts = Vec::new();
+    while i != 0 {
+        parts.push(std::ffi::OsStr::from_bytes(dirs[i as usize].name.as_bytes()));
+        i = dirs[i as usize].parent;
     }
-    oo.open(path).with_context(|| format!("create {}", path.display()))
+    parts.iter().rev().collect()
 }
 
-/// Creates the file (preallocated, sized to DataLength) on first use.
-fn ensure_open<'a>(st: &'a mut JobState, job: &Job, dest: &Path, overwrite: bool) -> Result<&'a File> {
-    if st.file.is_none() {
-        let path = dest.join(&job.rel);
-        let f = open_dest(&path, overwrite)?;
-        crate::util::preallocate(&f, job.len);
-        f.set_len(job.len).with_context(|| format!("size {}", path.display()))?;
-        st.file = Some(f);
+/// Removes the temp files of replacements that never completed.
+fn cleanup_temps(jobs: &[Job], d: &Dest) {
+    let mut cache = DirCache::default();
+    for job in jobs {
+        let mut st = job.st.lock().unwrap();
+        st.file = None;
+        if let Some(tmp) = st.tmp.take()
+            && let Ok(dir) = cache.get(d, job.parent)
+        {
+            let _ = dirfd::unlink_at(dir, &tmp);
+        }
     }
-    Ok(st.file.as_ref().unwrap())
-}
-
-fn finish(st: &mut JobState, job: &Job, dest: &Path) -> Result<()> {
-    if let (Some(f), Some(t)) = (st.file.take(), job.mtime) {
-        f.set_modified(t).with_context(|| format!("set mtime of {}", dest.join(&job.rel).display()))?;
-    }
-    Ok(())
 }
 
 pub fn pull(target: &Path, dest: &Path, o: &PullOpts, sink: Sink<'_>) -> Result<PullStats> {
@@ -445,8 +629,8 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
     let t0 = Instant::now();
     ensure!(!(o.skip_existing && o.overwrite), "--skip-existing and --overwrite are mutually exclusive");
     ensure!(
-        o.chunk >= 4 * ALIGN as usize && o.chunk.is_multiple_of(ALIGN as usize),
-        "chunk must be a multiple of 4 KB and at least 16 KB"
+        o.chunk >= 4 * ALIGN as usize && o.chunk.is_multiple_of(ALIGN as usize) && o.chunk <= 1 << 30,
+        "chunk must be a multiple of 4 KB, between 16 KB and 1 GB"
     );
     let mut tick = Ticker::new(sink);
     let (file, dev_len, _guard, mounted) = open_source(target)?;
@@ -462,91 +646,175 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
         None => {}
     }
     set_direct(&file, false);
-    let mut v = Vol::open(file.try_clone().context("dup source fd")?, dev_len, true)?;
+    // The allocation bitmap is not needed (and not loaded): `seen` is the only cluster-sized set.
+    let mut v = Vol::open(file.try_clone().context("dup source fd")?, dev_len, true, false)?;
     if v.flags & FLAG_DIRTY != 0 && mounted.is_none() {
         eprintln!("warning: the volume is marked dirty (not cleanly unmounted); consider fsck.exfat");
     }
     let cs = v.cs;
+    let mut seen = cluster_set(v.cc);
+    let mut cur = v.dirs.pop().ok_or_else(|| anyhow!("no root directory"))?;
+    let system = [(&cur.clusters, "the root directory"), (&v.bitmap_clusters, "the allocation bitmap")];
+    for (clusters, what) in system.into_iter().chain([(&v.upcase_clusters, "the up-case table")]) {
+        for &c in clusters {
+            ensure!(mark(&mut seen, c), "cluster {c} of {what} is used twice (cross-linked); run fsck.exfat");
+        }
+    }
 
     // ── --from ──
-    let mut cur = v.dirs.pop().ok_or_else(|| anyhow!("no root directory"))?;
     for comp in o.from.as_deref().unwrap_or("").split('/').filter(|c| !c.is_empty() && *c != ".") {
         ensure!(comp != "..", "--from must not contain '..'");
         let key = upcase(&comp.encode_utf16().collect::<Vec<_>>(), &v.upc);
         let shown = format!("{}/{comp}", cur.path);
         match cur.children.get(&key).cloned() {
-            Some(ch) if ch.is_dir => cur = v.read_child(0, &cur.path, &ch)?,
+            Some(ch) if ch.is_dir => {
+                cur = v.read_child(0, &cur.path, &ch)?;
+                for &c in &cur.clusters {
+                    ensure!(mark(&mut seen, c), "--from: {shown}: cluster {c} is used twice; run fsck.exfat");
+                }
+            }
             Some(_) => bail!("--from: {shown} is a file on the volume, not a directory"),
             None => bail!("--from: {shown} not found on the volume"),
         }
     }
 
     // ── plan ──
-    // A destination that does not exist yet (or is empty) cannot collide with anything.
-    let fresh = match fs::symlink_metadata(dest) {
+    // A destination that does not exist yet cannot collide with anything.
+    let root = match fs::symlink_metadata(dest) {
         Ok(m) => {
-            ensure!(m.is_dir(), "destination {} is not a directory", dest.display());
-            fs::read_dir(dest).with_context(|| format!("read {}", dest.display()))?.next().is_none()
+            ensure!(m.is_dir(), "destination {} is not a directory (or is a symlink)", dest.display());
+            Some(dirfd::open_root(dest).with_context(|| format!("open {}", dest.display()))?)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("stat {}", dest.display())),
     };
-    let mut p = plan(&mut v, cur, dest, fresh, o)?;
+    let start: Vec<Child> = std::mem::take(&mut cur.children).into_values().collect();
+    drop(cur);
+    let mut p = plan(&mut v, start, &mut seen, root.as_ref(), o)?;
+    drop(seen);
     if !p.collisions.is_empty() {
         p.collisions.sort();
         let n = p.collisions.len();
         let list: Vec<_> = p.collisions.into_iter().take(10).collect();
         bail!(
-            "{n} file(s) already exist in the destination, e.g. {}; pass --skip-existing or --overwrite",
+            "{n} file(s) already exist in the destination {}, e.g. {}; pass --skip-existing or --overwrite",
+            dest.display(),
             list.join(", ")
         );
     }
     p.exts.sort_unstable_by_key(|e| e.phys);
-    let chunks = coalesce(&p.exts, o.chunk, o.gap);
-    let read_bytes: u64 = chunks.iter().map(|c| c.len as u64).sum();
+    let cut = v.vol_bytes / ALIGN * ALIGN;
+    let tail_at = p.exts.partition_point(|e| e.phys < cut);
+    let chunks = coalesce(&p.exts[..tail_at], o.chunk, o.gap);
+    let tail_bytes = p.exts[tail_at..].iter().map(|e| e.phys + e.len as u64).max().map_or(0, |e| e - cut);
+    let read_bytes: u64 = chunks.iter().map(|c| c.len as u64).sum::<u64>() + tail_bytes;
     let data_bytes: u64 = p.jobs.iter().map(|j| j.len).sum();
-    let (files, dirs) = (p.jobs.len() as u64, p.dirs.len() as u64);
+    let (files, dirs) = (p.jobs.len() as u64, p.dirs.len() as u64 - 1);
+    let root = match root {
+        Some(r) => r,
+        None => {
+            fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+            dirfd::open_root(dest).with_context(|| format!("open {}", dest.display()))?
+        }
+    };
+    // Room for every byte, plus a block per directory and file of metadata slack.
+    let need = data_bytes + (files + dirs) * 4096;
+    let free = dirfd::free_bytes(root.as_fd()).with_context(|| format!("statvfs {}", dest.display()))?;
+    ensure!(
+        need <= free,
+        "not enough space in {}: this pull needs {} ({} of file data), only {} is free",
+        dest.display(),
+        human_bytes(need as f64),
+        human_bytes(data_bytes as f64),
+        human_bytes(free as f64)
+    );
     let detail = format!(
         "pull: {files} files, {dirs} dirs, {} of data → {}{}; reading {} in {} requests of up to {} (cluster {})",
         human_bytes(data_bytes as f64),
         dest.display(),
         if p.skipped > 0 { format!(" ({} existing skipped)", p.skipped) } else { String::new() },
         human_bytes(read_bytes as f64),
-        chunks.len(),
+        chunks.len() + usize::from(tail_bytes > 0),
         human_bytes(o.chunk as f64),
         human_bytes(cs as f64),
     );
     tick.emit(Event::Plan { op: Op::Pull, files, dirs, bytes: data_bytes, write_bytes: read_bytes, detail });
+    if let Ok(cmd) = std::env::var(AFTER_PLAN_ENV) {
+        let ok = std::process::Command::new("sh").arg("-c").arg(&cmd).status().is_ok_and(|s| s.success());
+        ensure!(ok, "{AFTER_PLAN_ENV} command failed");
+    }
+    let trace = std::env::var_os(TRACE_READS_ENV).is_some();
+    let d = Dest { root, path: dest.to_path_buf(), dirs: p.dirs };
+    let jobs = p.jobs;
+    let exts = p.exts;
 
-    // ── directories, then files with nothing to read ──
-    fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
-    for (rel, _) in &p.dirs {
-        let path = dest.join(rel);
-        match fs::create_dir(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Checked during planning; re-checked so a racing symlink is never followed.
-                let m = fs::symlink_metadata(&path)?;
-                ensure!(m.is_dir(), "{} is not a directory", path.display());
-            }
-            Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+    let res = transfer(&file, &d, &jobs, &exts, &chunks, tail_at, cut, o, trace, &mut tick);
+    if let Err(e) = res {
+        cleanup_temps(&jobs, &d);
+        return Err(e.context("pull failed; the destination holds a partial copy"));
+    }
+    drop(_guard);
+    // Directory mtimes last (creating entries changed them), deepest first.
+    let mut cache = DirCache::default();
+    for dn in d.dirs.iter().skip(1).rev() {
+        if let Some((secs, ns)) = dn.mtime {
+            let dir = cache.get(&d, dn.parent)?;
+            dirfd::set_mtime_at(dir, &dn.name, secs, ns)
+                .with_context(|| format!("set mtime of {}", d.shown(dn.parent, &dn.name)))?;
         }
+    }
+    dirfd::syncfs(d.root.as_fd()).context("syncfs on the destination")?;
+    tick.progress(files, data_bytes, true);
+    let secs = t0.elapsed().as_secs_f64();
+    tick.emit(Event::Done { files, bytes: data_bytes, secs });
+    Ok(PullStats {
+        files,
+        dirs,
+        skipped: p.skipped,
+        data_bytes,
+        read_bytes,
+        reads: chunks.len() as u64 + u64::from(tail_bytes > 0),
+        cluster: cs,
+        secs,
+    })
+}
+
+/// Directories, empty files, then the data: readers → writers, then the buffered tail.
+#[allow(clippy::too_many_arguments)]
+fn transfer(
+    file: &File,
+    d: &Dest,
+    jobs: &[Job],
+    exts: &[Ext],
+    chunks: &[Chunk],
+    tail_at: usize,
+    cut: u64,
+    o: &PullOpts,
+    trace: bool,
+    tick: &mut Ticker<'_>,
+) -> Result<()> {
+    let mut cache = DirCache::default();
+    for (i, dn) in d.dirs.iter().enumerate().skip(1) {
+        let parent = cache.get(d, dn.parent)?;
+        dirfd::mkdir_at(parent, &dn.name).with_context(|| {
+            format!("create directory {} (it must not be a file or a symlink)", d.shown(dn.parent, &dn.name))
+        })?;
+        debug_assert!(dn.parent < i as u32);
     }
     raise_nofile();
     let files_done = AtomicU64::new(0);
     let bytes_done = AtomicU64::new(0);
-    for job in &p.jobs {
+    for job in jobs {
         let mut st = job.st.lock().unwrap();
         if st.left == 0 {
-            ensure_open(&mut st, job, dest, o.overwrite)?;
-            finish(&mut st, job, dest)?;
+            ensure_open(&mut st, job, d, &mut cache)?;
+            finish(&mut st, job, d, &mut cache)?;
             files_done.fetch_add(1, Ordering::Relaxed);
             bytes_done.fetch_add(job.len, Ordering::Relaxed);
         }
     }
 
-    // ── data: readers → writers ──
-    let direct = AtomicBool::new(set_direct(&file, true));
+    let direct = AtomicBool::new(set_direct(file, true));
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
@@ -556,13 +824,20 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
         first_err.lock().unwrap().get_or_insert(e);
         pool.close();
     };
+    let done = |job: &Job, n: u64, completed: bool| {
+        bytes_done.fetch_add(n, Ordering::Relaxed);
+        if completed {
+            files_done.fetch_add(1, Ordering::Relaxed);
+            // Zeros past ValidDataLength count as done too.
+            bytes_done.fetch_add(job.len - job.valid, Ordering::Relaxed);
+        }
+    };
     let (full_tx, full_rx) = bounded::<(usize, AlignedBuf)>(o.inflight.max(1));
     let (alive_tx, alive_rx) = bounded::<()>(0);
     std::thread::scope(|s| {
         for _ in 0..o.inflight.max(1) {
             let (full_tx, alive, pool) = (full_tx.clone(), alive_tx.clone(), &pool);
-            let (file, chunks, next, failed, direct, fail) = (&file, &chunks, &next, &failed, &direct, &fail);
-            let exts = &p.exts;
+            let (next, failed, direct, fail) = (&next, &failed, &direct, &fail);
             s.spawn(move || {
                 let _alive = alive;
                 while !failed.load(Ordering::Relaxed) {
@@ -570,6 +845,9 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
                     let Some(c) = chunks.get(i) else { return };
                     let Some(mut buf) = pool.get(c.len) else { return };
                     let need = exts[c.exts.clone()].iter().map(|e| e.phys + e.len as u64).max().unwrap() - c.start;
+                    if trace {
+                        eprintln!("flashcp-read {} {}", c.start, c.len);
+                    }
                     let mut r = read_full(file, &mut buf.as_mut()[..c.len], c.start);
                     if matches!(&r, Err(e) if e.raw_os_error() == Some(libc::EINVAL))
                         && direct.swap(false, Ordering::Relaxed)
@@ -581,9 +859,7 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
                     }
                     match r {
                         Ok(n) if n as u64 >= need => {}
-                        Ok(n) => {
-                            return fail(anyhow!("short read at byte {}: {n} of {need} bytes", c.start));
-                        }
+                        Ok(n) => return fail(anyhow!("short read at byte {}: {n} of {need} bytes", c.start)),
                         Err(e) => {
                             return fail(anyhow::Error::new(e).context(format!("read {} bytes at {}", c.len, c.start)));
                         }
@@ -597,11 +873,10 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
         drop(full_tx);
         for _ in 0..o.writers.max(1) {
             let (full_rx, alive, pool) = (full_rx.clone(), alive_tx.clone(), &pool);
-            let (chunks, failed, fail, jobs, exts) = (&chunks, &failed, &fail, &p.jobs, &p.exts);
-            let (files_done, bytes_done) = (&files_done, &bytes_done);
-            let overwrite = o.overwrite;
+            let (failed, fail, done) = (&failed, &fail, &done);
             s.spawn(move || {
                 let _alive = alive;
+                let mut cache = DirCache::default();
                 for (i, buf) in full_rx.iter() {
                     if failed.load(Ordering::Relaxed) {
                         return;
@@ -610,23 +885,9 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
                     for e in &exts[c.exts.clone()] {
                         let job = &jobs[e.file as usize];
                         let at = (e.phys - c.start) as usize;
-                        let res = (|| -> Result<()> {
-                            let mut st = job.st.lock().unwrap();
-                            let f = ensure_open(&mut st, job, dest, overwrite)?;
-                            f.write_all_at(&buf.as_ref()[at..at + e.len as usize], e.foff)
-                                .with_context(|| format!("write {}", dest.join(&job.rel).display()))?;
-                            st.left -= e.len as u64;
-                            bytes_done.fetch_add(e.len as u64, Ordering::Relaxed);
-                            if st.left == 0 {
-                                finish(&mut st, job, dest)?;
-                                files_done.fetch_add(1, Ordering::Relaxed);
-                                // Zeros past ValidDataLength count as done too.
-                                bytes_done.fetch_add(job.len - job.valid, Ordering::Relaxed);
-                            }
-                            Ok(())
-                        })();
-                        if let Err(e) = res {
-                            return fail(e);
+                        match write_ext(job, &buf.as_ref()[at..at + e.len as usize], e.foff, d, &mut cache) {
+                            Ok(completed) => done(job, e.len as u64, completed),
+                            Err(e) => return fail(e),
                         }
                     }
                     pool.put(buf);
@@ -643,37 +904,35 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
         }
     });
     if let Some(e) = first_err.into_inner().unwrap() {
-        return Err(e.context("pull failed; the destination holds a partial copy"));
+        return Err(e);
     }
-    drop(_guard);
-    for job in &p.jobs {
-        ensure!(job.st.lock().unwrap().file.is_none(), "internal error: {} was not completed", job.rel.display());
-    }
-    // Directory mtimes last (creating entries changed them), deepest first.
-    for (rel, t) in p.dirs.iter().rev() {
-        if let Some(t) = t {
-            let path = dest.join(rel);
-            File::open(&path)
-                .and_then(|f| f.set_modified(*t))
-                .with_context(|| format!("set mtime of {}", path.display()))?;
+    // The unaligned end of the volume: one small buffered read, never past VolumeLength.
+    let tail = &exts[tail_at..];
+    if let Some(end) = tail.iter().map(|e| e.phys + e.len as u64).max() {
+        set_direct(file, false);
+        let mut buf = vec![0u8; (end - cut) as usize];
+        if trace {
+            eprintln!("flashcp-read {cut} {}", buf.len());
+        }
+        let n = read_full(file, &mut buf, cut).with_context(|| format!("read {} bytes at {cut}", buf.len()))?;
+        ensure!(n == buf.len(), "short read at byte {cut}: {n} of {} bytes", buf.len());
+        for e in tail {
+            let job = &jobs[e.file as usize];
+            let at = (e.phys - cut) as usize;
+            let completed = write_ext(job, &buf[at..at + e.len as usize], e.foff, d, &mut cache)?;
+            done(job, e.len as u64, completed);
         }
     }
-    crate::util::syncfs(dest)?;
-    tick.progress(files, data_bytes, true);
-    let secs = t0.elapsed().as_secs_f64();
-    tick.emit(Event::Done { files, bytes: data_bytes, secs });
-    Ok(PullStats {
-        files,
-        dirs,
-        skipped: p.skipped,
-        data_bytes,
-        read_bytes,
-        reads: chunks.len() as u64,
-        cluster: cs,
-        secs,
-    })
+    for job in jobs {
+        let st = job.st.lock().unwrap();
+        ensure!(
+            st.file.is_none() && st.left == 0,
+            "internal error: {} was not completed",
+            d.shown(job.parent, &job.name)
+        );
+    }
+    Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,7 +944,7 @@ mod tests {
     #[test]
     fn push_run_splits_at_max() {
         let mut v = Vec::new();
-        push_run(&mut v, 7, 1000, 50, 25, 10);
+        push_run(&mut v, 7, 1000, 50, 25, 10, u64::MAX);
         assert_eq!(
             v,
             vec![
@@ -694,8 +953,15 @@ mod tests {
                 Ext { phys: 1020, foff: 70, len: 5, file: 7 }
             ]
         );
-        push_run(&mut v, 7, 0, 0, 0, 10);
+        push_run(&mut v, 7, 0, 0, 0, 10, u64::MAX);
         assert_eq!(v.len(), 3, "an empty run adds nothing");
+        // A run crossing the cut is split there.
+        let mut v = Vec::new();
+        push_run(&mut v, 1, 4000, 0, 200, 1000, 4096);
+        assert_eq!(
+            v,
+            vec![Ext { phys: 4000, foff: 0, len: 96, file: 1 }, Ext { phys: 4096, foff: 96, len: 104, file: 1 }]
+        );
     }
 
     #[test]

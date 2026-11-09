@@ -314,7 +314,7 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
     // only for the data phase. Duplicated fds share the description, hence the flags.
     let excl = Arc::new(tgt.file);
     set_direct(&excl, false);
-    let mut v = Vol::open(excl.try_clone().context("dup target fd")?, tgt.bytes, false)?;
+    let mut v = Vol::open(excl.try_clone().context("dup target fd")?, tgt.bytes, false, true)?;
     let cs = v.cs;
     let mut nodes = scan_tree(src, &v.upc)?;
     // Mandatory: never trust a clear bitmap bit that something still references. The walk
@@ -798,7 +798,7 @@ pub fn info_of(target: &TargetSpec) -> Result<VolumeInfo> {
             (f, len)
         }
     };
-    let mut v = Vol::open(f, len, true)?;
+    let mut v = Vol::open(f, len, true, true)?;
     let (mut files, mut dirs) = (0u64, 0u64);
     // Directories are read one at a time and dropped, so memory stays bounded.
     let mut stack: Vec<Dir> = vec![v.dirs.pop().ok_or_else(|| anyhow!("no root directory"))?];
