@@ -44,36 +44,59 @@
 //!
 //! A sync runs between every phase (`FLASHCP_TEST_STOP_AFTER=<phase>` stops after it):
 //!
-//! | phase    | writes                                                                     |
-//! |----------|----------------------------------------------------------------------------|
-//! | `dirty`  | (after the UNDO journal) VolumeDirty set; nothing to do → nothing written   |
-//! | `data`   | new files and versions, new directories, extension clusters (free space)   |
-//! | `alloc`  | (after the REDO journal) bitmap bits of new clusters, chains of new objects |
-//! | `fat`    | FAT links extending existing directory chains                               |
-//! | `unlink` | primaries of deleted / moved-away / conflicting / duplicate sets → 0x05    |
-//! | `link`   | appended sets (new, moved, relocated), lengths, in-place edits             |
-//! | `retire` | primaries of relocated sets' old copies → 0x05                             |
-//! | `free`   | those sets' secondaries and old orphans: InUse cleared; bitmap bits freed  |
-//! | `clean`  | VolumeDirty cleared, PercentInUse; then the journal is removed             |
+//! | phase       | writes                                                                     |
+//! |-------------|----------------------------------------------------------------------------|
+//! | (host)      | the journal on this machine, fsynced with every directory it creates      |
+//! | `dirty`     | VolumeDirty set (nothing to do → nothing written, no journal)              |
+//! | `data`      | new files and versions, new directories, extension clusters, the journal's text (all in free space; the root's extension as zeros) |
+//! | `alloc`     | bitmap bits of every new cluster (the journal's too), chains of new objects |
+//! | `fat`       | FAT links extending existing directory chains                               |
+//! | `journal`   | the journal's entry set, inside one sector: over an earlier run's deleted one, else appended to the root (deleted entries pad up to the sector): from here the volume carries `/.flashcp-sync-journal` |
+//! | `unlink`    | primaries of deleted / moved-away / conflicting / duplicate sets → 0x05    |
+//! | `link`      | appended sets (new, moved, relocated), lengths, in-place edits             |
+//! | `retire`    | primaries of relocated sets' old copies → 0x05                             |
+//! | `free`      | those sets' secondaries and old orphans: InUse cleared; bitmap bits freed  |
+//! | `unjournal` | the journal's primary entry → 0x05 (one byte)                              |
+//! | `clean`     | its secondaries and bitmap bits; VolumeDirty cleared, PercentInUse; then the host journal is removed |
 //!
-//! The journal (see [`crate::journal`]) holds every write from `alloc` to `clean` with its
-//! before and after bytes, on the local machine; the start of every sync (and
-//! `flashcp sync --recover`) replays it, so with the journal every crash state below simply
-//! completes. Without it (another machine, or the state directory lost) the volume is dirty and
-//! is refused until `fsck.exfat -y` has run; what that leaves, and what the next sync does:
+//! The journal (see [`crate::journal`]: every write from `unlink` to `clean` with its bytes
+//! before and after, the moves, a random job id and the identity of the volume and device) is
+//! kept twice: on this machine before anything is written, and on the volume, where it appears
+//! atomically in `journal`, which needs everything before it on the device (the file's presence
+//! proves the data phase completed), and disappears in `unjournal`, after everything it
+//! describes but its own cleanup. The start of every sync (and `flashcp sync --recover`)
+//! replays it; with the volume's copy that needs nothing from this machine. What each crash
+//! leaves, and what recovers it:
 //!
-//! | crash after | volume                                    | `fsck.exfat -n` / `-y`, then sync     |
-//! |-------------|-------------------------------------------|----------------------------------------|
-//! | dirty, data | old tree; data in free clusters (undo journal: the dirty flag is cleared) | clean / dirty flag cleared; sync redoes it |
-//! | alloc, fat  | old tree, leaked clusters                 | clean; leaks stay allocated (as `add`) |
-//! | unlink      | gone: deleted, moved-away entries (orphan secondaries left); changed files still OLD | "clean" with an "unknown entry type 0xc0" error per orphan; `-y` clears them; moved files no longer in SRC are lost only here and only without the journal |
-//! | link        | the new tree, plus DUPLICATES: each relocated set's old copy is still live | re-point duplicate (same name, other clusters): corrupted, `-y` renames the later (new) set to `FILE0000000.CHK` (sync rewrites the name from SRC; `--delete` removes the .CHK); relocated rename (same clusters): "cluster is already allocated", `-y` truncates the later set to 0 bytes (a directory to DataLength 0); sync keeps the set with the data and renames it again |
-//! | retire      | the new tree, orphan secondaries          | as after unlink                        |
-//! | free        | done but dirty                            | clean                                  |
-//! | torn link   | a relocated set half written (its old copy still live) | "checksum of a file is wrong", corrupted; `-y` deletes the torn set: the file is there with its OLD version, sync redoes it |
+//! | crash after | volume                                         | with the host journal                       | without it (another machine, state lost) |
+//! |-------------|------------------------------------------------|---------------------------------------------|-------------------------------------------|
+//! | (host)      | untouched, clean                               | clean: the journal is stale, removed        | nothing to do                             |
+//! | dirty, data | old tree; data in free clusters; dirty         | no journal on the volume, same device, every covered sector in a journaled state: only the dirty flag is cleared; sync redoes the run | dirty, refused: `fsck.exfat -y` (clean, flag cleared), then sync redoes it |
+//! | alloc, fat  | as above, plus clusters allocated (and the root's FAT chain extended by zeroed clusters) | as above; the clusters stay allocated, leaked (as by `add`) | as above; leaks stay |
+//! | journal     | old tree + `/.flashcp-sync-journal` (Hidden, System) | replayed: the new tree, exactly, no leaks | replayed from the volume: the same       |
+//! | unlink      | deleted and moved-away names gone (orphan secondaries); changed files still OLD | replayed | replayed from the volume: moved files come back under their new names |
+//! | link        | the new tree, plus DUPLICATES (each relocated set's old copy still live); a torn link: a relocated set half written | replayed (each sector holds a journaled state, torn or not) | replayed from the volume |
+//! | retire, free | the new tree, orphan secondaries; done but dirty | replayed                                 | replayed from the volume                  |
+//! | unjournal   | the new tree; the journal's set deleted (orphan secondaries), its clusters allocated; dirty | no journal on the volume: only the dirty flag is cleared; the next sync clears the orphans; the journal's clusters stay leaked | dirty, refused: `fsck.exfat -y`, then sync |
+//! | clean (torn) | the new tree, maybe marked clean already      | as after unjournal (or nothing to do)       | as after unjournal (or nothing to do)     |
 //!
-//! No crash state loses a file that is in SRC, nor any name: a directory never has a name
-//! missing between phases (a new set is live before its old copy dies). The parser accepts the
+//! Recovery never writes to a device it has not identified: a journal is replayed only when the
+//! volume carries it (its checksum, serial and geometry checked; a host copy is used instead
+//! only with the same job id and the same serial, geometry and device identity), and only when
+//! every sector it covers holds one of its states (else nothing is written: "the volume changed
+//! since"). The one decision without the job id is the dirty-flag-only one: no journal on the
+//! volume means the run never reached `journal` or already passed `unjournal`, so the volume
+//! shows a complete tree either way; the host journal must match serial, geometry and device,
+//! and every sector it covers (from `data` on) must hold one of its states. A volume journal
+//! that cannot be replayed (fsck.exfat changed what it covers) stops every sync, with its moves
+//! listed, until it is deleted. An entry named `.flashcp-sync-journal` (any case) in the
+//! source's top level (synced to the volume's root) is refused, by `add` too; `info`, `pull`
+//! and `optimize` skip the volume's journal.
+//!
+//! No crash state loses a file or its name, even without the host journal: a directory never
+//! has a name missing between phases except between `unlink` and `link` (a move's new set is
+//! appended after its old set died), and those states carry the journal on the volume, which
+//! puts them back. The parser accepts the
 //! leftovers: ORPHAN secondaries (in-use secondaries right after a deleted 0x05 file entry,
 //! within its SecondaryCount) are skipped by every command and cleared by sync's `free`
 //! whenever it writes, or on a run that has nothing else to do; DUPLICATE names are accepted by
@@ -186,12 +209,15 @@ pub fn recovery_note(r: &Recovery) -> Option<String> {
     match r {
         Recovery::None => None,
         Recovery::Stale => Some("note: removed a stale sync journal (the volume is clean)".into()),
-        Recovery::Replayed { undo: true, .. } => {
-            Some("note: an interrupted sync had written only file data; its dirty flag is cleared".into())
-        }
-        Recovery::Replayed { writes, .. } => {
-            Some(format!("note: completed an interrupted sync from its journal ({writes} metadata writes replayed)"))
-        }
+        Recovery::DirtyCleared => Some(
+            "note: an interrupted sync had committed nothing yet (or everything but its cleanup); its dirty flag is \
+             cleared"
+                .into(),
+        ),
+        Recovery::Replayed { writes, from_volume } => Some(format!(
+            "note: completed an interrupted sync from its journal {} ({writes} metadata writes replayed)",
+            if *from_volume { "on the volume" } else { "on this machine" }
+        )),
     }
 }
 
@@ -227,6 +253,8 @@ struct Edit {
 enum Item {
     Node(usize),
     Reloc(usize),
+    /// The on-volume journal's entry set (root only, first, written in its own phase).
+    Journal,
 }
 
 /// A volume file that goes away (and may be the source of a move).
@@ -522,8 +550,49 @@ fn json_list(items: impl Iterator<Item = String>) -> String {
     format!("[{}]", items.collect::<Vec<_>>().join(","))
 }
 
-/// The metadata phases after `data`, in order (each one journaled, then committed and synced).
-const META_PHASES: [&str; 7] = ["alloc", "fat", "unlink", "link", "retire", "free", "clean"];
+/// The metadata phases after `data`, in order (each one committed and synced).
+const META_PHASES: [&str; 9] = ["alloc", "fat", "journal", "unlink", "link", "retire", "free", "unjournal", "clean"];
+
+/// Bytes of the on-volume journal's entry set (file, stream, two name entries).
+const JSET: usize = 32 * (2 + SYNC_JOURNAL_NAME.len().div_ceil(15));
+
+/// The offset of a deleted on-volume journal set in root data `d` (before its end marker) that
+/// can take this run's: exactly as `clean` left it (every entry's InUse bit clear, the checksum
+/// of the live set still right), inside one 512-byte sector.
+fn deleted_journal_slot(d: &[u8]) -> Option<usize> {
+    (0..d.len().saturating_sub(JSET - 1)).step_by(32).find(|&i| {
+        let set = &d[i..i + JSET];
+        if i % SECTOR_ALIGN + JSET > SECTOR_ALIGN || (0..JSET / 32).any(|k| set[32 * k] & 0x80 != 0) {
+            return false;
+        }
+        let mut live = set.to_vec();
+        for k in 0..JSET / 32 {
+            live[32 * k] |= 0x80;
+        }
+        is_sync_journal_set(&live) && checksum_ok_set(&live)
+    })
+}
+
+/// The on-volume journal's entry set: a file of `len` bytes at `first`, Hidden | System |
+/// Archive.
+fn journal_set(upc: &[u16], first: u32, len: u64, frag: bool, now: (i64, u32)) -> Vec<u8> {
+    let n = Node {
+        name: SYNC_JOURNAL_NAME.encode_utf16().collect(),
+        src: PathBuf::new(),
+        is_dir: false,
+        size: len,
+        mtime: now,
+        children: vec![],
+        first_cluster: first,
+        clusters: 0,
+    };
+    let mut e = entry_set(&n, upc);
+    e[4..6].copy_from_slice(&SYNC_JOURNAL_ATTRS.to_le_bytes());
+    if frag {
+        e[33] = 0x01;
+    }
+    finish_set(e, len, len)
+}
 
 /// [`sync`] onto a [`TargetSpec`] (a path, or an inherited block-device fd).
 pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) -> Result<SyncStats> {
@@ -533,6 +602,7 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         fs::metadata(src).with_context(|| format!("source {}", src.display()))?.is_dir(),
         "source must be a directory"
     );
+    refuse_journal_name(src, o.to.as_deref())?;
     let tgt = target.open_rw()?;
     set_direct(&tgt.file, false);
     // An interrupted run first: its journal is replayed before anything is planned.
@@ -544,9 +614,9 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         tgt.file.read_exact_at(&mut s0, 0).context("read boot sector")?;
         ensure!(
             &s0[3..11] != b"EXFAT   " || u16::from_le_bytes([s0[106], s0[107]]) & FLAG_DIRTY == 0,
-            "volume is marked dirty and there is no sync journal for it here (still mounted, not cleanly \
-             unmounted, or a sync interrupted on another machine): unmount it, or run fsck.exfat -y, then re-run \
-             the sync"
+            "volume is marked dirty and there is no sync journal for it (still mounted, not cleanly unmounted, or a \
+             sync interrupted before it put its journal on the volume, on another machine): unmount it, or run \
+             fsck.exfat -y, then re-run the sync"
         );
     }
     // Duplicates in the root (an interrupted sync) make the volume non-empty: skip the build.
@@ -584,7 +654,15 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     set_direct(&excl, false);
     let mut v = Vol::open_with(excl.try_clone().context("dup target fd")?, tgt.bytes, false, true, true)?;
     let cs = v.cs;
-    let serial = le32(&v.sector0, 100);
+    let jkey = upcase(&SYNC_JOURNAL_NAME.encode_utf16().collect::<Vec<_>>(), &v.upc);
+    if let Some(ch) = v.dirs[0].children.get(&jkey) {
+        bail!(
+            "the volume's root holds /{}, the name flashcp sync keeps its on-volume journal under ({}); rename or \
+             delete it, then re-run the sync (nothing was written)",
+            String::from_utf16_lossy(&ch.name),
+            if is_sync_journal(ch) { "a journal no recovery could replay" } else { "not flashcp's" }
+        );
+    }
     let mut nodes = scan_tree(src, &v.upc)?;
 
     // ── verification walk, keeping every directory on the way to and under the destination ──
@@ -1010,11 +1088,29 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         (0..v.dirs.len()).filter(|d| !gone_set.contains(d) && !v.dirs[*d].orphans.is_empty()).collect();
     st.orphans = orphan_dirs.iter().map(|&d| v.dirs[d].orphans.len() as u64).sum();
 
+    let nothing = appends.is_empty() && edits.is_empty() && deletes.is_empty() && repairs.is_empty() && st.orphans == 0;
+    // The on-volume journal's entry set lies inside one 512-byte sector, so that it appears in
+    // one atomic write: over an earlier run's deleted set (nobody else's since: still exactly
+    // ours, secondaries not in use), so the root does not grow by a set per run; else first
+    // among the root's appends (deleted entries pad up to the sector it needs).
+    let rend = v.dirs[0].end;
+    let reuse = deleted_journal_slot(&v.dirs[0].data[..rend]);
+    let jat = match reuse {
+        Some(at) => at,
+        None if rend % SECTOR_ALIGN + JSET > SECTOR_ALIGN => rend.next_multiple_of(SECTOR_ALIGN),
+        None => rend,
+    };
+    let appended = !nothing && reuse.is_none();
+    if appended {
+        appends.entry(0).or_default().insert(0, Item::Journal);
+    }
+
     // ── in place or relocated, and directory growth: deepest directories first, so that a
     //    directory's own set edit (its new length) is known before its parent is sized ──
     let item_bytes = |nodes: &[Node], edits: &BTreeMap<(usize, usize), Edit>, d: usize, it: Item| match it {
         Item::Node(c) => set_bytes(&nodes[c]),
         Item::Reloc(off) => edits[&(d, off)].len as u64,
+        Item::Journal => (jat + JSET - rend) as u64,
     };
     let mut depth: Vec<usize> = (0..v.dirs.len()).filter(|d| !gone_set.contains(d)).collect();
     depth.sort_by_key(|&d| std::cmp::Reverse(v.dirs[d].key.len()));
@@ -1115,6 +1211,15 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
             edits.get_mut(&(p, off)).unwrap().clear_nfc = true;
         }
     }
+    // The root's extension clusters are written as zeros with the data; what goes into them is
+    // metadata (journal, link), so nothing shows in the root before its phase.
+    let root_old_last = *v.dirs[0].clusters.last().unwrap();
+    let root_ext: Vec<(u64, u64)> = runs.get(&Obj::Ext(0)).cloned().unwrap_or_default();
+    if !root_ext.is_empty() {
+        let r = &mut v.dirs[0];
+        r.clusters.extend(run_clusters(&root_ext));
+        r.data.resize(r.clusters.len() * cs as usize, 0);
+    }
     let upc = v.upc.clone();
     let (heap, bps) = (v.heap_off, v.bps);
     let coff = move |c: u64| heap + (c - 2) * cs;
@@ -1178,6 +1283,28 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         push_mem(&mut segs, &mut mems, &runs[&Obj::NewDir(d)], bytes);
     }
 
+    // ── journal: padding, then the on-volume journal's entry set (placeholder bytes until its
+    //    clusters are known: every phase's writes get the real ones overlaid, see below) ──
+    let mut t_journal = Touched::default();
+    if !nothing && !appended {
+        v.dirs[0].data[jat..jat + JSET].copy_from_slice(&journal_set(&upc, 0, 0, false, now));
+        t_journal.mark(0, jat, jat + JSET);
+    } else if appended {
+        let r = &mut v.dirs[0];
+        for k in (rend..jat).step_by(32) {
+            r.data[k..k + 32].fill(0);
+            r.data[k] = 0x05; // a deleted entry, SecondaryCount 0
+        }
+        r.data[jat..jat + JSET].copy_from_slice(&journal_set(&upc, 0, 0, false, now));
+        let after = jat + JSET;
+        if r.data[after..].iter().any(|&b| b != 0) {
+            r.data[after..].fill(0);
+            t_journal.mark(0, after, r.data.len());
+        }
+        t_journal.mark(0, rend, after);
+    }
+    let p_journal = t_journal.patches(&v);
+
     // ── unlink: primaries only ──
     let dead: Vec<(usize, usize, usize)> =
         deletes.iter().chain(&repairs).map(|(d, ch)| (*d, ch.set_off, ch.set_len)).collect();
@@ -1196,7 +1323,8 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     let mut t_link = Touched::default();
     let mut ext_fat: Vec<(u32, u32)> = Vec::new();
     for (&d, kids) in &appends {
-        let (end, dlen) = (v.dirs[d].end, v.dirs[d].data.len());
+        let end = if d == 0 && appended { jat + JSET } else { v.dirs[d].end };
+        let dlen = v.dirs[d].data.len();
         let mut bytes = Vec::new();
         for &it in kids {
             match it {
@@ -1206,9 +1334,11 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
                     new_sets.push((d, end + bytes.len(), e.len));
                     bytes.extend(edited(&nodes, &v.dirs[d].data[off..off + e.len], e));
                 }
+                Item::Journal => {}
             }
         }
         let tail = bytes.len().min(dlen - end);
+        ensure!(d != 0 || tail == bytes.len(), "internal error: the root's appends do not fit its extension");
         v.dirs[d].data[end..end + tail].copy_from_slice(&bytes[..tail]);
         let after = end + tail;
         if v.dirs[d].data[after..].iter().any(|&b| b != 0) {
@@ -1218,6 +1348,14 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         }
         t_link.mark(d, end, after);
         let Some(r) = runs.get(&Obj::Ext(d)).cloned() else { continue };
+        if d == 0 {
+            // Zeros with the data (they are in v.dirs[0] already); the FAT links them.
+            push_mem(&mut segs, &mut mems, &r, Vec::new());
+            let mut all = vec![root_old_last];
+            all.extend(run_clusters(&r));
+            chain_entries(&all, &mut ext_fat);
+            continue;
+        }
         push_mem(&mut segs, &mut mems, &r, bytes[tail..].to_vec());
         let dir = &v.dirs[d];
         if !contiguous_ext.contains(&d) {
@@ -1248,18 +1386,13 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     }
     let p_retire = t_retire.patches(&v);
 
-    // ── alloc, and free: secondaries of every set that died, old orphans, bitmap bits ──
-    let mut bm = v.bitmap.clone();
-    let mut p_alloc = Patches::default();
-    let all_runs: Vec<(u64, u64)> = runs.values().flatten().copied().collect();
-    bitmap_patches(&v, &mut bm, &all_runs, true, &mut p_alloc);
+    // ── free: secondaries of every set that died, old orphans (the bitmap bits below) ──
     let mut new_fat: Vec<(u32, u32)> = Vec::new();
     for (&obj, r) in &runs {
         if !matches!(obj, Obj::Ext(_)) && r.len() > 1 {
             chain_entries(&run_clusters(r), &mut new_fat);
         }
     }
-    p_alloc.fat(&v, &new_fat);
     let mut t_free = Touched::default();
     let retired: Vec<(usize, usize, usize)> = relocs.iter().map(|&(d, off)| (d, off, edits[&(d, off)].len)).collect();
     for &(d, off, len) in dead.iter().chain(&retired) {
@@ -1274,18 +1407,127 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
             t_free.mark(d, o, o + 1);
         }
     }
-    let mut p_free = t_free.patches(&v);
-    bitmap_patches(&v, &mut bm, &freed, false, &mut p_free);
-    // clean: VolumeDirty cleared, PercentInUse of the final bitmap.
-    let pct = (used_clusters(&bm, v.cc) * 100 / v.cc).min(100) as u8;
+    let p_free_dirs = t_free.patches(&v);
+    let all_runs: Vec<(u64, u64)> = runs.values().flatten().copied().collect();
     let orig_s0 = v.sector0.clone();
     let mut dirty_s0 = orig_s0.clone();
     dirty_s0[106..108].copy_from_slice(&working_flags(v.flags).to_le_bytes());
-    let mut clean_s0 = orig_s0.clone();
-    clean_s0[106..108].copy_from_slice(&clean_flags(v.flags).to_le_bytes());
-    clean_s0[112] = pct;
-    let mut p_clean = Patches::default();
-    p_clean.add(0, clean_s0);
+    let mut p_dirty = Patches::default();
+    p_dirty.add(0, dirty_s0);
+    // What the data phase writes under later metadata writes: the root's zeroed extension.
+    let mut p_data = Patches::default();
+    for &(s, n) in &root_ext {
+        p_data.add(coff(s), vec![0u8; (n * cs) as usize]);
+    }
+    let mut moves_list: Vec<(String, String, usize)> =
+        moves.iter().map(|(&f, &g)| (gone_files[g].path.clone(), path_of[&f].clone(), g)).collect();
+    moves_list.sort();
+
+    // ── the journal: its clusters (after everyone else's), its entry set and its text, which
+    //    holds the writes of unlink .. clean. Those writes depend on where the journal's
+    //    clusters are (its entry set, its bitmap bits), and its size on them: start with one
+    //    cluster and grow until the text fits ──
+    let mut taken = v.bitmap.clone();
+    let mut scratch = Patches::default();
+    bitmap_patches(&v, &mut taken, &all_runs, true, &mut scratch);
+    let rem = free_extents(&taken, v.cc);
+    let rem_total: u64 = rem.iter().map(|e| e.1).sum();
+    let jdev =
+        if nothing { 0 } else { v.cluster_off(v.dirs[0].clusters[jat / cs as usize]) + (jat % cs as usize) as u64 };
+    let ident = journal::ident_of(&excl, &orig_s0);
+    let job = crate::optimize::random_id()?;
+    let move_recs: Vec<MoveRec> = moves_list
+        .iter()
+        .map(|(a, b, g)| {
+            let ch = &gone_files[*g].ch;
+            MoveRec {
+                from: a.clone(),
+                to: b.clone(),
+                first: ch.first,
+                len: ch.len,
+                valid_len: ch.valid_len,
+                no_fat_chain: ch.no_fat_chain,
+                mtime: ch.mtime,
+            }
+        })
+        .collect();
+    let mut jn = 1u64;
+    let (jruns, jtext, j, all_writes) = loop {
+        if nothing {
+            break (Vec::new(), String::new(), None, Vec::new());
+        }
+        let Some(ext) = choose_extents(&rem, jn) else {
+            bail!(
+                "not enough free space for the sync journal ({} on the volume): {} free after the rest of this sync",
+                human_bytes((jn * cs) as f64),
+                human_bytes((rem_total * cs) as f64)
+            );
+        };
+        let jr = carve(&mut ext.into(), jn);
+        let jset = journal_set(&upc, jr[0].0 as u32, jn * cs, jr.len() > 1, now);
+        let overlay = |p: &Patches| {
+            let mut p = p.clone();
+            p.overlay(jdev, &jset);
+            p
+        };
+        let mut bm = v.bitmap.clone();
+        let mut p_alloc = Patches::default();
+        let with_j: Vec<(u64, u64)> = all_runs.iter().chain(&jr).copied().collect();
+        bitmap_patches(&v, &mut bm, &with_j, true, &mut p_alloc);
+        let mut fat = new_fat.clone();
+        if jr.len() > 1 {
+            chain_entries(&run_clusters(&jr), &mut fat);
+        }
+        p_alloc.fat(&v, &fat);
+        let mut p_free = overlay(&p_free_dirs);
+        bitmap_patches(&v, &mut bm, &freed, false, &mut p_free);
+        // unjournal: the primary entry alone (one byte), synced before the rest goes.
+        let mut p_unjournal = Patches::default();
+        p_unjournal.object(&v, &v.dirs[0].clusters, jat, &[0x05]);
+        // clean: its secondaries, its bitmap bits, VolumeDirty cleared, PercentInUse.
+        let mut p_clean = Patches::default();
+        for k in 1..JSET / 32 {
+            p_clean.object(&v, &v.dirs[0].clusters, jat + 32 * k, &[jset[32 * k] & 0x7F]);
+        }
+        bitmap_patches(&v, &mut bm, &jr, false, &mut p_clean);
+        let mut clean_s0 = orig_s0.clone();
+        clean_s0[106..108].copy_from_slice(&clean_flags(v.flags).to_le_bytes());
+        clean_s0[112] = (used_clusters(&bm, v.cc) * 100 / v.cc).min(100) as u8;
+        p_clean.add(0, clean_s0);
+        let writes = journal::plan_writes(
+            &v.dev,
+            vec![
+                ("dirty", p_dirty.clone()),
+                ("data", p_data.clone()),
+                ("alloc", p_alloc),
+                ("fat", p_fat.clone()),
+                ("journal", overlay(&p_journal)),
+                ("unlink", overlay(&p_unlink)),
+                ("link", overlay(&p_link)),
+                ("retire", overlay(&p_retire)),
+                ("free", p_free),
+                ("unjournal", p_unjournal),
+                ("clean", p_clean),
+            ],
+        )?;
+        let pick = |keep: &dyn Fn(&str) -> bool| Journal {
+            job,
+            ident: ident.clone(),
+            moves: move_recs.clone(),
+            writes: writes.iter().filter(|w| keep(&w.phase)).cloned().collect(),
+        };
+        let text = pick(&|p| journal::REPLAYED.contains(&p)).encode();
+        if text.len() as u64 <= jn * cs {
+            v.dirs[0].data[jat..jat + JSET].copy_from_slice(&jset);
+            break (jr, text, Some(pick(&|p| p != "dirty")), writes);
+        }
+        jn = (text.len() as u64).div_ceil(cs);
+    };
+    if !jruns.is_empty() {
+        let mut bytes = jtext.clone().into_bytes();
+        bytes.resize((jn * cs) as usize, b'\n');
+        push_mem(&mut segs, &mut mems, &jruns, bytes);
+    }
 
     // ── plan ──
     segs.sort_by_key(|s| s.dev);
@@ -1301,24 +1543,13 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     segs.sort_by_key(|s| s.dev);
     let sizes: Vec<u64> = file_order.iter().map(|&f| nodes[f].size).collect();
     let data_write = data_write_bytes(&segs, &sizes);
-    let nothing = appends.is_empty() && edits.is_empty() && deletes.is_empty() && repairs.is_empty() && st.orphans == 0;
-    let meta: Vec<(&str, Patches)> = vec![
-        ("alloc", p_alloc),
-        ("fat", p_fat),
-        ("unlink", p_unlink),
-        ("link", p_link),
-        ("retire", p_retire),
-        ("free", p_free),
-        ("clean", p_clean),
-    ];
-    let write_bytes = if nothing { 0 } else { data_write + meta.iter().map(|(_, p)| p.bytes()).sum::<u64>() + bps };
+    let meta_bytes: u64 =
+        all_writes.iter().filter(|w| META_PHASES.contains(&w.phase.as_str())).map(|w| w.post.len() as u64).sum();
+    let write_bytes = if nothing { 0 } else { data_write + meta_bytes + bps };
     let direct = tgt.direct && cs.is_multiple_of(4096) && v.heap_off.is_multiple_of(4096);
     let pol = data_gap_policy(&excl, direct, &v, tgt.part_off * 512, o.dry_run, &segs, &sizes);
 
     let (files, dirs, bytes) = (st.new + st.changed, st.new_dirs, st.data_written);
-    let mut moves_list: Vec<(String, String, usize)> =
-        moves.iter().map(|(&f, &g)| (gone_files[g].path.clone(), path_of[&f].clone(), g)).collect();
-    moves_list.sort();
     let shown = |p: &str, dir: bool| if dir { format!("{p}/") } else { p.to_string() };
     let sync_json = format!(
         r#"{{"unchanged":{},"new":{},"changed":{},"moved":{},"deleted":{},"deleted_dirs":{},"new_dirs":{},"bytes_skipped":{},"relocated":{},"repaired":{},"orphans":{},"moves_verified":{},"moves_fast":{},"moves_copied_budget":{},"delete":{},"moves":{}}}"#,
@@ -1416,24 +1647,17 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
          confirm (nothing was written)"
     );
 
-    // ── phase 0: the undo journal, then mark dirty ──
-    let device = match target {
-        TargetSpec::Path(p) => p.display().to_string(),
-        TargetSpec::Fd(fd) => format!("fd {fd}"),
-    };
-    let mut j = Journal {
-        serial,
-        device: format!("{device} ({} bytes)", tgt.bytes),
-        mode: "undo".into(),
-        moves: Vec::new(),
-        writes: vec![JWrite { phase: "clean".into(), off: 0, pre: dirty_s0, post: orig_s0.clone() }],
-    };
-    journal::save(&j).context("write the sync journal (nothing was written to the volume)")?;
+    // ── 0: the host journal, durable before the first byte goes to the device ──
+    let j = j.expect("a journal for a run with writes");
+    let jpath = journal::save(&j, &j.encode()).context("write the sync journal (nothing was written to the volume)")?;
+
+    // ── 1: dirty ──
+    journal::trace(|| "dirty".into());
     let flags = v.flags;
     write_flags(&mut v, working_flags(flags), None)?;
     stop_after("dirty")?;
 
-    // ── phase 1: data, one ascending stream ──
+    // ── 2: data, one ascending stream (with the journal's text and the root's extension) ──
     let done0 = files - file_order.len() as u64;
     tick.progress(done0, 0, true);
     let reads: Vec<(PathBuf, u64)> = file_order.iter().map(|&i| (nodes[i].src.clone(), nodes[i].size)).collect();
@@ -1441,38 +1665,11 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     excl.sync_all().context("sync")?;
     stop_after("data")?;
 
-    // ── the redo journal: every metadata write from here on, with its before and after bytes ──
-    let journaled = journal::plan_writes(&v.dev, meta).and_then(|writes| {
-        j.mode = "redo".into();
-        j.writes = writes;
-        j.moves = moves_list
-            .iter()
-            .map(|(a, b, g)| {
-                let ch = &gone_files[*g].ch;
-                MoveRec {
-                    from: a.clone(),
-                    to: b.clone(),
-                    first: ch.first,
-                    len: ch.len,
-                    valid_len: ch.valid_len,
-                    no_fat_chain: ch.no_fat_chain,
-                    mtime: ch.mtime,
-                }
-            })
-            .collect();
-        journal::save(&j)
-    });
-    if let Err(e) = journaled {
-        // Only data was written, into free clusters: nothing references it.
-        write_flags(&mut v, flags, None)?;
-        journal::remove(serial)?;
-        return Err(e.context("write the sync journal (the volume is unchanged)"));
-    }
-
-    // ── phases 2..8: alloc, fat, unlink, link, retire, free, clean ──
-    let mut by_phase: HashMap<String, Vec<JWrite>> = HashMap::new();
-    for w in &j.writes {
-        by_phase.entry(w.phase.clone()).or_default().push(w.clone());
+    // ── 3..: alloc, fat, journal (from here the volume carries the journal), unlink, link,
+    //    retire, free, unjournal, clean ──
+    let mut by_phase: HashMap<&str, Vec<JWrite>> = HashMap::new();
+    for w in &all_writes {
+        by_phase.entry(w.phase.as_str()).or_default().push(w.clone());
     }
     for phase in META_PHASES {
         journal::apply(&v.dev, by_phase.get(phase).map_or(&[][..], |w| &w[..]))?;
@@ -1483,7 +1680,7 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
             stop_after(phase)?;
         }
     }
-    journal::remove(serial)?;
+    journal::remove(&jpath)?;
     tick.progress(files, bytes, true);
     if !tgt.direct {
         eprintln!("note: target does not support O_DIRECT, used buffered writes");
@@ -1545,6 +1742,37 @@ fn from_build(s: AddStats) -> SyncStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_host_journal_and_every_directory_it_creates_are_durable_before_the_volume_is_dirtied() {
+        let base = std::env::temp_dir().join(format!("flashcp-sync-durable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (old, new, img) = (base.join("old"), base.join("new"), base.join("disk.img"));
+        for (d, body) in [(&old, &b"old"[..]), (&new, &b"new, longer"[..])] {
+            fs::create_dir_all(d).unwrap();
+            fs::write(d.join("f.txt"), body).unwrap();
+        }
+        File::create(&img).unwrap().set_len(64 << 20).unwrap();
+        let bo = crate::exfat::BuildOpts {
+            cluster: Some(4096),
+            label: String::new(),
+            fat: crate::exfat::FatMode::Prefix,
+            readers: 2,
+            dry_run: false,
+            serial: None,
+            job: None,
+        };
+        crate::exfat::build(&old, &img, &bo, &mut |_| {}).unwrap();
+        // The state directory and two of its parents do not exist yet.
+        let state = base.join("state/flashcp/sync-journal");
+        let o = SyncOpts { readers: 2, ..Default::default() };
+        let (r, log) = crate::journal::tests::traced(&state, || sync(&new, &img, &o, &mut |_| {}));
+        let st = r.unwrap();
+        assert_eq!(st.changed, 1);
+        crate::journal::tests::assert_durable(&log, &base, Some("dirty"));
+        assert_eq!(fs::read_dir(&state).unwrap().count(), 0, "the journal was not removed");
+        fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn coalesce_rounds_and_merges_close_ranges() {
