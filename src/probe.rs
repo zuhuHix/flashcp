@@ -70,6 +70,29 @@ pub struct ProbeResult {
     pub rand4k_qd8_iops: f64,
     pub small_files_per_sec: f64,
     pub flush_ms_median: f64,
+    /// Device-profile cache entry the measurements were saved to (see [`crate::devprofile`]).
+    pub saved_as: Option<String>,
+}
+
+/// What `flashcp probe` measured, as a device profile. None for buffered I/O (that measures
+/// the page cache, not the device).
+pub fn profile_of(r: &ProbeResult) -> Option<crate::devprofile::DevProfile> {
+    if !r.direct_io {
+        return None;
+    }
+    let big = r.seq_write.iter().filter(|x| x.0 >= 1 << 20).map(|x| x.1 * 1e6).fold(0.0, f64::max);
+    let small = r.seq_write.iter().find(|x| x.0 == 4096).map(|x| x.1 * 1e6).filter(|v| *v > 0.0);
+    let qd = |a: f64, b: f64| if a > 0.0 && b > 1.5 * a { 8 } else { 1 };
+    Some(crate::devprofile::DevProfile {
+        seq_write_bps: (big > 0.0).then_some(big),
+        // 4 KB requests back to back cost 4096/small each, the same bytes inside big requests
+        // 4096/big: the difference is what one more request costs in an ascending stream.
+        write_skip_s: small.filter(|_| big > 0.0).map(|s| (4096.0 / s - 4096.0 / big).max(0.0)),
+        // Only QD1 and QD8 are measured: 8 if parallel writes clearly help, else 1.
+        write_qd: Some(qd(r.rand4k_qd1_iops, r.rand4k_qd8_iops)),
+        transport: Some(r.info.transport.clone().unwrap_or_else(|| "other".into())),
+        ..Default::default()
+    })
 }
 
 fn open_probe(path: &Path) -> Result<(File, bool)> {
@@ -89,7 +112,13 @@ pub fn probe(dir: &Path, size: u64) -> Result<ProbeResult> {
     let r = run(&work, size, info);
     let _ = fs::remove_dir_all(&work);
     let _ = syncfs(dir);
-    r
+    let mut r = r?;
+    // Cache what was measured for this disk (merged; never fails the probe).
+    if let (Some(p), Ok(md)) = (profile_of(&r), fs::metadata(dir)) {
+        crate::devprofile::save(md.dev(), &p);
+        r.saved_as = crate::devprofile::device_key(md.dev());
+    }
+    Ok(r)
 }
 
 fn run(work: &Path, size: u64, info: DeviceInfo) -> Result<ProbeResult> {
@@ -196,6 +225,7 @@ fn run(work: &Path, size: u64, info: DeviceInfo) -> Result<ProbeResult> {
         rand4k_qd8_iops,
         small_files_per_sec,
         flush_ms_median,
+        saved_as: None,
     })
 }
 
@@ -235,8 +265,51 @@ pub fn report(r: &ProbeResult) {
         "  a copier that flushes per file would cap at ~{:.0} files/s; never do that",
         1000.0 / r.flush_ms_median.max(0.001)
     );
+    if let (Some(key), Some(p)) = (&r.saved_as, profile_of(r)) {
+        let (bps, skip) = p.write_cost();
+        println!(
+            "  saved device profile {key}: {}/s sequential, {:.2} ms per extra write request, {} in flight",
+            human_bytes(bps),
+            skip * 1e3,
+            p.write_qd.unwrap_or(1)
+        );
+    }
 }
 
 fn fmt_bs(bs: usize) -> String {
     if bs >= 1 << 20 { format!("{}M", bs >> 20) } else { format!("{}K", bs >> 10) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(direct_io: bool) -> ProbeResult {
+        // The SanDisk Cruzer Blade (USB 2, BOT) reference numbers.
+        ProbeResult {
+            info: DeviceInfo { transport: Some("usb-storage".into()), ..Default::default() },
+            direct_io,
+            seq_write: vec![(4 << 10, 2.5), (64 << 10, 5.0), (1 << 20, 6.3), (8 << 20, 6.5)],
+            rand4k_qd1_iops: 48.0,
+            rand4k_qd8_iops: 357.0,
+            small_files_per_sec: 100.0,
+            flush_ms_median: 20.0,
+            saved_as: None,
+        }
+    }
+
+    #[test]
+    fn profile_from_probe_numbers() {
+        let p = profile_of(&result(true)).unwrap();
+        assert_eq!(p.seq_write_bps, Some(6.5e6));
+        let skip = p.write_skip_s.unwrap();
+        assert!((skip - (4096.0 / 2.5e6 - 4096.0 / 6.5e6)).abs() < 1e-12, "{skip}");
+        assert_eq!(p.write_qd, Some(8));
+        assert_eq!(p.transport.as_deref(), Some("usb-storage"));
+        assert_eq!((p.seq_read_bps, p.read_cmd_s), (None, None), "probe measures no reads");
+        let mut r = result(true);
+        r.rand4k_qd8_iops = 60.0;
+        assert_eq!(profile_of(&r).unwrap().write_qd, Some(1), "parallel writes do not help");
+        assert_eq!(profile_of(&result(false)), None, "buffered I/O measures the page cache");
+    }
 }

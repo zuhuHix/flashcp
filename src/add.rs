@@ -40,7 +40,13 @@ use std::time::Instant;
 
 /// Test hook: stop after the named phase (dirty | data | alloc | fat) to simulate a crash.
 const STOP_ENV: &str = "FLASHCP_TEST_STOP_AFTER";
-/// Gaps up to this size between written spans are zero-filled rather than skipped.
+/// Test hook: print how many gap bytes the data phase zero-filled and how many it skipped.
+const GAPS_ENV: &str = "FLASHCP_TEST_GAPS";
+/// Test hook: use a "fill gaps up to N bytes, free clusters too" policy (any target), so the
+/// rule that a used cluster is never zero-filled can be exercised on image files.
+const GAP_FILL_ENV: &str = "FLASHCP_TEST_GAP_FILL";
+/// Without a device profile (image files, unmeasured devices): gaps up to this size are
+/// zero-filled, and only when they are our own cluster slack.
 const SLACK_FILL: u64 = 32 << 10;
 
 #[derive(Clone, Debug, Default)]
@@ -194,6 +200,192 @@ fn chain_entries(clusters: &[u32], out: &mut Vec<(u32, u32)>) {
     for (k, &c) in clusters.iter().enumerate() {
         out.push((c, clusters.get(k + 1).copied().unwrap_or(EOC)));
     }
+}
+
+// ───────────────────────── gap policy ─────────────────────────
+
+/// How the data phase treats a gap between two spans it writes: zero-fill it (the stream stays
+/// one sequential run) or skip it (the next span is a new request).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GapPolicy {
+    /// Fill gaps of at most this many bytes, skip bigger ones.
+    pub(crate) max_fill: u64,
+    /// Gaps may also cover clusters outside our runs that are free in the pre-add bitmap
+    /// (otherwise only our own slack is filled).
+    pub(crate) free_too: bool,
+    /// Writes in flight for the scattered spans.
+    pub(crate) qd: usize,
+    /// Where the numbers came from, for the plan line.
+    pub(crate) source: &'static str,
+}
+
+/// Filling a gap of `gap` bytes costs gap / bps; skipping it costs one more request
+/// (skip_s). Fill iff that is cheaper.
+pub(crate) fn worth_filling(gap: u64, bps: f64, skip_s: f64) -> bool {
+    (gap as f64) / bps < skip_s
+}
+
+impl GapPolicy {
+    /// The old fixed behaviour: our own slack up to 32 KB, 8 writes in flight.
+    pub(crate) fn fallback(source: &'static str) -> GapPolicy {
+        GapPolicy { max_fill: SLACK_FILL, free_too: false, qd: crate::devprofile::DEFAULT_WRITE_QD, source }
+    }
+    /// From a measured write model: the largest gap [`worth_filling`] accepts.
+    pub(crate) fn from_profile(p: &crate::devprofile::DevProfile, source: &'static str) -> GapPolicy {
+        let (bps, skip) = p.write_cost();
+        let g = (bps * skip).floor().max(0.0) as u64;
+        let max_fill = if worth_filling(g, bps, skip) { g } else { g.saturating_sub(1) };
+        let qd = p.write_qd.unwrap_or(crate::devprofile::DEFAULT_WRITE_QD);
+        GapPolicy { max_fill, free_too: true, qd, source }
+    }
+    pub(crate) fn describe(&self) -> String {
+        let what = if self.free_too { "fill" } else { "fill own slack" };
+        format!(
+            "gaps: {what} ≤ {}, skip otherwise; {} in flight ({})",
+            human_bytes(self.max_fill as f64),
+            self.qd,
+            self.source
+        )
+    }
+}
+
+/// Whether every cluster in `clusters` is free in `bitmap` (bit c − 2).
+fn all_free(bitmap: &[u8], clusters: std::ops::Range<u64>) -> bool {
+    clusters.into_iter().all(|c| {
+        let i = (c - 2) as usize;
+        bitmap.get(i / 8).is_some_and(|b| b >> (i % 8) & 1 == 0)
+    })
+}
+
+/// The gap decision. The gap is `gap` bytes: our own slack (inside the run we just wrote, so
+/// always ours to write), followed by the clusters `foreign` that lie between our runs. Those
+/// belong to nobody only if the PRE-ADD bitmap calls them free (verify_allocation proved that
+/// no clear bit is referenced). A used cluster is never written, whatever the policy says:
+/// that would destroy an existing file.
+pub(crate) fn fill_gap(gap: u64, foreign: std::ops::Range<u64>, pre_bitmap: &[u8], pol: &GapPolicy) -> bool {
+    if gap > pol.max_fill {
+        return false;
+    }
+    foreign.is_empty() || (pol.free_too && all_free(pre_bitmap, foreign))
+}
+
+// ───────────────────────── write micro-probe ─────────────────────────
+
+/// The micro-probe writes four regions of this size (aligned to it on the whole device).
+const PROBE_REGION: u64 = 4 << 20;
+/// Gapped pattern: 8 KB written, 24 KB skipped (a small file in a 32 KB cluster).
+const PROBE_SPAN: usize = 8 << 10;
+const PROBE_STRIDE: u64 = 32 << 10;
+/// Writes in flight tried for the gapped pattern.
+const PROBE_QDS: [usize; 3] = [1, 8, 32];
+
+/// A byte offset (partition-relative) where 4 × [`PROBE_REGION`] of free clusters start,
+/// aligned to PROBE_REGION on the whole device (`dev_off` = partition start). `free` are free
+/// extents (start cluster, clusters) from the pre-add bitmap.
+fn probe_region(free: &[(u64, u64)], heap_off: u64, cs: u64, dev_off: u64) -> Option<u64> {
+    free.iter().find_map(|&(s, n)| {
+        let (a, e) = (heap_off + (s - 2) * cs, heap_off + (s - 2 + n) * cs);
+        let at = (a + dev_off).div_ceil(PROBE_REGION) * PROBE_REGION - dev_off;
+        (at + 4 * PROBE_REGION <= e).then_some(at)
+    })
+}
+
+/// Measures, with O_DIRECT in free (unreferenced) clusters at `at`, what the gap policy needs:
+/// sequential bandwidth (3 MB in 1 MB writes, after 1 MB of warm-up), then 128 spans of the
+/// gapped pattern at 1, 8 and 32 writes in flight. A span costs its bytes at sequential speed
+/// plus one skip; the best depth gives write_qd and its excess per span write_skip_s. About
+/// 1.5 s on a USB 2 stick (each pattern also stops early on a slower device). The junk left in
+/// free clusters is harmless.
+fn write_micro_probe(dev: &File, at: u64) -> Option<crate::devprofile::DevProfile> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use std::time::Duration;
+    let mut buf = crate::util::AlignedBuf::new(1 << 20);
+    crate::util::Rng(0x5EED).fill(buf.as_mut());
+    let buf = &buf;
+    dev.write_all_at(buf.as_ref(), at).ok()?; // warm-up: wakes the device, opens the region
+    let t = Instant::now();
+    let mut seq = 0u64;
+    while seq < 3 << 20 && (seq == 0 || t.elapsed() < Duration::from_millis(800)) {
+        dev.write_all_at(buf.as_ref(), at + (1 << 20) + seq).ok()?;
+        seq += 1 << 20;
+    }
+    let bps = seq as f64 / t.elapsed().as_secs_f64().max(1e-6);
+    let mut best: Option<(f64, usize)> = None; // (seconds per span, depth)
+    for (r, &qd) in PROBE_QDS.iter().enumerate() {
+        let base = at + (r as u64 + 1) * PROBE_REGION;
+        let n = (PROBE_REGION / PROBE_STRIDE) as usize;
+        let (next, done) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let t = Instant::now();
+        let ok = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..qd)
+                .map(|_| {
+                    s.spawn(|| {
+                        loop {
+                            let i = next.fetch_add(1, Relaxed);
+                            // Stop early on a slow device, once there is enough to average.
+                            if i >= n || (i >= 32 && t.elapsed() > Duration::from_millis(500)) {
+                                return true;
+                            }
+                            let off = base + i as u64 * PROBE_STRIDE;
+                            if dev.write_all_at(&buf.as_ref()[..PROBE_SPAN], off).is_err() {
+                                return false;
+                            }
+                            done.fetch_add(1, Relaxed);
+                        }
+                    })
+                })
+                .collect();
+            hs.into_iter().all(|h| h.join().unwrap_or(false))
+        });
+        let per = t.elapsed().as_secs_f64() / done.load(Relaxed).max(1) as f64;
+        if !ok {
+            return None;
+        }
+        if std::env::var_os(GAPS_ENV).is_some() {
+            eprintln!("probe: {bps:.0} B/s seq; gapped QD{qd}: {:.3} ms/span", per * 1e3);
+        }
+        // A deeper queue has to win clearly (5 %) to be chosen.
+        if best.is_none_or(|(b, _)| per < b * 0.95) {
+            best = Some((per, qd));
+        }
+    }
+    let _ = dev.sync_data();
+    let (per, qd) = best?;
+    Some(crate::devprofile::DevProfile {
+        seq_write_bps: Some(bps),
+        write_skip_s: Some((per - PROBE_SPAN as f64 / bps).max(0.0)),
+        write_qd: Some(qd),
+        ..Default::default()
+    })
+}
+
+/// The gap policy for this target: the cached device profile, else a micro-probe now (block
+/// devices only, never in a dry run), else the fallback. Image files always use the fallback:
+/// they have no device of their own to measure (their cost is the page cache's).
+fn choose_gap_policy(dev: &File, direct: bool, v: &Vol, free: &[(u64, u64)], dev_off: u64, dry_run: bool) -> GapPolicy {
+    use crate::devprofile as dp;
+    if let Some(max_fill) = std::env::var(GAP_FILL_ENV).ok().and_then(|v| v.parse().ok()) {
+        return GapPolicy { max_fill, free_too: true, qd: dp::DEFAULT_WRITE_QD, source: "test override" };
+    }
+    let Some(rdev) = dp::block_dev_of(dev) else { return GapPolicy::fallback("image default") };
+    if let Some(p) = dp::load(rdev).filter(|p| p.has_write_model()) {
+        return GapPolicy::from_profile(&p, "cached profile");
+    }
+    if dry_run {
+        return GapPolicy::fallback("default; not measured in a dry run");
+    }
+    let Some(at) = probe_region(free, v.heap_off, v.cs, dev_off).filter(|_| direct) else {
+        return GapPolicy::fallback("default; no 16 MB free run to measure in");
+    };
+    if !set_direct(dev, true) {
+        return GapPolicy::fallback("default; no O_DIRECT");
+    }
+    let measured = write_micro_probe(dev, at);
+    set_direct(dev, false);
+    let Some(mut p) = measured else { return GapPolicy::fallback("default; measuring failed") };
+    p.transport = Some(crate::probe::device_info_of(rdev).transport.unwrap_or_else(|| "other".into()));
+    dp::save(rdev, &p);
+    GapPolicy::from_profile(&p, "measured now")
 }
 
 // ───────────────────────── patches ─────────────────────────
@@ -633,14 +825,21 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
     let write_bytes = data_write + p2.bytes() + p3_fat.bytes() + p3_dir.bytes() + 2 * v.bps;
     let fragmented = runs.iter().filter(|(o, r)| !matches!(o, Obj::Ext(_)) && r.len() > 1).count() as u64;
     let (files, dirs) = (new_files.len() as u64, new_dirs.len() as u64);
+    // Measuring writes into free clusters, so it happens before anything else is written.
+    let pol = if segs.is_empty() {
+        GapPolicy::fallback("nothing to write")
+    } else {
+        choose_gap_policy(&excl, tgt.direct, &v, &free_extents(&v.bitmap, v.cc), tgt.part_off * 512, o.dry_run)
+    };
     let detail = format!(
-        "plan: add {files} files, {dirs} dirs, {} data │ cluster {} │ {} free │ {} new objects fragmented │ will write {}{} │ verified {verified} objects in {:.0} ms",
+        "plan: add {files} files, {dirs} dirs, {} data │ cluster {} │ {} free │ {} new objects fragmented │ will write {}{} │ {} │ verified {verified} objects in {:.0} ms",
         human_bytes(data_bytes as f64),
         human_bytes(cs as f64),
         human_bytes((free_total * cs) as f64),
         fragmented,
         human_bytes(write_bytes as f64),
         if skipped > 0 { format!(" │ skipping {skipped} existing") } else { String::new() },
+        pol.describe(),
         verify_secs * 1e3
     );
     tick.emit(Event::Plan { op: Op::Add, files, dirs, bytes: data_bytes, write_bytes, detail, strategy: None });
@@ -671,6 +870,7 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
         let direct =
             tgt.direct && cs.is_multiple_of(4096) && v.heap_off.is_multiple_of(4096) && set_direct(&excl, true);
         let mut w = if direct { SeqWriter::new(excl.clone()) } else { SeqWriter::with_align(excl.clone(), 1) };
+        w.set_inflight(pol.qd);
         let reads: Vec<(PathBuf, u64)> = file_order.iter().map(|&i| (nodes[i].src.clone(), nodes[i].size)).collect();
         let (rx, budget) = ordered_reader(reads, o.readers.max(1), 256 << 20, 16 << 20);
         let mut pending: BTreeMap<usize, Item> = BTreeMap::new();
@@ -681,22 +881,30 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
         let mut cur: Option<(usize, Cur)> = None;
         let mut last_k = 0usize;
         let (mut files_done, mut bytes_done) = (empty_files, 0u64);
-        let mut prev_end = 0u64;
+        let mut prev_end: Option<u64> = None;
+        let (pre_bitmap, heap) = (&v.bitmap, v.heap_off);
+        let (mut filled, mut skipped_gaps) = (0u64, 0u64);
         for s in &segs {
             // Unwritten cluster slack after a file's data is not part of the file (beyond
-            // ValidDataLength), so a big gap is skipped instead of zero-filled. A small gap is
-            // filled to keep writes merged, but ONLY when it is our own slack (this segment
-            // starts right where the previous one ended); otherwise the gap holds clusters that
-            // belong to existing files.
+            // ValidDataLength), so a gap may be skipped or zero-filled, whichever the device
+            // does faster (fill_gap). Clusters between our runs are only ever filled when the
+            // pre-add bitmap calls them free; segments are whole clusters, so prev_end and
+            // s.dev are cluster boundaries.
             if s.dev > w.cur() {
-                if s.dev == prev_end && s.dev - w.cur() <= SLACK_FILL {
+                let fill = prev_end.is_some_and(|pe| {
+                    let foreign = (pe - heap) / cs + 2..(s.dev - heap) / cs + 2;
+                    fill_gap(s.dev - w.cur(), foreign, pre_bitmap, &pol)
+                });
+                if fill {
+                    filled += s.dev - w.cur();
                     w.zeros_to(s.dev)?;
                 } else {
+                    skipped_gaps += 1;
                     w.skip_to(s.dev)?;
                 }
             }
             ensure!(w.cur() == s.dev, "internal layout error: overlapping data segments");
-            prev_end = s.dev + s.len;
+            prev_end = Some(s.dev + s.len);
             match s.kind {
                 SegKind::Mem(m, off) => w.write(&mems[m][off..off + s.len as usize])?,
                 SegKind::File(k, off) => {
@@ -742,6 +950,9 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
             }
         }
         ensure!(cur.is_none(), "internal layout error: a file was not fully written");
+        if std::env::var_os(GAPS_ENV).is_some() {
+            eprintln!("gaps: {filled} bytes zero-filled, {skipped_gaps} skipped");
+        }
         w.finish()?; // syncs
         set_direct(&excl, false); // metadata phases are small buffered writes
     }
@@ -908,6 +1119,70 @@ mod tests {
         let mut v = Vec::new();
         chain_entries(&[5, 6, 9], &mut v);
         assert_eq!(v, vec![(5, 6), (6, 9), (9, EOC)]);
+    }
+
+    fn profile(bps: f64, skip: f64) -> crate::devprofile::DevProfile {
+        crate::devprofile::DevProfile { seq_write_bps: Some(bps), write_skip_s: Some(skip), ..Default::default() }
+    }
+
+    #[test]
+    fn gap_threshold_is_the_cost_crossover() {
+        // 6.5 MB/s, 2 ms per extra request: filling is cheaper below 13 000 bytes.
+        assert!(worth_filling(12_999, 6.5e6, 0.002));
+        assert!(!worth_filling(13_000, 6.5e6, 0.002));
+        let p = GapPolicy::from_profile(&profile(6.5e6, 0.002), "t");
+        assert_eq!(p.max_fill, 12_999);
+        assert!(p.free_too);
+        // max_fill is exactly the largest gap worth_filling accepts, for awkward numbers too.
+        for (bps, skip) in [(9_708_427.533, 0.000_869_66), (1e9, 1e-4), (3.3e6, 1.0 / 3.0), (6e6, 0.0)] {
+            let p = GapPolicy::from_profile(&profile(bps, skip), "t");
+            assert!(p.max_fill == 0 || worth_filling(p.max_fill, bps, skip), "{bps} {skip}");
+            assert!(!worth_filling(p.max_fill + 1, bps, skip), "{bps} {skip}");
+        }
+        assert_eq!(GapPolicy::from_profile(&profile(6e6, 0.0), "t").max_fill, 0);
+        assert_eq!(GapPolicy::from_profile(&profile(6e6, 0.001), "t").qd, crate::devprofile::DEFAULT_WRITE_QD);
+    }
+
+    #[test]
+    fn gap_never_fills_a_used_cluster() {
+        // Clusters 2..=17; 5 and 9 are used by existing files.
+        let mut bm = vec![0u8; 2];
+        for c in [5u64, 9] {
+            bm[((c - 2) / 8) as usize] |= 1 << ((c - 2) % 8);
+        }
+        let generous = GapPolicy { max_fill: u64::MAX, free_too: true, qd: 8, source: "t" };
+        assert!(fill_gap(1 << 20, 6..9, &bm, &generous), "free clusters between our runs");
+        assert!(fill_gap(1 << 20, 10..18, &bm, &generous));
+        for r in [5..6, 4..6, 2..10, 9..10, 8..12] {
+            assert!(!fill_gap(4096, r.clone(), &bm, &generous), "used cluster in {r:?} would be overwritten");
+        }
+        // Past the bitmap counts as not free.
+        assert!(!fill_gap(4096, 17..19, &bm, &generous));
+        // Own slack only (no foreign clusters): just the size limit.
+        assert!(fill_gap(1 << 20, 7..7, &bm, &generous));
+        let fallback = GapPolicy::fallback("t");
+        assert!(fill_gap(SLACK_FILL, 7..7, &bm, &fallback));
+        assert!(!fill_gap(SLACK_FILL + 1, 7..7, &bm, &fallback));
+        assert!(!fill_gap(4096, 6..7, &bm, &fallback), "the fallback fills only its own slack");
+        let tight = GapPolicy { max_fill: 8192, ..generous };
+        assert!(fill_gap(8192, 6..8, &bm, &tight));
+        assert!(!fill_gap(8193, 6..8, &bm, &tight));
+    }
+
+    #[test]
+    fn probe_region_is_free_and_device_aligned() {
+        let (heap, cs) = (1u64 << 20, 32u64 << 10);
+        let r = PROBE_REGION;
+        // Extent 1: too small. Extent 2: big enough only after alignment to the whole device.
+        let free = [(2u64, 100u64), (1000, 5 * r / cs)];
+        let at = probe_region(&free, heap, cs, 1 << 20).unwrap();
+        let (a, e) = (heap + 998 * cs, heap + (998 + free[1].1) * cs);
+        assert!(at >= a && at + 4 * r <= e);
+        assert_eq!((at + (1 << 20)) % r, 0, "aligned on the device, not in the partition");
+        assert_eq!(probe_region(&free[..1], heap, cs, 0), None);
+        // Exactly 16 MB, misaligned by one cluster: does not fit.
+        assert_eq!(probe_region(&[(3, 4 * r / cs)], 0, cs, 0), None);
+        assert_eq!(probe_region(&[(2, 4 * r / cs)], 0, cs, 0), Some(0));
     }
 
     #[test]

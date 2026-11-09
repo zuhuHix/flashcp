@@ -19,6 +19,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -439,44 +440,147 @@ pub(crate) struct SeqWriter {
     align: usize,
     /// Device offset of stream offset 0 (see [`SeqWriter::set_device_offset`]).
     base: u64,
+    /// Writes in flight for scattered spans, read by the I/O thread ([`SeqWriter::set_inflight`]).
+    inflight: Arc<AtomicUsize>,
 }
 
 /// A full buffer and its spans: (offset in buf, device offset, length).
 type Batch = (AlignedBuf, Vec<(usize, u64, usize)>);
 
-/// Concurrent writes per buffer when it holds many spans.
-const IO_WORKERS: usize = 8;
+/// Writes in flight for scattered spans unless the caller sets it ([`SeqWriter::set_inflight`]).
+const IO_WORKERS: usize = crate::devprofile::DEFAULT_WRITE_QD;
+/// A span this big is written alone, with nothing else in flight: big writes are the
+/// sequential stream, and two of them interleaved would make it two streams.
+const SOLO_SPAN: usize = 1 << 20;
 
-fn write_batch(dev: &File, buf: &AlignedBuf, spans: &[(usize, u64, usize)]) -> Result<()> {
-    let one = |&(bo, off, len): &(usize, u64, usize)| -> Result<()> {
-        dev.write_all_at(&buf.as_ref()[bo..bo + len], off).with_context(|| format!("write at {off}"))
-    };
-    if spans.len() == 1 {
-        return one(&spans[0]);
-    }
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    std::thread::scope(|s| {
-        for _ in 0..IO_WORKERS.min(spans.len()) {
-            s.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if i >= spans.len() {
-                        return;
-                    }
-                    if let Err(e) = one(&spans[i]) {
-                        first_err.lock().unwrap().get_or_insert(e);
-                        next.store(spans.len(), std::sync::atomic::Ordering::Relaxed);
-                        return;
-                    }
-                }
-            });
+/// A batch's buffer, shared by the jobs that write its spans. When the last one is done (the
+/// last Arc drops), the buffer goes back to the producer.
+struct Shared {
+    buf: Option<AlignedBuf>,
+    back: Sender<AlignedBuf>,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        if let Some(b) = self.buf.take() {
+            let _ = self.back.send(b); // never blocks: that channel can hold every buffer there is
         }
-    });
-    match first_err.into_inner().unwrap() {
-        Some(e) => Err(e),
-        None => Ok(()),
     }
+}
+
+fn write_span(dev: &File, sh: &Shared, bo: usize, off: u64, len: usize) -> Result<()> {
+    let buf = sh.buf.as_ref().expect("buffer present until drop").as_ref();
+    dev.write_all_at(&buf[bo..bo + len], off).with_context(|| format!("write at {off}"))
+}
+
+/// One small span for the pool: (buffer, offset in it, device offset, length).
+type Job = (Arc<Shared>, usize, u64, usize);
+/// (jobs submitted and not finished, first error), its condvar, and "some job failed".
+type PoolState = Arc<(Mutex<(usize, Option<anyhow::Error>)>, Condvar, AtomicBool)>;
+
+/// A fixed set of threads writing small spans, `n` in flight. It is fed across buffer
+/// boundaries: a buffer is cut at every 8 MB device boundary, so a scattered stream may hold
+/// only a few dozen spans per buffer, and waiting for each buffer's last span before starting
+/// the next one would leave the queue nearly empty at every boundary (worse the deeper it is).
+struct Pool {
+    tx: Option<Sender<Job>>,
+    state: PoolState,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// Marks a pool job finished when dropped, also when the write panicked, so that
+/// [`Pool::wait_idle`] can never hang.
+struct Done<'a>(&'a PoolState, Option<Result<()>>);
+
+impl Drop for Done<'_> {
+    fn drop(&mut self) {
+        let r = self.1.take().unwrap_or_else(|| Err(anyhow::anyhow!("I/O worker panicked")));
+        let (m, cv, failed) = &**self.0;
+        let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 -= 1;
+        if let Err(e) = r {
+            failed.store(true, Relaxed);
+            g.1.get_or_insert(e);
+        }
+        cv.notify_all();
+    }
+}
+
+impl Pool {
+    fn new(dev: Arc<File>, n: usize) -> Pool {
+        let (tx, rx) = bounded::<Job>(n);
+        let state: PoolState = Arc::new((Mutex::new((0, None)), Condvar::new(), AtomicBool::new(false)));
+        let workers = (0..n)
+            .map(|_| {
+                let (rx, dev, st) = (rx.clone(), dev.clone(), state.clone());
+                std::thread::spawn(move || {
+                    for (sh, bo, off, len) in rx {
+                        let mut done = Done(&st, None);
+                        // After a failure the remaining jobs are drained without writing.
+                        done.1 = Some(if st.2.load(Relaxed) { Ok(()) } else { write_span(&dev, &sh, bo, off, len) });
+                        drop(sh); // the buffer may go back before the job is marked done
+                    }
+                })
+            })
+            .collect();
+        Pool { tx: Some(tx), state, workers }
+    }
+    fn submit(&self, sh: &Arc<Shared>, bo: usize, off: u64, len: usize) -> Result<()> {
+        {
+            let mut g = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(e) = g.1.take() {
+                return Err(e);
+            }
+            g.0 += 1;
+        }
+        let tx = self.tx.as_ref().expect("pool is open");
+        tx.send((sh.clone(), bo, off, len)).map_err(|_| anyhow::anyhow!("I/O workers stopped"))
+    }
+    /// Waits until every submitted span has been written, then reports the first error.
+    fn wait_idle(&self) -> Result<()> {
+        let (m, cv, _) = &*self.state;
+        let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+        while g.0 > 0 {
+            g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        g.1.take().map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        for h in self.workers.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+/// The I/O thread. Big spans are written one at a time, in order; small spans go through the
+/// pool, which keeps `inflight` of them going. A big span first waits for every small one
+/// before it (the stream stays ascending), and the final sync waits for all of them, so
+/// finish() returning Ok means every byte is on the device.
+fn io_loop(dev: Arc<File>, rx: Receiver<Batch>, btx: Sender<AlignedBuf>, inflight: Arc<AtomicUsize>) -> Result<()> {
+    let mut pool: Option<Pool> = None;
+    for (buf, spans) in rx {
+        let sh = Arc::new(Shared { buf: Some(buf), back: btx.clone() });
+        for &(bo, off, len) in &spans {
+            if spans.len() == 1 || len >= SOLO_SPAN {
+                if let Some(p) = &pool {
+                    p.wait_idle()?;
+                }
+                write_span(&dev, &sh, bo, off, len)?;
+            } else {
+                let n = inflight.load(Relaxed).clamp(1, crate::devprofile::MAX_WRITE_QD);
+                pool.get_or_insert_with(|| Pool::new(dev.clone(), n)).submit(&sh, bo, off, len)?;
+            }
+        }
+    }
+    if let Some(p) = &pool {
+        p.wait_idle()?;
+    }
+    dev.sync_all()?;
+    Ok(())
 }
 
 impl SeqWriter {
@@ -489,14 +593,9 @@ impl SeqWriter {
         for _ in 0..2 {
             btx.send(AlignedBuf::new(IO_CHUNK)).unwrap();
         }
-        let io = std::thread::spawn(move || -> Result<()> {
-            for (buf, spans) in rx {
-                write_batch(&dev, &buf, &spans)?;
-                let _ = btx.send(buf);
-            }
-            dev.sync_all()?;
-            Ok(())
-        });
+        let inflight = Arc::new(AtomicUsize::new(IO_WORKERS));
+        let n = inflight.clone();
+        let io = std::thread::spawn(move || io_loop(dev, rx, btx, n));
         SeqWriter {
             buf: AlignedBuf::new(IO_CHUNK),
             fill: 0,
@@ -507,7 +606,13 @@ impl SeqWriter {
             written: 0,
             align,
             base: 0,
+            inflight,
         }
+    }
+    /// Writes in flight for scattered spans (from the device profile's write_qd). Takes effect
+    /// if called before the first scattered buffer is flushed.
+    pub(crate) fn set_inflight(&mut self, n: usize) {
+        self.inflight.store(n.clamp(1, crate::devprofile::MAX_WRITE_QD), Relaxed);
     }
     /// Makes buffer flushes (the big writes) end on absolute DEVICE multiples of [`IO_CHUNK`]
     /// when the stream's offset 0 sits at byte `dev_off` of the whole device (a partition's
@@ -1010,33 +1115,101 @@ pub(crate) fn device_offset(tgt: &Target) -> u64 {
     tgt.part_off * SECTOR
 }
 
+/// Clusters below 4 KB (512 B, 1 KB, 2 KB) may be chosen at all. They are valid exFAT, but
+/// the choice depends on other systems accepting them (Windows chkdsk, macOS fsck_exfat; the
+/// xos CI checks exactly that): if CI rejects them, set this to false.
+const SMALL_CLUSTERS: bool = true;
+/// Sub-4 KB clusters only on volumes up to this size, where FAT and bitmap stay small.
+const SMALL_MAX_VOLUME: u64 = 32 << 30;
+
+/// What the sub-4 KB gate looks at, measured on the plan at 4 KB clusters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClusterStats {
+    pub(crate) vol_bytes: u64,
+    /// Heap clusters the 4 KB plan uses (u64::MAX if the data does not even fit at 4 KB).
+    pub(crate) used_4k: u64,
+    pub(crate) heap_4k: u64,
+    /// File data bytes, and the cluster slack those files have at 4 KB.
+    pub(crate) data: u64,
+    pub(crate) slack_4k: u64,
+}
+
+/// Whether sub-4 KB clusters are worth considering; Err says why not. All three must hold:
+/// (a) flashcp fills the volume: the 4 KB plan uses ≥ 50 % of the heap. Little free space is
+///     left for other systems to write big files into, which tiny clusters would slow down.
+/// (b) the data is dominated by tiny files: the slack at 4 KB is ≥ 15 % of the data bytes.
+///     Slack is exactly what smaller clusters save (bytes written and space); a median file
+///     size would ignore how the bytes are distributed (a few big files make tiny clusters
+///     pointless however many tiny ones there are).
+/// (c) the volume is ≤ 32 GB, so FAT and bitmap (8× larger at 512 B) stay small.
+pub(crate) fn small_clusters_gate(s: &ClusterStats) -> std::result::Result<String, String> {
+    let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 * 100.0 / b as f64 };
+    if !SMALL_CLUSTERS {
+        return Err("sub-4K disabled".into());
+    }
+    if s.vol_bytes > SMALL_MAX_VOLUME {
+        return Err("sub-4K: volume > 32 GB".into());
+    }
+    let full = if s.used_4k == u64::MAX { 100.0 } else { pct(s.used_4k, s.heap_4k) };
+    if full < 50.0 {
+        return Err(format!("sub-4K: data fills {full:.0} % < 50 %"));
+    }
+    let slack = pct(s.slack_4k, s.data);
+    if s.data == 0 || slack < 15.0 {
+        return Err(format!("sub-4K: slack at 4K is {slack:.0} % of data < 15 %"));
+    }
+    Ok(format!("sub-4K allowed: data fills {full:.0} %, slack at 4K {slack:.0} % of data"))
+}
+
+/// Estimated seconds to write plan `p`: its bytes at sequential speed plus one request per
+/// skip (Prefix FAT mode skips once, from the FAT's used prefix to the heap).
+pub(crate) fn plan_cost(p: &Plan, fat: FatMode, bps: f64, skip_s: f64) -> f64 {
+    let skips = if fat == FatMode::Prefix { 1.0 } else { 0.0 };
+    p.write_bytes as f64 / bps + skips * skip_s
+}
+
 /// Cluster-size optimizer: plans every candidate cluster size and returns the cheapest plan
-/// (with `nodes` laid out for it). An explicit `o.cluster` is the only candidate.
-pub(crate) fn choose_cluster(nodes: &mut [Node], tgt: &Target, o: &BuildOpts) -> Result<Plan> {
+/// (with `nodes` laid out for it) and why it was chosen. Cost is estimated time, from the
+/// target device's cached profile (default constants otherwise): written bytes (FAT + bitmap +
+/// per-file slack) at sequential speed plus per-request costs. Small files want small
+/// clusters; huge drives in Full FAT mode want bigger ones. Candidates are 4 KB … 128 KB, and
+/// 512 B … 2 KB too when [`small_clusters_gate`] allows. An explicit `o.cluster` is the only
+/// candidate.
+pub(crate) fn choose_cluster(nodes: &mut [Node], tgt: &Target, o: &BuildOpts) -> Result<(Plan, String)> {
     let vol_bytes = usable_bytes(tgt.bytes);
     let dev_off = device_offset(tgt);
-    // Pick the size that minimizes bytes physically written (FAT + bitmap + per-file slack).
-    // Small files want small clusters; huge drives in Full FAT mode want bigger ones.
-    let candidates: Vec<u64> = match o.cluster {
-        Some(c) => {
-            ensure!(
-                valid_cluster(c as u64),
-                "cluster size must be a power of two between 512 bytes and 32 MB, got {c}"
-            );
-            vec![c as u64]
-        }
-        None => (12..=17).map(|s| 1u64 << s).collect(), // 4K … 128K
+    if let Some(c) = o.cluster {
+        ensure!(valid_cluster(c as u64), "cluster size must be a power of two between 512 bytes and 32 MB, got {c}");
+        let g = geometry(vol_bytes, c as u64, dev_off).context("data does not fit, or volume size is unsupported")?;
+        return Ok((plan(nodes, g, o.fat)?, "set by --cluster".into()));
+    }
+    let profile = crate::devprofile::block_dev_of(&tgt.file).and_then(crate::devprofile::load);
+    let (bps, skip_s) = profile.clone().unwrap_or_default().write_cost();
+    let model = if profile.is_some_and(|p| p.has_write_model()) { "cached profile" } else { "default model" };
+    let g4 = geometry(vol_bytes, 4096, dev_off);
+    let used_4k = g4.and_then(|g| plan(nodes, g, o.fat).ok()).map_or(u64::MAX, |p| p.used_end - 2);
+    let files = nodes.iter().filter(|n| !n.is_dir);
+    let stats = ClusterStats {
+        vol_bytes,
+        used_4k,
+        heap_4k: g4.map_or(0, |g| g.cluster_count),
+        data: files.clone().map(|n| n.size).sum(),
+        slack_4k: files.map(|n| n.size.div_ceil(4096) * 4096 - n.size).sum(),
     };
-    let mut best: Option<Plan> = None;
-    for c in candidates {
+    let gate = small_clusters_gate(&stats);
+    let low = if gate.is_ok() { 9 } else { 12 };
+    let mut best: Option<(f64, Plan)> = None;
+    for c in (low..=17).map(|s| 1u64 << s) {
         let Some(g) = geometry(vol_bytes, c, dev_off) else { continue };
         let Ok(p) = plan(nodes, g, o.fat) else { continue };
-        if best.as_ref().is_none_or(|b| p.write_bytes < b.write_bytes) {
-            best = Some(p);
+        let cost = plan_cost(&p, o.fat, bps, skip_s);
+        if best.as_ref().is_none_or(|b| cost < b.0) {
+            best = Some((cost, p));
         }
     }
-    let Some(best) = best else { bail!("data does not fit, or volume size is unsupported") };
-    plan(nodes, best.g, o.fat) // re-plan so nodes hold the winner's layout
+    let Some((cost, best)) = best else { bail!("data does not fit, or volume size is unsupported") };
+    let why = format!("auto: est. {cost:.1} s, {model}; {}", gate.unwrap_or_else(|e| e));
+    Ok((plan(nodes, best.g, o.fat)?, why)) // re-plan so nodes hold the winner's layout
 }
 
 /// [`build`] of an already scanned tree onto an already opened (exclusively held) target.
@@ -1046,7 +1219,7 @@ pub(crate) fn build_target(mut nodes: Vec<Node>, tgt: Target, o: &BuildOpts, sin
     let upc = upcase_map();
     let label: Vec<u16> = o.label.encode_utf16().collect();
     ensure!(label.len() <= 11, "label is at most 11 characters");
-    let p = choose_cluster(&mut nodes, &tgt, o)?;
+    let (p, why) = choose_cluster(&mut nodes, &tgt, o)?;
     let vol_bytes = usable_bytes(tgt.bytes);
     let g = p.g;
     let cs = g.cluster;
@@ -1054,7 +1227,7 @@ pub(crate) fn build_target(mut nodes: Vec<Node>, tgt: Target, o: &BuildOpts, sin
     let dirs = nodes.len() - files;
     let data: u64 = nodes.iter().map(|n| n.size).sum();
     let detail = format!(
-        "plan: {} files, {} dirs, {} data │ cluster {} │ {} clusters │ FAT {} ({:?}) │ will write {}",
+        "plan: {} files, {} dirs, {} data │ cluster {} ({why}) │ {} clusters │ FAT {} ({:?}) │ will write {}",
         files,
         dirs,
         human_bytes(data as f64),
@@ -1396,6 +1569,142 @@ mod tests {
         let msg = got.expect_err("writes to a read-only target succeeded");
         assert!(msg.contains("write at"), "lost the original I/O error: {msg}");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Scattered small spans (the pool) across many buffers, a big solo span in between, then
+    /// more small ones: every byte lands where it belongs and nothing else is written.
+    #[test]
+    fn seq_writer_scattered_spans_land_exactly() {
+        let dir = std::env::temp_dir().join(format!("flashcp-seqw-scatter-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.img");
+        let f = File::create(&p).unwrap();
+        f.set_len(64 << 20).unwrap();
+        for qd in [1usize, 3, 32] {
+            let dev = Arc::new(OpenOptions::new().read(true).write(true).open(&p).unwrap());
+            dev.write_all_at(&vec![0xEEu8; 64 << 20], 0).unwrap();
+            let mut w = SeqWriter::with_align(dev.clone(), 1);
+            w.set_inflight(qd);
+            let mut want = vec![0xEEu8; 64 << 20];
+            let mut put = |w: &mut SeqWriter, at: u64, len: usize, v: u8| {
+                w.skip_to(at).unwrap();
+                w.write(&vec![v; len]).unwrap();
+                want[at as usize..at as usize + len].fill(v);
+            };
+            for k in 0..1500u64 {
+                put(&mut w, k * 12288, 4096 + (k as usize % 3) * 1000, (k % 251) as u8);
+            }
+            put(&mut w, 20 << 20, 3 << 20, 0x77); // solo: waits for the small ones
+            for k in 0..900u64 {
+                put(&mut w, (24 << 20) + k * 40960, 8192, (k % 7) as u8 + 1);
+            }
+            w.finish().unwrap();
+            let mut got = vec![0u8; 64 << 20];
+            dev.read_exact_at(&mut got, 0).unwrap();
+            assert!(got == want, "qd {qd}: device content differs");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Scattered spans to a target that rejects every write: the pool's error must come back
+    /// from write()/finish() with the original message, never a hang.
+    #[test]
+    fn seq_writer_scattered_failure_does_not_hang() {
+        let dir = std::env::temp_dir().join(format!("flashcp-seqw-scatter-ro-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("ro.img");
+        File::create(&p).unwrap().set_len(256 << 20).unwrap();
+        let ro = Arc::new(File::open(&p).unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut w = SeqWriter::with_align(ro, 1);
+            w.set_inflight(8);
+            let chunk = vec![0xA5u8; 8192];
+            let mut res = Ok(());
+            for k in 0..20_000u64 {
+                res = w.skip_to(k * 12288).and_then(|_| w.write(&chunk));
+                if res.is_err() {
+                    break;
+                }
+            }
+            let res = res.and_then(|_| w.finish().map(|_| ()));
+            let _ = tx.send(res.map_err(|e| format!("{e:#}")));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("SeqWriter hung on a failing target");
+        let msg = got.expect_err("writes to a read-only target succeeded");
+        assert!(msg.contains("write at"), "lost the original I/O error: {msg}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ───── cluster-size policy ─────
+
+    fn stats(vol_gb: u64, used_pct: u64, slack_pct: u64) -> ClusterStats {
+        ClusterStats {
+            vol_bytes: vol_gb << 30,
+            used_4k: used_pct * 1000,
+            heap_4k: 100_000,
+            data: 1_000_000,
+            slack_4k: slack_pct * 10_000,
+        }
+    }
+
+    #[test]
+    fn small_clusters_only_when_full_tiny_and_small() {
+        assert!(small_clusters_gate(&stats(8, 50, 15)).is_ok(), "all three hold at the limits");
+        assert!(small_clusters_gate(&stats(32, 90, 80)).is_ok());
+        // (a) fails: the volume stays mostly empty.
+        assert!(small_clusters_gate(&stats(8, 49, 80)).unwrap_err().contains("fills 49 %"));
+        // (b) fails: the data is not tiny files.
+        assert!(small_clusters_gate(&stats(8, 90, 14)).unwrap_err().contains("slack"));
+        // (c) fails: big volume.
+        assert!(small_clusters_gate(&stats(33, 90, 80)).unwrap_err().contains("32 GB"));
+        // No data at all, and data that does not even fit at 4 KB.
+        assert!(small_clusters_gate(&ClusterStats { data: 0, slack_4k: 0, ..stats(8, 90, 0) }).is_err());
+        assert!(small_clusters_gate(&ClusterStats { used_4k: u64::MAX, ..stats(8, 0, 50) }).is_ok());
+    }
+
+    /// The optimizer on plan statistics alone: tiny files filling a small volume get a sub-4K
+    /// cluster; the same files on a volume 64× bigger get 4 KB.
+    #[test]
+    fn choose_cluster_goes_below_4k_only_when_the_gate_allows() {
+        let tree = |n: usize| {
+            let mut v = vec![node("", true, 0, (0, 0), 0, 0)];
+            v[0].children = (1..=n).collect();
+            v.extend((0..n).map(|i| node(&format!("f{i}"), false, 300 + (i as u64 % 700), (0, 0), 0, 0)));
+            v
+        };
+        let dir = std::env::temp_dir().join(format!("flashcp-choose-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let o = BuildOpts { cluster: None, label: String::new(), fat: FatMode::Prefix, readers: 1, dry_run: true };
+        let pick = |bytes: u64, n: usize| {
+            let p = dir.join("i.img");
+            let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&p).unwrap();
+            f.set_len(bytes).unwrap();
+            let tgt = Target { _flags: FlagGuard::new(&f).unwrap(), file: f, bytes, part_off: 0, direct: false };
+            let (plan, why) = choose_cluster(&mut tree(n), &tgt, &o).unwrap();
+            (plan.g.cluster, why)
+        };
+        let (c, why) = pick(16 << 20, 2500);
+        assert!(c < 4096, "full volume of tiny files: {c} ({why})");
+        let (c, why) = pick(1 << 30, 2500);
+        assert_eq!(c, 4096, "mostly empty volume: {why}");
+        let o = BuildOpts { cluster: Some(65536), ..o.clone() };
+        let f = File::create(dir.join("j.img")).unwrap();
+        f.set_len(16 << 20).unwrap();
+        let tgt = Target { _flags: FlagGuard::new(&f).unwrap(), file: f, bytes: 16 << 20, part_off: 0, direct: false };
+        let (plan, why) = choose_cluster(&mut tree(10), &tgt, &o).unwrap();
+        assert_eq!((plan.g.cluster, why.as_str()), (65536, "set by --cluster"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn plan_cost_counts_bytes_and_the_prefix_skip() {
+        let mut nodes = sample_tree();
+        let g = geometry(64 << 20, 4096, 0).unwrap();
+        let p = plan(&mut nodes, g, FatMode::Prefix).unwrap();
+        let full = plan_cost(&p, FatMode::Full, 1e6, 0.5);
+        assert!((full - p.write_bytes as f64 / 1e6).abs() < 1e-9);
+        assert!((plan_cost(&p, FatMode::Prefix, 1e6, 0.5) - full - 0.5).abs() < 1e-9);
     }
 
     // ───── checksums and up-case table ─────
