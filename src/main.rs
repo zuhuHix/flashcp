@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use flashcp::TargetSpec;
 use flashcp::events::{Event, error_json};
-use flashcp::{add, bench, copy, dataset, exfat, pack, probe, pull, util};
+use flashcp::{add, bench, copy, dataset, exfat, optimize, pack, probe, pull, util};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -142,6 +142,35 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Rewrite an EXISTING exFAT volume on TARGET into the flashcp layout (every file
+    /// contiguous, all metadata together, the optimizer's cluster size) WITHOUT losing data:
+    /// copies everything to a local temp dir, verifies it, rebuilds the volume from it, verifies
+    /// the result, deletes the copy. Re-running after an interruption resumes.
+    Optimize {
+        /// Block device or image file (or use --target-fd)
+        #[arg(required_unless_present = "target_fd", conflicts_with = "target_fd")]
+        target: Option<PathBuf>,
+        /// Use this inherited, already-open block-device fd (O_RDWR|O_EXCL) instead of opening
+        /// TARGET, e.g. from a privileged helper
+        #[arg(long, value_name = "N")]
+        target_fd: Option<i32>,
+        /// Directory for the temporary copy (default: the first disk-backed one with room of
+        /// $FLASHCP_TMPDIR, /var/tmp, $TMPDIR or /tmp, $XDG_CACHE_HOME or ~/.cache)
+        #[arg(long, value_name = "DIR")]
+        temp: Option<PathBuf>,
+        /// Only print the plan
+        #[arg(long)]
+        dry_run: bool,
+        /// Required unless --dry-run: confirms TARGET may be rebuilt
+        #[arg(long)]
+        yes: bool,
+        /// Rebuild even if the volume is already optimized
+        #[arg(long)]
+        force: bool,
+        /// Print progress as JSON lines on stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// Show an exFAT volume's label, size, free space and file count (read-only)
     Info {
         /// Block device or image file (or use --target-fd)
@@ -196,6 +225,7 @@ fn main() {
         Cmd::Build { json: true, .. }
             | Cmd::Add { json: true, .. }
             | Cmd::Pull { json: true, .. }
+            | Cmd::Optimize { json: true, .. }
             | Cmd::Info { json: true, .. }
     );
     if let Err(e) = run(cli.cmd) {
@@ -335,6 +365,39 @@ fn run(cmd: Cmd) -> Result<()> {
                     s.data_bytes as f64 / 1e6 / s.secs,
                     util::human_bytes(s.read_bytes as f64),
                     s.reads
+                );
+            }
+            Ok(())
+        }
+        Cmd::Optimize { target, target_fd, temp, dry_run, yes, force, json } => {
+            let target = spec(target, target_fd);
+            anyhow::ensure!(
+                dry_run || yes,
+                "this rebuilds the volume on {} (its files are copied off, verified and written back); nothing was \
+                 changed. Pass --yes to confirm, or --dry-run to see the plan",
+                target.describe()
+            );
+            let o = optimize::OptimizeOpts { temp, dry_run, force };
+            let mut human = |e: &Event| match e {
+                Event::Plan { detail, .. } => println!("{detail}"),
+                Event::Phase { phase, step, steps, .. } => println!("[{step}/{steps}] {phase}"),
+                _ => {}
+            };
+            let mut js = sink(true);
+            let s = optimize::optimize(&target, &o, if json { &mut js } else { &mut human })?;
+            if !json && !dry_run && !s.already {
+                let phases: Vec<String> = s.phases.iter().map(|(n, t)| format!("{n} {t:.2}s")).collect();
+                println!(
+                    "optimized{}: {} files, {} dirs, {} data, cluster {} → {}, {} written in {:.2}s ({})",
+                    if s.resumed { " (resumed)" } else { "" },
+                    s.files,
+                    s.dirs,
+                    util::human_bytes(s.data_bytes as f64),
+                    util::human_bytes(s.old_cluster as f64),
+                    util::human_bytes(s.cluster as f64),
+                    util::human_bytes(s.written as f64),
+                    s.secs,
+                    phases.join(", ")
                 );
             }
             Ok(())
