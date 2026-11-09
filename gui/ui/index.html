@@ -29,6 +29,29 @@
         Plug in a USB drive. Only USB drives are shown; internal disks never appear.
       </p>
       <div id="nonexfat" class="notice warn" hidden></div>
+      <div id="optimize-entry" class="optimize-entry" hidden>
+        <p id="optimize-resume-note" class="notice warn" hidden>
+          An interrupted optimize was found on this stick. Resume it to finish.
+        </p>
+        <button id="optimize-open" class="link" type="button">Optimize this stick…</button>
+      </div>
+    </section>
+
+    <section id="optimize" class="card panel" tabindex="-1" aria-labelledby="optimize-title" hidden>
+      <p id="optimize-title" class="stage">Optimize this stick</p>
+      <p id="optimize-status" class="hint" role="status">
+        Checking the stick… (you may be asked for your password)
+      </p>
+      <div id="optimize-body" hidden>
+        <div id="optimize-lines" class="optimize-lines"></div>
+        <p id="optimize-note" class="stage" hidden></p>
+        <p id="optimize-risk" class="notice warn risk" hidden></p>
+        <div class="button-row">
+          <button id="optimize-confirm" class="accent" type="button" hidden>Optimize this stick</button>
+          <button id="optimize-cancel" type="button">Cancel</button>
+        </div>
+      </div>
+      <p id="optimize-error" class="trust-error" role="alert" hidden></p>
     </section>
 
     <section id="trust" class="card panel warn" aria-live="polite" hidden>
@@ -139,13 +162,28 @@
       <p id="stage" class="stage"></p>
       <progress id="bar" max="1" value="0"></progress>
       <p id="progress-text" class="hint"></p>
+      <p id="progress-note" class="risk" hidden>Don't unplug the stick.</p>
     </section>
 
     <section id="done" class="card panel success" aria-live="polite" hidden>
       <p id="summary" class="summary"></p>
       <p id="done-warning" class="hint" role="status" hidden></p>
       <p id="wall" class="hint"></p>
+      <div id="optimize-tip" class="tip" hidden>
+        <p>This stick could be ~2–3× faster for small files: <button id="tip-open" class="link" type="button">Optimize it</button></p>
+        <button id="tip-dismiss" type="button">Don't suggest again</button>
+      </div>
       <button id="copy-more" type="button">Copy more</button>
+    </section>
+
+    <section id="recovery" class="card panel warn" role="alert" hidden>
+      <p id="recovery-message" class="stage"></p>
+      <p id="recovery-text" class="recovery-text"></p>
+      <p id="recovery-warning" class="risk"></p>
+      <div class="button-row">
+        <button id="recovery-resume" class="accent" type="button" hidden>Resume optimize</button>
+        <button id="recovery-dismiss" type="button">Dismiss</button>
+      </div>
     </section>
 
     <section id="error" class="card panel error" role="alert" hidden>

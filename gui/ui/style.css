@@ -760,3 +760,73 @@ button.folder .arrow {
     padding: 0 var(--gutter);
   }
 }
+
+/* ---- optimize this stick ---- */
+
+.optimize-entry {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.optimize-entry .notice {
+  align-self: stretch;
+}
+
+.optimize-entry button.link {
+  margin-top: 8px;
+}
+
+#optimize {
+  scroll-margin-top: 12px;
+}
+
+#optimize:focus {
+  outline-offset: 0;
+}
+
+.optimize-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.optimize-lines p {
+  margin-top: 0;
+  color: var(--text);
+}
+
+#optimize-note {
+  margin-top: 4px;
+}
+
+.risk {
+  font-weight: 600;
+}
+
+.recovery-text {
+  font-size: 16px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.tip {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--success-text);
+}
+
+.tip p {
+  margin: 0;
+}
+
+.tip button.link {
+  padding: 0;
+  font-weight: 600;
+}

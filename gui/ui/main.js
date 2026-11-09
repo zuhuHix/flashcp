@@ -49,6 +49,21 @@ import {
   showCollision,
   clearCollision,
   collisionText,
+  optimizeAction,
+  optimizeEntryLabel,
+  optimizePlanView,
+  optimizeSummaryText,
+  optimizeErrorView,
+  progressIndeterminate,
+  openOptimize,
+  optimizePlanned,
+  optimizeFailed,
+  closeOptimize,
+  beginOptimize,
+  shouldShowOptimizeTip,
+  tipKey,
+  parseDismissed,
+  addDismissed,
 } from "./logic.js";
 
 const tauri = window.__TAURI__ || null;
@@ -104,6 +119,16 @@ let demoSettings = { autostart: false, notifyOnPlug: true };
 // ?pull=conflict: the first demo pull ends with the "already exist" error.
 const demoParams = new URLSearchParams(window.location.search);
 let demoConflictPending = !hasTauri && demoParams.get("pull") === "conflict";
+// ?optimize=a,b (preview only):
+//   resume    the demo stick has no filesystem and an interrupted optimize is pending
+//   recovery  the first optimize fails half-way through the rebuild, with the recovery message
+//   nospace   the plan refuses: not enough free space on this computer
+//   already   the plan says the stick is already optimized
+//   tip       the demo copy is many small files on a coarse stick (shows the optimize tip)
+const demoOptimize = new Set(hasTauri ? [] : (demoParams.get("optimize") || "").split(",").filter(Boolean));
+let demoOptimizePending = demoOptimize.has("resume");
+let demoRecoveryPending = demoOptimize.has("recovery");
+const TIP_KEY = "flashcp.optimizeTipDismissed";
 
 let state = {
   drives: [],
@@ -124,6 +149,10 @@ let state = {
   pullFolders: null,
   pullDestOverride: null,
   pullCollision: null,
+  optimize: null,
+  optimizeDriveId: null,
+  optimizePending: false,
+  tipDismissed: [],
 };
 
 const ids = [
@@ -141,6 +170,11 @@ const ids = [
   "pull-dest-card", "pull-dest-path", "pull-change", "pull-default",
   "collision", "collision-title", "collision-text", "collision-skip", "collision-overwrite",
   "collision-cancel", "pull-actions", "pull-start",
+  "optimize-entry", "optimize-open", "optimize-resume-note", "optimize", "optimize-status",
+  "optimize-body", "optimize-lines", "optimize-note", "optimize-risk", "optimize-error",
+  "optimize-confirm", "optimize-cancel", "progress-note",
+  "recovery", "recovery-message", "recovery-text", "recovery-warning", "recovery-resume",
+  "recovery-dismiss", "optimize-tip", "tip-open", "tip-dismiss",
 ];
 const els = Object.fromEntries(ids.map((id) => [id, document.getElementById(id)]));
 
@@ -152,6 +186,10 @@ let folderSig = null;
 let foldersInFlight = null;
 // Whether the collision panel was open on the last render (to move focus into it once).
 let collisionOpen = false;
+// Same for the optimize plan panel.
+let optimizeOpen = false;
+// Latest optimize_plan request; an older answer (panel closed or reopened meanwhile) is ignored.
+let planSeq = 0;
 
 function messageOf(err) {
   if (typeof err === "string") return err;
@@ -220,6 +258,24 @@ async function demoInvoke(cmd, args) {
       drive.trusted = true;
       return null;
     }
+    case "optimize_pending":
+      return demoOptimizePending;
+    case "optimize_plan": {
+      // Simulated: the real helper unmounts, dry-runs and remounts (and may ask for a password).
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      const drive = DEMO_DRIVES.find((d) => d.id === args.driveId);
+      if (!drive) throw new Error("Preview mode: unknown drive");
+      if (!drive.isExfat && !demoOptimizePending) throw new Error(`${drive.label} is not exFAT`);
+      return demoOptimizePlan(drive);
+    }
+    case "start_optimize": {
+      const drive = DEMO_DRIVES.find((d) => d.id === args.driveId);
+      if (!drive) throw new Error("Preview mode: unknown drive");
+      const fail = demoRecoveryPending;
+      demoRecoveryPending = false;
+      runDemoOptimize({ resume: !drive.isExfat, fail });
+      return null;
+    }
     default:
       throw new Error(`Preview mode: ${cmd} is not simulated`);
   }
@@ -228,8 +284,10 @@ async function demoInvoke(cmd, args) {
 // Simulated job for the browser preview: same stage sequence the backend emits.
 // extra.conflict: stop before copying with the "already exist" error (backend behaviour).
 function runDemoJob(total, op, extra = {}) {
-  const planFiles = 40;
-  const planBytes = 120_000_000;
+  // ?optimize=tip: an add copies many small files onto a coarse-cluster stick (the optimize tip shows).
+  const tip = op === "add" && demoOptimize.has("tip");
+  const planFiles = tip ? 4000 : 40;
+  const planBytes = tip ? 400_000_000 : 120_000_000;
   const base = { op, total, index: 0, filesDone: 0, bytesDone: 0, planFiles, planBytes, message: null, summary: null, conflict: false };
   let steps;
   if (extra.conflict) {
@@ -268,11 +326,112 @@ function runDemoJob(total, op, extra = {}) {
         mountPoint: op === "pull" ? null : DEMO_DRIVES[0].mountPoint,
         dest: op === "pull" ? extra.dest : null,
         warning: null,
+        clusterBytes: op === "add" ? (tip ? 32768 : 4096) : null,
       },
     });
   }
   steps.forEach((step, n) => {
     setTimeout(() => onJob({ ...base, ...step, planFiles, planBytes }), 350 * (n + 1));
+  });
+}
+
+// The demo stick's plan. A stick with no filesystem (resume) has no old cluster size.
+function demoOptimizePlan(drive) {
+  const resume = !drive.isExfat && demoOptimizePending;
+  return {
+    files: 20000,
+    dirs: 900,
+    bytes: 169_000_000,
+    writeBytes: 169_000_000,
+    temp: "/home/demo/.cache/flashcp/optimize",
+    oldCluster: resume ? null : 32768,
+    newCluster: 4096,
+    label: drive.label,
+    resume,
+    alreadyOptimized: demoOptimize.has("already"),
+    needBytes: 1_200_000_000,
+    tempFree: demoOptimize.has("nospace") ? 300_000_000 : 48_000_000_000,
+    enoughSpace: !demoOptimize.has("nospace"),
+  };
+}
+
+// Demo drive without a filesystem (an interrupted optimize) or back to exFAT.
+function demoSetFs(exfat) {
+  DEMO_DRIVES[0].fsType = exfat ? "exfat" : "";
+  DEMO_DRIVES[0].isExfat = exfat;
+}
+if (!hasTauri && demoOptimizePending) demoSetFs(false);
+
+// Simulated optimize job: the phases and step numbers the backend reports, each with its
+// own per-phase progress. resume starts at the check of the existing copy (no copy step).
+// fail stops half-way through the rebuild with the recovery message.
+function runDemoOptimize({ resume = false, fail = false } = {}) {
+  const names = resume ? ["verify", "build", "check", "cleanup"] : ["pull", "verify", "build", "check", "cleanup"];
+  const planFiles = 20000;
+  const planBytes = 169_000_000;
+  const base = { op: "optimize", index: 0, total: 1, message: null, summary: null, conflict: false };
+  const updates = [{ stage: "unmounting", filesDone: 0, bytesDone: 0, planFiles, planBytes }];
+  for (let i = 0; i < names.length; i++) {
+    const phase = names[i];
+    const step = i + 1;
+    const bytes = phase === "cleanup" ? 0 : planBytes;
+    if (phase === "build") updates.push({ stage: "authorizing", phase, step, steps: names.length, planFiles, planBytes: bytes });
+    const fractions = fail && phase === "build" ? [0.4] : [0.25, 0.5, 0.75, 1];
+    for (const f of fractions) {
+      updates.push({
+        stage: "running",
+        phase,
+        step,
+        steps: names.length,
+        filesDone: Math.round(planFiles * f),
+        bytesDone: Math.round(bytes * f),
+        planFiles,
+        planBytes: bytes,
+      });
+    }
+    if (fail && phase === "build") {
+      updates.push({
+        stage: "error",
+        phase,
+        step,
+        steps: names.length,
+        planFiles,
+        planBytes: bytes,
+        message: "Optimize stopped while the stick was being rebuilt.",
+        recovery: "Your verified copy is kept in /home/demo/.cache/flashcp/optimize.",
+      });
+      break;
+    }
+  }
+  if (!fail) {
+    updates.push({
+      stage: "done",
+      planFiles,
+      planBytes,
+      summary: {
+        files: planFiles,
+        bytes: planBytes,
+        secs: 155,
+        wallSecs: 170,
+        mountPoint: DEMO_DRIVES[0].mountPoint,
+        dest: null,
+        warning: null,
+        clusterBytes: null,
+      },
+    });
+  }
+  updates.forEach((u, n) => {
+    setTimeout(() => {
+      // The stick is rebuilt on success and has no filesystem after a failed rebuild.
+      if (u.stage === "done") {
+        demoSetFs(true);
+        demoOptimizePending = false;
+      } else if (u.stage === "error") {
+        demoSetFs(false);
+        demoOptimizePending = true;
+      }
+      onJob({ ...base, filesDone: 0, bytesDone: 0, planFiles, planBytes, ...u });
+    }, 350 * (n + 1));
   });
 }
 
@@ -294,6 +453,12 @@ function onJob(update) {
     next = showCollision(next, pullDestination(state), "conflict");
   }
   setState(next);
+  // A finished job can change the stick's filesystem (an optimize leaves it without one, or rebuilds it),
+  // so the drive list and the Resume entry are refreshed.
+  if (update && (update.stage === "done" || update.stage === "error")) {
+    refreshDrives();
+    refreshOptimizePending();
+  }
 }
 
 function failJob(message) {
@@ -315,11 +480,94 @@ function failJob(message) {
 async function refreshDrives() {
   try {
     const drives = await call("list_drives");
-    const next = selectDrive({ ...state, drives }, defaultSelection(drives, state.selectedId));
+    await refreshOptimizePending();
+    const next = selectDrive({ ...state, drives }, defaultSelection(drives, state.selectedId, state.optimizePending));
     setState(next);
   } catch (err) {
     setNotice(`Could not list drives: ${messageOf(err)}`);
   }
+}
+
+// ---- Optimize this stick ---------------------------------------------------------
+
+function loadTipDismissed() {
+  try {
+    return parseDismissed(window.localStorage.getItem(TIP_KEY));
+  } catch {
+    return [];
+  }
+}
+
+function saveTipDismissed(list) {
+  try {
+    window.localStorage.setItem(TIP_KEY, JSON.stringify(list));
+  } catch {
+    // Storage is blocked: the dismissal lasts until the window closes.
+  }
+}
+
+async function refreshOptimizePending() {
+  let pending = false;
+  try {
+    pending = (await call("optimize_pending")) === true;
+  } catch {
+    pending = false;
+  }
+  if (pending !== state.optimizePending) setState({ ...state, optimizePending: pending });
+}
+
+// Open the plan panel and ask the helper for the plan (it unmounts, dry-runs and remounts).
+async function openOptimizePanel() {
+  const drive = selectedDrive(state);
+  if (!drive || !optimizeAction(state, state.optimizePending)) return;
+  const seq = ++planSeq;
+  setState(openOptimize(state, drive.id));
+  let outcome;
+  try {
+    outcome = { plan: await call("optimize_plan", { driveId: drive.id }) };
+  } catch (err) {
+    outcome = { error: messageOf(err) };
+  }
+  // The dry run unmounts and remounts the stick, so the drive list may have changed.
+  refreshDrives();
+  if (seq !== planSeq || !state.optimize) return;
+  setState(outcome.error === undefined ? optimizePlanned(state, outcome.plan) : optimizeFailed(state, outcome.error));
+}
+
+function closeOptimizePanel() {
+  planSeq++; // a plan still in flight must not reopen the panel
+  setState(closeOptimize(state));
+}
+
+async function startOptimizeFromPlan() {
+  const opt = state.optimize;
+  const view = opt && opt.status === "ready" ? optimizePlanView(opt.plan) : null;
+  if (!view || !view.canConfirm || jobActive(state)) return;
+  await runOptimize(opt.driveId);
+}
+
+// Start the optimize job for a drive: the progress view takes over; a failure lands in the error view.
+async function runOptimize(driveId) {
+  setState(beginOptimize(state, driveId));
+  try {
+    await call("start_optimize", { driveId });
+  } catch (err) {
+    failJob(messageOf(err));
+  }
+}
+
+// Resume straight from the recovery panel: same drive, no new plan.
+function resumeOptimize() {
+  if (!state.optimizeDriveId || jobActive(state)) return;
+  runOptimize(state.optimizeDriveId);
+}
+
+function dismissTip() {
+  const drive = selectedDrive(state);
+  if (!drive) return;
+  const dismissed = addDismissed(state.tipDismissed, tipKey(drive));
+  saveTipDismissed(dismissed);
+  setState({ ...state, tipDismissed: dismissed });
 }
 
 function addSources(paths) {
@@ -568,6 +816,9 @@ function render() {
   // Trust: shown while the selected drive is not trusted
   renderTrust(drive, busy);
 
+  // Optimize: the entry on the drive card and the plan panel
+  renderOptimize(busy);
+
   // Copy button
   els.copy.textContent = drive ? `Fast copy to ${driveTitle(drive)}` : "Fast copy";
   els.copy.disabled = !canCopy(state);
@@ -576,8 +827,11 @@ function render() {
   els.progress.hidden = !busy;
   if (busy) {
     els.stage.textContent = stageText(job);
-    els.bar.value = progressFraction(job);
+    // Optimize's cleanup phase (and any phase without bytes) has no fraction: the bar runs indeterminate.
+    if (progressIndeterminate(job)) els.bar.removeAttribute("value");
+    else els.bar.value = progressFraction(job);
     els["progress-text"].textContent = progressText(job);
+    els["progress-note"].hidden = job.op !== "optimize";
   }
 
   // Done
@@ -585,18 +839,35 @@ function render() {
   els.done.hidden = !done;
   if (done) {
     const isPull = job.op === "pull";
-    els.summary.textContent = isPull ? pullSummaryText(job.summary) : summaryText(job.summary);
+    const isOptimize = job.op === "optimize";
+    els.summary.textContent = isOptimize
+      ? optimizeSummaryText(job.summary)
+      : isPull
+        ? pullSummaryText(job.summary)
+        : summaryText(job.summary);
     const warning = isPull && job.summary.warning ? job.summary.warning : "";
     els["done-warning"].hidden = !warning;
     els["done-warning"].textContent = warning;
     const mount = job.summary.mountPoint ? ` Drive is mounted at ${job.summary.mountPoint}.` : "";
     els.wall.textContent = `Whole job including unmount and remount: ${formatDuration(job.summary.wallSecs)}.${mount}`;
   }
+  els["optimize-tip"].hidden = !shouldShowOptimizeTip(job, drive, state.tipDismissed);
 
-  // Error (a collision is shown in its own panel instead)
+  // Error (a collision is shown in its own panel instead; an optimize that may have left the
+  // stick half-built shows its recovery panel)
   const failed = job && job.stage === "error";
-  els.error.hidden = !failed || collisionShown;
-  if (failed) els["error-message"].textContent = stageText(job);
+  const recovery = failed && job.op === "optimize" ? optimizeErrorView(job) : null;
+  const recovering = !!recovery && recovery.recovery !== null;
+  els.recovery.hidden = !recovering;
+  if (recovering) {
+    els["recovery-message"].textContent = recovery.message;
+    els["recovery-text"].textContent = recovery.recovery;
+    els["recovery-warning"].textContent = recovery.warning;
+    els["recovery-resume"].hidden = !recovery.canResume;
+    els["recovery-resume"].disabled = busy || !state.optimizeDriveId;
+  }
+  els.error.hidden = !failed || collisionShown || recovering;
+  if (failed && !recovering) els["error-message"].textContent = stageText(job);
 
   // Notice
   els.notice.hidden = !state.notice;
@@ -765,6 +1036,57 @@ function renderTrust(drive, busy) {
   els["trust-error"].textContent = state.trustError || "";
 }
 
+function renderOptimize(busy) {
+  const action = optimizeAction(state, state.optimizePending);
+  const opt = state.optimize;
+
+  // Entry under the drive card; hidden while the plan panel is open.
+  const entryShown = !!action && !opt;
+  els["optimize-entry"].hidden = !entryShown;
+  if (entryShown) {
+    els["optimize-open"].textContent = optimizeEntryLabel(action);
+    els["optimize-resume-note"].hidden = action !== "resume";
+  }
+
+  els.optimize.hidden = !opt;
+  if (!opt) {
+    optimizeOpen = false;
+    return;
+  }
+
+  const view = opt.plan ? optimizePlanView(opt.plan) : null;
+  const errorText = opt.status === "error" ? opt.error : view ? view.error : null;
+  els["optimize-status"].hidden = opt.status !== "checking";
+  els["optimize-error"].hidden = !errorText;
+  els["optimize-error"].textContent = errorText || "";
+
+  els["optimize-body"].hidden = !view;
+  if (view) {
+    els["optimize-note"].hidden = !view.note;
+    els["optimize-note"].textContent = view.note || "";
+    els["optimize-lines"].replaceChildren(
+      ...view.lines.map((text) => {
+        const p = document.createElement("p");
+        p.className = "hint";
+        p.textContent = text;
+        return p;
+      }),
+    );
+    els["optimize-risk"].hidden = !view.canConfirm;
+    els["optimize-risk"].textContent = view.risk;
+    els["optimize-confirm"].hidden = !view.canConfirm;
+    els["optimize-confirm"].textContent = view.confirmLabel;
+    els["optimize-confirm"].disabled = busy;
+  }
+  // Cancel while a choice is open; Close when there is nothing to confirm.
+  els["optimize-cancel"].textContent = view && view.canConfirm ? "Cancel" : "Close";
+
+  if (!optimizeOpen) {
+    optimizeOpen = true;
+    els.optimize.focus();
+  }
+}
+
 function renderDrives() {
   const sig = JSON.stringify([state.drives, state.selectedId, jobActive(state)]);
   if (sig === drivesSig) return;
@@ -922,6 +1244,14 @@ function wire() {
   els["trust-cancel"].addEventListener("click", cancelTrust);
   els["trust-yes"].addEventListener("click", startTrust);
 
+  els["optimize-open"].addEventListener("click", () => openOptimizePanel());
+  els["optimize-confirm"].addEventListener("click", () => startOptimizeFromPlan());
+  els["optimize-cancel"].addEventListener("click", closeOptimizePanel);
+  els["tip-open"].addEventListener("click", () => openOptimizePanel());
+  els["tip-dismiss"].addEventListener("click", dismissTip);
+  els["recovery-resume"].addEventListener("click", resumeOptimize);
+  els["recovery-dismiss"].addEventListener("click", () => setState(dismissJob(state)));
+
   els["set-autostart"].addEventListener("change", () =>
     changeSetting({ autostart: els["set-autostart"].checked }),
   );
@@ -963,6 +1293,7 @@ async function listenToBackend() {
 async function init() {
   // Preview only: ?mode=pull opens the Copy from USB view.
   if (!hasTauri && demoParams.get("mode") === "pull") state = { ...state, mode: "pull" };
+  state = { ...state, tipDismissed: loadTipDismissed() };
 
   wire();
   wireDragDrop();
