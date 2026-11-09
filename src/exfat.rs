@@ -669,6 +669,33 @@ pub(crate) struct Target {
     pub(crate) part_off: u64,
     /// O_DIRECT is available on this file (and currently enabled; see [`set_direct`]).
     pub(crate) direct: bool,
+    /// Restores the open file description's original status flags when the run ends, on
+    /// every path (success, error, unwind). Matters for --target-fd, whose description is
+    /// shared with the helper that opened it.
+    pub(crate) _flags: FlagGuard,
+}
+
+/// Snapshot of an open file description's status flags (F_GETFL), restored on Drop. Holds its
+/// own dup of the fd (same description), so it works whoever closes the original first.
+pub(crate) struct FlagGuard {
+    file: File,
+    flags: libc::c_int,
+}
+
+impl FlagGuard {
+    pub(crate) fn new(f: &File) -> Result<FlagGuard> {
+        use std::os::unix::io::AsRawFd;
+        let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) };
+        ensure!(flags >= 0, "F_GETFL failed: {}", std::io::Error::last_os_error());
+        Ok(FlagGuard { file: f.try_clone().context("dup target fd")?, flags })
+    }
+}
+
+impl Drop for FlagGuard {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_SETFL, self.flags) };
+    }
 }
 
 /// Where to write: a path flashcp opens itself, or an inherited file descriptor that a
@@ -772,8 +799,9 @@ pub(crate) fn open_target(path: &Path) -> Result<Target> {
             return Err(anyhow::Error::new(e).context(format!("flock {}", path.display())));
         }
         ensure!(md.len() > 0, "image file is empty; create it first, e.g. truncate -s 8G image.img");
+        let _flags = FlagGuard::new(&file)?;
         let direct = set_direct(&file, true);
-        Ok(Target { file, bytes: md.len(), part_off: 0, direct })
+        Ok(Target { file, bytes: md.len(), part_off: 0, direct, _flags })
     } else {
         bail!("{} is neither a block device nor a regular image file", path.display())
     }
@@ -809,7 +837,8 @@ pub(crate) fn open_target_fd(fd: std::os::unix::io::RawFd, write: bool) -> Resul
         block_target(file, &md, &name)
     } else {
         let bytes = blk_size(&file)?;
-        Ok(Target { file, bytes, part_off: 0, direct: false })
+        let _flags = FlagGuard::new(&file)?;
+        Ok(Target { file, bytes, part_off: 0, direct: false, _flags })
     }
 }
 
@@ -828,8 +857,9 @@ fn block_target(file: File, md: &fs::Metadata, name: &str) -> Result<Target> {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0u64);
+    let _flags = FlagGuard::new(&file)?;
     let direct = set_direct(&file, true);
-    Ok(Target { file, bytes: size, part_off: start, direct })
+    Ok(Target { file, bytes: size, part_off: start, direct, _flags })
 }
 
 /// Best-effort (device, mount point) of a mounted block device at `path`, its partitions or
@@ -1209,6 +1239,56 @@ mod tests {
         assert!(fd_err(rw, true).contains("not a block device")); // consumed (closed) by the call
         let ro = File::open(&p).unwrap().into_raw_fd();
         assert!(fd_err(ro, false).contains("not a block device"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn getfl(f: &File) -> libc::c_int {
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) }
+    }
+
+    /// The flags of the shared open file description come back exactly as they were, whether
+    /// the run succeeds, fails, or panics. `observer` is a dup (same description), like the
+    /// helper's own fd under --target-fd.
+    #[test]
+    fn target_flags_restored_on_every_path() {
+        let dir = std::env::temp_dir().join(format!("flashcp-flags-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("img");
+        File::create(&p).unwrap().set_len(1 << 20).unwrap();
+        let run = |fail: bool, panic: bool| -> (libc::c_int, libc::c_int) {
+            let t = open_target(&p).unwrap(); // enables O_DIRECT where supported
+            let observer = t.file.try_clone().unwrap();
+            let before = t._flags.flags;
+            // Toggle something every filesystem supports too, so a change is always visible.
+            let toggled = getfl(&t.file) ^ libc::O_APPEND;
+            assert_eq!(
+                unsafe { libc::fcntl(std::os::unix::io::AsRawFd::as_raw_fd(&t.file), libc::F_SETFL, toggled) },
+                0
+            );
+            assert_ne!(getfl(&observer), before, "flags did not change during the run");
+            let body = std::panic::AssertUnwindSafe(move || -> Result<()> {
+                let _t = t;
+                if panic {
+                    panic!("injected panic");
+                }
+                if fail {
+                    bail!("injected error");
+                }
+                Ok(())
+            });
+            let r = std::panic::catch_unwind(body);
+            assert_eq!(r.is_err(), panic);
+            if let Ok(res) = r {
+                assert_eq!(res.is_err(), fail);
+            }
+            (before, getfl(&observer))
+        };
+        for (fail, panic) in [(false, false), (true, false), (false, true)] {
+            let (before, after) = run(fail, panic);
+            assert_eq!(after, before, "flags not restored (fail={fail}, panic={panic})");
+            assert_eq!(after & libc::O_DIRECT, 0, "O_DIRECT left on (fail={fail}, panic={panic})");
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
