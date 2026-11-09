@@ -6,7 +6,7 @@ use flashcp::{add, bench, copy, dataset, exfat, optimize, pack, probe, pull, uti
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "flashcp", about = "Fast file transfer to USB sticks and external drives")]
+#[command(name = "flashcp", version, about = "Fast file transfer to USB sticks and external drives")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
