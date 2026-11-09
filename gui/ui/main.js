@@ -266,11 +266,12 @@ async function demoInvoke(cmd, args) {
       const drive = DEMO_DRIVES.find((d) => d.id === args.driveId);
       if (!drive) throw new Error("Preview mode: unknown drive");
       if (!drive.isExfat && !demoOptimizePending) throw new Error(`${drive.label} is not exFAT`);
-      return demoOptimizePlan(drive);
+      return { ...demoOptimizePlan(drive), token: `demo-${Date.now()}` };
     }
     case "start_optimize": {
       const drive = DEMO_DRIVES.find((d) => d.id === args.driveId);
       if (!drive) throw new Error("Preview mode: unknown drive");
+      if (!args.token) throw new Error("This optimize plan is unknown or was already used, please plan again.");
       const fail = demoRecoveryPending;
       demoRecoveryPending = false;
       runDemoOptimize({ resume: !drive.isExfat, fail });
@@ -520,6 +521,12 @@ async function refreshOptimizePending() {
 async function openOptimizePanel() {
   const drive = selectedDrive(state);
   if (!drive || !optimizeAction(state, state.optimizePending)) return;
+  await planOptimize(drive.id);
+}
+
+// Plan (dry run) for one drive. The plan carries the single-use token start_optimize needs.
+async function planOptimize(driveId) {
+  const drive = { id: driveId };
   const seq = ++planSeq;
   setState(openOptimize(state, drive.id));
   let outcome;
@@ -543,23 +550,26 @@ async function startOptimizeFromPlan() {
   const opt = state.optimize;
   const view = opt && opt.status === "ready" ? optimizePlanView(opt.plan) : null;
   if (!view || !view.canConfirm || jobActive(state)) return;
-  await runOptimize(opt.driveId);
+  await runOptimize(opt.driveId, opt.plan.token);
 }
 
 // Start the optimize job for a drive: the progress view takes over; a failure lands in the error view.
-async function runOptimize(driveId) {
+async function runOptimize(driveId, token) {
   setState(beginOptimize(state, driveId));
   try {
-    await call("start_optimize", { driveId });
+    await call("start_optimize", { driveId, token });
   } catch (err) {
     failJob(messageOf(err));
   }
 }
 
-// Resume straight from the recovery panel: same drive, no new plan.
+// Resume from the recovery panel: a fresh dry run of the same drive (flashcp reports the
+// interrupted job), shown in the plan panel for its own confirmation.
 function resumeOptimize() {
   if (!state.optimizeDriveId || jobActive(state)) return;
-  runOptimize(state.optimizeDriveId);
+  const driveId = state.optimizeDriveId;
+  setState(dismissJob(selectDrive(state, driveId)));
+  planOptimize(driveId);
 }
 
 function dismissTip() {

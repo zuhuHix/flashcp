@@ -1123,6 +1123,9 @@ export function optimizeResumeText(plan) {
 export function optimizePlanMode(plan) {
   if (plan.alreadyOptimized === true) return "already";
   if (plan.enoughSpace !== true) return "refused";
+  if (plan.tempVolatile === true) return "volatile";
+  // Without a confirmation token the backend would refuse to start it anyway.
+  if (typeof plan.token !== "string" || plan.token === "") return "refused";
   return plan.resume === true ? "resume" : "ready";
 }
 
@@ -1149,8 +1152,14 @@ export function optimizePlanView(plan) {
   };
   if (mode === "already") {
     view.note = "This stick is already optimized. Nothing to do.";
+  } else if (mode === "volatile") {
+    view.error =
+      `The temporary copy would be kept in memory (${plan.temp || "your cache folder"} is on tmpfs), ` +
+      "so a crash while the stick is rebuilt could lose your files. Optimize needs a folder on a disk.";
   } else if (mode === "refused") {
-    view.error = `${optimizeSpaceText(plan)} Free up space on this computer, then check again.`;
+    view.error = plan.enoughSpace === true
+      ? "This plan cannot be started. Close it and check the stick again."
+      : `${optimizeSpaceText(plan)} Free up space on this computer, then check again.`;
   } else {
     if (mode === "resume") view.lines.push(optimizeResumeText(plan));
     view.lines.push(OPTIMIZE_WHAT, optimizeKeptText(plan), OPTIMIZE_LOST, optimizeTimeText(plan));

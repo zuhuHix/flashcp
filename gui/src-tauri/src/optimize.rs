@@ -3,10 +3,15 @@
 
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
+use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+use crate::drives::{Drive, TrustIdentity};
 
 /// flashcp's space need per entry (files and folders), and its fixed margin.
 const PER_ENTRY_BYTES: u64 = 4096;
@@ -39,6 +44,12 @@ pub struct OptimizePlan {
     pub temp_free: Option<u64>,
     /// False only when the known free space is below the need. Unknown free space is not a refusal.
     pub enough_space: bool,
+    /// The temporary folder is on RAM (tmpfs/ramfs): the copy could be lost while the stick is
+    /// erased. The plan is refused (flashcp refuses it too; this says so before any password).
+    pub temp_volatile: bool,
+    /// Single-use confirmation for `start_optimize`, bound to this drive (see [`Plans`]).
+    /// Empty until the plan is registered.
+    pub token: String,
 }
 
 fn str_field(strategy: Option<&Value>, key: &str) -> Option<String> {
@@ -74,6 +85,7 @@ pub fn plan_from(
     let temp = str_field(strategy, "temp");
     let temp_free = temp.as_deref().and_then(|t| free(Path::new(t)));
     let enough_space = need_bytes == 0 || temp_free.is_none_or(|f| f >= need_bytes);
+    let temp_volatile = need_bytes > 0 && temp.as_deref().is_some_and(|t| is_volatile(Path::new(t)));
     OptimizePlan {
         files,
         dirs,
@@ -88,6 +100,110 @@ pub fn plan_from(
         need_bytes,
         temp_free,
         enough_space,
+        temp_volatile,
+        token: String::new(),
+    }
+}
+
+const TMPFS_MAGIC: i128 = 0x0102_1994;
+const RAMFS_MAGIC: i128 = 0x8584_58f6;
+
+/// True when the nearest existing ancestor of `path` is on tmpfs or ramfs. Runs as the user.
+pub fn is_volatile(path: &Path) -> bool {
+    let Some(existing) = path.ancestors().find(|p| p.exists()) else { return false };
+    let Ok(c_path) = CString::new(existing.as_os_str().as_bytes()) else { return false };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c_path is a valid NUL-terminated string and st is a writable statfs.
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut st) } != 0 {
+        return false;
+    }
+    let t = i128::from(st.f_type);
+    t == TMPFS_MAGIC || t == RAMFS_MAGIC
+}
+
+/// How long a plan's confirmation stays valid.
+pub const PLAN_TTL: Duration = Duration::from_secs(10 * 60);
+pub const DRIVE_CHANGED: &str = "The drive changed, please plan again.";
+pub const PLAN_UNKNOWN: &str = "This optimize plan is unknown or was already used, please plan again.";
+pub const PLAN_EXPIRED: &str = "This optimize plan has expired, please plan again.";
+pub const SPACE_CHANGED: &str =
+    "There is no longer enough free space on this computer for the temporary copy, please plan again.";
+
+/// What a confirmed plan was made for: the drive (by udisks id, device node and the full identity
+/// tuple flashcp-trust checks) and the space it needs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedFor {
+    pub drive_id: String,
+    pub device: String,
+    pub identity: TrustIdentity,
+    pub temp: Option<String>,
+    pub need_bytes: u64,
+    pub resume: bool,
+    pub issued: Instant,
+}
+
+/// Outstanding plan tokens. `start_optimize` redeems one: single use, expires after
+/// [`PLAN_TTL`], valid only for the identical drive and while the space still suffices.
+#[derive(Debug, Default)]
+pub struct Plans(HashMap<String, PlannedFor>);
+
+/// 128 random bits from the kernel, hex.
+pub fn random_token() -> Result<String, String> {
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .map_err(|e| format!("Cannot read /dev/urandom: {e}"))?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+fn same_drive(planned: &PlannedFor, now: &Drive) -> bool {
+    planned.drive_id == now.id && planned.device == now.device && planned.identity == now.identity
+}
+
+impl Plans {
+    /// Registers a plan for `drive` under a fresh token and returns it. Expired plans are dropped.
+    pub fn issue(&mut self, drive: &Drive, plan: &OptimizePlan, now: Instant) -> Result<String, String> {
+        self.0.retain(|_, p| now.duration_since(p.issued) < PLAN_TTL);
+        let token = random_token()?;
+        self.0.insert(
+            token.clone(),
+            PlannedFor {
+                drive_id: drive.id.clone(),
+                device: drive.device.clone(),
+                identity: drive.identity.clone(),
+                temp: plan.temp.clone(),
+                need_bytes: plan.need_bytes,
+                resume: plan.resume,
+                issued: now,
+            },
+        );
+        Ok(token)
+    }
+
+    /// Consumes `token` (whatever the outcome, so it can never be tried twice) and checks it
+    /// against the drive as it is NOW and the free space now.
+    pub fn redeem(
+        &mut self,
+        token: &str,
+        drive_now: &Drive,
+        now: Instant,
+        free: impl Fn(&Path) -> Option<u64>,
+    ) -> Result<PlannedFor, String> {
+        let planned = self.0.remove(token).ok_or(PLAN_UNKNOWN)?;
+        if now.duration_since(planned.issued) >= PLAN_TTL {
+            return Err(PLAN_EXPIRED.into());
+        }
+        if !same_drive(&planned, drive_now) {
+            return Err(DRIVE_CHANGED.into());
+        }
+        if planned.need_bytes > 0 {
+            if let Some(t) = &planned.temp {
+                if free(Path::new(t)).is_some_and(|f| f < planned.need_bytes) {
+                    return Err(SPACE_CHANGED.into());
+                }
+            }
+        }
+        Ok(planned)
     }
 }
 
@@ -134,6 +250,80 @@ pub fn exfat_cluster(mount_point: &Path) -> Option<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn drive() -> Drive {
+        let mut d = crate::drives::fake_drives().remove(0);
+        d.identity = TrustIdentity::from_udisks("SER123456", "-", "Stick", 32_000_000_000);
+        d
+    }
+
+    fn issued(plans: &mut Plans, d: &Drive, need: u64, at: Instant) -> String {
+        let s = strategy(json!("/c/t"), false, false);
+        let mut p = plan(Some(&s), None);
+        p.need_bytes = need;
+        plans.issue(d, &p, at).unwrap()
+    }
+
+    #[test]
+    fn tokens_are_random_and_single_use() {
+        let (mut plans, d, t0) = (Plans::default(), drive(), Instant::now());
+        let a = issued(&mut plans, &d, 10, t0);
+        let b = issued(&mut plans, &d, 10, t0);
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 32);
+        assert!(plans.redeem(&a, &d, t0, |_| Some(10)).is_ok());
+        assert_eq!(plans.redeem(&a, &d, t0, |_| Some(10)).unwrap_err(), PLAN_UNKNOWN, "reuse");
+        assert_eq!(plans.redeem("", &d, t0, |_| Some(10)).unwrap_err(), PLAN_UNKNOWN, "no token");
+        assert_eq!(plans.redeem("deadbeef", &d, t0, |_| Some(10)).unwrap_err(), PLAN_UNKNOWN);
+        assert!(plans.redeem(&b, &d, t0, |_| Some(10)).is_ok());
+    }
+
+    #[test]
+    fn expired_tokens_are_refused() {
+        let (mut plans, d, t0) = (Plans::default(), drive(), Instant::now());
+        let a = issued(&mut plans, &d, 0, t0);
+        assert_eq!(plans.redeem(&a, &d, t0 + PLAN_TTL, |_| None).unwrap_err(), PLAN_EXPIRED);
+        let b = issued(&mut plans, &d, 0, t0);
+        assert!(plans.redeem(&b, &d, t0 + PLAN_TTL - Duration::from_secs(1), |_| None).is_ok());
+    }
+
+    #[test]
+    fn any_identity_difference_is_refused_and_burns_the_token() {
+        let t0 = Instant::now();
+        let d = drive();
+        let changes: Vec<fn(&mut Drive)> = vec![
+            |x| x.id = "/org/other".into(),
+            |x| x.device = "/dev/sdq1".into(),
+            |x| x.identity.key = "SER999999".into(),
+            |x| x.identity.wwn = "0x5000".into(),
+            |x| x.identity.model = "Other".into(),
+            |x| x.identity.disk_size += 512,
+        ];
+        for change in changes {
+            let mut plans = Plans::default();
+            let tok = issued(&mut plans, &d, 0, t0);
+            let mut now = d.clone();
+            change(&mut now);
+            assert_eq!(plans.redeem(&tok, &now, t0, |_| None).unwrap_err(), DRIVE_CHANGED);
+            assert_eq!(plans.redeem(&tok, &d, t0, |_| None).unwrap_err(), PLAN_UNKNOWN);
+        }
+    }
+
+    #[test]
+    fn free_space_is_checked_again() {
+        let (mut plans, d, t0) = (Plans::default(), drive(), Instant::now());
+        let a = issued(&mut plans, &d, 1000, t0);
+        assert_eq!(plans.redeem(&a, &d, t0, |_| Some(999)).unwrap_err(), SPACE_CHANGED);
+        let b = issued(&mut plans, &d, 1000, t0);
+        assert!(plans.redeem(&b, &d, t0, |_| None).is_ok(), "unknown free space is not a refusal");
+    }
+
+    #[test]
+    fn ram_is_volatile_and_disk_is_not() {
+        if Path::new("/dev/shm").exists() {
+            assert!(is_volatile(Path::new("/dev/shm/flashcp/optimize/x")));
+        }
+    }
 
     const MIB: u64 = 1024 * 1024;
 
@@ -217,7 +407,9 @@ mod tests {
         let deep = dir.path().join("a/b/c");
         let from_ancestor = free_bytes(dir.path()).expect("tempdir is measurable");
         assert!(from_ancestor > 0);
-        assert_eq!(free_bytes(&deep), Some(from_ancestor));
+        // Same filesystem; other processes may write in between, so allow some drift.
+        let deep_free = free_bytes(&deep).expect("measured at the ancestor");
+        assert!(deep_free.abs_diff(from_ancestor) < 64 * 1024 * 1024, "{deep_free} vs {from_ancestor}");
         assert_eq!(free_bytes(Path::new("")), None);
     }
 

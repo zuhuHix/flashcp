@@ -26,7 +26,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{App, AppHandle, Emitter, Manager, State, WindowEvent};
@@ -42,6 +42,8 @@ pub struct AppState {
     pending_pull: Mutex<Option<PullRequest>>,
     /// Drive ids seen at the last refresh, used to notify only for newly plugged drives.
     known: Mutex<HashSet<String>>,
+    /// Confirmations `optimize_plan` handed out; `start_optimize` redeems one.
+    plans: Mutex<optimize::Plans>,
 }
 
 impl Default for AppState {
@@ -51,6 +53,7 @@ impl Default for AppState {
             pending: Mutex::new(Vec::new()),
             pending_pull: Mutex::new(None),
             known: Mutex::new(HashSet::new()),
+            plans: Mutex::new(optimize::Plans::default()),
         }
     }
 }
@@ -287,35 +290,54 @@ fn optimize_dry_run(drive: Drive) -> Result<OptimizePlan, String> {
 /// What "Optimize this stick" would do to this drive, for the confirmation dialog.
 #[tauri::command]
 async fn optimize_plan(state: State<'_, AppState>, drive_id: String) -> Result<OptimizePlan, String> {
-    let lock = JobLock::acquire(&state.job_running)?;
+    let job_lock = JobLock::acquire(&state.job_running)?;
     let drive = find_drive(drives_now().await?, &drive_id)?;
     require_optimizable(&drive)?;
     require_trusted(&drive)?;
     runner::optimize_temp_dir()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let _lock = lock;
+    let planned = drive.clone();
+    let mut plan = tauri::async_runtime::spawn_blocking(move || {
+        let _lock = job_lock;
         optimize_dry_run(drive)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+    // Only a plan that can be started gets a confirmation token.
+    if !plan.already_optimized && plan.enough_space && !plan.temp_volatile {
+        plan.token = lock(&state.plans).issue(&planned, &plan, Instant::now())?;
+    }
+    Ok(plan)
 }
 
-/// Rewrites the drive with flashcp optimize (through the helper or directly). Runs as a job.
-#[tauri::command]
-async fn start_optimize(app: AppHandle, state: State<'_, AppState>, drive_id: String) -> Result<(), String> {
-    let lock = JobLock::acquire(&state.job_running)?;
-    let drive = find_drive(drives_now().await?, &drive_id)?;
+/// The job for a confirmed plan: the token must be one `optimize_plan` issued, unused, unexpired,
+/// for this very drive (same udisks id, device and identity tuple as now), with the space still
+/// free. Anything else is refused before anything runs.
+fn optimize_request(plans: &Mutex<optimize::Plans>, token: &str, drive: Drive) -> Result<Request, String> {
     require_optimizable(&drive)?;
     require_trusted(&drive)?;
     runner::optimize_temp_dir()?;
-    let request = Request {
+    lock(plans).redeem(token, &drive, Instant::now(), optimize::free_bytes)?;
+    Ok(Request {
         op: events::Op::Optimize,
         drive,
         action: Action::Optimize { dry_run: false },
         total: 1,
         stage_dir: PathBuf::new(),
         staged: Vec::new(),
-    };
+    })
+}
+
+/// Rewrites the drive with flashcp optimize (through the helper or directly). Runs as a job.
+#[tauri::command]
+async fn start_optimize(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    drive_id: String,
+    token: String,
+) -> Result<(), String> {
+    let lock = JobLock::acquire(&state.job_running)?;
+    let drive = find_drive(drives_now().await?, &drive_id).map_err(|_| optimize::DRIVE_CHANGED.to_string())?;
+    let request = optimize_request(&state.plans, &token, drive)?;
     job::spawn(app, request, lock)
 }
 
@@ -559,6 +581,38 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn optimize_start_needs_a_valid_token_for_the_same_drive() {
+        use crate::optimize::{Plans, DRIVE_CHANGED, PLAN_EXPIRED, PLAN_TTL, PLAN_UNKNOWN};
+        let mut d = crate::drives::fake_drives().into_iter().find(|d| d.is_exfat).unwrap();
+        d.trusted = true;
+        let plan = crate::optimize::plan_from(1, 0, 1, 1, None, |_| None);
+        let plans = std::sync::Mutex::new(Plans::default());
+        let err = |tok: &str, drive: &Drive| super::optimize_request(&plans, tok, drive.clone()).err().unwrap();
+        // No token, an invented one.
+        assert_eq!(err("", &d), PLAN_UNKNOWN);
+        assert_eq!(err("00112233445566778899aabbccddeeff", &d), PLAN_UNKNOWN);
+        // Reused.
+        let tok = super::lock(&plans).issue(&d, &plan, std::time::Instant::now()).unwrap();
+        let req = super::optimize_request(&plans, &tok, d.clone()).unwrap();
+        assert_eq!(req.action, Action::Optimize { dry_run: false });
+        assert_eq!(err(&tok, &d), PLAN_UNKNOWN);
+        // Expired.
+        let old = std::time::Instant::now().checked_sub(PLAN_TTL).unwrap();
+        let tok = super::lock(&plans).issue(&d, &plan, old).unwrap();
+        assert_eq!(err(&tok, &d), PLAN_EXPIRED);
+        // Another drive behind the same id (swapped between plan and confirm).
+        let tok = super::lock(&plans).issue(&d, &plan, std::time::Instant::now()).unwrap();
+        let mut swapped = d.clone();
+        swapped.identity.key = format!("{}X", swapped.identity.key);
+        assert_eq!(err(&tok, &swapped), DRIVE_CHANGED);
+        assert_eq!(err(&tok, &d), PLAN_UNKNOWN, "a refused token is burnt");
+        // An untrusted drive is refused before the token is even looked at.
+        let tok = super::lock(&plans).issue(&d, &plan, std::time::Instant::now()).unwrap();
+        let untrusted = Drive { trusted: false, ..d.clone() };
+        assert!(super::optimize_request(&plans, &tok, untrusted).is_err());
+    }
+
     use super::*;
 
     #[test]
