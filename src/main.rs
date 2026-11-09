@@ -113,9 +113,10 @@ enum Cmd {
     ///
     /// A file is taken as unchanged when its size and modification time (at exFAT's 10 ms
     /// precision) match: a change that keeps both (`cp -p`, `rsync -t`, some editors and tools
-    /// restore the time) is skipped unless --checksum. Every metadata write is journaled under
-    /// $XDG_STATE_HOME/flashcp/sync-journal first: an interrupted sync is completed by the next
-    /// sync of that volume (or by --recover)
+    /// restore the time) is skipped unless --checksum. Every metadata write is journaled, under
+    /// $XDG_STATE_HOME/flashcp/sync-journal first and in the hidden file /.flashcp-sync-journal
+    /// on the volume while the run commits: an interrupted sync is completed by the next sync of
+    /// that volume (or by --recover), on any machine
     Sync {
         /// SRC TARGET: the local tree, then the block device or image file. With --target-fd,
         /// only SRC; with --recover, only TARGET (or nothing with --target-fd)
