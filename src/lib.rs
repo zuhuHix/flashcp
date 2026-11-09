@@ -12,6 +12,6 @@ pub mod pack;
 pub mod probe;
 pub mod util;
 
-pub use add::{AddOpts, AddStats, VolumeInfo, add, info};
+pub use add::{AddOpts, AddStats, VolumeInfo, add, add_to, info, info_of};
 pub use events::{Event, Op};
-pub use exfat::{BuildOpts, BuildStats, FatMode, build};
+pub use exfat::{BuildOpts, BuildStats, FatMode, TargetSpec, build, build_to};

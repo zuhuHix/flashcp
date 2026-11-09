@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use flashcp::TargetSpec;
 use flashcp::events::{Event, error_json};
 use flashcp::{add, bench, copy, dataset, exfat, pack, probe, util};
 use std::path::PathBuf;
@@ -50,7 +51,13 @@ enum Cmd {
     /// sequential pass. ERASES TARGET.
     Build {
         src: PathBuf,
-        target: PathBuf,
+        /// Block device or image file (or use --target-fd)
+        #[arg(required_unless_present = "target_fd", conflicts_with = "target_fd")]
+        target: Option<PathBuf>,
+        /// Use this inherited, already-open block-device fd (O_RDWR|O_EXCL; O_RDONLY for info)
+        /// instead of opening TARGET, e.g. from a privileged helper
+        #[arg(long, value_name = "N")]
+        target_fd: Option<i32>,
         /// Cluster size in bytes (default: optimizer picks)
         #[arg(long)]
         cluster: Option<u32>,
@@ -74,7 +81,13 @@ enum Cmd {
     /// image file) without erasing anything
     Add {
         src: PathBuf,
-        target: PathBuf,
+        /// Block device or image file (or use --target-fd)
+        #[arg(required_unless_present = "target_fd", conflicts_with = "target_fd")]
+        target: Option<PathBuf>,
+        /// Use this inherited, already-open block-device fd (O_RDWR|O_EXCL; O_RDONLY for info)
+        /// instead of opening TARGET, e.g. from a privileged helper
+        #[arg(long, value_name = "N")]
+        target_fd: Option<i32>,
         /// Directory inside the volume to add into, e.g. "Backups/2026" (created if missing)
         #[arg(long)]
         to: Option<String>,
@@ -92,7 +105,13 @@ enum Cmd {
     },
     /// Show an exFAT volume's label, size, free space and file count (read-only)
     Info {
-        target: PathBuf,
+        /// Block device or image file (or use --target-fd)
+        #[arg(required_unless_present = "target_fd", conflicts_with = "target_fd")]
+        target: Option<PathBuf>,
+        /// Use this inherited, already-open block-device fd (O_RDWR|O_EXCL; O_RDONLY for info)
+        /// instead of opening TARGET, e.g. from a privileged helper
+        #[arg(long, value_name = "N")]
+        target_fd: Option<i32>,
         #[arg(long)]
         json: bool,
     },
@@ -119,6 +138,15 @@ fn sink(json: bool) -> impl FnMut(&Event) {
         } else if let Event::Plan { detail, .. } = e {
             println!("{detail}");
         }
+    }
+}
+
+/// clap guarantees exactly one of TARGET / --target-fd.
+fn spec(target: Option<PathBuf>, fd: Option<i32>) -> TargetSpec {
+    match (target, fd) {
+        (_, Some(fd)) => TargetSpec::Fd(fd),
+        (Some(p), None) => TargetSpec::Path(p),
+        (None, None) => unreachable!("clap requires TARGET or --target-fd"),
     }
 }
 
@@ -178,10 +206,11 @@ fn run(cmd: Cmd) -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Build { src, target, cluster, label, fat, readers, dry_run, yes_erase, json } => {
-            anyhow::ensure!(dry_run || yes_erase, "this ERASES {}; pass --yes-erase to confirm", target.display());
+        Cmd::Build { src, target, target_fd, cluster, label, fat, readers, dry_run, yes_erase, json } => {
+            let target = spec(target, target_fd);
+            anyhow::ensure!(dry_run || yes_erase, "this ERASES {}; pass --yes-erase to confirm", target.describe());
             let o = exfat::BuildOpts { cluster, label, fat, readers, dry_run };
-            let s = exfat::build(&src, &target, &o, &mut sink(json))?;
+            let s = exfat::build_to(&src, &target, &o, &mut sink(json))?;
             if !dry_run && !json {
                 println!(
                     "built: {} files, {} dirs, {} data, {} written, cluster {} in {:.2}s ({:.0} files/s, {:.1} MB/s of data)",
@@ -197,9 +226,10 @@ fn run(cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Add { src, target, to, skip_existing, readers, dry_run, json } => {
+        Cmd::Add { src, target, target_fd, to, skip_existing, readers, dry_run, json } => {
+            let target = spec(target, target_fd);
             let o = add::AddOpts { to, skip_existing, readers, dry_run };
-            let s = add::add(&src, &target, &o, &mut sink(json))?;
+            let s = add::add_to(&src, &target, &o, &mut sink(json))?;
             if !dry_run && !json {
                 println!(
                     "added: {} files, {} dirs, {} data{}{}, cluster {} in {:.2}s ({:.0} files/s, {:.1} MB/s of data)",
@@ -216,8 +246,8 @@ fn run(cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Info { target, json } => {
-            let i = add::info(&target)?;
+        Cmd::Info { target, target_fd, json } => {
+            let i = add::info_of(&spec(target, target_fd))?;
             if json {
                 println!("{}", i.to_json());
             } else {

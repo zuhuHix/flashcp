@@ -667,7 +667,60 @@ pub(crate) struct Target {
     pub(crate) file: File,
     pub(crate) bytes: u64,
     pub(crate) part_off: u64,
+    /// O_DIRECT is available on this file (and currently enabled; see [`set_direct`]).
     pub(crate) direct: bool,
+}
+
+/// Where to write: a path flashcp opens itself, or an inherited file descriptor that a
+/// privileged helper already opened (O_RDWR|O_EXCL, or O_RDONLY for `info`) on a BLOCK DEVICE.
+/// An fd is never reopened by path; flashcp itself may run unprivileged.
+#[derive(Clone, Debug)]
+pub enum TargetSpec {
+    Path(PathBuf),
+    Fd(std::os::unix::io::RawFd),
+}
+
+impl TargetSpec {
+    pub fn describe(&self) -> String {
+        match self {
+            TargetSpec::Path(p) => p.display().to_string(),
+            TargetSpec::Fd(fd) => format!("fd {fd}"),
+        }
+    }
+    /// Opens (or adopts) the target for writing, with every safety check applied.
+    pub(crate) fn open_rw(&self) -> Result<Target> {
+        match self {
+            TargetSpec::Path(p) => open_target(p),
+            TargetSpec::Fd(fd) => open_target_fd(*fd, true),
+        }
+    }
+}
+
+impl From<&Path> for TargetSpec {
+    fn from(p: &Path) -> Self {
+        TargetSpec::Path(p.to_path_buf())
+    }
+}
+
+/// Turns O_DIRECT on or off on an open file description (F_SETFL). Returns false if the file
+/// does not support it (EINVAL); the caller then uses buffered I/O.
+pub(crate) fn set_direct(f: &File, on: bool) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let fd = f.as_raw_fd();
+    let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if fl < 0 {
+        return false;
+    }
+    let want = if on { fl | libc::O_DIRECT } else { fl & !libc::O_DIRECT };
+    want == fl || unsafe { libc::fcntl(fd, libc::F_SETFL, want) } == 0
+}
+
+/// Block device size in bytes (BLKGETSIZE64).
+pub(crate) fn blk_size(f: &File) -> Result<u64> {
+    let mut size: u64 = 0;
+    let r = unsafe { libc::ioctl(std::os::unix::io::AsRawFd::as_raw_fd(f), BLKGETSIZE64 as _, &mut size) };
+    ensure!(r == 0, "BLKGETSIZE64 failed: {}", std::io::Error::last_os_error());
+    Ok(size)
 }
 
 pub(crate) fn open_target(path: &Path) -> Result<Target> {
@@ -678,14 +731,8 @@ pub(crate) fn open_target(path: &Path) -> Result<Target> {
     // O_EXCL is always passed, so the claim is atomic with the open. Without O_CREAT, Linux
     // treats it as an exclusive claim on block devices: it fails with EBUSY if the device, a
     // partition or a holder is mounted or claimed (LVM, dm, md), and nobody can mount it while
-    // we hold the fd (for the whole build). For regular files Linux ignores it.
-    let open = |direct: bool| {
-        let mut flags = libc::O_EXCL;
-        if direct {
-            flags |= libc::O_DIRECT;
-        }
-        OpenOptions::new().write(true).read(true).custom_flags(flags).open(path)
-    };
+    // we hold the fd (for the whole build). For regular files Linux ignores it; those get an
+    // exclusive flock instead.
     let busy = |e: std::io::Error| -> anyhow::Error {
         if e.raw_os_error() == Some(libc::EBUSY) {
             // We are refusing anyway; a path-based lookup only improves the message.
@@ -700,31 +747,11 @@ pub(crate) fn open_target(path: &Path) -> Result<Target> {
             anyhow::Error::new(e).context(format!("open {}", path.display()))
         }
     };
-    let (file, direct) = match open(true) {
-        Ok(f) => (f, true),
-        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => return Err(busy(e)),
-        Err(_) => (open(false).map_err(busy)?, false),
-    };
+    let file = OpenOptions::new().write(true).read(true).custom_flags(libc::O_EXCL).open(path).map_err(busy)?;
     let md = file.metadata().with_context(|| format!("fstat {}", path.display()))?;
     let ft = md.file_type();
     if ft.is_block_device() {
-        // Friendlier message naming the mount point. Sound after the open: the O_EXCL claim
-        // already blocks new mounts, so this cannot go stale.
-        let (maj, min) = (libc::major(md.rdev()), libc::minor(md.rdev()));
-        let devs = related_devs(Path::new(SYS_BLOCK), &format!("{maj}:{min}"))?;
-        let mounts = fs::read_to_string("/proc/self/mountinfo")?;
-        if let Some((dev, at)) = mounted_dev(&mounts, &devs) {
-            bail!("{} is in use: device {dev} is mounted at {at}; unmount it first", path.display());
-        }
-        let mut size: u64 = 0;
-        // BLKGETSIZE64 = _IOR(0x12, 114, size_t)
-        let r = unsafe { libc::ioctl(std::os::unix::io::AsRawFd::as_raw_fd(&file), BLKGETSIZE64 as _, &mut size) };
-        ensure!(r == 0, "BLKGETSIZE64 failed");
-        let start = fs::read_to_string(format!("{SYS_BLOCK}/{maj}:{min}/start"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0u64);
-        Ok(Target { file, bytes: size, part_off: start, direct })
+        block_target(file, &md, &path.display().to_string())
     } else if ft.is_file() {
         if let Some(dev) = crate::add::loop_device_of(&md) {
             bail!(
@@ -732,11 +759,77 @@ pub(crate) fn open_target(path: &Path) -> Result<Target> {
                 path.display()
             );
         }
+        // Held until the file is closed (end of the run): two flashcp runs on one image, or
+        // any other flock-respecting writer, cannot interleave.
+        let r = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
+        if r != 0 {
+            let e = std::io::Error::last_os_error();
+            ensure!(
+                e.raw_os_error() != Some(libc::EWOULDBLOCK),
+                "{} is locked by another process (another flashcp run?)",
+                path.display()
+            );
+            return Err(anyhow::Error::new(e).context(format!("flock {}", path.display())));
+        }
         ensure!(md.len() > 0, "image file is empty; create it first, e.g. truncate -s 8G image.img");
+        let direct = set_direct(&file, true);
         Ok(Target { file, bytes: md.len(), part_off: 0, direct })
     } else {
         bail!("{} is neither a block device nor a regular image file", path.display())
     }
+}
+
+/// Adopts an inherited fd. It must be open (F_GETFD), O_RDWR when `write` (any read mode
+/// otherwise), and a block device. For writing, the same post-open checks as
+/// [`open_target`] apply (mounted/holders, size, partition start); only our own O_EXCL open
+/// is skipped, because the inherited open file description already holds that claim.
+pub(crate) fn open_target_fd(fd: std::os::unix::io::RawFd, write: bool) -> Result<Target> {
+    use std::os::unix::io::FromRawFd;
+    ensure!(
+        fd >= 0 && unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1,
+        "--target-fd {fd} is not an open file descriptor"
+    );
+    let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    ensure!(fl >= 0, "--target-fd {fd}: F_GETFL failed");
+    let acc = fl & libc::O_ACCMODE;
+    if write {
+        ensure!(acc == libc::O_RDWR, "--target-fd {fd} must be opened read-write (O_RDWR)");
+    } else {
+        ensure!(acc == libc::O_RDONLY || acc == libc::O_RDWR, "--target-fd {fd} is not readable");
+    }
+    // Only now take ownership (it is closed when the run ends).
+    let file = unsafe { File::from_raw_fd(fd) };
+    let md = file.metadata().with_context(|| format!("fstat fd {fd}"))?;
+    ensure!(
+        md.file_type().is_block_device(),
+        "--target-fd {fd} is not a block device (only block devices are accepted)"
+    );
+    let name = format!("fd {fd}");
+    if write {
+        block_target(file, &md, &name)
+    } else {
+        let bytes = blk_size(&file)?;
+        Ok(Target { file, bytes, part_off: 0, direct: false })
+    }
+}
+
+/// Post-open checks and geometry for a block device we hold (exclusively claimed).
+fn block_target(file: File, md: &fs::Metadata, name: &str) -> Result<Target> {
+    // Friendlier message naming the mount point. Sound after the open: the O_EXCL claim
+    // already blocks new mounts, so this cannot go stale.
+    let (maj, min) = (libc::major(md.rdev()), libc::minor(md.rdev()));
+    let devs = related_devs(Path::new(SYS_BLOCK), &format!("{maj}:{min}"))?;
+    let mounts = fs::read_to_string("/proc/self/mountinfo")?;
+    if let Some((dev, at)) = mounted_dev(&mounts, &devs) {
+        bail!("{name} is in use: device {dev} is mounted at {at}; unmount it first");
+    }
+    let size = blk_size(&file)?;
+    let start = fs::read_to_string(format!("{SYS_BLOCK}/{maj}:{min}/start"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0u64);
+    let direct = set_direct(&file, true);
+    Ok(Target { file, bytes: size, part_off: start, direct })
 }
 
 /// Best-effort (device, mount point) of a mounted block device at `path`, its partitions or
@@ -830,13 +923,18 @@ pub struct BuildStats {
 
 /// Builds a whole volume from `src` onto `target`, reporting progress through `sink`.
 pub fn build(src: &Path, target: &Path, o: &BuildOpts, sink: Sink<'_>) -> Result<BuildStats> {
+    build_to(src, &TargetSpec::from(target), o, sink)
+}
+
+/// [`build`] onto a [`TargetSpec`] (a path, or an inherited block-device fd).
+pub fn build_to(src: &Path, target: &TargetSpec, o: &BuildOpts, sink: Sink<'_>) -> Result<BuildStats> {
     let t0 = Instant::now();
     let mut tick = Ticker::new(sink);
     let upc = upcase_map();
     let label: Vec<u16> = o.label.encode_utf16().collect();
     ensure!(label.len() <= 11, "label is at most 11 characters");
     let mut nodes = scan_tree(src, &upc)?;
-    let tgt = open_target(target)?;
+    let tgt = target.open_rw()?;
 
     // Cluster-size optimizer: pick the size that minimizes bytes physically written
     // (FAT + bitmap + per-file slack). Small files want small clusters; huge drives in
@@ -1084,6 +1182,34 @@ mod tests {
         let err = validate(name, &mut HashSet::new(), &upc).expect_err("name should be rejected");
         let msg = format!("{err:#}");
         assert!(msg.contains(needle), "message was: {msg}");
+    }
+
+    // ───── inherited target fd ─────
+
+    fn fd_err(fd: i32, write: bool) -> String {
+        format!("{:#}", open_target_fd(fd, write).err().expect("fd should be refused"))
+    }
+
+    #[test]
+    fn target_fd_validation() {
+        use std::os::unix::io::IntoRawFd;
+        // Closed / never-opened descriptors.
+        assert!(fd_err(-1, true).contains("not an open file descriptor"));
+        assert!(fd_err(1_000_000, false).contains("not an open file descriptor"));
+        let dir = std::env::temp_dir().join(format!("flashcp-fd-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("img");
+        File::create(&p).unwrap().set_len(1 << 20).unwrap();
+        // Read-only fd: refused for build/add before anything else is looked at.
+        let ro = File::open(&p).unwrap().into_raw_fd();
+        assert!(fd_err(ro, true).contains("O_RDWR"));
+        unsafe { libc::close(ro) };
+        // Read-write regular file: refused, only block devices are accepted (for info too).
+        let rw = File::options().read(true).write(true).open(&p).unwrap().into_raw_fd();
+        assert!(fd_err(rw, true).contains("not a block device")); // consumed (closed) by the call
+        let ro = File::open(&p).unwrap().into_raw_fd();
+        assert!(fd_err(ro, false).contains("not a block device"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     // ───── sequential writer ─────
