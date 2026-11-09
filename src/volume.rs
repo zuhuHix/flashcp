@@ -671,10 +671,52 @@ pub(crate) fn decode_ts(t: u32, tens_ms: u8, offset: u8) -> Option<(i64, u32)> {
     Some((local - q * 900, (tens_ms % 100) as u32 * 10_000_000))
 }
 
+/// The quick check shared by `sync` and `pull --update`: whether a local mtime (UTC secs,
+/// nanos) and a stored exFAT LastModified timestamp (field, 10 ms increment, UTC offset byte)
+/// name the same instant at exFAT's precision. The local time is first encoded the way
+/// flashcp would store it (10 ms, clamped to 1980..=2107), so a file written by flashcp (or
+/// pulled by it) always matches itself. A stored time whose UTC offset is not recorded (bit 7
+/// clear: written by a driver that only knew local time) is accepted when it differs by a
+/// whole number of quarter hours, at most 14 h, with the same sub-second part. An undecodable
+/// stored timestamp never matches.
+pub(crate) fn same_mtime(local: (i64, u32), stored: (u32, u8, u8)) -> bool {
+    let (t, t10) = crate::exfat::ts(local.0, local.1);
+    let (Some(a), Some(b)) = (decode_ts(t, t10, 0x80), decode_ts(stored.0, stored.1, stored.2)) else {
+        return false;
+    };
+    if a == b {
+        return true;
+    }
+    let d = a.0 - b.0;
+    stored.2 & 0x80 == 0 && a.1 == b.1 && d % 900 == 0 && d.abs() <= 14 * 3600
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::exfat::{Node, entry_set, finish_set};
+
+    #[test]
+    fn same_mtime_at_exfat_precision() {
+        let (t, t10) = crate::exfat::ts(1_700_000_001, 123_456_789);
+        // 10 ms precision: anything inside the same 10 ms matches, the next 10 ms does not.
+        assert!(same_mtime((1_700_000_001, 129_999_999), (t, t10, 0x80)));
+        assert!(!same_mtime((1_700_000_001, 130_000_000), (t, t10, 0x80)));
+        assert!(!same_mtime((1_700_000_002, 123_456_789), (t, t10, 0x80)));
+        // A recorded UTC offset is applied: local 10:00 at UTC+1 is 09:00 UTC.
+        let (lt, lt10) = crate::exfat::ts(1_700_000_000 + 3600, 0);
+        assert!(same_mtime((1_700_000_000, 0), (lt, lt10, 0x80 | 4)));
+        assert!(!same_mtime((1_700_000_000 + 3600, 0), (lt, lt10, 0x80 | 4)));
+        // No recorded offset: a whole-quarter-hour shift up to 14 h is the time zone.
+        assert!(same_mtime((1_700_000_000, 0), (lt, lt10, 0)));
+        assert!(!same_mtime((1_700_000_000 + 1, 0), (lt, lt10, 0)));
+        let (ft, ft10) = crate::exfat::ts(1_700_000_000 + 15 * 3600, 0);
+        assert!(!same_mtime((1_700_000_000, 0), (ft, ft10, 0)));
+        // Before 1980 clamps to the exFAT epoch, as flashcp stores it; garbage never matches.
+        let (et, et10) = crate::exfat::ts(0, 0);
+        assert!(same_mtime((100, 5), (et, et10, 0x80)));
+        assert!(!same_mtime((1_700_000_000, 0), (0, 0, 0x80)));
+    }
     use std::fs;
     use std::path::PathBuf;
 
