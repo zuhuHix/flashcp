@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect x="32" y="32" width="448" height="448" rx="96" fill="#0f9d8a"/>
+  <!-- USB stick body -->
+  <rect x="176" y="96" width="160" height="96" rx="12" fill="#e8f7f4"/>
+  <rect x="210" y="124" width="28" height="28" rx="4" fill="#0f9d8a"/>
+  <rect x="274" y="124" width="28" height="28" rx="4" fill="#0f9d8a"/>
+  <rect x="144" y="184" width="224" height="232" rx="28" fill="#ffffff"/>
+  <!-- lightning bolt -->
+  <path d="M276 212 L196 324 H252 L232 396 L320 276 H262 Z" fill="#f2a01e"/>
+</svg>

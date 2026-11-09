@@ -1,0 +1,29 @@
+[package]
+name = "flashcp-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Tray app: fast copy to USB exFAT drives with flashcp"
+license = "GPL-3.0-or-later"
+build = "build.rs"
+
+[lib]
+name = "flashcp_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "flashcp-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.7.4", features = [] }
+
+[dependencies]
+tauri = { version = "2.12.4", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2.5.5"
+tauri-plugin-dialog = "2.8.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zbus = "5.19"
+
+[dev-dependencies]
+tempfile = "3"

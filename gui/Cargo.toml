@@ -1,0 +1,9 @@
+# Separate workspace for the desktop app. NOT part of the root flashcp crate.
+[workspace]
+resolver = "2"
+members = ["src-tauri", "helper"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
