@@ -5,7 +5,7 @@
 //! ```text
 //! {"event":"plan","op":"add"|"build"|"pull"|"optimize","files":N,"dirs":N,"bytes":N,"write_bytes":N}
 //!     pull adds "strategy":{"transport":"uas"|"usb-storage"|..,"gap_kb":N,"inflight":N,
-//!     "direct":B,"overhead_ms":F|null,"mbps":F|null}
+//!     "direct":B,"overhead_ms":F|null,"mbps":F|null,"chunk_kb":N,"tail":N}
 //! {"event":"phase","op":"optimize","phase":"pull"|..,"step":N,"steps":N}
 //!     optimize only: a new phase starts; progress events that follow count within it
 //! {"event":"progress","files_done":N,"bytes_done":N}   (at most ~10 per second)
