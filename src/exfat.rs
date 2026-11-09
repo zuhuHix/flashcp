@@ -590,6 +590,13 @@ fn open_target(path: &Path) -> Result<Target> {
     };
     let busy = |e: std::io::Error| -> anyhow::Error {
         if e.raw_os_error() == Some(libc::EBUSY) {
+            // We are refusing anyway; a path-based lookup only improves the message.
+            if let Some((dev, at)) = mount_of(path) {
+                return anyhow::anyhow!(
+                    "{} is in use: device {dev} is mounted at {at}; unmount it first",
+                    path.display()
+                );
+            }
             anyhow::anyhow!("{} is in use (mounted or held by LVM/dm/md); unmount it first", path.display())
         } else {
             anyhow::Error::new(e).context(format!("open {}", path.display()))
@@ -626,6 +633,15 @@ fn open_target(path: &Path) -> Result<Target> {
     } else {
         bail!("{} is neither a block device nor a regular image file", path.display())
     }
+}
+
+/// Best-effort (device, mount point) of a mounted block device at `path`, its partitions or
+/// holders. Only used to word an error message, never to decide whether to write.
+fn mount_of(path: &Path) -> Option<(String, String)> {
+    let md = fs::metadata(path).ok().filter(|m| m.file_type().is_block_device())?;
+    let devs =
+        related_devs(Path::new(SYS_BLOCK), &format!("{}:{}", libc::major(md.rdev()), libc::minor(md.rdev()))).ok()?;
+    mounted_dev(&fs::read_to_string("/proc/self/mountinfo").ok()?, &devs)
 }
 
 const SYS_BLOCK: &str = "/sys/dev/block";
