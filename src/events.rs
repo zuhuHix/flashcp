@@ -4,6 +4,8 @@
 //!
 //! ```text
 //! {"event":"plan","op":"add"|"build"|"pull","files":N,"dirs":N,"bytes":N,"write_bytes":N}
+//!     pull adds "strategy":{"transport":"uas"|"usb-storage"|..,"gap_kb":N,"inflight":N,
+//!     "direct":B,"overhead_ms":F|null,"mbps":F|null}
 //! {"event":"progress","files_done":N,"bytes_done":N}   (at most ~10 per second)
 //! {"event":"done","files":N,"bytes":N,"secs":F}
 //! {"event":"error","message":"..."}                     (and a non-zero exit code)
@@ -41,6 +43,8 @@ pub enum Event {
         bytes: u64,
         write_bytes: u64,
         detail: String,
+        /// `pull` only: how the volume will be read, as a JSON object (transport, gap, depth).
+        strategy: Option<String>,
     },
     /// Throttled to at most ~10 per second, plus one final event at 100 %.
     Progress {
@@ -80,9 +84,10 @@ fn json_f64(v: f64) -> String {
 impl Event {
     pub fn to_json(&self) -> String {
         match self {
-            Event::Plan { op, files, dirs, bytes, write_bytes, .. } => format!(
-                r#"{{"event":"plan","op":"{}","files":{files},"dirs":{dirs},"bytes":{bytes},"write_bytes":{write_bytes}}}"#,
-                op.as_str()
+            Event::Plan { op, files, dirs, bytes, write_bytes, strategy, .. } => format!(
+                r#"{{"event":"plan","op":"{}","files":{files},"dirs":{dirs},"bytes":{bytes},"write_bytes":{write_bytes}{}}}"#,
+                op.as_str(),
+                strategy.as_ref().map(|s| format!(r#","strategy":{s}"#)).unwrap_or_default()
             ),
             Event::Progress { files_done, bytes_done } => {
                 format!(r#"{{"event":"progress","files_done":{files_done},"bytes_done":{bytes_done}}}"#)
@@ -130,7 +135,15 @@ mod tests {
 
     #[test]
     fn json_lines_match_contract() {
-        let p = Event::Plan { op: Op::Add, files: 3, dirs: 1, bytes: 10, write_bytes: 4096, detail: "x".into() };
+        let p = Event::Plan {
+            op: Op::Add,
+            files: 3,
+            dirs: 1,
+            bytes: 10,
+            write_bytes: 4096,
+            detail: "x".into(),
+            strategy: None,
+        };
         assert_eq!(p.to_json(), r#"{"event":"plan","op":"add","files":3,"dirs":1,"bytes":10,"write_bytes":4096}"#);
         let g = Event::Progress { files_done: 1, bytes_done: 2 };
         assert_eq!(g.to_json(), r#"{"event":"progress","files_done":1,"bytes_done":2}"#);

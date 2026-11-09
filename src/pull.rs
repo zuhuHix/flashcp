@@ -65,10 +65,13 @@ pub struct PullOpts {
     pub overwrite: bool,
     /// Largest single device read, in bytes.
     pub chunk: usize,
-    /// Gaps between extents up to this many bytes are read through rather than skipped.
-    pub gap: u64,
-    /// Device reads in flight (at most [`READ_BUDGET`] bytes of them).
-    pub inflight: usize,
+    /// Gaps between extents up to this many bytes are read through rather than skipped
+    /// (None: chosen per device, see [`Strategy`]).
+    pub gap: Option<u64>,
+    /// Device reads in flight, at most [`READ_BUDGET`] bytes of them (None: chosen per device).
+    pub inflight: Option<usize>,
+    /// Buffered (page cache + readahead) reads instead of O_DIRECT (None: chosen per device).
+    pub buffered: Option<bool>,
     /// Threads writing destination files.
     pub writers: usize,
 }
@@ -80,8 +83,9 @@ impl Default for PullOpts {
             skip_existing: false,
             overwrite: false,
             chunk: 8 << 20,
-            gap: 32 << 10,
-            inflight: 32,
+            gap: None,
+            inflight: None,
+            buffered: None,
             writers: 4,
         }
     }
@@ -118,6 +122,101 @@ struct DirNode {
     parent: u32,
     name: CString,
     mtime: Option<(i64, u32)>,
+}
+
+/// How the volume is read, chosen from the device (see [`choose_strategy`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Strategy {
+    /// "uas", "usb-storage" (Bulk-Only Transport: one command at a time), or "other".
+    pub transport: String,
+    pub gap: u64,
+    pub inflight: usize,
+    pub direct: bool,
+    /// Measured by the micro-probe (BOT only): extra cost of one more request in a forward
+    /// stream, and sequential bandwidth.
+    pub overhead_ms: Option<f64>,
+    pub mbps: Option<f64>,
+}
+
+impl Strategy {
+    pub fn to_json(&self) -> String {
+        let f = |v: Option<f64>| v.map_or("null".to_string(), |v| format!("{v:.3}"));
+        format!(
+            r#"{{"transport":{},"gap_kb":{},"inflight":{},"direct":{},"overhead_ms":{},"mbps":{}}}"#,
+            crate::events::json_str(&self.transport),
+            self.gap >> 10,
+            self.inflight,
+            self.direct,
+            f(self.overhead_ms),
+            f(self.mbps)
+        )
+    }
+}
+
+/// Queued transports (UAS, NVMe, SATA): many requests in flight hide the per-request cost,
+/// so only small gaps are worth reading through (measured on a UAS SSD: 16–64 KB best).
+const QUEUED_GAP: u64 = 32 << 10;
+const QUEUED_INFLIGHT: usize = 32;
+/// Bulk-Only Transport executes one command at a time; a second request only keeps the next
+/// command ready (measured on a USB 2 stick: 2 ≈ 4 > 1).
+const BOT_INFLIGHT: usize = 2;
+/// The BOT gap is latency × bandwidth, clamped to this.
+const BOT_GAP_MAX: u64 = 4 << 20;
+
+/// Measures, with O_DIRECT inside the cluster heap, the sequential bandwidth (one 4 MB read)
+/// and the extra cost of one more request in a forward stream: 256 back-to-back 4 KB reads
+/// against one 1 MB read of the next megabyte. That cost, not random-read latency, is what
+/// reading through a gap saves. About 0.5 s on a USB 2 stick. Returns (overhead s, bytes/s).
+fn micro_probe(file: &File, v: &Vol) -> Option<(f64, f64)> {
+    let start = v.heap_off.div_ceil(ALIGN) * ALIGN;
+    let end = (v.heap_off + v.cc * v.cs) / ALIGN * ALIGN;
+    if end < start + (6 << 20) || !set_direct(file, true) {
+        return None;
+    }
+    let mut buf = AlignedBuf::new(4 << 20);
+    let timed = |buf: &mut [u8], off: u64| -> Option<f64> {
+        let t = Instant::now();
+        (read_full(file, buf, off).ok()? == buf.len()).then(|| t.elapsed().as_secs_f64().max(1e-6))
+    };
+    timed(&mut buf.as_mut()[..4096], start)?; // wake the device up
+    let bw = (4u64 << 20) as f64 / timed(buf.as_mut(), start)?;
+    let one = timed(&mut buf.as_mut()[..1 << 20], start + (4 << 20))?;
+    let mut many = 0.0;
+    for k in 0..256u64 {
+        many += timed(&mut buf.as_mut()[..4096], start + (5 << 20) + k * 4096)?;
+    }
+    Some(((many - one).max(0.0) / 255.0, bw))
+}
+
+/// Picks gap, depth and I/O mode from the source's transport (sysfs), and on BOT from a
+/// micro-probe: a gap is read through only when reading it costs less than the request it
+/// saves (gap / bandwidth < per-request overhead). Explicit options override every choice.
+fn choose_strategy(file: &File, v: &Vol, o: &PullOpts) -> Strategy {
+    let dev = file.metadata().map(|m| if m.file_type().is_block_device() { m.rdev() } else { m.dev() }).unwrap_or(0);
+    let transport = crate::probe::device_info_of(dev).transport.unwrap_or_else(|| "other".into());
+    let mut s =
+        Strategy { transport, gap: QUEUED_GAP, inflight: QUEUED_INFLIGHT, direct: true, overhead_ms: None, mbps: None };
+    if s.transport == "usb-storage" {
+        s.inflight = BOT_INFLIGHT;
+        s.gap = 0;
+        if o.gap.is_none()
+            && let Some((lat, bw)) = micro_probe(file, v)
+        {
+            s.overhead_ms = Some(lat * 1e3);
+            s.mbps = Some(bw / 1e6);
+            s.gap = ((lat * bw) as u64 / ALIGN * ALIGN).min(BOT_GAP_MAX);
+        }
+    }
+    if let Some(g) = o.gap {
+        s.gap = g;
+    }
+    if let Some(n) = o.inflight {
+        s.inflight = n.max(1);
+    }
+    if let Some(b) = o.buffered {
+        s.direct = !b;
+    }
+    s
 }
 
 /// A volume name as a single, safe path component.
@@ -705,7 +804,8 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
     p.exts.sort_unstable_by_key(|e| e.phys);
     let cut = v.vol_bytes / ALIGN * ALIGN;
     let tail_at = p.exts.partition_point(|e| e.phys < cut);
-    let chunks = coalesce(&p.exts[..tail_at], o.chunk, o.gap);
+    let strat = choose_strategy(&file, &v, o);
+    let chunks = coalesce(&p.exts[..tail_at], o.chunk, strat.gap);
     let tail_bytes = p.exts[tail_at..].iter().map(|e| e.phys + e.len as u64).max().map_or(0, |e| e - cut);
     let read_bytes: u64 = chunks.iter().map(|c| c.len as u64).sum::<u64>() + tail_bytes;
     let data_bytes: u64 = p.jobs.iter().map(|j| j.len).sum();
@@ -729,7 +829,7 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
         human_bytes(free as f64)
     );
     let detail = format!(
-        "pull: {files} files, {dirs} dirs, {} of data → {}{}; reading {} in {} requests of up to {} (cluster {})",
+        "pull: {files} files, {dirs} dirs, {} of data → {}{}; reading {} in {} requests of up to {} (cluster {}; {}: gap {}, {} in flight{})",
         human_bytes(data_bytes as f64),
         dest.display(),
         if p.skipped > 0 { format!(" ({} existing skipped)", p.skipped) } else { String::new() },
@@ -737,8 +837,20 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
         chunks.len() + usize::from(tail_bytes > 0),
         human_bytes(o.chunk as f64),
         human_bytes(cs as f64),
+        strat.transport,
+        human_bytes(strat.gap as f64),
+        strat.inflight,
+        if strat.direct { "" } else { ", buffered" },
     );
-    tick.emit(Event::Plan { op: Op::Pull, files, dirs, bytes: data_bytes, write_bytes: read_bytes, detail });
+    tick.emit(Event::Plan {
+        op: Op::Pull,
+        files,
+        dirs,
+        bytes: data_bytes,
+        write_bytes: read_bytes,
+        detail,
+        strategy: Some(strat.to_json()),
+    });
     if let Ok(cmd) = std::env::var(AFTER_PLAN_ENV) {
         let ok = std::process::Command::new("sh").arg("-c").arg(&cmd).status().is_ok_and(|s| s.success());
         ensure!(ok, "{AFTER_PLAN_ENV} command failed");
@@ -748,7 +860,7 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
     let jobs = p.jobs;
     let exts = p.exts;
 
-    let res = transfer(&file, &d, &jobs, &exts, &chunks, tail_at, cut, o, trace, &mut tick);
+    let res = transfer(&file, &d, &jobs, &exts, &chunks, tail_at, cut, &strat, o, trace, &mut tick);
     if let Err(e) = res {
         cleanup_temps(&jobs, &d);
         return Err(e.context("pull failed; the destination holds a partial copy"));
@@ -789,6 +901,7 @@ fn transfer(
     chunks: &[Chunk],
     tail_at: usize,
     cut: u64,
+    strat: &Strategy,
     o: &PullOpts,
     trace: bool,
     tick: &mut Ticker<'_>,
@@ -814,7 +927,11 @@ fn transfer(
         }
     }
 
-    let direct = AtomicBool::new(set_direct(file, true));
+    let direct = AtomicBool::new(set_direct(file, strat.direct) && strat.direct);
+    if !strat.direct {
+        // Buffered: let the kernel's readahead stream the device.
+        unsafe { libc::posix_fadvise(std::os::fd::AsRawFd::as_raw_fd(file), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+    }
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
@@ -832,10 +949,10 @@ fn transfer(
             bytes_done.fetch_add(job.len - job.valid, Ordering::Relaxed);
         }
     };
-    let (full_tx, full_rx) = bounded::<(usize, AlignedBuf)>(o.inflight.max(1));
+    let (full_tx, full_rx) = bounded::<(usize, AlignedBuf)>(strat.inflight);
     let (alive_tx, alive_rx) = bounded::<()>(0);
     std::thread::scope(|s| {
-        for _ in 0..o.inflight.max(1) {
+        for _ in 0..strat.inflight {
             let (full_tx, alive, pool) = (full_tx.clone(), alive_tx.clone(), &pool);
             let (next, failed, direct, fail) = (&next, &failed, &direct, &fail);
             s.spawn(move || {

@@ -123,15 +123,18 @@ enum Cmd {
         /// Replace files that already exist in DEST
         #[arg(long)]
         overwrite: bool,
-        /// Largest device read in MB
-        #[arg(long, default_value_t = 8, hide = true)]
-        chunk_mb: usize,
-        /// Read through gaps between files up to this many KB
-        #[arg(long, default_value_t = 32, hide = true)]
-        gap_kb: u64,
-        /// Device reads in flight
-        #[arg(long, default_value_t = 32, hide = true)]
-        inflight: usize,
+        /// Largest device read in KB
+        #[arg(long, default_value_t = 8192, hide = true)]
+        chunk_kb: usize,
+        /// Read through gaps between files up to this many KB (default: chosen per device)
+        #[arg(long, hide = true)]
+        gap_kb: Option<u64>,
+        /// Device reads in flight (default: chosen per device)
+        #[arg(long, hide = true)]
+        inflight: Option<usize>,
+        /// Buffered reads instead of O_DIRECT (default: chosen per device)
+        #[arg(long, hide = true)]
+        buffered: Option<bool>,
         /// Destination writer threads
         #[arg(long, default_value_t = 4, hide = true)]
         writers: usize,
@@ -287,7 +290,19 @@ fn run(cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Pull { paths, target_fd, from, skip_existing, overwrite, chunk_mb, gap_kb, inflight, writers, json } => {
+        Cmd::Pull {
+            paths,
+            target_fd,
+            from,
+            skip_existing,
+            overwrite,
+            chunk_kb,
+            gap_kb,
+            inflight,
+            buffered,
+            writers,
+            json,
+        } => {
             let (target, dest) = match (target_fd, <[PathBuf; 1]>::try_from(paths)) {
                 (Some(fd), Ok([dest])) => (TargetSpec::Fd(fd), dest),
                 (None, Err(p)) if p.len() == 2 => {
@@ -301,8 +316,9 @@ fn run(cmd: Cmd) -> Result<()> {
                 from,
                 skip_existing,
                 overwrite,
-                chunk: chunk_mb << 20,
-                gap: gap_kb << 10,
+                chunk: chunk_kb << 10,
+                gap: gap_kb.map(|g| g << 10),
+                buffered,
                 inflight,
                 writers,
             };

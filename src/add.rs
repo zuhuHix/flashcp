@@ -643,7 +643,7 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
         if skipped > 0 { format!(" │ skipping {skipped} existing") } else { String::new() },
         verify_secs * 1e3
     );
-    tick.emit(Event::Plan { op: Op::Add, files, dirs, bytes: data_bytes, write_bytes, detail });
+    tick.emit(Event::Plan { op: Op::Add, files, dirs, bytes: data_bytes, write_bytes, detail, strategy: None });
     let stats = |written: u64| AddStats {
         files,
         dirs,
