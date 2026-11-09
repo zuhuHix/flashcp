@@ -71,10 +71,12 @@ jobs:
             sudo diff -r src-tree /mnt/flashcp
             sudo umount /mnt/flashcp
           done
-      - name: Mount-and-diff integration test
+      - name: Mount-and-diff + busy-device integration tests (as root)
         env:
-          FLASHCP_MOUNT_TESTS: "1"
-          FLASHCP_REQUIRE_FSCK: "1"
-          # Only the test binary runs as root (it needs mount -o loop); cargo itself does not.
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
-        run: cargo test --locked --test build mount
+          # Only the test binary runs as root (it needs losetup/mount); cargo itself does not.
+          # The env is passed explicitly because sudo resets it.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo env FLASHCP_MOUNT_TESTS=1 FLASHCP_REQUIRE_FSCK=1
+        run: |
+          set -o pipefail
+          cargo test --locked --test build mount -- --nocapture 2>&1 | tee mount-tests.log
+          if grep -q SKIP mount-tests.log; then echo "::error::a gated mount test was skipped"; exit 1; fi
