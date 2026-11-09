@@ -15,6 +15,7 @@ use std::hash::{DefaultHasher, Hasher};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::time::Instant;
 
 const T0: i64 = 1_700_000_000;
 
@@ -25,6 +26,7 @@ fn sync_cmd(src: &Path, img: &Path, extra: &[&str]) -> Output {
         .arg(img)
         .args(extra)
         .env("FLASHCP_TEST_NO_ADD_BUILD", "1")
+        .env("XDG_STATE_HOME", img.parent().unwrap().join("state"))
         .output()
         .expect("run flashcp sync")
 }
@@ -102,17 +104,17 @@ fn second_sync_writes_nothing() {
     let img = built(&dir, &base);
     let src = dir.join("src");
     make_tricky_tree(&src);
-    sync_ok(&src, &img, &["--delete"]);
+    sync_ok(&src, &img, &["--delete", "--yes"]);
     fsck_clean(&img);
     expect_same(&src, &read_ok(&img), "first sync");
     let before = digest(&img);
-    let out = sync_ok(&src, &img, &["--delete", "--json"]);
+    let out = sync_ok(&src, &img, &["--delete", "--yes", "--json"]);
     let plan = plan_line(&out);
     assert_eq!(json_u64(&plan, "write_bytes"), 0, "{plan}");
     assert_eq!(json_u64(&plan, "new") + json_u64(&plan, "changed") + json_u64(&plan, "deleted"), 0, "{plan}");
     assert_eq!(digest(&img), before, "a sync with nothing to do changed the image");
     // --checksum agrees, and writes nothing either.
-    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--checksum", "--json"]));
+    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--yes", "--checksum", "--json"]));
     assert_eq!(json_u64(&plan, "changed"), 0, "{plan}");
     assert_eq!(digest(&img), before, "a --checksum sync with nothing to do changed the image");
     fs::remove_dir_all(&dir).unwrap();
@@ -192,7 +194,7 @@ fn delete_removes_extraneous_entries_and_without_it_they_stay() {
     // Without --delete nothing is removed (and nothing is written: keep.txt is unchanged).
     sync_ok(&src, &img, &[]);
     assert_eq!(digest(&img), before);
-    let out = sync_ok(&src, &img, &["--delete"]);
+    let out = sync_ok(&src, &img, &["--delete", "--yes"]);
     let plan = String::from_utf8_lossy(&out.stdout);
     assert!(plan.contains("delete: /extra.txt") && plan.contains("delete: /old/ (2 files)"), "{plan}");
     fsck_clean(&img);
@@ -213,7 +215,7 @@ fn type_conflict_is_refused_without_delete() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("pass --delete"), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(digest(&img), before, "a refused sync changed the image");
-    sync_ok(&src, &img, &["--delete"]);
+    sync_ok(&src, &img, &["--delete", "--yes"]);
     fsck_clean(&img);
     expect_same(&src, &read_ok(&img), "after replacing a file by a directory");
     fs::remove_dir_all(&dir).unwrap();
@@ -233,7 +235,7 @@ fn renamed_folder_is_moved_not_copied() {
     random(&src.join("Archive/Photos-2025/b.jpg"), 200_000, 2, T0 + 1);
     text(&src.join("notes.txt"), "notes\n", T0); // case-only rename
     text(&src.join("docs/readme.txt"), "readme\n", T0); // a directory's case-only rename
-    let out = sync_ok(&src, &img, &["--delete", "--json"]);
+    let out = sync_ok(&src, &img, &["--delete", "--yes", "--json"]);
     let plan = plan_line(&out);
     assert_eq!(json_u64(&plan, "moved"), 3, "{plan}");
     assert_eq!((json_u64(&plan, "new"), json_u64(&plan, "bytes")), (0, 0), "{plan}");
@@ -245,7 +247,79 @@ fn renamed_folder_is_moved_not_copied() {
 
 // ───────────────────────── crash ordering ─────────────────────────
 
-const PHASES: [&str; 7] = ["dirty", "data", "alloc", "fat", "unlink", "link", "free"];
+const PHASES: [&str; 8] = ["dirty", "data", "alloc", "fat", "unlink", "link", "retire", "free"];
+
+/// The sync journals kept for the images in `img`'s directory (XDG_STATE_HOME of the tests).
+fn journals(img: &Path) -> Vec<std::path::PathBuf> {
+    let d = img.parent().unwrap().join("state/flashcp/sync-journal");
+    let mut v: Vec<_> = fs::read_dir(&d).map(|r| r.map(|e| e.unwrap().path()).collect()).unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// `flashcp sync` stopped after `phase` (FLASHCP_TEST_STOP_AFTER), asserting it did stop there.
+fn stop_at(src: &Path, img: &Path, phase: &str, extra: &[&str]) {
+    let out = flashcp()
+        .arg("sync")
+        .arg(src)
+        .arg(img)
+        .args(extra)
+        .env("FLASHCP_TEST_NO_ADD_BUILD", "1")
+        .env("XDG_STATE_HOME", img.parent().unwrap().join("state"))
+        .env("FLASHCP_TEST_STOP_AFTER", phase)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains(&format!("stopped after the {phase} phase")), "{phase}: {err}");
+}
+
+fn fsck_y(img: &Path) -> String {
+    let out = Command::new("fsck.exfat").arg("-y").arg(img).output().expect("run fsck.exfat -y");
+    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+}
+
+fn fsck_n(img: &Path) -> String {
+    let out = Command::new("fsck.exfat").arg("-n").arg(img).output().expect("run fsck.exfat -n");
+    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+}
+
+/// After an interrupted sync of `img`: recovery with the journal (the next sync replays it,
+/// and the result is exact, no leaks) and, on a copy, without it (`fsck.exfat -y`, then sync;
+/// leaks of the interrupted run stay). Both end equal to `src`, and a repeat sync is a no-op.
+fn recover_both_ways(src: &Path, img: &Path, what: &str, args: &[&str]) {
+    let alt = img.with_extension("nojournal.img");
+    fs::copy(img, &alt).unwrap();
+    assert_eq!(journals(img).len(), 1, "{what}: no journal was left");
+    sync_ok(src, img, args);
+    assert!(journals(img).is_empty(), "{what}: the journal was not removed");
+    fsck_clean(img);
+    expect_same(src, &read_ok(img), &format!("{what}: after the journal replay"));
+    let d = digest(img);
+    sync_ok(src, img, args);
+    assert_eq!(digest(img), d, "{what}: a repeat sync after the replay wrote something");
+    // Without the journal (another machine): fsck.exfat -y, then sync.
+    let y = fsck_y(&alt);
+    eprintln!("{what}: fsck.exfat -y said:\n{y}");
+    sync_ok(src, &alt, args);
+    fsck_clean(&alt);
+    let vol = exfat_reader::read_volume_allow_leaks(&alt).unwrap_or_else(|e| panic!("{what}: {e}"));
+    expect_same(src, &vol, &format!("{what}: after fsck -y and sync"));
+    let d = digest(&alt);
+    sync_ok(src, &alt, args);
+    assert_eq!(digest(&alt), d, "{what}: a repeat sync after fsck -y wrote something");
+    fs::remove_file(&alt).unwrap();
+}
+
+/// The volume an interrupted sync left, checked: fsck.exfat -n is clean except in the
+/// duplicate window (after link, when sets were relocated), and the lenient reader sees it.
+fn crashed_state(img: &Path, phase: &str) -> exfat_reader::Volume {
+    if phase == "link" {
+        eprintln!("{phase}: fsck.exfat -n said:\n{}", fsck_n(img));
+    } else {
+        fsck_clean(img);
+    }
+    exfat_reader::read_volume_crashed(img).unwrap_or_else(|e| panic!("{phase}: {e}"))
+}
 
 /// Old tree → new tree with every kind of change: unchanged, changed, case rename, new files in
 /// an existing directory that must grow, a deleted subtree, a renamed folder (moves into a new
@@ -291,19 +365,8 @@ fn crash_at_every_phase_leaves_a_clean_volume_of_old_or_new_files() {
     for phase in PHASES {
         let img = dir.join(format!("{phase}.img"));
         fs::copy(&pristine, &img).unwrap();
-        let out = flashcp()
-            .arg("sync")
-            .arg(&src)
-            .arg(&img)
-            .arg("--delete")
-            .env("FLASHCP_TEST_NO_ADD_BUILD", "1")
-            .env("FLASHCP_TEST_STOP_AFTER", phase)
-            .output()
-            .unwrap();
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(!out.status.success() && err.contains(&format!("stopped after the {phase} phase")), "{phase}: {err}");
-        fsck_clean(&img);
-        let vol = exfat_reader::read_volume_allow_leaks(&img).unwrap_or_else(|e| panic!("{phase}: {e}"));
+        stop_at(&src, &img, phase, &["--delete", "--yes"]);
+        let vol = crashed_state(&img, phase);
         // Every file is its old or its new version.
         for (p, n) in &vol.tree {
             let ok = |t: &BTreeMap<String, SrcNode>| {
@@ -322,18 +385,11 @@ fn crash_at_every_phase_leaves_a_clean_volume_of_old_or_new_files() {
             }
             _ => expect_same(&src, &vol, phase),
         }
-        // Recovery: fsck -y clears the dirty flag, then the sync completes the job.
-        let _ = Command::new("fsck.exfat").arg("-y").arg(&img).output().unwrap();
-        sync_ok(&src, &img, &["--delete"]);
-        fsck_clean(&img);
-        let vol = exfat_reader::read_volume_allow_leaks(&img).unwrap();
-        expect_same(&src, &vol, &format!("{phase}: after recovery"));
-        let d = digest(&img);
-        sync_ok(&src, &img, &["--delete"]);
-        assert_eq!(digest(&img), d, "{phase}: a repeat sync after recovery wrote something");
+        recover_both_ways(&src, &img, phase, &["--delete", "--yes"]);
+        fs::remove_file(&img).unwrap();
     }
     // The uninterrupted run leaves no leaks at all.
-    sync_ok(&src, &pristine, &["--delete"]);
+    sync_ok(&src, &pristine, &["--delete", "--yes"]);
     fsck_clean(&pristine);
     expect_same(&src, &read_ok(&pristine), "uninterrupted");
     let _ = new;
@@ -408,12 +464,12 @@ fn nested_directories_changes_new_deep_dirs_and_deep_subtree_deletes() {
     text(&src.join("a/b/c/d/keep.txt"), "keep\n", T0);
     random(&src.join("a/b/n1/n2/n3/new.bin"), 12_000, 3, T0 + 20); // new deep directories
     text(&src.join("a/top.txt"), "top\n", T0);
-    sync_ok(&src, &img, &["--delete"]);
+    sync_ok(&src, &img, &["--delete", "--yes"]);
     fsck_clean(&img);
     expect_same(&src, &read_ok(&img), "nested tree after sync");
     // A second run is a no-op.
     let before = digest(&img);
-    sync_ok(&src, &img, &["--delete"]);
+    sync_ok(&src, &img, &["--delete", "--yes"]);
     assert_eq!(digest(&img), before, "a repeat sync wrote something");
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -486,7 +542,7 @@ fn a_file_moved_between_existing_directories_is_relinked_only_with_delete() {
 
     // With --delete: the file is re-linked from its old clusters.
     let img = built(&dir, &base);
-    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--json"]));
+    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--yes", "--json"]));
     assert_eq!(json_u64(&plan, "moved"), 1, "{plan}");
     assert_eq!((json_u64(&plan, "bytes"), json_u64(&plan, "new")), (0, 0), "{plan}");
     assert!(plan.contains(r#"{"from":"/one/movie.bin","to":"/two/movie.bin"}"#), "{plan}");
@@ -527,7 +583,7 @@ fn swapped_names_with_equal_size_and_time_keep_their_own_contents() {
     let src = dir.join("src");
     random(&src.join("a.bin"), 80_000, 2, T0);
     random(&src.join("b.bin"), 80_000, 1, T0);
-    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--checksum", "--json"]));
+    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--yes", "--checksum", "--json"]));
     assert_eq!((json_u64(&plan, "changed"), json_u64(&plan, "moved")), (2, 0), "{plan}");
     fsck_clean(&img);
     expect_same(&src, &read_ok(&img), "after the in-place swap");
@@ -543,7 +599,7 @@ fn swapped_names_with_equal_size_and_time_keep_their_own_contents() {
     let src = dir.join("src");
     random(&src.join("c.bin"), 80_000, 2, T0);
     random(&src.join("d.bin"), 80_000, 1, T0);
-    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--json"]));
+    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--yes", "--json"]));
     assert_eq!((json_u64(&plan, "moved"), json_u64(&plan, "bytes")), (2, 0), "{plan}");
     fsck_clean(&img);
     expect_same(&src, &read_ok(&img), "after the rename swap");
@@ -592,13 +648,13 @@ fn mixed_run_with_delete_matches_the_source_and_frees_what_it_should() {
     let dir = test_dir("sync_mixed");
     let (base, src) = mixed(&dir);
     let img = built(&dir, &base);
-    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--json"]));
+    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--yes", "--json"]));
     assert_eq!((json_u64(&plan, "moved"), json_u64(&plan, "changed")), (2, 4), "{plan}");
     fsck_clean(&img);
     // Strict read: no leaked clusters and every cluster owned.
     expect_same(&src, &read_ok(&img), "after the mixed run");
     let after = digest(&img);
-    sync_ok(&src, &img, &["--delete"]);
+    sync_ok(&src, &img, &["--delete", "--yes"]);
     assert_eq!(digest(&img), after, "a second sync after the mixed run wrote something");
 
     // Space: the same source built onto an identical fresh image. Each directory holds at least one
@@ -623,7 +679,7 @@ fn json_plan_lists_deletes_and_moves_and_every_line_is_an_object() {
     let dir = test_dir("sync_json");
     let (base, src) = mixed(&dir);
     let img = built(&dir, &base);
-    let out = sync_ok(&src, &img, &["--delete", "--json"]);
+    let out = sync_ok(&src, &img, &["--delete", "--yes", "--json"]);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(!stdout.trim().is_empty());
     for line in stdout.lines() {
@@ -657,7 +713,7 @@ fn dry_run_with_deletes_reports_them_and_writes_nothing() {
     assert!(text.contains("delete: /gonedir/"), "{text}");
     assert!(text.contains("move: /movefrom/m.bin → /dest/m.bin"), "{text}");
     assert_eq!(digest(&img), before, "--dry-run with deletes changed the image");
-    sync_ok(&src, &img, &["--delete"]);
+    sync_ok(&src, &img, &["--delete", "--yes"]);
     fsck_clean(&img);
     expect_same(&src, &read_ok(&img), "after the real run");
     fs::remove_dir_all(&dir).unwrap();
@@ -673,19 +729,8 @@ fn crash_at_every_phase_of_a_mixed_run_is_exactly_old_then_new() {
     for phase in PHASES {
         let img = dir.join(format!("{phase}.img"));
         fs::copy(&pristine, &img).unwrap();
-        let out = flashcp()
-            .arg("sync")
-            .arg(&src)
-            .arg(&img)
-            .arg("--delete")
-            .env("FLASHCP_TEST_NO_ADD_BUILD", "1")
-            .env("FLASHCP_TEST_STOP_AFTER", phase)
-            .output()
-            .unwrap();
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(!out.status.success() && err.contains(&format!("stopped after the {phase} phase")), "{phase}: {err}");
-        fsck_clean(&img);
-        let vol = exfat_reader::read_volume_allow_leaks(&img).unwrap_or_else(|e| panic!("{phase}: {e}"));
+        stop_at(&src, &img, phase, &["--delete", "--yes"]);
+        let vol = crashed_state(&img, phase);
         let got = as_src(&vol);
         for (p, n) in &got {
             let ok = |t: &BTreeMap<String, SrcNode>| {
@@ -707,14 +752,8 @@ fn crash_at_every_phase_of_a_mixed_run_is_exactly_old_then_new() {
                 assert!(problems.is_empty(), "{phase}: not exactly the new tree:\n{}", problems.join("\n"));
             }
         }
-        // Recovery: fsck -y clears the dirty flag, then the sync completes the job. Clusters an
-        // interrupted run leaked stay allocated (see the ignored test below), so the read tolerates them.
-        let _ = Command::new("fsck.exfat").arg("-y").arg(&img).output().unwrap();
-        sync_ok(&src, &img, &["--delete"]);
-        fsck_clean(&img);
-        let vol = exfat_reader::read_volume_allow_leaks(&img).unwrap_or_else(|e| panic!("{phase}: {e}"));
-        let problems = compare_trees(&new, &vol);
-        assert!(problems.is_empty(), "{phase}: after recovery:\n{}", problems.join("\n"));
+        recover_both_ways(&src, &img, phase, &["--delete", "--yes"]);
+        fs::remove_file(&img).unwrap();
     }
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -915,7 +954,7 @@ fn random_mutation_rounds_converge_to_the_source() {
             let checksum = round % 2 == 1;
             let ops: Vec<String> = (0..4).map(|_| mutate(&mut g, &src, checksum)).collect();
             eprintln!("seed {seed} round {round} (checksum: {checksum}): {ops:?}");
-            let mut args = vec!["--delete"];
+            let mut args = vec!["--delete", "--yes"];
             if checksum {
                 args.push("--checksum");
             }
@@ -937,4 +976,473 @@ fn random_mutation_rounds_converge_to_the_source() {
         }
         fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+// ───────────────────────── raw access to the root directory ─────────────────────────
+
+/// The root directory of an image: its bytes and the device offset of each 32-byte slot.
+fn root_dir(img: &Path) -> (Vec<u8>, Vec<u64>) {
+    use std::os::unix::fs::FileExt;
+    let f = fs::File::open(img).unwrap();
+    let mut s0 = [0u8; 512];
+    f.read_exact_at(&mut s0, 0).unwrap();
+    let le32 = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let bps = 1u64 << s0[108];
+    let cs = bps << s0[109];
+    let (fat, heap) = (le32(&s0, 80) as u64 * bps, le32(&s0, 88) as u64 * bps);
+    let (mut c, mut data, mut offs) = (le32(&s0, 96), Vec::new(), Vec::new());
+    while c != 0xFFFF_FFFF {
+        let at = heap + (c as u64 - 2) * cs;
+        let mut buf = vec![0u8; cs as usize];
+        f.read_exact_at(&mut buf, at).unwrap();
+        data.extend(buf);
+        offs.extend((0..cs).step_by(32).map(|k| at + k));
+        let mut n = [0u8; 4];
+        f.read_exact_at(&mut n, fat + 4 * c as u64).unwrap();
+        c = u32::from_le_bytes(n);
+    }
+    (data, offs)
+}
+
+/// (offset, name, type) of every file entry set (live 0x85 or deleted 0x05) of the root, and
+/// how many in-use secondary entries stand outside a live set (orphans).
+fn root_sets(img: &Path) -> (Vec<(usize, String, u8)>, usize) {
+    let (d, _) = root_dir(img);
+    let (mut out, mut orphans, mut i) = (Vec::new(), 0, 0);
+    while i + 32 <= d.len() && d[i] != 0 {
+        let t = d[i];
+        if t == 0x85 || t == 0x05 {
+            let sc = d[i + 1] as usize;
+            let n = d[i + 32 + 3] as usize;
+            let units: Vec<u16> = (0..n)
+                .map(|k| {
+                    let at = i + 64 + 32 * (k / 15) + 2 + 2 * (k % 15);
+                    u16::from_le_bytes([d[at], d[at + 1]])
+                })
+                .collect();
+            out.push((i, String::from_utf16_lossy(&units), t));
+            if t == 0x85 {
+                i += 32 * (1 + sc);
+                continue;
+            }
+        } else if t & 0xC0 == 0xC0 {
+            orphans += 1;
+        }
+        i += 32;
+    }
+    (out, orphans)
+}
+
+fn offset_of(img: &Path, name: &str) -> usize {
+    root_sets(img).0.iter().find(|s| s.1 == name && s.2 == 0x85).unwrap_or_else(|| panic!("no live {name}")).0
+}
+
+fn poke(img: &Path, at: u64, bytes: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    fs::OpenOptions::new().write(true).open(img).unwrap().write_all_at(bytes, at).unwrap();
+}
+
+fn run_env(src: &Path, img: &Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut c = flashcp();
+    c.arg("sync").arg(src).arg(img).args(extra);
+    c.env("FLASHCP_TEST_NO_ADD_BUILD", "1").env("XDG_STATE_HOME", img.parent().unwrap().join("state"));
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    c.output().unwrap()
+}
+
+fn recover_cmd(img: &Path) -> Output {
+    flashcp()
+        .arg("sync")
+        .arg("--recover")
+        .arg(img)
+        .env("XDG_STATE_HOME", img.parent().unwrap().join("state"))
+        .output()
+        .unwrap()
+}
+
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).to_string()
+}
+
+// ───────────────────────── --delete confirmation ─────────────────────────
+
+#[test]
+fn deletions_need_yes_and_more_than_a_thousand_need_yes_many() {
+    let dir = test_dir("sync_yes");
+    let base = dir.join("base");
+    text(&base.join("keep.txt"), "keep\n", T0);
+    for i in 0..1000 {
+        text(&base.join(format!("many/f{i:04}")), "x", T0);
+    }
+    text(&base.join("one.txt"), "one\n", T0);
+    let img = built(&dir, &base);
+    let src = dir.join("src");
+    text(&src.join("keep.txt"), "keep\n", T0);
+    let before = digest(&img);
+    // 1000 files + 1 directory + one.txt: 1002 entries.
+    let out = sync_cmd(&src, &img, &["--delete"]);
+    assert!(!out.status.success() && stderr(&out).contains("pass --yes"), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("delete: /one.txt"), "the plan is printed first");
+    let out = sync_cmd(&src, &img, &["--delete", "--yes"]);
+    assert!(!out.status.success() && stderr(&out).contains("--yes-many"), "{}", stderr(&out));
+    assert_eq!(digest(&img), before, "a refused sync wrote something");
+    assert!(journals(&img).is_empty(), "a refused sync left a journal");
+    sync_ok(&src, &img, &["--delete", "--dry-run"]); // a dry run needs neither
+    // Fewer: --yes is enough.
+    text(&src.join("many/f0000"), "x", T0);
+    for i in 1..1000 {
+        text(&src.join(format!("many/f{i:04}")), "x", T0);
+    }
+    let out = sync_cmd(&src, &img, &["--delete"]);
+    assert!(!out.status.success() && stderr(&out).contains("pass --yes"), "{}", stderr(&out));
+    sync_ok(&src, &img, &["--delete", "--yes"]);
+    expect_same(&src, &read_ok(&img), "after one deletion");
+    fs::remove_dir_all(src.join("many")).unwrap();
+    sync_ok(&src, &img, &["--delete", "--yes", "--yes-many"]);
+    fsck_clean(&img);
+    expect_same(&src, &read_ok(&img), "after the many deletions");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+// ───────────────────────── relocated entry sets: torn writes, duplicates ─────────────────────────
+
+/// e00..e{n-1}: files of 5000 random bytes (e20 a directory when `with_dir`). Sets of a
+/// 3-character name are 96 bytes after the 96 bytes of label, bitmap and up-case entries, so
+/// e04, e20 and e36 start at offset 480 of a sector.
+fn padded(dir: &Path, n: usize, with_dir: bool) -> std::path::PathBuf {
+    let base = dir.join("base");
+    for i in 0..n {
+        if with_dir && i == 20 {
+            text(&base.join("e20/inside.txt"), "inside\n", T0);
+            set_mtime(&base.join("e20"), T0, 0);
+        } else {
+            random(&base.join(format!("e{i:02}")), 5000, 100 + i as u64, T0);
+        }
+    }
+    base
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    let st = Command::new("cp").arg("-a").arg(from).arg(to).status().unwrap();
+    assert!(st.success());
+}
+
+#[test]
+fn torn_write_of_a_relocated_set_keeps_the_old_or_new_file_with_and_without_the_journal() {
+    let dir = test_dir("sync_torn");
+    let base = padded(&dir, 9, false);
+    let img = built(&dir, &base);
+    // e04 straddles (480) and its new copy goes to 960, across the sector boundary at 1024.
+    assert_eq!(offset_of(&img, "e04"), 480, "layout precondition");
+    assert_eq!(root_sets(&img).0.last().unwrap().0 + 96, 960, "layout precondition");
+    let src = dir.join("src");
+    copy_tree(&base, &src);
+    random(&src.join("e04"), 7000, 9, T0 + 50);
+    let old = read_source_tree(&base)["e04"].bytes.clone();
+    let new = read_source_tree(&src)["e04"].bytes.clone();
+    let out = run_env(&src, &img, &[], &[("FLASHCP_TEST_TORN", "relocate")]);
+    assert!(!out.status.success() && stderr(&out).contains("simulated torn write"), "{}", stderr(&out));
+    let n = fsck_n(&img);
+    eprintln!("torn: fsck.exfat -n said:\n{n}");
+    assert!(n.contains("checksum") && n.contains("corrupted"), "{n}");
+    // Without the journal: fsck -y drops the torn set; the file is there, OLD.
+    let alt = dir.join("alt.img");
+    fs::copy(&img, &alt).unwrap();
+    fsck_y(&alt);
+    let vol = exfat_reader::read_volume_crashed(&alt).unwrap();
+    let got = &vol.tree["e04"].bytes;
+    assert!(*got == old || *got == new, "e04 is neither old nor new");
+    fs::remove_file(&alt).unwrap();
+    recover_both_ways(&src, &img, "torn", &[]);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn stop_after_link_leaves_duplicates_that_the_next_sync_resolves() {
+    let dir = test_dir("sync_dups");
+    let base = padded(&dir, 40, true);
+    let img = built(&dir, &base);
+    for (name, off) in [("e04", 480), ("e20", 2016), ("e36", 3552)] {
+        assert_eq!(offset_of(&img, name), off, "layout precondition");
+    }
+    let src = dir.join("src");
+    copy_tree(&base, &src);
+    random(&src.join("e04"), 6000, 77, T0 + 9); // re-point across 480: relocated
+    fs::rename(src.join("e36"), src.join("E36")).unwrap(); // case rename crossing: relocated
+    fs::rename(src.join("e20"), src.join("E20")).unwrap(); // a directory's, too
+    let plan = plan_line(&sync_ok(&src, &img, &["--dry-run", "--json"]));
+    assert_eq!(json_u64(&plan, "relocated"), 3, "{plan}");
+    stop_at(&src, &img, "link", &[]);
+    // The duplicate window: the new sets are live, their old copies too.
+    let (sets, _) = root_sets(&img);
+    let live = |n: &str| sets.iter().filter(|s| s.2 == 0x85 && s.1.eq_ignore_ascii_case(n)).count();
+    assert_eq!((live("e04"), live("e20"), live("e36")), (2, 2, 2), "{sets:?}");
+    let info = flashcp().arg("info").arg(&img).output().unwrap();
+    assert!(!info.status.success() && stderr(&info).contains("flashcp sync --recover"), "{}", stderr(&info));
+    let n = fsck_n(&img);
+    eprintln!("dups: fsck.exfat -n said:\n{n}");
+    assert!(n.contains("corrupted"), "{n}");
+    let crashed = exfat_reader::read_volume_crashed(&img).unwrap();
+    expect_same(&src, &crashed, "the duplicate window, newer sets");
+
+    // 1. Duplicates on a volume no fsck touched (the dirty flag cleared by hand, no journal):
+    //    the keeper is the set that matches the source; the others are unlinked.
+    let hand = dir.join("hand.img");
+    fs::copy(&img, &hand).unwrap();
+    let mut flags = [0u8; 2];
+    {
+        use std::os::unix::fs::FileExt;
+        fs::File::open(&hand).unwrap().read_exact_at(&mut flags, 106).unwrap();
+    }
+    poke(&hand, 106, &[flags[0] & !2, flags[1]]);
+    let saved = journals(&img)[0].clone();
+    let keep_journal = dir.join("journal.json");
+    fs::rename(&saved, &keep_journal).unwrap();
+    let plan = plan_line(&sync_ok(&src, &hand, &["--json"]));
+    assert_eq!(json_u64(&plan, "repaired"), 3, "{plan}");
+    fsck_clean(&hand);
+    expect_same(&src, &read_ok(&hand), "after resolving the duplicates");
+    let d = digest(&hand);
+    sync_ok(&src, &hand, &[]);
+    assert_eq!(digest(&hand), d, "a repeat sync wrote something");
+
+    // 2. fsck.exfat -y without the journal: it renames the newer copy of the re-pointed file to
+    //    FILE0000000.CHK and truncates the later of two sets sharing clusters; sync keeps the
+    //    sets with the data, rewrites e04 from SRC, and (with --delete) removes the .CHK.
+    let y = dir.join("y.img");
+    fs::copy(&img, &y).unwrap();
+    let said = fsck_y(&y);
+    eprintln!("dups: fsck.exfat -y said:\n{said}");
+    let plan = plan_line(&sync_ok(&src, &y, &["--json"]));
+    assert!(json_u64(&plan, "repaired") >= 2, "{plan}");
+    let vol = exfat_reader::read_volume_allow_leaks(&y).unwrap();
+    for (p, s) in read_source_tree(&src) {
+        assert_eq!(vol.tree[&p].bytes, s.bytes, "{p} after fsck -y and sync");
+    }
+    let chk: Vec<_> = vol.tree.keys().filter(|k| k.ends_with(".CHK")).cloned().collect();
+    for k in &chk {
+        assert_eq!(vol.tree[k].bytes, read_source_tree(&src)["e04"].bytes, "{k} holds e04's new version");
+    }
+    sync_ok(&src, &y, &["--delete", "--yes"]);
+    fsck_clean(&y);
+    expect_same(&src, &read_ok(&y), "after fsck -y, sync --delete (strict: nothing leaked)");
+
+    // 3. With the journal (put back): the next sync replays it (and the other way, as everywhere).
+    fs::rename(&keep_journal, &saved).unwrap();
+    recover_both_ways(&src, &img, "dups", &["--delete", "--yes"]);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+// ───────────────────────── the journal ─────────────────────────
+
+#[test]
+fn journal_replay_finishes_moves_even_after_their_sources_are_gone() {
+    let dir = test_dir("sync_journal_moves");
+    let base = dir.join("base");
+    random(&base.join("old/a.bin"), 300_000, 1, T0);
+    random(&base.join("old/b.bin"), 200_000, 2, T0 + 1);
+    text(&base.join("keep.txt"), "keep\n", T0);
+    let img = built(&dir, &base);
+    let src = dir.join("src");
+    random(&src.join("new/a.bin"), 300_000, 1, T0);
+    random(&src.join("new/b.bin"), 200_000, 2, T0 + 1);
+    text(&src.join("keep.txt"), "keep\n", T0);
+    let want = read_source_tree(&src);
+    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--yes", "--dry-run", "--json"]));
+    assert_eq!(json_u64(&plan, "moved"), 2, "{plan}");
+    stop_at(&src, &img, "unlink", &["--delete", "--yes"]);
+    let text_j = fs::read_to_string(&journals(&img)[0]).unwrap();
+    assert!(text_j.contains(r#""from":"/old/a.bin","to":"/new/a.bin""#), "{text_j:.400}");
+    // The moved files leave the source: only the journal knows where they went.
+    let rec = dir.join("rec.img");
+    fs::copy(&img, &rec).unwrap();
+    let jpath = journals(&img)[0].clone();
+    let saved = dir.join("saved.json");
+    fs::copy(&jpath, &saved).unwrap();
+    fs::remove_dir_all(src.join("new")).unwrap();
+    let out = sync_ok(&src, &img, &[]);
+    assert!(stderr(&out).contains("completed an interrupted sync"), "{}", stderr(&out));
+    let vol = read_ok(&img);
+    for p in ["new/a.bin", "new/b.bin"] {
+        assert_eq!(vol.tree[p].bytes, want[p].bytes, "{p} after the replay");
+    }
+    assert!(!vol.tree.contains_key("old"), "the old directory is back");
+    fsck_clean(&img);
+    // --recover alone does the same, and nothing else.
+    fs::copy(&saved, &jpath).unwrap();
+    let out = recover_cmd(&rec);
+    assert_success(&out, "sync --recover");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("completed an interrupted sync"));
+    assert!(journals(&rec).is_empty());
+    fsck_clean(&rec);
+    let vol = read_ok(&rec);
+    for (p, s) in &want {
+        assert_eq!(vol.tree[p].bytes, s.bytes, "{p} after --recover");
+    }
+    let out = recover_cmd(&rec);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no interrupted sync"), "{out:?}");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The writes a journal holds: (phase, offset, pre, post).
+fn journal_writes(path: &Path) -> Vec<(String, u64, Vec<u8>, Vec<u8>)> {
+    let field = |l: &str, k: &str| {
+        let pat = format!("\"{k}\":");
+        let r = &l[l.find(&pat).unwrap() + pat.len()..];
+        let r = r.trim_start_matches('"');
+        r[..r.find(['"', ',', '}']).unwrap()].to_string()
+    };
+    let unhex = |s: String| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect();
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter(|l| l.starts_with("{\"phase\":"))
+        .map(|l| {
+            (field(l, "phase"), field(l, "offset").parse().unwrap(), unhex(field(l, "pre")), unhex(field(l, "post")))
+        })
+        .collect()
+}
+
+#[test]
+fn a_volume_changed_since_the_crash_is_not_replayed_and_stale_or_missing_journals_are_handled() {
+    let dir = test_dir("sync_journal_tamper");
+    let (base, src) = mixed(&dir);
+    let img = built(&dir, &base);
+    stop_at(&src, &img, "alloc", &["--delete", "--yes"]);
+    let jpath = journals(&img)[0].clone();
+    let ws = journal_writes(&jpath);
+    // Change a byte the link phase will write to a value no journaled state has.
+    let (_, off, pre, post) = ws.iter().find(|w| w.0 == "link").unwrap().clone();
+    let held: Vec<u8> = ws
+        .iter()
+        .filter(|w| w.1 <= off && off < w.1 + w.2.len() as u64)
+        .flat_map(|w| [w.2[(off - w.1) as usize], w.3[(off - w.1) as usize]])
+        .collect();
+    let bad = (0..=255u8).find(|b| !held.contains(b)).unwrap();
+    assert!(pre[0] != bad && post[0] != bad);
+    let tampered = dir.join("tampered.img");
+    fs::copy(&img, &tampered).unwrap();
+    poke(&tampered, off, &[bad]);
+    let before = digest(&tampered);
+    let out = sync_cmd(&src, &tampered, &["--delete", "--yes"]);
+    assert!(!out.status.success() && stderr(&out).contains("changed since"), "{}", stderr(&out));
+    let out = recover_cmd(&tampered);
+    assert!(!out.status.success() && stderr(&out).contains("changed since"), "{}", stderr(&out));
+    assert_eq!(digest(&tampered), before, "a refused recovery wrote something");
+    assert!(jpath.exists(), "a refused recovery removed the journal");
+    // A dirty volume without its journal is refused, with the fsck hint.
+    let saved = dir.join("saved.json");
+    fs::rename(&jpath, &saved).unwrap();
+    let out = sync_cmd(&src, &img, &["--delete", "--yes"]);
+    assert!(!out.status.success() && stderr(&out).contains("fsck.exfat -y"), "{}", stderr(&out));
+    // A journal for a clean volume is stale: removed with a note, then the sync runs.
+    fsck_y(&img);
+    fs::rename(&saved, &jpath).unwrap();
+    let out = sync_ok(&src, &img, &["--delete", "--yes"]);
+    assert!(stderr(&out).contains("stale sync journal"), "{}", stderr(&out));
+    assert!(journals(&img).is_empty());
+    let vol = exfat_reader::read_volume_allow_leaks(&img).unwrap();
+    expect_same(&src, &vol, "after the stale journal");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+// ───────────────────────── orphan secondaries ─────────────────────────
+
+#[test]
+fn orphan_secondaries_are_skipped_by_everyone_and_cleared_by_the_next_sync() {
+    let dir = test_dir("sync_orphans");
+    let base = dir.join("base");
+    text(&base.join("a.txt"), "a\n", T0);
+    text(&base.join("b.txt"), "b\n", T0);
+    let img = built(&dir, &base);
+    // What an interrupted unlink leaves: a.txt's file entry deleted, its secondaries in use.
+    let (_, offs) = root_dir(&img);
+    poke(&img, offs[offset_of(&img, "a.txt") / 32], &[0x05]);
+    assert_eq!(root_sets(&img).1, 2);
+    let n = fsck_n(&img);
+    eprintln!("orphans: fsck.exfat -n said:\n{n}");
+    assert!(n.contains("clean"), "{n}");
+    let info = flashcp().arg("info").arg(&img).output().unwrap();
+    assert_success(&info, "flashcp info on a volume with orphan secondaries");
+    let src = dir.join("src");
+    text(&src.join("b.txt"), "b\n", T0);
+    // Nothing else to do: the run only clears them.
+    let plan = plan_line(&sync_ok(&src, &img, &["--json"]));
+    assert_eq!(json_u64(&plan, "orphans"), 2, "{plan}");
+    assert!(json_u64(&plan, "write_bytes") > 0, "{plan}");
+    assert_eq!(root_sets(&img).1, 0, "orphans left");
+    let n = fsck_n(&img);
+    assert!(!n.contains("ERROR"), "{n}");
+    // a.txt's clusters were never freed by the interrupted run: a leak, as for add.
+    expect_same(&src, &exfat_reader::read_volume_allow_leaks(&img).unwrap(), "after clearing orphans");
+    let d = digest(&img);
+    sync_ok(&src, &img, &[]);
+    assert_eq!(digest(&img), d, "a repeat sync wrote something");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+// ───────────────────────── move confirmation ─────────────────────────
+
+#[test]
+fn five_thousand_renamed_files_of_equal_size_and_time_are_all_moved_fast() {
+    let dir = test_dir("sync_many_moves");
+    let base = dir.join("base");
+    const N: usize = 5000;
+    for i in 0..N {
+        random(&base.join(format!("f{i:04}.bin")), 8000, 1000 + i as u64, T0);
+    }
+    let img = dir.join("disk.img");
+    make_image(&img, 128 * MB);
+    assert_success(&run_build(&base, &img, &["--cluster", "4096"]), "flashcp build");
+    let src = dir.join("src");
+    for i in 0..N {
+        // Renamed, and shuffled: g{i} holds f{(i * 7919) % N}'s content.
+        random(&src.join(format!("g{i:04}.bin")), 8000, 1000 + ((i * 7919) % N) as u64, T0);
+    }
+    let t = Instant::now();
+    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--yes", "--yes-many", "--json"]));
+    let secs = t.elapsed().as_secs_f64();
+    assert_eq!(
+        (json_u64(&plan, "moved"), json_u64(&plan, "new"), json_u64(&plan, "bytes")),
+        (N as u64, 0, 0),
+        "{plan}"
+    );
+    assert_eq!(json_u64(&plan, "moves_verified"), N as u64, "{plan}");
+    assert!(secs < 30.0, "5000 moves took {secs:.1} s");
+    fsck_clean(&img);
+    expect_same(&src, &read_ok(&img), "after 5000 moves");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn equal_samples_with_a_different_middle_are_copied_unless_fast_moves() {
+    let dir = test_dir("sync_fast_moves");
+    let base = dir.join("base");
+    random(&base.join("old.bin"), 1 << 20, 5, T0);
+    random(&base.join("same_old.bin"), 1 << 20, 6, T0 + 1);
+    let src = dir.join("src");
+    let mut mid = fs::read(base.join("old.bin")).unwrap();
+    // Samples sit at k * (len - 4096) / 7; a byte halfway between the first two is in none.
+    let at = ((1 << 20) - 4096) / 14;
+    mid[at] ^= 0xFF;
+    write_file(&src.join("new.bin"), &mid);
+    set_mtime(&src.join("new.bin"), T0, 0);
+    random(&src.join("same_new.bin"), 1 << 20, 6, T0 + 1); // a true move
+    // Default: the full comparison catches it; it is copied, the true move is taken.
+    let img = built(&dir, &base);
+    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--yes", "--json"]));
+    assert_eq!((json_u64(&plan, "moved"), json_u64(&plan, "new")), (1, 1), "{plan}");
+    assert_eq!(json_u64(&plan, "moves_verified"), 1, "{plan}");
+    fsck_clean(&img);
+    expect_same(&src, &read_ok(&img), "default");
+    // --fast-moves takes the fingerprint for the content: new.bin gets old.bin's bytes.
+    fs::remove_file(&img).unwrap();
+    let img = built(&dir, &base);
+    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--yes", "--fast-moves", "--json"]));
+    assert_eq!((json_u64(&plan, "moved"), json_u64(&plan, "moves_fast")), (2, 2), "{plan}");
+    let vol = read_ok(&img);
+    assert_eq!(vol.tree["new.bin"].bytes, fs::read(base.join("old.bin")).unwrap(), "the risk --fast-moves takes");
+    fs::remove_dir_all(&dir).unwrap();
 }
