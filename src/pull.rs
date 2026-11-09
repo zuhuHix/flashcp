@@ -139,20 +139,23 @@ pub struct Strategy {
     pub mbps: Option<f64>,
     /// Largest single read, in bytes.
     pub chunk: usize,
+    /// Reads end on a multiple of this (4096, or the device's 512-byte logical block on BOT).
+    pub tail: u64,
 }
 
 impl Strategy {
     pub fn to_json(&self) -> String {
         let f = |v: Option<f64>| v.map_or("null".to_string(), |v| format!("{v:.3}"));
         format!(
-            r#"{{"transport":{},"gap_kb":{},"chunk_kb":{},"inflight":{},"direct":{},"overhead_ms":{},"mbps":{}}}"#,
+            r#"{{"transport":{},"gap_kb":{},"inflight":{},"direct":{},"overhead_ms":{},"mbps":{},"chunk_kb":{},"tail":{}}}"#,
             crate::events::json_str(&self.transport),
             self.gap >> 10,
-            self.chunk >> 10,
             self.inflight,
             self.direct,
             f(self.overhead_ms),
-            f(self.mbps)
+            f(self.mbps),
+            self.chunk >> 10,
+            self.tail
         )
     }
 }
@@ -213,6 +216,7 @@ fn choose_strategy(file: &File, v: &Vol, o: &PullOpts) -> Strategy {
         overhead_ms: None,
         mbps: None,
         chunk: QUEUED_CHUNK,
+        tail: ALIGN,
     };
     if s.transport == "usb-storage" {
         s.inflight = BOT_INFLIGHT;
@@ -221,6 +225,11 @@ fn choose_strategy(file: &File, v: &Vol, o: &PullOpts) -> Strategy {
         // flashcp layout), 120 KB reads 15.9 s vs 8 MB reads 17.6 s for the same 208 MB.
         let hw = info.max_sectors_kb.as_deref().and_then(|k| k.parse::<usize>().ok()).unwrap_or(0) << 10;
         s.chunk = (hw / ALIGN as usize * ALIGN as usize).clamp(MIN_CHUNK, QUEUED_CHUNK);
+        // Every byte costs on a slow stick: stop a file's last read at its 512-byte sector
+        // (on 32 KB-cluster kernel layouts each file's read otherwise ends up to 3.5 KB late).
+        if logical_block(file) == Some(512) {
+            s.tail = 512;
+        }
         let bdev = crate::devprofile::block_dev_of(file);
         let cached = || bdev.and_then(crate::devprofile::load).and_then(|p| Some((p.read_cmd_s?, p.seq_read_bps?)));
         let measure = || {
@@ -253,10 +262,28 @@ fn choose_strategy(file: &File, v: &Vol, o: &PullOpts) -> Strategy {
     if let Some(b) = o.buffered {
         s.direct = !b;
     }
+    if std::env::var_os(TAIL4K_ENV).is_some() {
+        s.tail = ALIGN;
+    }
     if let Some(c) = o.chunk {
         s.chunk = c;
     }
     s
+}
+
+/// Test/benchmark hook: end reads on 4 KB even where 512 bytes would do.
+const TAIL4K_ENV: &str = "FLASHCP_TEST_TAIL_4K";
+
+/// Logical block size of a block device (BLKSSZGET), None for anything else.
+fn logical_block(f: &File) -> Option<u64> {
+    use std::os::unix::io::AsRawFd;
+    if !f.metadata().ok()?.file_type().is_block_device() {
+        return None;
+    }
+    let mut n: libc::c_int = 0;
+    // BLKSSZGET = _IO(0x12, 104); request type differs between glibc and musl, hence `as _`.
+    let r = unsafe { libc::ioctl(f.as_raw_fd(), 0x1268 as _, &mut n) };
+    (r == 0 && n > 0).then_some(n as u64)
 }
 
 /// A volume name as a single, safe path component.
@@ -410,7 +437,9 @@ fn read_full(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
 
 /// Coalesces extents (sorted by `phys`) into aligned reads of at most `max` bytes, reading
 /// through gaps of up to `gap` bytes. Every extent must be at most `max - 2 * ALIGN` bytes.
-fn coalesce(exts: &[Ext], max: usize, gap: u64) -> Vec<Chunk> {
+/// The last read of a run ends on a multiple of `tail` (≤ ALIGN; 512 lets O_DIRECT on a
+/// 512-byte-sector device stop at the logical block instead of the next 4 KB).
+fn coalesce(exts: &[Ext], max: usize, gap: u64, tail: u64) -> Vec<Chunk> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < exts.len() {
@@ -431,7 +460,7 @@ fn coalesce(exts: &[Ext], max: usize, gap: u64) -> Vec<Chunk> {
             end = e_end;
             j += 1;
         }
-        let len = (end.div_ceil(ALIGN) * ALIGN - start) as usize;
+        let len = (end.div_ceil(tail) * tail - start) as usize;
         debug_assert!(len <= max, "chunk of {len} bytes exceeds {max}");
         out.push(Chunk { start, len, exts: i..j });
         i = j;
@@ -483,7 +512,7 @@ pub(crate) struct Chunk {
 /// `phys`, each at most `max - 2 × 4 KB` bytes, become aligned reads of at most `max` bytes
 /// reading through gaps of up to `gap` bytes.
 pub(crate) fn plan_reads(exts: &[Ext], max: usize, gap: u64) -> Vec<Chunk> {
-    coalesce(exts, max, gap)
+    coalesce(exts, max, gap, ALIGN)
 }
 
 /// Pull's default read strategy for `file` (holding the volume `v`), for other readers of a
@@ -930,7 +959,7 @@ fn pull_inner(
     p.exts.sort_unstable_by_key(|e| e.phys);
     let cut = v.vol_bytes / ALIGN * ALIGN;
     let tail_at = p.exts.partition_point(|e| e.phys < cut);
-    let chunks = coalesce(&p.exts[..tail_at], strat.chunk, strat.gap);
+    let chunks = coalesce(&p.exts[..tail_at], strat.chunk, strat.gap, strat.tail);
     let tail_bytes = p.exts[tail_at..].iter().map(|e| e.phys + e.len as u64).max().map_or(0, |e| e - cut);
     let read_bytes: u64 = chunks.iter().map(|c| c.len as u64).sum::<u64>() + tail_bytes;
     let data_bytes: u64 = p.jobs.iter().map(|j| j.len).sum();
@@ -1240,7 +1269,7 @@ mod tests {
         let k = ALIGN;
         // Two extents 4 KB apart (merged), then one 1 MB further (separate with a 64 KB gap).
         let e = [ext(k, 100, 0), ext(2 * k + 10, 50, 1), ext(2 * k + (1 << 20), 4096, 2)];
-        let c = coalesce(&e, 8 << 20, 64 << 10);
+        let c = coalesce(&e, 8 << 20, 64 << 10, ALIGN);
         assert_eq!(
             c,
             vec![
@@ -1249,7 +1278,7 @@ mod tests {
             ]
         );
         // With a huge gap threshold everything is one read.
-        assert_eq!(coalesce(&e, 8 << 20, 2 << 20).len(), 1);
+        assert_eq!(coalesce(&e, 8 << 20, 2 << 20, ALIGN).len(), 1);
     }
 
     #[test]
@@ -1257,14 +1286,24 @@ mod tests {
         // Back-to-back files on a flashcp layout: the first ends inside a block, the next
         // starts in the following one. Nothing lies between the aligned ends: one read.
         let e = [ext(0, 5000, 0), ext(8192, 100, 1)];
-        assert_eq!(coalesce(&e, 8 << 20, 0), vec![Chunk { start: 0, len: 3 * ALIGN as usize, exts: 0..2 }]);
+        assert_eq!(coalesce(&e, 8 << 20, 0, ALIGN), vec![Chunk { start: 0, len: 3 * ALIGN as usize, exts: 0..2 }]);
         // Sub-4 KB clusters: two files sharing one block are one read, never two of the block.
         let e = [ext(0, 512, 0), ext(1024, 512, 1)];
-        assert_eq!(coalesce(&e, 8 << 20, 0).len(), 1);
+        assert_eq!(coalesce(&e, 8 << 20, 0, ALIGN).len(), 1);
         // A real hole of one block is still skipped with gap 0, read through with gap 4 KB.
         let e = [ext(0, 4096, 0), ext(8192, 100, 1)];
-        assert_eq!(coalesce(&e, 8 << 20, 0).len(), 2);
-        assert_eq!(coalesce(&e, 8 << 20, ALIGN).len(), 1);
+        assert_eq!(coalesce(&e, 8 << 20, 0, ALIGN).len(), 2);
+        assert_eq!(coalesce(&e, 8 << 20, ALIGN, ALIGN).len(), 1);
+    }
+
+    #[test]
+    fn coalesce_tail_ends_on_the_logical_block() {
+        // A file of 5000 bytes, then one 32 KB further: reads end at 5120 (512-byte sector).
+        let e = [ext(0, 5000, 0), ext(32 << 10, 100, 1)];
+        let c = coalesce(&e, 8 << 20, 0, 512);
+        assert_eq!(c[0], Chunk { start: 0, len: 5120, exts: 0..1 });
+        assert_eq!(c[1], Chunk { start: 32 << 10, len: 512, exts: 1..2 });
+        assert_eq!(coalesce(&e, 8 << 20, 0, ALIGN)[0].len, 8192);
     }
 
     #[test]
@@ -1273,7 +1312,7 @@ mod tests {
         // Unaligned extents of max - 2 * ALIGN bytes, back to back: one per chunk, never over max.
         let n = (max as u64 - 2 * ALIGN) as u32;
         let e: Vec<Ext> = (0..5).map(|i| ext(512 + i * n as u64, n, i as u32)).collect();
-        let c = coalesce(&e, max, 1 << 30);
+        let c = coalesce(&e, max, 1 << 30, ALIGN);
         assert_eq!(c.len(), 5);
         for ch in &c {
             assert!(ch.len <= max && ch.start.is_multiple_of(ALIGN) && ch.len.is_multiple_of(ALIGN as usize));
@@ -1283,7 +1322,7 @@ mod tests {
         }
         // Overlapping extents (a cross-linked volume) stay inside one read.
         let e = [ext(0, 8192, 0), ext(4096, 100, 1)];
-        assert_eq!(coalesce(&e, max, 0), vec![Chunk { start: 0, len: 8192, exts: 0..2 }]);
+        assert_eq!(coalesce(&e, max, 0, ALIGN), vec![Chunk { start: 0, len: 8192, exts: 0..2 }]);
     }
 
     #[test]
