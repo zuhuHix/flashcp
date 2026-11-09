@@ -42,7 +42,7 @@ jobs:
             librsvg2-dev libssl-dev libxdo-dev pkg-config desktop-file-utils libxml2-utils
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 22.23.4
       - name: cargo fmt
         working-directory: gui
         run: cargo fmt --all --check
