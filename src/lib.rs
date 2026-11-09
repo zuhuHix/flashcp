@@ -6,13 +6,16 @@ pub mod add;
 pub mod bench;
 pub mod copy;
 pub mod dataset;
+pub mod devprofile;
 pub(crate) mod dirfd;
 pub mod events;
 pub mod exfat;
+pub mod optimize;
 pub mod pack;
 pub mod probe;
 pub mod pull;
 pub mod util;
+pub(crate) mod verify;
 pub(crate) mod volume;
 
 pub use add::{AddOpts, AddStats, VolumeInfo, add, add_to, info, info_of};

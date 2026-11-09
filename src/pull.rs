@@ -239,7 +239,7 @@ fn systime((secs, ns): (i64, u32)) -> Option<SystemTime> {
 }
 
 /// (device, mount point, read-write) of a mount.
-type MountState = (String, String, bool);
+pub(crate) type MountState = (String, String, bool);
 
 /// The first mount of the volume's device (or the loop device its image is attached to), if any.
 fn mount_state(md: &fs::Metadata) -> Option<MountState> {
@@ -731,6 +731,23 @@ pub fn pull(target: &Path, dest: &Path, o: &PullOpts, sink: Sink<'_>) -> Result<
 
 /// [`pull`] from a [`TargetSpec`] (a path, or an inherited block-device fd, O_RDONLY is enough).
 pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>) -> Result<PullStats> {
+    let (file, dev_len, guard, mounted) = open_source(target)?;
+    let r = pull_file(file, dev_len, mounted, &target.describe(), dest, o, sink);
+    drop(guard);
+    r
+}
+
+/// [`pull_from`] of an already opened source (`file`, `dev_len` bytes). `mounted` only words
+/// warnings; `what` names the source in them.
+pub(crate) fn pull_file(
+    file: File,
+    dev_len: u64,
+    mounted: Option<MountState>,
+    what: &str,
+    dest: &Path,
+    o: &PullOpts,
+    sink: Sink<'_>,
+) -> Result<PullStats> {
     let t0 = Instant::now();
     ensure!(!(o.skip_existing && o.overwrite), "--skip-existing and --overwrite are mutually exclusive");
     ensure!(
@@ -738,15 +755,14 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
         "chunk must be a multiple of 4 KB, between 16 KB and 1 GB"
     );
     let mut tick = Ticker::new(sink);
-    let (file, dev_len, _guard, mounted) = open_source(target)?;
     match &mounted {
         Some((dev, at, true)) => eprintln!(
             "warning: {} is mounted read-write at {at} (device {dev}); files written since the last `sync` \
              may be missing or partial. Unmount it (or at least run `sync`) for a consistent copy.",
-            target.describe()
+            what
         ),
         Some((_, at, false)) => {
-            eprintln!("note: {} is mounted read-only at {at}; reading it is safe", target.describe())
+            eprintln!("note: {what} is mounted read-only at {at}; reading it is safe")
         }
         None => {}
     }
@@ -871,7 +887,6 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
         cleanup_temps(&jobs, &d);
         return Err(e.context("pull failed; the destination holds a partial copy"));
     }
-    drop(_guard);
     // Directory mtimes last (creating entries changed them), deepest first.
     let mut cache = DirCache::default();
     for dn in d.dirs.iter().skip(1).rev() {
