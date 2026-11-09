@@ -1,5 +1,6 @@
-//! Strict argv parsing. The helper accepts exactly three command shapes and builds the flashcp
-//! argv itself from the validated values, so nothing the caller sends is forwarded verbatim.
+//! Strict argv parsing for both programs. The helper accepts exactly three command shapes and
+//! builds every flashcp argv itself from the validated values, so nothing the caller sends is
+//! forwarded verbatim.
 
 use std::ffi::OsString;
 
@@ -10,6 +11,12 @@ const MAX_TO: usize = 1024;
 /// exFAT volume labels hold at most 15 UTF-16 units; we count chars, which is never more lenient
 /// for the BMP and keeps the rule simple.
 const MAX_LABEL: usize = 15;
+/// Longest `--expect` / `--confirm` value, in chars.
+pub const MAX_KEY: usize = 128;
+/// Most `--item`s in one `add` job.
+pub const MAX_ITEMS: usize = 256;
+/// The fd number flashcp is told to use (`--target-fd`).
+pub const TARGET_FD: i32 = 3;
 
 /// A validated device name: `/dev/sd` + 1-3 lowercase letters + optional 1-3 digits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,107 +32,182 @@ impl DevName {
         self.name != self.disk
     }
 
-    /// The path flashcp is told to open. Always the canonical `/dev/<name>` spelling.
+    /// The canonical `/dev/<name>` spelling.
     pub fn path(&self) -> String {
         format!("/dev/{}", self.name)
     }
 }
 
+/// One `--item <src> <to>` of an `add` job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Item {
+    pub src: String,
+    pub to: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    Add { src: String, dev: DevName, to: Option<String>, skip_existing: bool },
-    Build { src: String, dev: DevName, label: Option<String> },
-    Info { dev: DevName },
+    Add { dev: DevName, expect: String, skip_existing: bool, items: Vec<Item> },
+    Build { dev: DevName, expect: String, confirm: String, label: Option<String>, src: String },
+    Info { dev: DevName, expect: String },
+}
+
+/// `flashcp-trust <dev> --expect <key>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustRequest {
+    pub dev: DevName,
+    pub expect: String,
+}
+
+fn tail() -> [String; 3] {
+    ["--target-fd".into(), TARGET_FD.to_string(), "--json".into()]
+}
+
+/// argv (without argv[0]) of `flashcp info --target-fd 3 --json`.
+pub fn info_args() -> Vec<String> {
+    let mut v = vec!["info".to_string()];
+    v.extend(tail());
+    v
 }
 
 impl Request {
     pub fn dev(&self) -> &DevName {
         match self {
-            Request::Add { dev, .. } | Request::Build { dev, .. } | Request::Info { dev } => dev,
+            Request::Add { dev, .. } | Request::Build { dev, .. } | Request::Info { dev, .. } => dev,
         }
     }
 
-    /// The exact argv (without argv[0]) handed to flashcp. `--json` is always appended.
-    pub fn flashcp_args(&self) -> Vec<String> {
-        let mut v: Vec<String> = Vec::new();
+    pub fn expect(&self) -> &str {
         match self {
-            Request::Add { src, dev, to, skip_existing } => {
-                v.extend(["add".into(), src.clone(), dev.path()]);
-                if let Some(to) = to {
-                    v.extend(["--to".into(), to.clone()]);
-                }
-                if *skip_existing {
-                    v.push("--skip-existing".into());
-                }
-            }
-            Request::Build { src, dev, label } => {
-                v.extend(["build".into(), src.clone(), dev.path(), "--yes-erase".into()]);
+            Request::Add { expect, .. } | Request::Build { expect, .. } | Request::Info { expect, .. } => expect,
+        }
+    }
+
+    /// `info` only reads; everything else needs a writable, exclusive open.
+    pub fn writes(&self) -> bool {
+        !matches!(self, Request::Info { .. })
+    }
+
+    /// The exact argvs (without argv[0]) of the flashcp runs, in order: one per item for `add`,
+    /// one for `build`/`info`.
+    pub fn flashcp_runs(&self) -> Vec<Vec<String>> {
+        match self {
+            Request::Add { skip_existing, items, .. } => items
+                .iter()
+                .map(|it| {
+                    let mut v = vec!["add".to_string(), it.src.clone()];
+                    v.extend(["--target-fd".into(), TARGET_FD.to_string(), "--to".into(), it.to.clone()]);
+                    if *skip_existing {
+                        v.push("--skip-existing".into());
+                    }
+                    v.push("--json".into());
+                    v
+                })
+                .collect(),
+            Request::Build { label, src, .. } => {
+                let mut v = vec!["build".to_string(), src.clone()];
+                v.extend(["--target-fd".into(), TARGET_FD.to_string(), "--yes-erase".into()]);
                 if let Some(l) = label {
                     v.extend(["--label".into(), l.clone()]);
                 }
+                v.push("--json".into());
+                vec![v]
             }
-            Request::Info { dev } => v.extend(["info".into(), dev.path()]),
+            Request::Info { .. } => vec![info_args()],
         }
-        v.push("--json".into());
-        v
     }
+}
+
+/// Non-UTF-8 is rejected outright: the GUI only ever sends UTF-8 and it keeps every later check
+/// a plain string check.
+fn utf8(args: &[OsString]) -> Result<Vec<&str>, String> {
+    args.iter().map(|a| a.to_str().ok_or_else(|| "arguments must be UTF-8".to_string())).collect()
+}
+
+/// Set a once-only flag value, refusing duplicates.
+fn once<T>(slot: &mut Option<T>, flag: &str, v: Result<T, String>) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!("duplicate flag {flag}"));
+    }
+    *slot = Some(v?);
+    Ok(())
+}
+
+/// The value after flag `f`.
+fn val<'a>(it: &mut impl Iterator<Item = &'a str>, f: &str) -> Result<&'a str, String> {
+    it.next().ok_or_else(|| format!("{f} needs a value"))
 }
 
 /// Parse the helper's argv (without argv[0]).
 pub fn parse(args: &[OsString]) -> Result<Request, String> {
-    // Non-UTF-8 is rejected outright: the GUI only ever sends UTF-8 and it keeps every later
-    // check a plain string check.
-    let args: Vec<&str> = args
-        .iter()
-        .map(|a| a.to_str().ok_or_else(|| "arguments must be UTF-8".to_string()))
-        .collect::<Result<_, _>>()?;
+    let args = utf8(args)?;
     let (op, rest) = args.split_first().ok_or("missing operation")?;
+    let Some((dev, flags)) = rest.split_first() else {
+        return Err(format!("usage: {op} <dev> --expect <key> ..."));
+    };
+    let dev = parse_dev(dev)?;
+    let mut it = flags.iter().copied();
+    let mut expect = None;
     match *op {
         "add" => {
-            let [src, dev, flags @ ..] = rest else {
-                return Err("usage: add <src> <dev> [--to <dir>] [--skip-existing]".into());
-            };
-            let (src, dev) = (check_src(src)?, parse_dev(dev)?);
-            let (mut to, mut skip_existing) = (None, false);
-            let mut it = flags.iter();
+            let (mut skip, mut items) = (false, Vec::new());
             while let Some(f) = it.next() {
-                match *f {
-                    "--to" if to.is_none() => to = Some(check_to(it.next().ok_or("--to needs a value")?)?),
-                    "--skip-existing" if !skip_existing => skip_existing = true,
-                    "--to" | "--skip-existing" => return Err(format!("duplicate flag {f}")),
+                match f {
+                    "--expect" => once(&mut expect, f, val(&mut it, f).and_then(check_key))?,
+                    "--skip-existing" if !skip => skip = true,
+                    "--skip-existing" => return Err(format!("duplicate flag {f}")),
+                    "--item" => {
+                        let src = check_src(val(&mut it, f)?)?;
+                        let to = check_to(val(&mut it, f)?)?;
+                        if items.len() == MAX_ITEMS {
+                            return Err(format!("at most {MAX_ITEMS} --item values"));
+                        }
+                        items.push(Item { src, to });
+                    }
                     _ => return Err("unexpected argument for add".into()),
                 }
             }
-            Ok(Request::Add { src, dev, to, skip_existing })
+            if items.is_empty() {
+                return Err("add needs at least one --item <src> <to>".into());
+            }
+            let expect = expect.ok_or("add requires --expect")?;
+            Ok(Request::Add { dev, expect, skip_existing: skip, items })
         }
         "build" => {
-            let [src, dev, flags @ ..] = rest else {
-                return Err("usage: build <src> <dev> --yes-erase [--label <L>]".into());
-            };
-            let (src, dev) = (check_src(src)?, parse_dev(dev)?);
-            let (mut yes, mut label) = (false, None);
-            let mut it = flags.iter();
+            let (mut confirm, mut label, mut src) = (None, None, None);
             while let Some(f) = it.next() {
-                match *f {
-                    "--yes-erase" if !yes => yes = true,
-                    "--label" if label.is_none() => {
-                        label = Some(check_label(it.next().ok_or("--label needs a value")?)?)
-                    }
-                    "--yes-erase" | "--label" => return Err(format!("duplicate flag {f}")),
+                match f {
+                    "--expect" => once(&mut expect, f, val(&mut it, f).and_then(check_key))?,
+                    "--confirm" => once(&mut confirm, f, val(&mut it, f).and_then(check_key))?,
+                    "--label" => once(&mut label, f, val(&mut it, f).and_then(check_label))?,
+                    s if s.starts_with('/') && src.is_none() => src = Some(check_src(s)?),
                     _ => return Err("unexpected argument for build".into()),
                 }
             }
-            // Erasing is never implied: the caller must say so explicitly.
-            if !yes {
-                return Err("build requires --yes-erase".into());
-            }
-            Ok(Request::Build { src, dev, label })
+            let expect = expect.ok_or("build requires --expect")?;
+            // Erasing is never implied: the caller must echo the drive's label (or serial).
+            let confirm = confirm.ok_or("build requires --confirm")?;
+            let src = src.ok_or("build requires a source directory")?;
+            Ok(Request::Build { dev, expect, confirm, label, src })
         }
-        "info" => match rest {
-            [dev] => Ok(Request::Info { dev: parse_dev(dev)? }),
-            _ => Err("usage: info <dev>".into()),
-        },
+        "info" => {
+            while let Some(f) = it.next() {
+                match f {
+                    "--expect" => once(&mut expect, f, val(&mut it, f).and_then(check_key))?,
+                    _ => return Err("unexpected argument for info".into()),
+                }
+            }
+            Ok(Request::Info { dev, expect: expect.ok_or("info requires --expect")? })
+        }
         _ => Err("unknown operation".into()),
+    }
+}
+
+/// Parse flashcp-trust's argv (without argv[0]): exactly `<dev> --expect <key>`.
+pub fn parse_trust(args: &[OsString]) -> Result<TrustRequest, String> {
+    match utf8(args)?.as_slice() {
+        [dev, "--expect", key] => Ok(TrustRequest { dev: parse_dev(dev)?, expect: check_key(key)? }),
+        _ => Err("usage: flashcp-trust <dev> --expect <key>".into()),
     }
 }
 
@@ -141,6 +223,16 @@ pub fn parse_dev(s: &str) -> Result<DevName, String> {
         return Err(bad());
     }
     Ok(DevName { name: format!("sd{rest}"), disk: format!("sd{}", &rest[..letters]) })
+}
+
+/// `--expect` / `--confirm`: 1-128 chars, no control characters. These are only ever compared
+/// against values the helper reads itself, never forwarded.
+pub fn check_key(s: &str) -> Result<String, String> {
+    let n = s.chars().count();
+    if n == 0 || n > MAX_KEY || s.chars().any(char::is_control) {
+        return Err(format!("--expect/--confirm must be 1-{MAX_KEY} characters without control characters"));
+    }
+    Ok(s.to_string())
 }
 
 /// The source is read by flashcp running as the invoking user, so the helper only needs to make
@@ -159,10 +251,10 @@ fn check_src(s: &str) -> Result<String, String> {
 /// upward, and no control characters (they cannot be represented sanely in exFAT names).
 fn check_to(s: &str) -> Result<String, String> {
     if !s.starts_with('/') {
-        return Err("--to must start with /".into());
+        return Err("destination must start with /".into());
     }
     if s.len() > MAX_TO || s.chars().any(char::is_control) || s.split('/').any(|c| c == "..") {
-        return Err("--to is invalid".into());
+        return Err("destination is invalid".into());
     }
     Ok(s.to_string())
 }
@@ -181,37 +273,80 @@ fn check_label(s: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    fn p(a: &[&str]) -> Result<Request, String> {
-        parse(&a.iter().map(OsString::from).collect::<Vec<_>>())
+    fn os(a: &[&str]) -> Vec<OsString> {
+        a.iter().map(OsString::from).collect()
     }
 
-    fn argv(a: &[&str]) -> Vec<String> {
-        p(a).unwrap().flashcp_args()
+    fn p(a: &[&str]) -> Result<Request, String> {
+        parse(&os(a))
+    }
+
+    fn runs(a: &[&str]) -> Vec<Vec<String>> {
+        p(a).unwrap().flashcp_runs()
+    }
+
+    fn add(dev: &str, extra: &[&str]) -> Vec<String> {
+        [&["add", dev, "--expect", "SER1"], extra].concat().iter().map(|s| s.to_string()).collect()
+    }
+
+    fn pa(dev: &str, extra: &[&str]) -> Result<Request, String> {
+        parse(&add(dev, extra).iter().map(OsString::from).collect::<Vec<_>>())
     }
 
     #[test]
-    fn valid_shapes_build_exact_argv() {
+    fn add_builds_one_run_per_item() {
+        let r = p(&["add", "/dev/sdb1", "--expect", "SER1", "--item", "/home/u/a", "/Photos", "--item", "/b c", "/"])
+            .unwrap();
+        assert_eq!(r.expect(), "SER1");
+        assert!(r.writes());
         assert_eq!(
-            argv(&["add", "/home/u/x", "/dev/sdb1", "--to", "/Photos", "--skip-existing"]),
-            ["add", "/home/u/x", "/dev/sdb1", "--to", "/Photos", "--skip-existing", "--json"]
+            r.flashcp_runs(),
+            [
+                vec!["add", "/home/u/a", "--target-fd", "3", "--to", "/Photos", "--json"],
+                vec!["add", "/b c", "--target-fd", "3", "--to", "/", "--json"],
+            ]
         );
-        // Flag order does not matter; output order is fixed.
+        // Flag order does not matter; --skip-existing applies to every run.
+        let r = runs(&["add", "/dev/sdc", "--item", "/x", "/ä/b c", "--skip-existing", "--expect", "K"]);
+        assert_eq!(r, [vec!["add", "/x", "--target-fd", "3", "--to", "/ä/b c", "--skip-existing", "--json"]]);
+    }
+
+    #[test]
+    fn add_item_count_limits() {
+        assert!(pa("/dev/sdb1", &[]).unwrap_err().contains("at least one"));
+        let mut many: Vec<String> = Vec::new();
+        for i in 0..MAX_ITEMS {
+            many.extend(["--item".into(), format!("/src{i}"), format!("/d{i}")]);
+        }
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(pa("/dev/sdb1", &refs).unwrap().flashcp_runs().len(), 256);
+        let mut more = refs.clone();
+        more.extend(["--item", "/one", "/more"]);
+        assert!(pa("/dev/sdb1", &more).unwrap_err().contains("at most 256"));
+    }
+
+    #[test]
+    fn build_and_info_shapes() {
         assert_eq!(
-            argv(&["add", "/home/u/x", "/dev/sdb1", "--skip-existing", "--to", "/Photos"]),
-            ["add", "/home/u/x", "/dev/sdb1", "--to", "/Photos", "--skip-existing", "--json"]
+            runs(&["build", "/dev/sdb", "--expect", "S", "--confirm", "MY STICK", "--label", "MY STICK", "/home/u/d"]),
+            [vec!["build", "/home/u/d", "--target-fd", "3", "--yes-erase", "--label", "MY STICK", "--json"]]
         );
-        assert_eq!(argv(&["add", "/x", "/dev/sdc"]), ["add", "/x", "/dev/sdc", "--json"]);
-        assert_eq!(argv(&["add", "/x", "/dev/sdc", "--to", "/"]), ["add", "/x", "/dev/sdc", "--to", "/", "--json"]);
+        let r = p(&["build", "/dev/sdaa12", "/d", "--confirm", "x", "--expect", "S"]).unwrap();
         assert_eq!(
-            argv(&["build", "/home/u/d", "/dev/sdb", "--yes-erase", "--label", "MY STICK"]),
-            ["build", "/home/u/d", "/dev/sdb", "--yes-erase", "--label", "MY STICK", "--json"]
+            r,
+            Request::Build {
+                dev: parse_dev("/dev/sdaa12").unwrap(),
+                expect: "S".into(),
+                confirm: "x".into(),
+                label: None,
+                src: "/d".into()
+            }
         );
-        assert_eq!(
-            argv(&["build", "/d", "/dev/sdaa12", "--label", "X", "--yes-erase"]),
-            ["build", "/d", "/dev/sdaa12", "--yes-erase", "--label", "X", "--json"]
-        );
-        assert_eq!(argv(&["info", "/dev/sdz9"]), ["info", "/dev/sdz9", "--json"]);
-        assert_eq!(argv(&["add", "/a b/ünï", "/dev/sdb1", "--to", "/ä/b c"])[1], "/a b/ünï");
+        assert_eq!(r.flashcp_runs(), [vec!["build", "/d", "--target-fd", "3", "--yes-erase", "--json"]]);
+        let r = p(&["info", "/dev/sdz9", "--expect", "S"]).unwrap();
+        assert!(!r.writes());
+        assert_eq!(r.flashcp_runs(), [vec!["info", "--target-fd", "3", "--json"]]);
+        assert_eq!(info_args(), ["info", "--target-fd", "3", "--json"]);
     }
 
     #[test]
@@ -243,8 +378,9 @@ mod tests {
             "/dev/sda\n",
             "",
         ] {
-            assert!(p(&["info", d]).is_err(), "{d:?} accepted");
-            assert!(p(&["add", "/x", d]).is_err(), "{d:?} accepted");
+            assert!(p(&["info", d, "--expect", "S"]).is_err(), "{d:?} accepted");
+            assert!(pa(d, &["--item", "/x", "/"]).is_err(), "{d:?} accepted");
+            assert!(parse_trust(&os(&[d, "--expect", "S"])).is_err(), "{d:?} accepted");
         }
     }
 
@@ -253,53 +389,120 @@ mod tests {
         let cases: &[&[&str]] = &[
             &[],
             &["frobnicate", "/dev/sdb"],
-            &["ADD", "/x", "/dev/sdb1"],
-            &["add", "/x"],
-            &["add", "x", "/dev/sdb1"],
-            &["add", "-rf", "/dev/sdb1"],
-            &["add", "./x", "/dev/sdb1"],
-            &["add", "/x\0y", "/dev/sdb1"],
-            &["add", "/x", "/dev/sdb1", "--to", "../etc"],
-            &["add", "/x", "/dev/sdb1", "--to", "/a/../../b"],
-            &["add", "/x", "/dev/sdb1", "--to", "/a/.."],
-            &["add", "/x", "/dev/sdb1", "--to", "a"],
-            &["add", "/x", "/dev/sdb1", "--to", "/a\nb"],
-            &["add", "/x", "/dev/sdb1", "--to", "/a\0b"],
-            &["add", "/x", "/dev/sdb1", "--to"],
-            &["add", "/x", "/dev/sdb1", "--to", "/a", "--to", "/b"],
-            &["add", "/x", "/dev/sdb1", "--skip-existing", "--skip-existing"],
-            &["add", "/x", "/dev/sdb1", "--yes-erase"],
-            &["add", "/x", "/dev/sdb1", "/extra"],
-            &["add", "/x", "/dev/sdb1", "--to=/a"],
-            &["build", "/x", "/dev/sdb"],
-            &["build", "/x", "/dev/sdb", "--label", "L"],
-            &["build", "/x", "/dev/sdb", "--yes-erase", "--yes-erase"],
-            &["build", "/x", "/dev/sdb", "--yes-erase", "--label", "SIXTEEN_CHARS_XX"],
-            &["build", "/x", "/dev/sdb", "--yes-erase", "--label", ""],
-            &["build", "/x", "/dev/sdb", "--yes-erase", "--label", "a/b"],
-            &["build", "/x", "/dev/sdb", "--yes-erase", "--label", "a\tb"],
-            &["build", "/x", "/dev/sdb", "--yes-erase", "--label", "-x"],
-            &["build", "/x", "/dev/sdb", "--yes-erase", "--label"],
-            &["build", "/x", "/dev/sdb", "--yes-erase", "--label", "A", "--label", "B"],
-            &["build", "/x", "/dev/sdb", "--yes-erase", "--skip-existing"],
+            &["ADD", "/dev/sdb1", "--expect", "S", "--item", "/x", "/"],
+            &["add"],
+            &["add", "/dev/sdb1", "--item", "/x", "/"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "x", "/"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "-rf", "/"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "./x", "/"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "/x\0y", "/"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "/x"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "/x", "../etc"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "/x", "/a/../../b"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "/x", "/a/.."],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "/x", "a"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "/x", "/a\nb"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "/x", "/a\0b"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "/x", "/", "--skip-existing", "--skip-existing"],
+            &["add", "/dev/sdb1", "--expect", "S", "--expect", "S", "--item", "/x", "/"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "/x", "/", "--yes-erase"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "/x", "/", "/extra"],
+            &["add", "/dev/sdb1", "--expect=S", "--item", "/x", "/"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "/x", "/", "--to", "/a"],
+            &["add", "/dev/sdb1", "--expect", "S", "--item", "/x", "/", "--target-fd", "5"],
+            &["add", "/dev/sdb1", "--expect", "", "--item", "/x", "/"],
+            &["add", "/dev/sdb1", "--expect", "a\tb", "--item", "/x", "/"],
+            &["add", "/dev/sdb1", "--expect"],
+            &["build", "/dev/sdb", "--expect", "S", "/x"],
+            &["build", "/dev/sdb", "--confirm", "C", "/x"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "C"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "C", "/x", "/y"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "C", "x"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "C", "--confirm", "C", "/x"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "", "/x"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "a\nb", "/x"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "C", "--yes-erase", "/x"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "C", "--label", "SIXTEEN_CHARS_XX", "/x"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "C", "--label", "", "/x"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "C", "--label", "a/b", "/x"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "C", "--label", "a\tb", "/x"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "C", "--label", "-x", "/x"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "C", "/x", "--label"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "C", "--label", "A", "--label", "B", "/x"],
+            &["build", "/dev/sdb", "--expect", "S", "--confirm", "C", "--skip-existing", "/x"],
             &["info"],
-            &["info", "/dev/sdb", "--json"],
+            &["info", "/dev/sdb"],
+            &["info", "/dev/sdb", "--expect"],
+            &["info", "/dev/sdb", "--expect", "S", "--json"],
+            &["info", "/dev/sdb", "--expect", "S", "--expect", "S"],
         ];
         for c in cases {
             assert!(p(c).is_err(), "{c:?} accepted");
         }
         let long = format!("/{}", "a".repeat(MAX_SRC));
-        assert!(p(&["add", &long, "/dev/sdb1"]).is_err());
+        assert!(pa("/dev/sdb1", &["--item", &long, "/"]).is_err());
         let long_to = format!("/{}", "a".repeat(MAX_TO));
-        assert!(p(&["add", "/x", "/dev/sdb1", "--to", &long_to]).is_err());
+        assert!(pa("/dev/sdb1", &["--item", "/x", &long_to]).is_err());
         // 15 chars (multi-byte) is fine.
-        assert!(p(&["build", "/x", "/dev/sdb", "--yes-erase", "--label", "ééééééééééééééé"]).is_ok());
+        assert!(
+            p(&["build", "/dev/sdb", "--expect", "S", "--confirm", "C", "--label", "ééééééééééééééé", "/x"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn missing_expect_reported() {
+        assert!(pa("/dev/sdb", &["--item", "/x", "/"]).is_ok());
+        let e = p(&["add", "/dev/sdb", "--item", "/x", "/"]).unwrap_err();
+        assert!(e.contains("--expect"), "{e}");
+        let e = p(&["build", "/dev/sdb", "--expect", "S", "/x"]).unwrap_err();
+        assert!(e.contains("--confirm"), "{e}");
+        let e = p(&["info", "/dev/sdb"]).unwrap_err();
+        assert!(e.contains("--expect"), "{e}");
+    }
+
+    #[test]
+    fn key_limits() {
+        let k128 = "é".repeat(MAX_KEY);
+        assert_eq!(check_key(&k128).unwrap(), k128);
+        assert!(check_key(&"a".repeat(MAX_KEY + 1)).is_err());
+        for bad in ["", "a\u{7f}", "a\rb", "\u{1b}[31m", "a\u{85}b"] {
+            assert!(check_key(bad).is_err(), "{bad:?}");
+        }
+        // Spaces and a leading dash are fine (serials can contain both; values are never forwarded).
+        assert!(check_key("-AB 12").is_ok());
+    }
+
+    #[test]
+    fn trust_args() {
+        let r = parse_trust(&os(&["/dev/sdb", "--expect", "4C53000"])).unwrap();
+        assert_eq!(r, TrustRequest { dev: parse_dev("/dev/sdb").unwrap(), expect: "4C53000".into() });
+        assert!(parse_trust(&os(&["/dev/sdb1", "--expect", "K"])).is_ok());
+        let cases: &[&[&str]] = &[
+            &[],
+            &["/dev/sdb"],
+            &["/dev/sdb", "--expect"],
+            &["/dev/sdb", "--expect", ""],
+            &["/dev/sdb", "--expect", "a\nb"],
+            &["/dev/sdb", "--expect", "K", "--expect", "K"],
+            &["/dev/sdb", "--expect", "K", "extra"],
+            &["--expect", "K", "/dev/sdb"],
+            &["/dev/sdb", "--expect=K"],
+            &["/dev/sdb", "--key", "K"],
+        ];
+        for c in cases {
+            assert!(parse_trust(&os(c)).is_err(), "{c:?} accepted");
+        }
+        assert!(parse_trust(&os(&["/dev/sdb", "--expect", &"k".repeat(129)])).is_err());
     }
 
     #[test]
     fn non_utf8_rejected() {
         use std::os::unix::ffi::OsStringExt;
-        let a = vec![OsString::from("add"), OsString::from_vec(b"/x\xff".to_vec()), OsString::from("/dev/sdb1")];
+        let mut a = os(&["add", "/dev/sdb1", "--expect", "S", "--item"]);
+        a.push(OsString::from_vec(b"/x\xff".to_vec()));
+        a.push("/".into());
         assert!(parse(&a).is_err());
+        let a = vec![OsString::from("/dev/sdb"), "--expect".into(), OsString::from_vec(b"K\xff".to_vec())];
+        assert!(parse_trust(&a).is_err());
     }
 }

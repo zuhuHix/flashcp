@@ -1,7 +1,9 @@
-//! The helper's own error report: one JSON line in the same shape flashcp uses, so the GUI needs
-//! a single parser.
+//! The helpers' own output: one JSON line in the same shape flashcp uses, so the GUI needs a
+//! single parser.
 
 use std::io::Write;
+
+use crate::identity::Identity;
 
 /// JSON string literal (with quotes) for `s`.
 pub fn quote(s: &str) -> String {
@@ -22,13 +24,19 @@ pub fn quote(s: &str) -> String {
     out
 }
 
-pub fn error_line(reason: &str) -> String {
-    format!("{{\"event\":\"error\",\"message\":{}}}", quote(&format!("flashcp-helper: {reason}")))
+/// `{"event":"error","message":"<prog>: <reason>"}`.
+pub fn error_line(prog: &str, reason: &str) -> String {
+    format!("{{\"event\":\"error\",\"message\":{}}}", quote(&format!("{prog}: {reason}")))
 }
 
-pub fn print_error(reason: &str) {
+/// `{"event":"trusted","key":..,"model":..,"size":N}`.
+pub fn trusted_line(id: &Identity) -> String {
+    format!("{{\"event\":\"trusted\",\"key\":{},\"model\":{},\"size\":{}}}", quote(&id.key), quote(&id.model), id.size)
+}
+
+pub fn print_line(line: &str) {
     let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{}", error_line(reason));
+    let _ = writeln!(out, "{line}");
     let _ = out.flush();
 }
 
@@ -39,8 +47,11 @@ mod tests {
     #[test]
     fn escapes() {
         assert_eq!(
-            error_line("bad \"x\"\\\n\u{1}é"),
+            error_line("flashcp-helper", "bad \"x\"\\\n\u{1}é"),
             r#"{"event":"error","message":"flashcp-helper: bad \"x\"\\\n\u0001é"}"#
         );
+        let id = Identity { key: "A\"1".into(), wwn: "-".into(), model: "Ultra".into(), size: 5 };
+        let v: serde_json::Value = serde_json::from_str(&trusted_line(&id)).unwrap();
+        assert_eq!(v, serde_json::json!({"event":"trusted","key":"A\"1","model":"Ultra","size":5}));
     }
 }

@@ -12,6 +12,8 @@
  * @property {string|null} mountPoint
  * @property {string} model
  * @property {boolean} wholeDisk
+ * @property {string} serial        disk serial from udisks; "" when the drive reports none
+ * @property {boolean} trusted      the helper's trust file has this drive (UI hint only)
  */
 
 /**
@@ -49,6 +51,9 @@
  * @property {{autostart: boolean, notifyOnPlug: boolean}} settings
  * @property {string} eraseTyped
  * @property {string|null} notice
+ * @property {boolean} trustOpen    the "Trust this drive" confirm panel is showing
+ * @property {boolean} trustBusy    a trust_drive call is in flight
+ * @property {string|null} trustError
  */
 
 const UNITS = ["kB", "MB", "GB", "TB"];
@@ -176,16 +181,88 @@ export function baseName(path) {
 }
 
 /**
- * The text the user must type to erase a drive: its label, or the device
- * basename ("sdb1") when the label is empty. "" when neither is known.
- * Must match the backend's check exactly.
+ * The label is used only for an exFAT volume that has one; everything else
+ * (vfat with a label, unlabelled exFAT, no filesystem) uses the serial number.
+ * "" when there is nothing to type. Must match the helper's rule exactly.
  * @param {Drive} drive
  * @returns {string}
  */
 export function expectedConfirm(drive) {
   if (!drive) return "";
-  if (typeof drive.label === "string" && drive.label !== "") return drive.label;
-  return baseName(drive.device);
+  if (usesLabel(drive)) return drive.label;
+  return typeof drive.serial === "string" ? drive.serial : "";
+}
+
+/** True when the confirm text is the volume label rather than the serial. */
+function usesLabel(drive) {
+  return drive.isExfat === true && typeof drive.label === "string" && drive.label !== "";
+}
+
+/**
+ * The line above the erase confirm box, naming what to type.
+ * @param {Drive|null} drive
+ * @returns {string}
+ */
+export function confirmHint(drive) {
+  if (!drive) return "Select a drive first.";
+  const expected = expectedConfirm(drive);
+  if (expected === "") return "This drive has no name or serial number to type.";
+  if (usesLabel(drive)) return `Type the drive name ${expected} to confirm`;
+  return `Type the drive's serial number ${expected} to confirm`;
+}
+
+/**
+ * "trusted": the helper's trust file has this drive.
+ * "untrustable": the drive reports no serial, so it can never be trusted.
+ * "untrusted": it has a serial but has not been trusted yet.
+ * @param {Drive|null} drive
+ * @returns {"trusted"|"untrusted"|"untrustable"}
+ */
+export function trustState(drive) {
+  if (!drive) return "untrusted";
+  if (typeof drive.serial !== "string" || drive.serial === "") return "untrustable";
+  return drive.trusted === true ? "trusted" : "untrusted";
+}
+
+/** True only for a drive the helper trusts (the UI gate for copy and erase). */
+export function isTrusted(drive) {
+  return trustState(drive) === "trusted";
+}
+
+/** True when the "Trust this drive…" button applies. */
+export function canTrust(drive) {
+  return !!drive && trustState(drive) === "untrusted";
+}
+
+/**
+ * The sentence shown while the selected drive is not trusted. "" when trusted.
+ * @param {Drive|null} drive
+ * @returns {string}
+ */
+export function trustNotice(drive) {
+  switch (trustState(drive)) {
+    case "trusted":
+      return "";
+    case "untrustable":
+      return "This drive doesn't report a serial number, so flashcp can't trust it.";
+    default:
+      return "flashcp hasn't been allowed to write to this drive yet.";
+  }
+}
+
+/**
+ * Rows for the trust confirm panel.
+ * @param {Drive|null} drive
+ * @returns {{label: string, value: string}[]}
+ */
+export function trustDetails(drive) {
+  if (!drive) return [];
+  return [
+    { label: "Model", value: drive.model || "—" },
+    { label: "Size", value: formatBytes(drive.size) },
+    { label: "Serial", value: drive.serial || "—" },
+    { label: "Device", value: drive.device || "—" },
+  ];
 }
 
 /**
@@ -247,6 +324,7 @@ export function canCopy(state) {
   return (
     !!drive &&
     drive.isExfat === true &&
+    isTrusted(drive) &&
     state.sources.length > 0 &&
     normalizeDestDir(state.destDir) !== null &&
     !jobActive(state)
@@ -254,8 +332,8 @@ export function canCopy(state) {
 }
 
 /**
- * Erase needs exactly one source (the folder that becomes the new volume),
- * a drive whose exact confirm text was typed, and no job in flight.
+ * Erase needs a trusted drive, exactly one source (the folder that becomes the
+ * new volume), the exact confirm text typed, and no job in flight.
  * @param {AppState} state
  * @param {string} typed
  */
@@ -263,6 +341,7 @@ export function canErase(state, typed) {
   const drive = selectedDrive(state);
   return (
     !!drive &&
+    isTrusted(drive) &&
     state.sources.length === 1 &&
     confirmMatches(drive, typed) &&
     !jobActive(state)
@@ -398,5 +477,27 @@ export function resetForm(state) {
 export function eraseSourceHint(count) {
   if (count === 1) return "";
   if (count === 0) return "Add exactly one folder to copy onto the rebuilt drive.";
-  return `Erase needs exactly one source folder, but ${count} are selected. Remove the extra ones.`;
+  return `Erase needs exactly one folder, but ${count} items are selected. Remove all but one folder.`;
+}
+
+/**
+ * Select a drive. Choosing a different drive closes the trust panel and clears
+ * the typed erase confirmation; re-selecting the same drive changes nothing.
+ * @param {AppState} state
+ * @param {string|null} id
+ * @returns {AppState}
+ */
+export function selectDrive(state, id) {
+  if (id === state.selectedId) return state;
+  return { ...state, selectedId: id, eraseTyped: "", trustOpen: false, trustError: null };
+}
+
+/** Show the trust confirm panel. */
+export function openTrust(state) {
+  return { ...state, trustOpen: true, trustError: null };
+}
+
+/** Hide the trust confirm panel and clear its busy flag and error. */
+export function closeTrust(state) {
+  return { ...state, trustOpen: false, trustBusy: false, trustError: null };
 }

@@ -1,10 +1,11 @@
-//! One copy or erase job: unmount, run flashcp per source, remount, open the folder.
+//! One copy or erase job: stage loose files, unmount, run flashcp, remount, open the folder.
 //! Emits "job" events. Only one job runs at a time (JobLock).
 
 use crate::drives::Drive;
 use crate::events::{JobAggregate, JobSummary, JobUpdate, Op, Stage};
-use crate::runner::{self, Invocation, Source};
+use crate::runner::{self, Action, Invocation, StageDir};
 use crate::udisks;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,11 +16,12 @@ use tauri::{AppHandle, Emitter};
 pub struct Request {
     pub op: Op,
     pub drive: Drive,
-    pub sources: Vec<Source>,
-    pub dest_dir: String,
-    pub skip_existing: bool,
-    /// Label for `build`; empty omits --label.
-    pub label: String,
+    pub action: Action,
+    /// Number of picked sources, for "item i of N".
+    pub total: usize,
+    /// Where loose files are staged, and the (file, link) pairs to create there. Empty when none.
+    pub stage_dir: PathBuf,
+    pub staged: Vec<(PathBuf, PathBuf)>,
 }
 
 /// Holds the single-job flag; released on drop.
@@ -56,17 +58,27 @@ fn emit(app: &AppHandle, update: JobUpdate) {
 }
 
 fn plain(req: &Request, stage: Stage, index: usize, message: Option<String>) -> JobUpdate {
-    JobAggregate::default().update(stage, req.op, index, req.sources.len(), message)
+    JobAggregate::default().update(stage, req.op, index, req.total, message)
 }
 
 fn last_index(req: &Request) -> usize {
-    req.sources.len().saturating_sub(1)
+    req.total.saturating_sub(1)
 }
 
 fn run(app: &AppHandle, req: &Request) {
     let started = Instant::now();
     let fake = udisks::fake_mode();
     let was_mounted = !fake && req.drive.mount_point.is_some();
+
+    // Stage loose files before touching the drive, so a staging failure leaves it as it was.
+    // The staging folder is removed when `_staged` drops, whatever happens below.
+    let _staged = match StageDir::create(&req.stage_dir, &req.staged) {
+        Ok(staged) => staged,
+        Err(e) => {
+            emit(app, plain(req, Stage::Error, 0, Some(e)));
+            return;
+        }
+    };
 
     if was_mounted {
         emit(app, plain(req, Stage::Unmounting, 0, None));
@@ -78,13 +90,13 @@ fn run(app: &AppHandle, req: &Request) {
 
     match run_flashcp(app, req) {
         Ok(agg) => {
-            emit(app, agg.update(Stage::Remounting, req.op, last_index(req), req.sources.len(), None));
+            emit(app, agg.update(Stage::Remounting, req.op, last_index(req), req.total, None));
             match remount(req, fake) {
                 Ok(mount_point) => {
                     if let Some(p) = mount_point.as_deref().filter(|_| !fake) {
                         open_folder(p);
                     }
-                    let mut update = agg.update(Stage::Done, req.op, last_index(req), req.sources.len(), None);
+                    let mut update = agg.update(Stage::Done, req.op, last_index(req), req.total, None);
                     update.summary = Some(JobSummary {
                         files: agg.finished_files(),
                         bytes: agg.finished_bytes(),
@@ -120,10 +132,8 @@ fn run(app: &AppHandle, req: &Request) {
 
 fn run_flashcp(app: &AppHandle, req: &Request) -> Result<JobAggregate, String> {
     let inv = Invocation::from_env();
-    let helper_args =
-        runner::build_args(req.op, &req.sources, &req.drive.device, &req.dest_dir, req.skip_existing, &req.label);
-    let arg_lists: Vec<Vec<String>> = helper_args.iter().map(|a| inv.full_args(a)).collect();
-    runner::run_job(&inv.program, &arg_lists, req.op, &[], |u| emit(app, u))
+    let runs = inv.runs(&req.drive.device, &req.drive.serial, &req.action);
+    runner::run_job(inv.program(), &runs, req.op, &[], |u| emit(app, u))
 }
 
 /// Rescan and mount (or, in fake mode, report the fake mount point).

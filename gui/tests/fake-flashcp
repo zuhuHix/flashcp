@@ -1,8 +1,21 @@
 #!/bin/sh
-# Fake flashcp for tests and dry runs. Speaks the JSON-lines contract, writes nothing.
-# FAKE_FLASHCP_FAIL=1 makes it emit an error event and exit 2.
+# Fake flashcp for tests and dry runs. Speaks the JSON-lines contract and writes nothing.
+# Accepts the shapes the GUI passes: add|build <src> --target-fd N [...], and info --target-fd N.
+# FAKE_FLASHCP_MODE selects the stdout stream:
+#   normal   (default) plan, progress, done; exit 0
+#   garbage  plan, progress, a non-JSON line mid-stream, progress, done; exit 0
+#   nodone   plan and progress only; exit 0
+#   twodone  two complete items (plan, progress, done each); exit 0
+#   error    plan, then an error event "fake failure: device busy"; exit 2
+# FAKE_FLASHCP_FAIL=1 is an alias for FAKE_FLASHCP_MODE=error.
 # FAKE_FLASHCP_LOG=<file> appends the received argv (one arg per line, then "--").
-if [ -n "$FAKE_FLASHCP_LOG" ]; then for a in "$@"; do printf '%s\n' "$a"; done >> "$FAKE_FLASHCP_LOG"; echo -- >> "$FAKE_FLASHCP_LOG"; fi
+# FAKE_FLASHCP_DELAY=<seconds> between progress lines (default 0.05).
+
+if [ -n "$FAKE_FLASHCP_LOG" ]; then
+  for a in "$@"; do printf '%s\n' "$a"; done >> "$FAKE_FLASHCP_LOG"
+  echo -- >> "$FAKE_FLASHCP_LOG"
+fi
+
 op="$1"
 case "$op" in
   info)
@@ -11,16 +24,34 @@ case "$op" in
   add|build) ;;
   *) echo "{\"event\":\"error\",\"message\":\"unknown op $op\"}"; exit 2 ;;
 esac
-if [ "$FAKE_FLASHCP_FAIL" = "1" ]; then
-  echo '{"event":"plan","op":"'"$op"'","files":10,"dirs":2,"bytes":1000000,"write_bytes":1100000}'
-  echo '{"event":"error","message":"fake failure: device busy"}'
-  exit 2
-fi
-echo '{"event":"plan","op":"'"$op"'","files":100,"dirs":5,"bytes":50000000,"write_bytes":52000000}'
-i=1
-while [ $i -le 10 ]; do
-  sleep "${FAKE_FLASHCP_DELAY:-0.05}"
-  echo '{"event":"progress","files_done":'$((i*10))',"bytes_done":'$((i*5000000))'}'
-  i=$((i+1))
-done
-echo '{"event":"done","files":100,"bytes":50000000,"secs":0.5}'
+
+mode="${FAKE_FLASHCP_MODE:-normal}"
+if [ "$FAKE_FLASHCP_FAIL" = "1" ]; then mode=error; fi
+
+plan() {
+  echo '{"event":"plan","op":"'"$op"'","files":100,"dirs":5,"bytes":50000000,"write_bytes":52000000}'
+}
+
+# progress N: N progress lines, paced by FAKE_FLASHCP_DELAY
+progress() {
+  i=1
+  while [ "$i" -le "$1" ]; do
+    sleep "${FAKE_FLASHCP_DELAY:-0.05}"
+    echo '{"event":"progress","files_done":'$((i*10))',"bytes_done":'$((i*5000000))'}'
+    i=$((i+1))
+  done
+}
+
+done_line() {
+  echo '{"event":"done","files":100,"bytes":50000000,"secs":0.5}'
+}
+
+case "$mode" in
+  normal) plan; progress 10; done_line ;;
+  garbage) plan; progress 5; echo 'this is not json'; progress 5; done_line ;;
+  nodone) plan; progress 10 ;;
+  twodone) plan; progress 10; done_line; plan; progress 10; done_line ;;
+  error) plan; echo '{"event":"error","message":"fake failure: device busy"}'; exit 2 ;;
+  *) echo "{\"event\":\"error\",\"message\":\"fake: unknown mode $mode\"}"; exit 2 ;;
+esac
+exit 0

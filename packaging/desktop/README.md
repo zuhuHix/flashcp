@@ -45,7 +45,10 @@ Uninstall with `sudo apt remove flashcp-gui`.
 | --- | --- | --- |
 | `/usr/bin/flashcp-gui` | Tauri build | The GUI and tray app |
 | `/usr/libexec/flashcp-helper` | `gui/helper` | Root helper, run through pkexec (mode 0755, root) |
-| `/usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.helper.policy` | `packaging/desktop` | polkit action that authorizes the helper |
+| `/usr/libexec/flashcp-trust` | `gui/helper` | Root helper that records a drive as trusted (mode 0755, root) |
+| `/usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.helper.policy` | `packaging/desktop` | polkit action for copy/erase runs (`auth_admin_keep`) |
+| `/usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.trust.policy` | `packaging/desktop` | polkit action for trusting a drive (`auth_admin`, never cached) |
+| `/etc/flashcp/trusted-drives` | created at runtime | Drives an admin trusted (root-owned, 0644); not shipped in the package |
 | `/usr/share/applications/flashcp-gui.desktop` | `flashcp-gui.desktop` (Tauri template) | Application menu entry |
 | `/etc/xdg/autostart/flashcp-gui.desktop` | `flashcp-gui-autostart.desktop` | Starts the tray at login (`--tray`) |
 | `/usr/share/nemo/actions/flashcp.nemo_action` | `flashcp.nemo_action` | Nemo context menu entry |
@@ -64,9 +67,10 @@ Check the real file list with `dpkg -c gui/target/release/bundle/deb/flashcp-gui
   Autostart can be turned off in the app's settings. That writes a
   `~/.config/autostart/flashcp-gui.desktop` override with `Hidden=true`.
 - The window can also be opened from the tray or the application menu. You can
-  drop files or folders on it, choose a drive, and start a copy. Copying onto an
-  erase-and-rebuild target is a separate action and requires typing the drive
-  name to confirm.
+  drop files or folders on it, choose a drive, and start a copy. The first time
+  you use a drive, the app asks you to trust it (admin password). Erasing and
+  rebuilding a drive is a separate action under *Advanced*. It requires typing
+  the drive's label, or its serial number if it has no exFAT label.
 - Context menus: "Fast copy to USB (flashcp)" passes the selected paths to
   `flashcp-gui`, which opens with those files queued.
 - Nemo needs a restart to pick up a new action: `nemo -q`.
@@ -75,13 +79,22 @@ Check the real file list with `dpkg -c gui/target/release/bundle/deb/flashcp-gui
 
 ## Privileged access
 
-The GUI runs as your user. Writing to a drive needs root for the mount and the
-raw device open, so the GUI starts `/usr/libexec/flashcp-helper` through
-`pkexec`. polkit asks for authentication, and the helper accepts only device
-paths of the form `/dev/sd[a-z]+[0-9]*` and passes them to `/usr/bin/flashcp`.
-The helper does not run any other command. See
-[SECURITY-NOTES.md](SECURITY-NOTES.md) for the full threat model and the
-limits of this design.
+The GUI runs as your user. Writing to a raw block device needs root, so the GUI
+starts small helpers through `pkexec`:
+
+- **Trusting a drive** (once per drive): `/usr/libexec/flashcp-trust` records the
+  drive's serial number, WWN, model and size in `/etc/flashcp/trusted-drives`.
+  polkit asks for an admin password every time (`auth_admin`, no caching). The
+  app shows the model, size and serial before you confirm.
+- **Copy or erase**: `/usr/libexec/flashcp-helper` opens the device once per job
+  with `O_EXCL` and checks that the opened device is a trusted, idle USB drive
+  that doesn't carry the system. It then runs `/usr/bin/flashcp` as *your* user
+  with only that open device handed over as fd 3. Nothing changes owner or
+  permissions. An erase also needs the drive's label (or its serial number if it
+  has no exFAT label), and the helper checks that against the disk itself.
+
+See [SECURITY-NOTES.md](SECURITY-NOTES.md) for the threat model and the limits of
+this design.
 
 ## Development and dry runs
 

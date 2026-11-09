@@ -7,6 +7,7 @@
 use std::ffi::CString;
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -63,24 +64,31 @@ impl NodeStat {
     }
 }
 
-/// `lstat` abstraction so tests can describe device nodes without creating real ones.
-pub trait DevStat {
-    fn lstat(&self, path: &Path) -> io::Result<NodeStat>;
+/// `fstat(2)` of an open fd.
+pub fn fstat(fd: BorrowedFd) -> io::Result<NodeStat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: valid fd and out-pointer.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(NodeStat::from_libc(&st))
 }
 
-/// The real thing: `lstat(2)`, which does not follow symlinks.
-pub struct RealStat;
-
-impl DevStat for RealStat {
-    fn lstat(&self, path: &Path) -> io::Result<NodeStat> {
-        let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: c is a valid NUL-terminated string and st is a valid out-pointer.
-        if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(NodeStat::from_libc(&st))
+/// Open `/dev/<name>` (under `roots.dev`) the way the helper hands it to flashcp:
+/// `O_RDWR|O_EXCL` for writing ops (the kernel refuses `O_EXCL` on a block device that is mounted
+/// or otherwise claimed, and keeps others from claiming it while we hold it), `O_RDONLY` for
+/// reading ones. Always `O_NOFOLLOW|O_CLOEXEC`. Validation happens afterwards, on this fd.
+pub fn open_device(roots: &Roots, dev: &DevName, write: bool) -> io::Result<OwnedFd> {
+    let path = roots.dev.join(&dev.name);
+    let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mode = if write { libc::O_RDWR | libc::O_EXCL } else { libc::O_RDONLY };
+    // SAFETY: valid C string; the returned fd is owned below.
+    let raw = unsafe { libc::open(c.as_ptr(), mode | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
     }
+    // SAFETY: raw is a fresh fd we own.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
 /// A device that passed every check.
@@ -89,6 +97,10 @@ pub struct ValidDevice {
     pub name: DevName,
     pub major: u32,
     pub minor: u32,
+    /// `MAJ:MIN` of the whole disk (the target itself for a whole-disk target).
+    pub disk_majmin: String,
+    /// The whole disk's sysfs directory.
+    pub disk_dir: PathBuf,
 }
 
 /// A block device as seen in sysfs.
@@ -109,7 +121,7 @@ fn is_usb_bus(c: Component) -> bool {
 }
 
 /// Properties (`E:KEY=VALUE` lines) from the udev database entry for block device MAJ:MIN.
-fn udev_props(roots: &Roots, majmin: &str) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn udev_props(roots: &Roots, majmin: &str) -> Result<Vec<(String, String)>, String> {
     let p = roots.udev_data.join(format!("b{majmin}"));
     let text = fs::read_to_string(&p).map_err(|_| format!("no udev database entry for {majmin}"))?;
     Ok(text
@@ -152,14 +164,18 @@ fn holders_empty(dir: &Path) -> Result<bool, String> {
     Ok(rd.next().is_none())
 }
 
-/// Run every check on `dev`. Returns the device identity (major:minor) that was validated, so the
-/// caller can pin the node it later opens to exactly this device.
-pub fn validate_device(roots: &Roots, stat: &dyn DevStat, dev: &DevName) -> Result<ValidDevice, String> {
+/// Run every check on the device the caller already OPENED as `dev`; `st` is `fstat` of that fd,
+/// so everything below is keyed by the rdev of the device that will actually be written, not by
+/// whatever the path points at now.
+///
+/// `require_idle` adds the in-use checks (mounts, swap, holders) for the target. The trust
+/// step passes `false` (a mounted stick may be trusted); a disk carrying the running system is
+/// refused either way.
+pub fn validate_device(roots: &Roots, st: NodeStat, dev: &DevName, require_idle: bool) -> Result<ValidDevice, String> {
     let shown = dev.path();
 
-    // 1. The node itself must be a real block device, not a symlink someone planted. Its rdev is
-    //    the identity everything below is looked up by.
-    let st = stat.lstat(&roots.dev.join(&dev.name)).map_err(|e| format!("{shown}: {e}"))?;
+    // 1. The fd must be a block device (O_NOFOLLOW already refused a symlink at open). Its rdev
+    //    is the identity everything below is looked up by.
     if st.is_symlink || !st.is_block {
         return Err(format!("{shown} is not a block device"));
     }
@@ -215,7 +231,8 @@ pub fn validate_device(roots: &Roots, stat: &dyn DevStat, dev: &DevName) -> Resu
         }
     }
 
-    // 5. Not in use. flashcp's O_EXCL open is a second line of defence, but we refuse up front.
+    // 5. Not the system disk, and (if required) not in use. The helper's O_EXCL open is a second
+    //    line of defence for the latter.
     let disk = Node { name: dev.disk.clone(), majmin: disk_majmin, dir: disk_dir.clone() };
     let parts = partitions(&disk_dir, &dev.disk)?;
     let mounts =
@@ -239,7 +256,11 @@ pub fn validate_device(roots: &Roots, stat: &dyn DevStat, dev: &DevName) -> Resu
     // For a partition only that partition matters; a whole-disk target overwrites every
     // partition, so all of them must be idle.
     let target = Node { name: dev.name.clone(), majmin: majmin.clone(), dir: node_dir.clone() };
-    let in_scope: Vec<&Node> = if is_part { vec![&target] } else { std::iter::once(&disk).chain(&parts).collect() };
+    let in_scope: Vec<&Node> = match (require_idle, is_part) {
+        (false, _) => vec![],
+        (true, true) => vec![&target],
+        (true, false) => std::iter::once(&disk).chain(&parts).collect(),
+    };
     for n in in_scope {
         if let Some(mp) = mounts_of(n).first() {
             return Err(format!("/dev/{} is mounted at {mp}", n.name));
@@ -260,7 +281,7 @@ pub fn validate_device(roots: &Roots, stat: &dyn DevStat, dev: &DevName) -> Resu
         return Err(format!("{shown} has no medium (size 0)"));
     }
 
-    Ok(ValidDevice { name: dev.clone(), major: st.major, minor: st.minor })
+    Ok(ValidDevice { name: dev.clone(), major: st.major, minor: st.minor, disk_majmin: disk.majmin, disk_dir })
 }
 
 #[cfg(test)]
@@ -268,18 +289,14 @@ mod tests {
     use super::*;
     use crate::args::parse_dev;
     use std::collections::HashMap;
+    use std::os::fd::AsFd;
     use std::os::unix::fs::symlink;
 
     const USB_PATH: &str = "pci0000:00/0000:00:14.0/usb2/2-1/2-1:1.0/host6/target6:0:0/6:0:0:0";
     const ATA_PATH: &str = "pci0000:00/0000:00:17.0/ata1/host0/target0:0:0/0:0:0:0";
 
-    struct FakeStat(HashMap<PathBuf, NodeStat>);
-
-    impl DevStat for FakeStat {
-        fn lstat(&self, path: &Path) -> io::Result<NodeStat> {
-            self.0.get(path).copied().ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
-        }
-    }
+    /// What `fstat` on the opened node would report, by node name (missing = open fails).
+    struct FakeStat(HashMap<String, NodeStat>);
 
     struct Fake {
         _tmp: tempfile::TempDir,
@@ -323,7 +340,7 @@ mod tests {
             let (ma, mi) = majmin.split_once(':').unwrap();
             let st =
                 NodeStat { is_block: true, is_symlink: false, major: ma.parse().unwrap(), minor: mi.parse().unwrap() };
-            self.stat.0.insert(self.roots.dev.join(name), st);
+            self.stat.0.insert(name.to_string(), st);
             dir
         }
 
@@ -347,8 +364,20 @@ mod tests {
             Fake::new().disk(USB_PATH, "sdb", 8, 16, 2, "usb")
         }
 
+        fn run(&self, dev: &str, require_idle: bool) -> Result<ValidDevice, String> {
+            let d = parse_dev(dev).unwrap();
+            let st = *self.stat.0.get(&d.name).ok_or(format!("{dev}: No such file or directory"))?;
+            validate_device(&self.roots, st, &d, require_idle)
+        }
+
+        /// The helper's view (idle required).
         fn check(&self, dev: &str) -> Result<ValidDevice, String> {
-            validate_device(&self.roots, &self.stat, &parse_dev(dev).unwrap())
+            self.run(dev, true)
+        }
+
+        /// The trust step's view (idle not required).
+        fn trust(&self, dev: &str) -> Result<ValidDevice, String> {
+            self.run(dev, false)
         }
 
         fn sys(&self, rel: &str) -> PathBuf {
@@ -374,6 +403,36 @@ mod tests {
         let v = f.check("/dev/sdb1").unwrap();
         assert_eq!((v.major, v.minor), (8, 17));
         assert_eq!(fs::read_to_string(f.sys("sdb/removable")).unwrap(), "0\n");
+    }
+
+    #[test]
+    fn valid_device_reports_its_disk() {
+        let f = Fake::usb();
+        let v = f.check("/dev/sdb1").unwrap();
+        assert_eq!(v.disk_majmin, "8:16");
+        assert_eq!(fs::canonicalize(&v.disk_dir).unwrap(), fs::canonicalize(f.sys("sdb")).unwrap());
+        assert_eq!(f.check("/dev/sdb").unwrap().disk_majmin, "8:16");
+    }
+
+    #[test]
+    fn trust_does_not_require_idle_but_still_refuses_system_disk() {
+        let f = Fake::usb();
+        f.mount("90 22 8:17 / /media/u/S rw - exfat /dev/sdb1 rw");
+        fs::write(&f.roots.proc_swaps, "Filename\tType\tSize\tUsed\tPriority\n/dev/sdb2 partition 1 0 -2\n").unwrap();
+        fs::create_dir(f.sys("sdb/holders/dm-0")).unwrap();
+        rejects(f.check("/dev/sdb1"), "mounted");
+        rejects(f.check("/dev/sdb"), "in use by another block device");
+        assert!(f.trust("/dev/sdb1").is_ok());
+        assert!(f.trust("/dev/sdb").is_ok());
+        f.mount("91 22 8:18 / /boot rw - ext4 /dev/sdb2 rw");
+        rejects(f.trust("/dev/sdb"), "system disk");
+        rejects(f.trust("/dev/sdb1"), "system disk");
+        // Non-USB and udisks hints are refused for trust too.
+        let f = Fake::new().disk(ATA_PATH, "sda", 8, 0, 1, "ata");
+        rejects(f.trust("/dev/sda"), "not a USB device");
+        let f = Fake::usb();
+        fs::write(f.roots.udev_data.join("b8:16"), "E:ID_BUS=usb\nE:UDISKS_IGNORE=1\n").unwrap();
+        rejects(f.trust("/dev/sdb"), "system/ignored");
     }
 
     #[test]
@@ -415,8 +474,8 @@ mod tests {
         let mut f = Fake::new();
         let rel = "pci0000:00/0000:00:1d.0/0000:3d:00.0/nvme/nvme0/nvme0n1";
         f.node(rel, "nvme0n1", "259:0", false, "nvme");
-        let st = f.stat.0[&f.roots.dev.join("nvme0n1")];
-        f.stat.0.insert(f.roots.dev.join("sde"), st);
+        let st = f.stat.0["nvme0n1"];
+        f.stat.0.insert("sde".into(), st);
         rejects(f.check("/dev/sde"), "does not match");
     }
 
@@ -424,37 +483,53 @@ mod tests {
     fn name_sysfs_mismatch_rejected() {
         // /dev/sdb1 node whose rdev is actually sdb2's.
         let mut f = Fake::usb();
-        let st = f.stat.0[&f.roots.dev.join("sdb2")];
-        f.stat.0.insert(f.roots.dev.join("sdb1"), st);
+        let st = f.stat.0["sdb2"];
+        f.stat.0.insert("sdb1".into(), st);
         rejects(f.check("/dev/sdb1"), "does not match");
         // Whole-disk name pointing at a partition's rdev.
         let mut f = Fake::usb();
-        let st = f.stat.0[&f.roots.dev.join("sdb1")];
-        f.stat.0.insert(f.roots.dev.join("sdb"), st);
+        let st = f.stat.0["sdb1"];
+        f.stat.0.insert("sdb".into(), st);
         rejects(f.check("/dev/sdb"), "does not match");
     }
 
     #[test]
     fn symlink_or_non_block_node_rejected() {
         let mut f = Fake::usb();
-        let p = f.roots.dev.join("sdb1");
-        let st = f.stat.0[&p];
-        f.stat.0.insert(p.clone(), NodeStat { is_symlink: true, is_block: false, ..st });
+        let st = f.stat.0["sdb1"];
+        f.stat.0.insert("sdb1".into(), NodeStat { is_symlink: true, is_block: false, ..st });
         rejects(f.check("/dev/sdb1"), "not a block device");
-        f.stat.0.insert(p.clone(), NodeStat { is_block: false, ..st });
+        rejects(f.trust("/dev/sdb1"), "not a block device");
+        f.stat.0.insert("sdb1".into(), NodeStat { is_block: false, ..st });
         rejects(f.check("/dev/sdb1"), "not a block device");
-        f.stat.0.remove(&p);
+        f.stat.0.remove("sdb1");
         assert!(f.check("/dev/sdb1").is_err());
     }
 
     #[test]
-    fn real_lstat_sees_symlinks() {
+    fn real_fstat_and_open_nofollow() {
+        let n = std::fs::File::open("/dev/null").unwrap();
+        let s = fstat(n.as_fd()).unwrap();
+        assert!(!s.is_block && !s.is_symlink && (s.major, s.minor) == (1, 3));
+        // open_device refuses a symlink at the final component (O_NOFOLLOW -> ELOOP).
         let t = tempfile::tempdir().unwrap();
-        symlink("/dev/null", t.path().join("l")).unwrap();
-        let s = RealStat.lstat(&t.path().join("l")).unwrap();
-        assert!(s.is_symlink && !s.is_block);
-        let n = RealStat.lstat(Path::new("/dev/null")).unwrap();
-        assert!(!n.is_block && (n.major, n.minor) == (1, 3));
+        fs::create_dir(t.path().join("dev")).unwrap();
+        symlink("/dev/null", t.path().join("dev/sdb")).unwrap();
+        let mut roots = Roots::system();
+        roots.dev = t.path().join("dev");
+        let dev = parse_dev("/dev/sdb").unwrap();
+        let e = open_device(&roots, &dev, false).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::ELOOP));
+        // A regular file opens fine and fstat says "not a block device", which validation rejects.
+        fs::remove_file(t.path().join("dev/sdb")).unwrap();
+        fs::write(t.path().join("dev/sdb"), "x").unwrap();
+        let fd = open_device(&roots, &dev, true).unwrap();
+        let st = fstat(fd.as_fd()).unwrap();
+        assert!(!st.is_block);
+        assert!(validate_device(&roots, st, &dev, true).unwrap_err().contains("not a block device"));
+        // The fd is close-on-exec.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
     }
 
     #[test]
@@ -562,7 +637,7 @@ mod tests {
         let outside = f.roots.sys.join("elsewhere/usb1/block/sdx");
         fs::create_dir_all(&outside).unwrap();
         symlink(&outside, f.roots.sys.join("dev/block/8:99")).unwrap();
-        f.stat.0.insert(f.roots.dev.join("sdx"), NodeStat { is_block: true, is_symlink: false, major: 8, minor: 99 });
+        f.stat.0.insert("sdx".into(), NodeStat { is_block: true, is_symlink: false, major: 8, minor: 99 });
         rejects(f.check("/dev/sdx"), "unexpected sysfs location");
     }
 }

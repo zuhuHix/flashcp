@@ -5,15 +5,16 @@ mod events;
 mod job;
 mod runner;
 mod settings;
+mod trust;
 mod udisks;
 
-use drives::{expected_confirm, Drive};
+use drives::{expected_confirm, require_trusted, Drive};
 use job::{JobLock, Request};
-use runner::Source;
+use runner::{Action, Source};
 use settings::{Paths, Settings};
 use std::collections::HashSet;
 use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -127,7 +128,17 @@ async fn start_copy(
             if drive.fs_type.is_empty() { "no filesystem" } else { &drive.fs_type }
         ));
     }
-    let request = Request { op: events::Op::Add, drive, sources, dest_dir, skip_existing, label: String::new() };
+    require_trusted(&drive)?;
+    let stage_dir = if sources.iter().any(|s| !s.is_dir) { runner::new_stage_dir()? } else { PathBuf::new() };
+    let plan = runner::plan_items(&sources, &dest_dir, &stage_dir)?;
+    let request = Request {
+        op: events::Op::Add,
+        drive,
+        action: Action::Add { items: plan.items, skip_existing },
+        total: sources.len(),
+        stage_dir: plan.stage_dir,
+        staged: plan.staged,
+    };
     job::spawn(app, request, lock)
 }
 
@@ -143,16 +154,46 @@ async fn start_erase(
     if sources.len() != 1 {
         return Err("Erase takes exactly one source folder".to_string());
     }
-    let sources = sources.iter().map(|s| Source::probe(s)).collect::<Result<Vec<_>, _>>()?;
+    let source = Source::probe(&sources[0])?;
+    if !source.is_dir {
+        return Err("Erase takes a folder, not a file".to_string());
+    }
     let drive = find_drive(drives_now().await?, &drive_id)?;
+    require_trusted(&drive)?;
     if confirm != expected_confirm(&drive) {
         return Err("Confirmation text does not match".to_string());
     }
     // Keep the existing label so the stick keeps its name after the erase.
     let label = drive.label.clone();
-    let request =
-        Request { op: events::Op::Build, drive, sources, dest_dir: "/".to_string(), skip_existing: false, label };
+    let request = Request {
+        op: events::Op::Build,
+        drive,
+        action: Action::Build { src: source.path, confirm, label },
+        total: 1,
+        stage_dir: PathBuf::new(),
+        staged: Vec::new(),
+    };
     job::spawn(app, request, lock)
+}
+
+/// Trusts a drive after admin authentication (flashcp-trust). Dev mode marks the fake drive.
+#[tauri::command]
+async fn trust_drive(app: AppHandle, drive_id: String) -> Result<(), String> {
+    let drive = find_drive(drives_now().await?, &drive_id)?;
+    if drive.serial.is_empty() {
+        return Err(drives::NO_SERIAL_MESSAGE.to_string());
+    }
+    if udisks::fake_mode() {
+        drives::fake_trust(&drive.id);
+    } else {
+        let (device, serial) = (drive.device.clone(), drive.serial.clone());
+        let result = tauri::async_runtime::spawn_blocking(move || runner::trust_device(&device, &serial))
+            .await
+            .map_err(|e| e.to_string())?;
+        result?;
+    }
+    let _ = app.emit("drives-changed", ());
+    Ok(())
 }
 
 /// Remembers new files and tells the window about them.
@@ -298,7 +339,8 @@ pub fn run() {
             set_settings,
             take_pending_files,
             start_copy,
-            start_erase
+            start_erase,
+            trust_drive
         ])
         .setup(setup_app)
         .run(tauri::generate_context!())
