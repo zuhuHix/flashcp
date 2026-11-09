@@ -74,8 +74,9 @@ with it.
 - `mkvhd.py` appends the 512-byte footer of a fixed VHD (disk type 2) so Windows can attach the
   image with `Mount-DiskImage`. The raw image is padded to a multiple of 512 bytes first.
 
-The `superfloppy` entry has no MBR. Windows may not give it a volume letter, which is why it is
-report-only.
+The `superfloppy` entry has no MBR. It is report-only because support for partitionless disks
+differs between OSes and disk types, but in practice both Windows and macOS accept it (see the
+results below).
 
 ### The manifest and the verify rules
 
@@ -109,16 +110,18 @@ This tests that the OS can write to a flashcp volume and keep it consistent, not
 
 ### The NFC probe
 
-`nfc_probe.py` is report-only and always exits 0. For two existing names and one new name it
-prints whether `readdir` returns the NFC or the NFD form, and whether a lookup by the NFC or the
-NFD spelling succeeds. macOS lists exFAT names in NFD. It also fails to find a name looked up in
-the NFC form it was stored in. The write test uses this to match names on disk, and the probe
-output shows the result for each OS.
+`nfc_probe.py` is report-only and always exits 0. It runs after the write test because it
+changes the volume. For names the volume's writer stored (in `accents/`) it tries stat, read,
+rename and unlink, addressing each name once in NFC and once in NFD. For names the OS creates
+itself, in either form, it records which form `readdir` returns and whether stat and unlink
+work in each form. The write test only deletes and renames ASCII names, so these Unicode cases
+are measured here and do not fail the job. Running the same probe on `control-mkfs` shows
+whether a difference comes from flashcp or from the OS driver.
 
 ### Report-only entries
 
 `superfloppy` and `control-mkfs` use `continue-on-error` in both the Windows and macOS jobs.
-A superfloppy disk has no partition table, and Windows and macOS handle those differently, so
+A superfloppy disk has no partition table, and OS support for those varies by OS and disk type, so
 failure there does not necessarily mean the volume is bad. `control-mkfs` is a reference: the
 same tree written by a different tool. If `control-mkfs` fails the same way a flashcp volume
 does, the cause is the OS driver, not flashcp. If only the flashcp volume fails, the cause is
@@ -182,9 +185,8 @@ Always unmount or eject the drive before you unplug it.
    (`python manifest.py <source> manifest.json`, then `python verify.py manifest.json E:\ --label usb`),
    or check single files with `Get-FileHash -Algorithm SHA256`. For a rough check,
    `robocopy <source> E:\ /L /E /NJH` lists what would be copied. Nothing is copied with `/L`.
-4. Disk Management may show the drive with no partition table, and may not assign a letter.
-   This is expected for a flashcp superfloppy volume. The superfloppy results from
-   `xos.yml` are report-only for the same reason.
+4. Disk Management shows a flashcp drive without a partition table (a superfloppy). That is
+   expected. In CI, Windows mounts the superfloppy VHD and chkdsk accepts it.
 5. Eject the drive with File Explorer or the tray icon before you unplug it.
 
 ### macOS
@@ -212,4 +214,30 @@ Always unmount or eject the drive before you unplug it.
 
 ## Cross-OS results
 
-<!-- XOS-RESULTS -->
+Run [42616790178](https://github.com/zuhuHix/flashcp/actions/runs/42616790178)
+(2026-11-09, `windows-latest` and `macos-latest`, runner time zone UTC+5:30):
+
+| Volume | Linux fsck.exfat + mount | Windows chkdsk, before / after write | Windows files | macOS fsck_exfat, before / after write | macOS files |
+|---|---|---|---|---|---|
+| `prefix-auto` (512 MiB, MBR) | OK | OK / OK | OK | OK / OK | OK |
+| `full-auto` (512 MiB, MBR) | OK | OK / OK | OK | OK / OK | OK |
+| `prefix-4k` (512 MiB, 4 KiB clusters, MBR) | OK | OK / OK | OK | OK / OK | OK |
+| `prefix-128k` (512 MiB, 128 KiB clusters, MBR) | OK | OK / OK | OK | OK / OK | OK |
+| `prefix-1g` (1 GiB, MBR) | OK | OK / OK | OK | OK / OK | OK |
+| `superfloppy` (512 MiB, no partition table) | OK | OK / OK | OK | OK / OK | OK |
+| `control-mkfs` (mkfs.exfat + Linux, MBR) | OK | OK / OK | OK | OK / OK | OK |
+
+"Files" means all 2054 files and 36 directories matched on content, size and mtime (exact to
+the 10 ms tick, including the 1980, 2000 and 2100 dates, with no time-zone shift), and the
+write test passed.
+
+Unicode names (from `nfc_probe.py`; identical on flashcp volumes and on `control-mkfs`):
+
+- Windows returns names exactly as stored (NFC) and matches them exactly: an NFD spelling of an
+  NFC name is a different name.
+- macOS returns every non-ASCII name in NFD. Stat, open and rename find a name in either form.
+  Unlink only works when the name is given in the form it was stored in on disk. Unlinking an
+  NFC-stored name by its NFD spelling, which is the form `readdir` returns, fails with ENOENT.
+  This happens on the mkfs.exfat control volume too, so it is a macOS driver behaviour, not a
+  flashcp one. Not yet checked: whether Finder is affected. Scripts that delete files by the
+  names `readdir` returns are.
