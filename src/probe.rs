@@ -24,9 +24,13 @@ fn read_trim(p: &Path) -> Option<String> {
 }
 
 pub fn device_info(path: &Path) -> DeviceInfo {
+    let Ok(md) = fs::metadata(path) else { return DeviceInfo::default() };
+    device_info_of(md.dev())
+}
+
+/// [`device_info`] of a block device number (st_rdev of a device node, or st_dev of a file).
+pub fn device_info_of(dev: u64) -> DeviceInfo {
     let mut info = DeviceInfo::default();
-    let Ok(md) = fs::metadata(path) else { return info };
-    let dev = md.dev();
     let (maj, min) = (libc::major(dev), libc::minor(dev));
     let Ok(mut p) = fs::canonicalize(format!("/sys/dev/block/{maj}:{min}")) else { return info };
     if p.join("partition").exists() {

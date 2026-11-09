@@ -305,3 +305,27 @@ fn reads_never_pass_an_unaligned_volume_end() {
     }
     assert!(reads.iter().any(|(off, len)| off + len == vol), "the unaligned tail was never read: {reads:?}");
 }
+
+// ───────────────────────── read strategy ─────────────────────────
+
+/// The plan event names the read strategy; the hidden tuning flags override it.
+#[test]
+fn plan_reports_the_read_strategy_and_overrides_apply() {
+    let dir = test_dir("crafted_strategy");
+    write_file(&dir.join("src/a.txt"), b"a");
+    let img = dir.join("v.img");
+    build(&dir.join("src"), &img, 32 * MB, &[]);
+    let plan = |extra: &[&str]| {
+        let dest = dir.join("out");
+        let _ = fs::remove_dir_all(&dest);
+        let mut args = vec!["--json"];
+        args.extend_from_slice(extra);
+        let out = pull_cmd(&img, &dest, &args, &[]);
+        assert_success(&out, "pull --json");
+        String::from_utf8_lossy(&out.stdout).lines().next().unwrap().to_string()
+    };
+    let p = plan(&[]);
+    assert!(p.contains(r#""op":"pull""#) && p.contains(r#""strategy":{"transport":""#), "{p}");
+    let p = plan(&["--gap-kb", "8", "--inflight", "3", "--buffered", "true"]);
+    assert!(p.contains(r#""gap_kb":8,"inflight":3,"direct":false"#), "{p}");
+}

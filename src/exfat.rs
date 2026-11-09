@@ -1012,6 +1012,7 @@ pub fn build_to(src: &Path, target: &TargetSpec, o: &BuildOpts, sink: Sink<'_>) 
         bytes: data,
         write_bytes: p.write_bytes,
         detail,
+        strategy: None,
     });
     if o.dry_run {
         tick.emit(Event::Done { files: files as u64, bytes: data, secs: t0.elapsed().as_secs_f64() });
