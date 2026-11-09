@@ -399,7 +399,12 @@ fn coalesce(exts: &[Ext], max: usize, gap: u64) -> Vec<Chunk> {
         while j < exts.len() {
             let e = exts[j];
             let e_end = (e.phys + e.len as u64).max(end);
-            if e.phys.saturating_sub(end) > gap || e_end.div_ceil(ALIGN) * ALIGN - start > max as u64 {
+            // The cost of merging is only the bytes between the aligned end of the read so far
+            // and the aligned start of the next extent: within one 4 KB block there is no gap
+            // (on a flashcp layout files share blocks, so gap 0 must still merge them).
+            if (e.phys / ALIGN * ALIGN).saturating_sub(end.div_ceil(ALIGN) * ALIGN) > gap
+                || e_end.div_ceil(ALIGN) * ALIGN - start > max as u64
+            {
                 break;
             }
             end = e_end;
@@ -1134,6 +1139,21 @@ mod tests {
         );
         // With a huge gap threshold everything is one read.
         assert_eq!(coalesce(&e, 8 << 20, 2 << 20).len(), 1);
+    }
+
+    #[test]
+    fn coalesce_gap_is_measured_between_aligned_blocks() {
+        // Back-to-back files on a flashcp layout: the first ends inside a block, the next
+        // starts in the following one. Nothing lies between the aligned ends: one read.
+        let e = [ext(0, 5000, 0), ext(8192, 100, 1)];
+        assert_eq!(coalesce(&e, 8 << 20, 0), vec![Chunk { start: 0, len: 3 * ALIGN as usize, exts: 0..2 }]);
+        // Sub-4 KB clusters: two files sharing one block are one read, never two of the block.
+        let e = [ext(0, 512, 0), ext(1024, 512, 1)];
+        assert_eq!(coalesce(&e, 8 << 20, 0).len(), 1);
+        // A real hole of one block is still skipped with gap 0, read through with gap 4 KB.
+        let e = [ext(0, 4096, 0), ext(8192, 100, 1)];
+        assert_eq!(coalesce(&e, 8 << 20, 0).len(), 2);
+        assert_eq!(coalesce(&e, 8 << 20, ALIGN).len(), 1);
     }
 
     #[test]
