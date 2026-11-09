@@ -3,7 +3,7 @@
 
 Usage: nfc_probe.py MOUNTPOINT [LABEL]
 
-For the existing NFC file "café.txt" (written by flashcp or by the control writer) and for a new
+For the existing NFC files "naïve résumé.txt" and "accents/café.txt" (written by flashcp or by the control writer) and for a new
 file this probe creates with an NFC name, it prints which form readdir returns and whether a
 lookup by the NFC and by the NFD spelling finds the file.
 """
@@ -22,6 +22,10 @@ def form(name):
 
 
 def probe(mount, name):
+    d, _, name = name.rpartition("/")
+    if d:
+        sub = [n for n in os.listdir(mount) if NFC(n) == NFC(d)]
+        mount = os.path.join(mount, sub[0] if sub else d)
     listed = [n for n in os.listdir(mount) if NFC(n) == NFC(name)]
     res = {}
     for f, fn in (("NFC", NFC), ("NFD", NFD)):
@@ -39,7 +43,8 @@ def main(argv):
         sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     mount = argv[0]
     label = argv[1] if len(argv) > 1 else mount
-    print(f"NFCPROBE {label} existing café.txt: {probe(mount, NFC('café.txt'))}")
+    print(f"NFCPROBE {label} existing naïve résumé.txt: {probe(mount, NFC('naïve résumé.txt'))}")
+    print(f"NFCPROBE {label} existing accents/café.txt: {probe(mount, NFC('accents/café.txt'))}")
     new = NFC("probe-é.txt")
     try:
         with open(os.path.join(mount, new), "wb") as f:
