@@ -175,7 +175,17 @@ struct Geometry {
     cluster_count: u64,
 }
 
+/// Largest cluster size the spec allows (SectorsPerClusterShift ≤ 25 − BytesPerSectorShift).
+const MAX_CLUSTER: u64 = 32 << 20;
+
+fn valid_cluster(cluster: u64) -> bool {
+    cluster.is_power_of_two() && (SECTOR..=MAX_CLUSTER).contains(&cluster)
+}
+
 fn geometry(vol_bytes: u64, cluster: u64) -> Option<Geometry> {
+    if !valid_cluster(cluster) {
+        return None;
+    }
     let vol = vol_bytes / SECTOR;
     let fat_off = (1 << 20) / SECTOR;
     let spc = cluster / SECTOR;
@@ -183,7 +193,7 @@ fn geometry(vol_bytes: u64, cluster: u64) -> Option<Geometry> {
     let fat_len = ((est + 2) * 4).div_ceil(SECTOR);
     let heap_off = (fat_off + fat_len).div_ceil(ALIGN / SECTOR) * (ALIGN / SECTOR);
     let cc = vol.checked_sub(heap_off)? / spc;
-    if cc < 16 || cc > 0xFFFF_FFF5 {
+    if !(16..=0xFFFF_FFF5).contains(&cc) {
         return None;
     }
     Some(Geometry { cluster, fat_off, fat_len, heap_off, cluster_count: cc })
@@ -277,7 +287,17 @@ fn boot_region(g: &Geometry, part_off: u64, vol_bytes: u64, root: u32, serial: u
 
 /// exFAT timestamp (UTC) + 10 ms increment.
 fn ts(secs: i64, nsec: u32) -> (u32, u8) {
-    let secs = secs.max(315_532_800); // 1980-01-01
+    // exFAT years run 1980..=2107. Out-of-range times saturate to the nearest end with
+    // no sub-second part, matching what the Linux driver writes.
+    const MIN: i64 = 315_532_800; // 1980-01-01 00:00:00
+    const MAX: i64 = 4_354_819_199; // 2107-12-31 23:59:59
+    let (secs, nsec) = if secs < MIN {
+        (MIN, 0)
+    } else if secs > MAX {
+        (MAX, 999_999_999)
+    } else {
+        (secs, nsec.min(999_999_999))
+    };
     let days = secs.div_euclid(86400);
     let sod = secs.rem_euclid(86400);
     // civil_from_days (H. Hinnant)
@@ -290,9 +310,10 @@ fn ts(secs: i64, nsec: u32) -> (u32, u8) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
-    let y = (y - 1980).clamp(0, 127);
+    let y = y - 1980;
     let (h, mi, s) = (sod / 3600, sod % 3600 / 60, sod % 60);
-    let t = (y as u32) << 25 | (m as u32) << 21 | (d as u32) << 16 | (h as u32) << 11 | (mi as u32) << 5 | (s as u32 / 2);
+    let t =
+        (y as u32) << 25 | (m as u32) << 21 | (d as u32) << 16 | (h as u32) << 11 | (mi as u32) << 5 | (s as u32 / 2);
     (t, ((s % 2) * 100 + (nsec / 10_000_000) as i64) as u8)
 }
 
@@ -463,7 +484,7 @@ impl SeqWriter {
     }
     /// Skip forward without writing (only used for regions whose contents don't matter).
     fn skip_to(&mut self, target: u64) -> Result<()> {
-        assert!(self.cur() % 4096 == 0 && target % 4096 == 0);
+        assert!(self.cur().is_multiple_of(4096) && target.is_multiple_of(4096));
         self.flush()?;
         assert!(target >= self.pos);
         self.pos = target;
@@ -488,7 +509,12 @@ type Budget = Arc<(Mutex<(usize, u64)>, Condvar)>;
 
 /// Reads files in parallel; the consumer reorders by index. Budget is granted in claim
 /// order, so the next file the consumer needs is always already claimed: no deadlock.
-fn ordered_reader(paths: Vec<(PathBuf, u64)>, readers: usize, budget: u64, stream_over: u64) -> (Receiver<(usize, Item)>, Budget) {
+fn ordered_reader(
+    paths: Vec<(PathBuf, u64)>,
+    readers: usize,
+    budget: u64,
+    stream_over: u64,
+) -> (Receiver<(usize, Item)>, Budget) {
     let (tx, rx) = bounded(8192);
     let paths = Arc::new(paths);
     let state: Budget = Arc::new((Mutex::new((0usize, budget)), Condvar::new()));
@@ -570,18 +596,46 @@ fn open_target(path: &Path) -> Result<Target> {
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0u64);
-        // Refuse to touch anything that is mounted.
+        // Refuse to touch anything that is mounted: the device itself, any of its
+        // partitions (a whole disk whose /dev/sdX1 is mounted), or a holder (dm, md).
         let mounts = fs::read_to_string("/proc/self/mountinfo")?;
-        ensure!(
-            !mounts.lines().any(|l| l.split(' ').nth(2) == Some(&format!("{maj}:{min}"))),
-            "{} is mounted; unmount it first",
-            path.display()
-        );
+        if let Some((dev, at)) = mounted_dev(&mounts, &related_devs(maj, min)) {
+            bail!("{} is in use: device {dev} is mounted at {at}; unmount it first", path.display());
+        }
         Ok(Target { file, bytes: size, part_off: start, direct })
     } else {
         ensure!(md.len() > 0, "image file is empty; create it first, e.g. truncate -s 8G image.img");
         Ok(Target { file, bytes: md.len(), part_off: 0, direct })
     }
+}
+
+/// "maj:min" of a block device, its partitions and its holders, read from sysfs.
+fn related_devs(maj: u32, min: u32) -> Vec<String> {
+    let base = PathBuf::from(format!("/sys/dev/block/{maj}:{min}"));
+    let mut v = vec![format!("{maj}:{min}")];
+    let mut add = |dir: PathBuf, need_partition: bool| {
+        for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if need_partition && !p.join("partition").exists() {
+                continue;
+            }
+            if let Ok(d) = fs::read_to_string(p.join("dev")) {
+                v.push(d.trim().to_string());
+            }
+        }
+    };
+    add(base.clone(), true);
+    add(base.join("holders"), false);
+    v
+}
+
+/// First mountinfo line whose device ("maj:min", field 3) is in `devs`: (device, mount point).
+fn mounted_dev(mountinfo: &str, devs: &[String]) -> Option<(String, String)> {
+    mountinfo.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(' ').collect();
+        let dev = *f.get(2)?;
+        devs.iter().any(|d| d == dev).then(|| (dev.to_string(), f.get(4).unwrap_or(&"?").to_string()))
+    })
 }
 
 // ───────────────────────── build ─────────────────────────
@@ -607,7 +661,13 @@ pub fn build(src: &Path, target: &Path, o: &BuildOpts) -> Result<BuildStats> {
     // (FAT + bitmap + per-file slack). Small files want small clusters; huge drives in
     // Full FAT mode want bigger ones.
     let candidates: Vec<u64> = match o.cluster {
-        Some(c) => vec![c as u64],
+        Some(c) => {
+            ensure!(
+                valid_cluster(c as u64),
+                "cluster size must be a power of two between 512 bytes and 32 MB, got {c}"
+            );
+            vec![c as u64]
+        }
         None => (12..=17).map(|s| 1u64 << s).collect(), // 4K … 128K
     };
     let mut best: Option<Plan> = None;
@@ -637,7 +697,14 @@ pub fn build(src: &Path, target: &Path, o: &BuildOpts) -> Result<BuildStats> {
         human_bytes(p.write_bytes as f64)
     );
     if o.dry_run {
-        return Ok(BuildStats { files, dirs, data_bytes: data, written: 0, cluster: cs, secs: t0.elapsed().as_secs_f64() });
+        return Ok(BuildStats {
+            files,
+            dirs,
+            data_bytes: data,
+            written: 0,
+            cluster: cs,
+            secs: t0.elapsed().as_secs_f64(),
+        });
     }
 
     let file_order: Vec<usize> = (0..nodes.len())

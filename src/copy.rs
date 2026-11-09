@@ -112,13 +112,14 @@ pub fn smart_copy(src: &Path, dst: &Path, o: SmartOpts) -> Result<Stats> {
         Mutex::new(Sched { budget_left: o.budget, next: starts.clone(), end: ends.clone() }),
         Condvar::new(),
     ));
-    let (txs, rxs): (Vec<Sender<(usize, Payload)>>, Vec<Receiver<(usize, Payload)>>) =
-        (0..w).map(|_| bounded(4096)).unzip();
+    type Chan = (Sender<(usize, Payload)>, Receiver<(usize, Payload)>);
+    let (txs, rxs): (Vec<_>, Vec<_>) = (0..w).map(|_| -> Chan { bounded(4096) }).unzip();
     let error: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
 
     std::thread::scope(|s| {
         for _ in 0..o.readers.max(1) {
-            let (sched, files, txs, error, starts) = (sched.clone(), files.clone(), txs.clone(), error.clone(), starts.clone());
+            let (sched, files, txs, error, starts) =
+                (sched.clone(), files.clone(), txs.clone(), error.clone(), starts.clone());
             s.spawn(move || {
                 loop {
                     // Claim the next file of the least-advanced writer, with budget, atomically.

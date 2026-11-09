@@ -40,12 +40,12 @@ pub fn device_info(path: &Path) -> DeviceInfo {
     // the USB device tells us the negotiated link speed.
     let mut a = p.clone();
     while a.pop() {
-        if info.transport.is_none() {
-            if let Ok(d) = fs::read_link(a.join("driver")) {
-                let name = d.file_name().unwrap().to_string_lossy().to_string();
-                if name == "uas" || name == "usb-storage" {
-                    info.transport = Some(name);
-                }
+        if info.transport.is_none()
+            && let Ok(d) = fs::read_link(a.join("driver"))
+        {
+            let name = d.file_name().unwrap().to_string_lossy().to_string();
+            if name == "uas" || name == "usb-storage" {
+                info.transport = Some(name);
             }
         }
         if info.usb_speed_mbps.is_none() && a.join("idVendor").exists() {
@@ -69,13 +69,8 @@ pub struct ProbeResult {
 }
 
 fn open_probe(path: &Path) -> Result<(File, bool)> {
-    let direct = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path);
+    let direct =
+        OpenOptions::new().read(true).write(true).create(true).truncate(true).custom_flags(libc::O_DIRECT).open(path);
     match direct {
         Ok(f) => Ok((f, true)),
         Err(_) => Ok((OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?, false)),
