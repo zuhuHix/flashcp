@@ -970,6 +970,49 @@ fn gap_fill_never_writes_over_existing_files() {
     fs::remove_dir_all(&dir).expect("remove scratch dir");
 }
 
+/// Every forced gap-policy candidate (skip all, fill all, pad files to 16 KB) gives the same,
+/// correct volume on a 32 KB-cluster volume that already holds data, and fills exactly what
+/// it says: nothing for skip and pad, the slack for fill.
+#[test]
+fn forced_gap_policies_all_give_a_correct_volume() {
+    let dir = test_dir("add_gap_policies");
+    let (base, new) = (dir.join("base"), dir.join("new"));
+    for k in 0..30u64 {
+        write_random(&base.join(format!("b/f{k:02}.bin")), 3000 + 997 * k, 70 + k);
+        write_random(&new.join(format!("n/g{k:02}.bin")), 1 + 2039 * k, 170 + k);
+    }
+    for (policy, plan, filled) in [
+        ("skip", "gaps: skip all; 1 in flight (test override)", false),
+        ("fill:2", "gaps: fill free ≤ 4.2 MB; 2 in flight (test override)", true),
+        ("pad", "gaps: pad files to 16.4 KB, skip the rest; 8 in flight (test override)", false),
+    ] {
+        let img = dir.join("disk.img");
+        make_image(&img, 64 * MB);
+        mkfs_32k_labelled(&img);
+        let first =
+            flashcp().arg("add").arg(&base).arg(&img).env("FLASHCP_TEST_NO_ADD_BUILD", "1").output().expect("add");
+        assert_success(&first, "first add");
+        let before = read_ok(&img);
+        let out = flashcp()
+            .arg("add")
+            .arg(&new)
+            .arg(&img)
+            .env("FLASHCP_TEST_GAP_POLICY", if policy == "skip" { "skip:1" } else { policy })
+            .env("FLASHCP_TEST_GAPS", "1")
+            .output()
+            .expect("run flashcp add");
+        assert_success(&out, "flashcp add");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(plan), "{policy}: {stdout}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(!stderr.contains("gaps: 0 bytes zero-filled"), filled, "{policy}: {stderr}");
+        fsck_clean(&img);
+        expect_tree(&read_ok(&img), as_src(&before), read_source_tree(&new), &[]);
+        fs::remove_file(&img).expect("remove image");
+    }
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
 // ───────────────────────── empty volume: add = build ─────────────────────────
 
 fn mkfs_32k_labelled(img: &Path) {
