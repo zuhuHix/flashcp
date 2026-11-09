@@ -36,6 +36,30 @@ import {
   resetForm,
   eraseSourceHint,
   jobActive,
+  isoLocalDate,
+  sanitizeLabel,
+  defaultPullDest,
+  normalizeFrom,
+  joinFrom,
+  parentFrom,
+  breadcrumbs,
+  folderRows,
+  isAbsolutePath,
+  pullDestination,
+  canPull,
+  pullArgs,
+  setMode,
+  setPullFrom,
+  setPullDest,
+  resetPullDest,
+  folderKey,
+  browseKey,
+  setFolders,
+  showCollision,
+  clearCollision,
+  collisionText,
+  pullSummaryText,
+  applyPullRequest,
 } from "../logic.js";
 
 const exfat = (over = {}) => ({
@@ -559,5 +583,267 @@ describe("selectDrive, openTrust and closeTrust", () => {
     assert.equal(s.trustOpen, false);
     assert.equal(s.trustBusy, false);
     assert.equal(s.trustError, null);
+  });
+});
+
+const pullState = (over = {}) =>
+  baseState({
+    mode: "pull",
+    downloads: "/home/zuhu/Downloads",
+    pullFrom: "",
+    pullFolders: null,
+    pullDestOverride: null,
+    pullCollision: null,
+    ...over,
+  });
+const NOV9 = new Date(2026, 10, 9, 23, 30);
+
+describe("isoLocalDate and sanitizeLabel", () => {
+  test("uses the local calendar date, zero-padded", () => {
+    assert.equal(isoLocalDate(NOV9), "2026-11-09");
+    assert.equal(isoLocalDate(new Date(2026, 0, 2, 0, 5)), "2026-01-02");
+  });
+  test("rejects an invalid date", () => {
+    assert.throws(() => isoLocalDate(new Date("nope")), TypeError);
+    assert.throws(() => isoLocalDate("2026-11-09"), TypeError);
+  });
+  test("slashes and control characters become underscores, empty becomes USB", () => {
+    assert.equal(sanitizeLabel("My/Stick\u0007"), "My_Stick_");
+    assert.equal(sanitizeLabel("  FAKEUSB  "), "FAKEUSB");
+    assert.equal(sanitizeLabel(""), "USB");
+    assert.equal(sanitizeLabel("   "), "USB");
+    assert.equal(sanitizeLabel(undefined), "USB");
+  });
+});
+
+describe("defaultPullDest", () => {
+  test("<downloads>/<label>-<date>", () => {
+    assert.equal(defaultPullDest("/home/zuhu/Downloads", "FAKEUSB", NOV9), "/home/zuhu/Downloads/FAKEUSB-2026-11-09");
+  });
+  test("no label uses USB, a slash in the label cannot add a folder", () => {
+    assert.equal(defaultPullDest("/home/zuhu/Downloads", "", NOV9), "/home/zuhu/Downloads/USB-2026-11-09");
+    assert.equal(defaultPullDest("/home/zuhu/Downloads", "a/b", NOV9), "/home/zuhu/Downloads/a_b-2026-11-09");
+  });
+  test("a trailing slash on downloads is not doubled", () => {
+    assert.equal(defaultPullDest("/home/zuhu/Downloads/", "X", NOV9), "/home/zuhu/Downloads/X-2026-11-09");
+  });
+});
+
+describe("normalizeFrom", () => {
+  test("trims surrounding slashes, root is empty", () => {
+    assert.equal(normalizeFrom(""), "");
+    assert.equal(normalizeFrom("/"), "");
+    assert.equal(normalizeFrom("/Photos/2026/"), "Photos/2026");
+    assert.equal(normalizeFrom("DCIM/100 CANON"), "DCIM/100 CANON");
+  });
+  test("refuses empty, dot and dot-dot components", () => {
+    assert.equal(normalizeFrom("a//b"), null);
+    assert.equal(normalizeFrom("a/./b"), null);
+    assert.equal(normalizeFrom("a/../b"), null);
+    assert.equal(normalizeFrom(".."), null);
+    assert.equal(normalizeFrom("."), null);
+  });
+  test("refuses a leading dash, control characters, non-strings and over 1024 bytes", () => {
+    assert.equal(normalizeFrom("-x"), null);
+    // Only a leading dash on the whole value is refused (it could parse as a flag).
+    assert.equal(normalizeFrom("a/-x"), "a/-x");
+    assert.equal(normalizeFrom("a\nb"), null);
+    assert.equal(normalizeFrom("a\u0085b"), null);
+    assert.equal(normalizeFrom("a\u007fb"), null);
+    assert.equal(normalizeFrom(undefined), null);
+    assert.equal(normalizeFrom("a".repeat(1025)), null);
+    assert.equal(normalizeFrom("a".repeat(1024)), "a".repeat(1024));
+  });
+});
+
+describe("joinFrom, parentFrom, breadcrumbs, folderRows", () => {
+  test("joinFrom appends one folder name", () => {
+    assert.equal(joinFrom("", "DCIM"), "DCIM");
+    assert.equal(joinFrom("DCIM", "100CANON"), "DCIM/100CANON");
+  });
+  test("joinFrom refuses names that are not one plain folder", () => {
+    assert.equal(joinFrom("", ""), null);
+    assert.equal(joinFrom("", "a/b"), null);
+    assert.equal(joinFrom("", ".."), null);
+    assert.equal(joinFrom("", "."), null);
+    assert.equal(joinFrom("", "-x"), null);
+    assert.equal(joinFrom("a", undefined), null);
+    assert.equal(joinFrom("..", "x"), null);
+  });
+  test("parentFrom goes up one level, stops at the root", () => {
+    assert.equal(parentFrom("DCIM/100CANON"), "DCIM");
+    assert.equal(parentFrom("DCIM"), "");
+    assert.equal(parentFrom(""), "");
+    assert.equal(parentFrom("bad//path"), "");
+  });
+  test("breadcrumbs lists the root and each folder with its path", () => {
+    assert.deepEqual(breadcrumbs(""), [{ label: "Drive", from: "" }]);
+    assert.deepEqual(breadcrumbs("DCIM/100CANON"), [
+      { label: "Drive", from: "" },
+      { label: "DCIM", from: "DCIM" },
+      { label: "100CANON", from: "DCIM/100CANON" },
+    ]);
+  });
+  test("folderRows maps names to the path each one opens", () => {
+    assert.deepEqual(folderRows(["DCIM", "-ok"], "Photos"), [
+      { name: "DCIM", from: "Photos/DCIM" },
+      { name: "-ok", from: "Photos/-ok" },
+    ]);
+    // At the root a leading "-" would start the --from value, so it cannot be opened.
+    assert.deepEqual(folderRows(["-bad"], ""), [{ name: "-bad", from: null }]);
+    assert.deepEqual(folderRows(undefined, ""), []);
+  });
+});
+
+describe("pull destination and canPull", () => {
+  test("isAbsolutePath needs a leading slash and more than the root", () => {
+    assert.equal(isAbsolutePath("/home/x"), true);
+    assert.equal(isAbsolutePath("home/x"), false);
+    assert.equal(isAbsolutePath("/"), false);
+    assert.equal(isAbsolutePath("//"), false);
+    assert.equal(isAbsolutePath(""), false);
+    assert.equal(isAbsolutePath("/a\u0000b"), false);
+  });
+  test("default destination for the selected drive, with the picked one overriding it", () => {
+    const s = pullState();
+    assert.equal(pullDestination(s, NOV9), "/home/zuhu/Downloads/FAKEUSB-2026-11-09");
+    assert.equal(pullDestination({ ...s, pullDestOverride: "/data/copies/" }, NOV9), "/data/copies");
+  });
+  test("no destination before pull_defaults answers", () => {
+    assert.equal(pullDestination(pullState({ downloads: null }), NOV9), null);
+  });
+  test("canPull needs trusted exfat, a valid folder, a destination and no job", () => {
+    assert.equal(canPull(pullState()), true);
+    assert.equal(canPull(pullState({ pullFrom: "DCIM" })), true);
+    assert.equal(canPull(pullState({ pullFrom: "a//b" })), false);
+    assert.equal(canPull(pullState({ downloads: null })), false);
+    assert.equal(canPull(pullState({ drives: [vfat()], selectedId: vfat().id })), false);
+    assert.equal(canPull(pullState({ drives: [exfat({ trusted: false })] })), false);
+    assert.equal(canPull(pullState({ selectedId: null })), false);
+    assert.equal(canPull(pullState({ job: upd({ stage: "running" }) })), false);
+    assert.equal(canPull(pullState({ job: upd({ stage: "done", op: "pull" }) })), true);
+  });
+  test("pullArgs builds start_pull arguments and rejects a bad existing choice", () => {
+    assert.deepEqual(pullArgs(pullState({ pullFrom: "/Photos/" }), "fail"), {
+      driveId: "/org/block/sdz1",
+      from: "Photos",
+      dest: "/home/zuhu/Downloads/FAKEUSB-" + isoLocalDate(new Date()),
+      existing: "fail",
+    });
+    assert.equal(pullArgs(pullState(), "merge"), null);
+    assert.equal(pullArgs(pullState({ pullFrom: "a/../b" }), "fail"), null);
+    assert.equal(pullArgs(pullState({ downloads: null }), "fail"), null);
+  });
+});
+
+describe("pull state transitions", () => {
+  test("setMode switches between copy and pull only", () => {
+    const s = baseState({ mode: "copy" });
+    assert.equal(setMode(s, "copy"), s);
+    assert.equal(setMode(s, "pull").mode, "pull");
+    assert.equal(setMode(s, "erase"), s);
+  });
+  test("setPullFrom stores the folder as given", () => {
+    assert.equal(setPullFrom(pullState(), "DCIM").pullFrom, "DCIM");
+    assert.equal(setPullFrom(pullState(), undefined).pullFrom, "");
+  });
+  test("setPullDest refuses a relative path and clears a collision on a good one", () => {
+    const s = pullState({ pullCollision: { dest: "/x", source: "conflict" } });
+    const bad = setPullDest(s, "relative/path");
+    assert.equal(bad.pullDestOverride, null);
+    assert.match(bad.notice, /full path/);
+    const good = setPullDest(s, "/data/copies/");
+    assert.equal(good.pullDestOverride, "/data/copies");
+    assert.equal(good.pullCollision, null);
+    assert.equal(good.notice, null);
+  });
+  test("resetPullDest returns to the default", () => {
+    const s = resetPullDest(pullState({ pullDestOverride: "/data" }));
+    assert.equal(s.pullDestOverride, null);
+    assert.equal(pullDestination(s, NOV9), "/home/zuhu/Downloads/FAKEUSB-2026-11-09");
+  });
+  test("selectDrive forgets the folder and any collision", () => {
+    const s = selectDrive(pullState({ pullFrom: "DCIM", pullCollision: { dest: "/x", source: "preflight" } }), "/other");
+    assert.equal(s.pullFrom, "");
+    assert.equal(s.pullCollision, null);
+  });
+  test("browseKey is null without a mount point or a valid folder", () => {
+    assert.equal(browseKey(pullState()), folderKey("/org/block/sdz1", ""));
+    assert.equal(browseKey(pullState({ pullFrom: "DCIM" })), "/org/block/sdz1\nDCIM");
+    assert.equal(browseKey(pullState({ pullFrom: "a//b" })), null);
+    assert.equal(browseKey(pullState({ drives: [exfat({ mountPoint: null })] })), null);
+  });
+  test("setFolders stores the listing for its key", () => {
+    const key = folderKey("/org/block/sdz1", "");
+    const s = setFolders(pullState(), key, ["DCIM", "Music"], null);
+    assert.deepEqual(s.pullFolders, { key, names: ["DCIM", "Music"], error: null });
+    const failed = setFolders(pullState(), key, undefined, "not mounted");
+    assert.deepEqual(failed.pullFolders, { key, names: [], error: "not mounted" });
+  });
+  test("showCollision and clearCollision", () => {
+    const s = showCollision(pullState(), "/data/x", "preflight");
+    assert.deepEqual(s.pullCollision, { dest: "/data/x", source: "preflight" });
+    assert.equal(clearCollision(s).pullCollision, null);
+    assert.equal(collisionText("/data/x"), "/data/x already has files in it.");
+  });
+});
+
+describe("pullSummaryText", () => {
+  test("says what was copied, where and how long", () => {
+    assert.equal(
+      pullSummaryText({ files: 3, bytes: 1_500_000, secs: 1.8, wallSecs: 4, mountPoint: null, dest: "/home/x/USB-2026-11-09" }),
+      "Copied 3 files (1.5 MB) to /home/x/USB-2026-11-09 in 1.80 s",
+    );
+  });
+  test("singular file, and no destination when there is none", () => {
+    assert.equal(
+      pullSummaryText({ files: 1, bytes: 2_000, secs: 12.25, wallSecs: 13, mountPoint: null, dest: null }),
+      "Copied 1 file (2.0 kB) in 12.3 s",
+    );
+  });
+  test("empty without a summary", () => {
+    assert.equal(pullSummaryText(null), "");
+  });
+});
+
+describe("stageText for a pull", () => {
+  test("copying says it is copying from the drive", () => {
+    assert.equal(stageText(upd({ op: "pull", stage: "running", index: 0, total: 1 })), "Copying from the drive…");
+    assert.equal(stageText(upd({ stage: "running", op: "add" })), "Copying item 1 of 2…");
+  });
+});
+
+describe("applyPullRequest", () => {
+  const two = [exfat(), vfat({ trusted: true, serial: "OLD0002" })];
+  test("switches to pull, selects the drive and sets the folder", () => {
+    const s = applyPullRequest(baseState({ drives: two, mode: "copy", pullCollision: { dest: "/x", source: "conflict" } }), {
+      driveId: vfat().id,
+      from: "/Documents/2026/",
+      error: null,
+    });
+    assert.equal(s.mode, "pull");
+    assert.equal(s.selectedId, vfat().id);
+    assert.equal(s.pullFrom, "Documents/2026");
+    assert.equal(s.pullCollision, null);
+    assert.equal(s.notice, null);
+  });
+  test("an unknown drive keeps the selection; an invalid folder becomes the root", () => {
+    const s = applyPullRequest(baseState({ drives: two }), { driveId: "/gone", from: "a/../b", error: null });
+    assert.equal(s.selectedId, "/org/block/sdz1");
+    assert.equal(s.pullFrom, "");
+  });
+  test("the backend error is shown as the notice", () => {
+    const s = applyPullRequest(baseState({ drives: two }), {
+      driveId: null,
+      from: "",
+      error: "That folder is not on a USB exFAT drive flashcp can see",
+    });
+    assert.equal(s.mode, "pull");
+    assert.equal(s.notice, "That folder is not on a USB exFAT drive flashcp can see");
+  });
+  test("null or malformed requests change nothing", () => {
+    const s = baseState();
+    assert.equal(applyPullRequest(s, null), s);
+    assert.equal(applyPullRequest(s, "x"), s);
   });
 });

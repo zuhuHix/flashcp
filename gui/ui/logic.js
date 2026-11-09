@@ -23,13 +23,16 @@
  * @property {number} secs
  * @property {number} wallSecs
  * @property {string|null} mountPoint
+ * @property {string|null} [dest]     pull: the local destination folder
+ * @property {string|null} [warning]  pull: set when the remount failed after a good copy
  */
 
 /**
  * @typedef {Object} JobUpdate
  * @property {"starting"|"unmounting"|"authorizing"|"running"|"remounting"|"done"|"error"} stage
  *   "starting" is client-only: set locally before start_copy/start_erase is invoked.
- * @property {"add"|"build"} op
+ * @property {"add"|"build"|"pull"} op
+ * @property {boolean} [conflict]  pull: the copy stopped because the destination already has files
  * @property {number} index
  * @property {number} total
  * @property {number} filesDone
@@ -54,6 +57,13 @@
  * @property {boolean} trustOpen    the "Trust this drive" confirm panel is showing
  * @property {boolean} trustBusy    a trust_drive call is in flight
  * @property {string|null} trustError
+ * @property {"copy"|"pull"} mode   which direction the window is showing
+ * @property {string|null} downloads        the user's Downloads folder (pull_defaults)
+ * @property {string} pullFrom              folder on the drive, "" = whole drive
+ * @property {{key: string, names: string[], error: string|null}|null} pullFolders
+ *   subfolders of the folder named by `key` (see folderKey); null until loaded
+ * @property {string|null} pullDestOverride a destination picked with Change…; null = default
+ * @property {{dest: string, source: "preflight"|"conflict"}|null} pullCollision
  */
 
 const UNITS = ["kB", "MB", "GB", "TB"];
@@ -144,6 +154,7 @@ export function stageText(update) {
     case "authorizing":
       return "Waiting for authorization…";
     case "running":
+      if (update.op === "pull") return "Copying from the drive…";
       return `Copying item ${update.index + 1} of ${update.total}…`;
     case "remounting":
       return "Remounting…";
@@ -513,7 +524,15 @@ export function eraseSourceHint(count) {
  */
 export function selectDrive(state, id) {
   if (id === state.selectedId) return state;
-  return { ...state, selectedId: id, eraseTyped: "", trustOpen: false, trustError: null };
+  return {
+    ...state,
+    selectedId: id,
+    eraseTyped: "",
+    trustOpen: false,
+    trustError: null,
+    pullFrom: "",
+    pullCollision: null,
+  };
 }
 
 /** Show the trust confirm panel. */
@@ -524,4 +543,302 @@ export function openTrust(state) {
 /** Hide the trust confirm panel and clear its busy flag and error. */
 export function closeTrust(state) {
   return { ...state, trustOpen: false, trustBusy: false, trustError: null };
+}
+
+// ---- Copy from USB (pull) ----------------------------------------------------
+
+/**
+ * Local calendar date as YYYY-MM-DD (the user's day, not UTC).
+ * @param {Date} date
+ * @returns {string}
+ */
+export function isoLocalDate(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
+    throw new TypeError("isoLocalDate needs a valid Date");
+  }
+  const y = String(date.getFullYear()).padStart(4, "0");
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+/**
+ * A drive label as a single file name: "/" and control characters become "_",
+ * surrounding spaces are trimmed, and an empty result becomes "USB".
+ * @param {string} label
+ * @returns {string}
+ */
+export function sanitizeLabel(label) {
+  const s = typeof label === "string" ? label.replace(/[\/\u0000-\u001f\u007f]/g, "_").trim() : "";
+  return s === "" ? "USB" : s;
+}
+
+/**
+ * Default copy destination: "<downloads>/<label or USB>-<YYYY-MM-DD>".
+ * @param {string} downloads absolute Downloads folder
+ * @param {string} label     drive label ("" when none)
+ * @param {Date} date
+ * @returns {string}
+ */
+export function defaultPullDest(downloads, label, date) {
+  const base = String(downloads || "").replace(/\/+$/, "");
+  return `${base}/${sanitizeLabel(label)}-${isoLocalDate(date)}`;
+}
+
+/**
+ * Canonical folder path on the drive: no leading or trailing "/" (trimmed),
+ * "" for the drive root. null when it is not allowed: an empty component
+ * (a "//" inside), a "." or ".." component, a leading "-",
+ * a control character, or more than 1024 bytes. Same rule as the helper.
+ * @param {string} s
+ * @returns {string|null}
+ */
+export function normalizeFrom(s) {
+  if (typeof s !== "string") return null;
+  const rel = s.replace(/^\/+|\/+$/g, "");
+  if (rel === "") return "";
+  // Same rule as the helper's check_from: Rust's char::is_control is C0, DEL and C1.
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(rel)) return null;
+  if (new TextEncoder().encode(rel).length > 1024) return null;
+  // Only a leading "-" on the whole value could be read as a flag; "a/-b" is fine.
+  if (rel.startsWith("-")) return null;
+  for (const seg of rel.split("/")) {
+    if (seg === "" || seg === "." || seg === "..") return null;
+  }
+  return rel;
+}
+
+/**
+ * The folder `name` inside `rel`, canonical, or null. `name` is one folder
+ * name as list_drive_folders returns it (no "/").
+ * @param {string} rel
+ * @param {string} name
+ * @returns {string|null}
+ */
+export function joinFrom(rel, name) {
+  if (typeof name !== "string" || name === "" || name.includes("/")) return null;
+  const base = normalizeFrom(rel);
+  if (base === null) return null;
+  return normalizeFrom(base === "" ? name : `${base}/${name}`);
+}
+
+/**
+ * The folder above `rel`. "" at the root or when `rel` is not valid.
+ * @param {string} rel
+ * @returns {string}
+ */
+export function parentFrom(rel) {
+  const r = normalizeFrom(rel);
+  if (!r) return "";
+  const i = r.lastIndexOf("/");
+  return i >= 0 ? r.slice(0, i) : "";
+}
+
+/**
+ * Breadcrumb trail for the folder browser: the drive root, then each folder.
+ * @param {string} rel
+ * @returns {{label: string, from: string}[]}
+ */
+export function breadcrumbs(rel) {
+  const r = normalizeFrom(rel) || "";
+  const out = [{ label: "Drive", from: "" }];
+  if (r === "") return out;
+  const parts = r.split("/");
+  parts.forEach((part, i) => out.push({ label: part, from: parts.slice(0, i + 1).join("/") }));
+  return out;
+}
+
+/**
+ * Rows for the folder list: each name with the canonical path it opens to.
+ * `from` is null for a name flashcp will not open (for example "-x").
+ * @param {string[]} names
+ * @param {string} rel
+ * @returns {{name: string, from: string|null}[]}
+ */
+export function folderRows(names, rel) {
+  return (Array.isArray(names) ? names : []).map((name) => ({ name, from: joinFrom(rel, name) }));
+}
+
+/** A usable absolute local folder path that is not the filesystem root. */
+export function isAbsolutePath(p) {
+  return (
+    typeof p === "string" &&
+    p.startsWith("/") &&
+    p.replace(/\/+$/, "") !== "" &&
+    !p.includes("\u0000")
+  );
+}
+
+/**
+ * The destination the pull will use: the picked folder if one was chosen,
+ * otherwise the default for the selected drive. null when there is no usable path.
+ * Trailing slashes are removed.
+ * @param {AppState} state
+ * @param {Date} [date]
+ * @returns {string|null}
+ */
+export function pullDestination(state, date = new Date()) {
+  let dest;
+  if (state.pullDestOverride) {
+    dest = state.pullDestOverride;
+  } else if (state.downloads) {
+    const drive = selectedDrive(state);
+    dest = defaultPullDest(state.downloads, drive ? drive.label : "", date);
+  } else {
+    return null;
+  }
+  dest = dest.replace(/\/+$/, "");
+  return isAbsolutePath(dest) ? dest : null;
+}
+
+/**
+ * Copy from USB is allowed for a trusted exFAT drive, a valid folder on it,
+ * a usable destination, and no job in flight.
+ * @param {AppState} state
+ */
+export function canPull(state) {
+  const drive = selectedDrive(state);
+  return (
+    !!drive &&
+    drive.isExfat === true &&
+    isTrusted(drive) &&
+    !jobActive(state) &&
+    normalizeFrom(state.pullFrom) !== null &&
+    pullDestination(state) !== null
+  );
+}
+
+/**
+ * Arguments for start_pull, or null when the pull cannot start.
+ * @param {AppState} state
+ * @param {"fail"|"skip"|"overwrite"} existing
+ * @returns {{driveId: string, from: string, dest: string, existing: string}|null}
+ */
+export function pullArgs(state, existing) {
+  if (!canPull(state)) return null;
+  if (existing !== "fail" && existing !== "skip" && existing !== "overwrite") return null;
+  return {
+    driveId: selectedDrive(state).id,
+    from: normalizeFrom(state.pullFrom),
+    dest: pullDestination(state),
+    existing,
+  };
+}
+
+/**
+ * Switch the window between "Copy to USB" and "Copy from USB".
+ * @param {AppState} state
+ * @param {"copy"|"pull"} mode
+ */
+export function setMode(state, mode) {
+  if (mode !== "copy" && mode !== "pull") return state;
+  return state.mode === mode ? state : { ...state, mode };
+}
+
+/** Set the folder on the drive to copy from. Stored as given; canPull validates it. */
+export function setPullFrom(state, rel) {
+  return { ...state, pullFrom: typeof rel === "string" ? rel : "" };
+}
+
+/**
+ * Choose a destination with Change…. A path that is not absolute is refused
+ * with a notice; a choice clears any collision panel for the old destination.
+ * @param {AppState} state
+ * @param {string} path
+ */
+export function setPullDest(state, path) {
+  const p = typeof path === "string" ? path.replace(/\/+$/, "") : "";
+  if (!isAbsolutePath(p)) {
+    return { ...state, notice: "Choose a folder with a full path, such as /home/you/Documents/USB." };
+  }
+  return { ...state, pullDestOverride: p, pullCollision: null, notice: null };
+}
+
+/** Go back to the default destination for the selected drive. */
+export function resetPullDest(state) {
+  return { ...state, pullDestOverride: null, pullCollision: null };
+}
+
+/** Key identifying one folder listing: the drive and the folder on it. */
+export function folderKey(driveId, from) {
+  return `${driveId}\n${from}`;
+}
+
+/**
+ * The listing the browser needs now: null when the drive is not mounted (or
+ * the folder text is not valid), otherwise folderKey for the selected drive.
+ * @param {AppState} state
+ * @returns {string|null}
+ */
+export function browseKey(state) {
+  const drive = selectedDrive(state);
+  if (!drive || !drive.mountPoint) return null;
+  const from = normalizeFrom(state.pullFrom);
+  return from === null ? null : folderKey(drive.id, from);
+}
+
+/**
+ * Store a listing result for `key`. Results for other folders are ignored by
+ * the caller, which checks browseKey first.
+ * @param {AppState} state
+ * @param {string} key
+ * @param {string[]} names
+ * @param {string|null} error
+ */
+export function setFolders(state, key, names, error) {
+  return {
+    ...state,
+    pullFolders: { key, names: Array.isArray(names) ? names.slice() : [], error: error || null },
+  };
+}
+
+/** Open the collision panel for `dest`. source: "preflight" (checked before start) or "conflict" (the job reported it). */
+export function showCollision(state, dest, source) {
+  return { ...state, pullCollision: { dest, source } };
+}
+
+/** Close the collision panel. */
+export function clearCollision(state) {
+  return { ...state, pullCollision: null };
+}
+
+/** The explanation at the top of the collision panel. */
+export function collisionText(dest) {
+  return `${dest} already has files in it.`;
+}
+
+/**
+ * The line for a finished pull: "Copied 3 files (1.5 MB) to /x/USB-2026-11-09 in 1.8 s".
+ * The warning (remount failed after a good copy) is shown separately.
+ * @param {JobSummary|null} summary
+ * @returns {string}
+ */
+export function pullSummaryText(summary) {
+  if (!summary) return "";
+  const files = summary.files === 1 ? "1 file" : `${summary.files} files`;
+  const to = summary.dest ? ` to ${summary.dest}` : "";
+  return `Copied ${files} (${formatBytes(summary.bytes)})${to} in ${formatDuration(summary.secs)}`;
+}
+
+/**
+ * Apply a pull request (take_pending_pull at start, or the "pull-requested"
+ * event): switch to Copy from USB, select the drive if it is listed, set the
+ * folder, and show the backend's error if there is one.
+ * @param {AppState} state
+ * @param {{driveId: string|null, from: string, error: string|null}|null} req
+ * @returns {AppState}
+ */
+export function applyPullRequest(state, req) {
+  if (!req || typeof req !== "object") return state;
+  let next = { ...state, mode: "pull", pullCollision: null };
+  if (typeof req.driveId === "string" && state.drives.some((d) => d.id === req.driveId)) {
+    next = selectDrive(next, req.driveId);
+  }
+  const from = normalizeFrom(typeof req.from === "string" ? req.from : "");
+  const error = typeof req.error === "string" && req.error !== "" ? req.error : null;
+  return {
+    ...next,
+    pullFrom: from === null ? "" : from,
+    notice: error || next.notice,
+  };
 }
