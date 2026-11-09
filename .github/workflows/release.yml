@@ -128,8 +128,10 @@ jobs:
         run: |
           set -eux
           sudo apt-get install -y "./dist/flashcp_${VERSION}_${DEB_ARCH}.deb"
-          test "$(command -v flashcp)" = "/usr/bin/flashcp"
-          flashcp --help
+          dpkg -L flashcp | grep -qx /usr/bin/flashcp
+          # Not `command -v`: mtd-utils (present on some runners) ships an
+          # unrelated /usr/sbin/flashcp that comes first in PATH.
+          /usr/bin/flashcp --help
           sudo apt-get remove -y flashcp
 
       - uses: actions/upload-artifact@v4
