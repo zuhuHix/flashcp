@@ -21,3 +21,20 @@ zstd = { version = "0.14.3", features = ["zstdmt"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[package.metadata.deb]
+maintainer = "zuhu <307932685+zuhuHix@users.noreply.github.com>"
+copyright = "zuhu and flashcp contributors"
+license-file = ["LICENSE", "0"]
+extended-description = """
+Fast file transfers to USB sticks and external drives. Builds a whole exFAT
+volume from a source directory in one sequential pass. Linux only.
+"""
+section = "utils"
+priority = "optional"
+depends = ""
+recommends = "exfatprogs"
+assets = [
+  ["target/release/flashcp", "usr/bin/", "755"],
+  ["README.md", "usr/share/doc/flashcp/README.md", "644"],
+]
