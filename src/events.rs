@@ -3,9 +3,11 @@
 //! The JSON contract, one object per line on stdout:
 //!
 //! ```text
-//! {"event":"plan","op":"add"|"build"|"pull","files":N,"dirs":N,"bytes":N,"write_bytes":N}
+//! {"event":"plan","op":"add"|"build"|"pull"|"optimize","files":N,"dirs":N,"bytes":N,"write_bytes":N}
 //!     pull adds "strategy":{"transport":"uas"|"usb-storage"|..,"gap_kb":N,"inflight":N,
 //!     "direct":B,"overhead_ms":F|null,"mbps":F|null}
+//! {"event":"phase","op":"optimize","phase":"pull"|..,"step":N,"steps":N}
+//!     optimize only: a new phase starts; progress events that follow count within it
 //! {"event":"progress","files_done":N,"bytes_done":N}   (at most ~10 per second)
 //! {"event":"done","files":N,"bytes":N,"secs":F}
 //! {"event":"error","message":"..."}                     (and a non-zero exit code)
@@ -18,6 +20,7 @@ pub enum Op {
     Build,
     Add,
     Pull,
+    Optimize,
 }
 
 impl Op {
@@ -26,6 +29,7 @@ impl Op {
             Op::Build => "build",
             Op::Add => "add",
             Op::Pull => "pull",
+            Op::Optimize => "optimize",
         }
     }
 }
@@ -45,6 +49,13 @@ pub enum Event {
         detail: String,
         /// `pull` only: how the volume will be read, as a JSON object (transport, gap, depth).
         strategy: Option<String>,
+    },
+    /// A multi-phase operation (`optimize`) enters phase `step` of `steps` (1-based).
+    Phase {
+        op: Op,
+        phase: &'static str,
+        step: u32,
+        steps: u32,
     },
     /// Throttled to at most ~10 per second, plus one final event at 100 %.
     Progress {
@@ -88,6 +99,11 @@ impl Event {
                 r#"{{"event":"plan","op":"{}","files":{files},"dirs":{dirs},"bytes":{bytes},"write_bytes":{write_bytes}{}}}"#,
                 op.as_str(),
                 strategy.as_ref().map(|s| format!(r#","strategy":{s}"#)).unwrap_or_default()
+            ),
+            Event::Phase { op, phase, step, steps } => format!(
+                r#"{{"event":"phase","op":"{}","phase":{},"step":{step},"steps":{steps}}}"#,
+                op.as_str(),
+                json_str(phase)
             ),
             Event::Progress { files_done, bytes_done } => {
                 format!(r#"{{"event":"progress","files_done":{files_done},"bytes_done":{bytes_done}}}"#)
@@ -147,6 +163,8 @@ mod tests {
         assert_eq!(p.to_json(), r#"{"event":"plan","op":"add","files":3,"dirs":1,"bytes":10,"write_bytes":4096}"#);
         let g = Event::Progress { files_done: 1, bytes_done: 2 };
         assert_eq!(g.to_json(), r#"{"event":"progress","files_done":1,"bytes_done":2}"#);
+        let ph = Event::Phase { op: Op::Optimize, phase: "verify", step: 2, steps: 5 };
+        assert_eq!(ph.to_json(), r#"{"event":"phase","op":"optimize","phase":"verify","step":2,"steps":5}"#);
         let d = Event::Done { files: 3, bytes: 10, secs: 1.5 };
         assert_eq!(d.to_json(), r#"{"event":"done","files":3,"bytes":10,"secs":1.500}"#);
         assert_eq!(error_json("a \"b\"\n\\"), r#"{"event":"error","message":"a \"b\"\n\\"}"#);

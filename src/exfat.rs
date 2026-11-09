@@ -28,6 +28,8 @@ const UPCASE_CHECKSUM: u32 = 0xE619D30D;
 /// Cluster heap is aligned to this many bytes (erase-block friendly).
 const ALIGN: u64 = 4 << 20;
 pub(crate) const IO_CHUNK: usize = 8 << 20;
+/// VolumeFlags bit 1.
+const FLAG_VOLUME_DIRTY: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
 pub enum FatMode {
@@ -173,12 +175,12 @@ pub(crate) fn set_bytes(n: &Node) -> u64 {
 // ───────────────────────── geometry & planning ─────────────────────────
 
 #[derive(Debug, Clone, Copy)]
-struct Geometry {
-    cluster: u64,
-    fat_off: u64,  // sectors
-    fat_len: u64,  // sectors
-    heap_off: u64, // sectors
-    cluster_count: u64,
+pub(crate) struct Geometry {
+    pub(crate) cluster: u64,
+    pub(crate) fat_off: u64,  // sectors
+    pub(crate) fat_len: u64,  // sectors
+    pub(crate) heap_off: u64, // sectors
+    pub(crate) cluster_count: u64,
 }
 
 /// Largest cluster size the spec allows (SectorsPerClusterShift ≤ 25 − BytesPerSectorShift).
@@ -188,7 +190,12 @@ fn valid_cluster(cluster: u64) -> bool {
     cluster.is_power_of_two() && (SECTOR..=MAX_CLUSTER).contains(&cluster)
 }
 
-fn geometry(vol_bytes: u64, cluster: u64) -> Option<Geometry> {
+/// Volume layout for `vol_bytes` and `cluster`. `dev_off` is the volume's byte offset on the
+/// whole DEVICE (partition start; 0 for an image or a superfloppy): the cluster heap is aligned
+/// to [`ALIGN`] in absolute device terms, so clusters line up with the flash's erase blocks
+/// even when the partition itself starts at, say, 1 MiB. An offset that is not a multiple of
+/// 4 KB is ignored (the heap is then aligned within the partition).
+pub(crate) fn geometry(vol_bytes: u64, cluster: u64, dev_off: u64) -> Option<Geometry> {
     if !valid_cluster(cluster) {
         return None;
     }
@@ -197,7 +204,8 @@ fn geometry(vol_bytes: u64, cluster: u64) -> Option<Geometry> {
     let spc = cluster / SECTOR;
     let est = vol.checked_sub(fat_off)? / spc;
     let fat_len = ((est + 2) * 4).div_ceil(SECTOR);
-    let heap_off = (fat_off + fat_len).div_ceil(ALIGN / SECTOR) * (ALIGN / SECTOR);
+    let base = if dev_off.is_multiple_of(4096) { dev_off / SECTOR } else { 0 };
+    let heap_off = (base + fat_off + fat_len).div_ceil(ALIGN / SECTOR) * (ALIGN / SECTOR) - base;
     let cc = vol.checked_sub(heap_off)? / spc;
     if !(16..=0xFFFF_FFF5).contains(&cc) {
         return None;
@@ -205,17 +213,17 @@ fn geometry(vol_bytes: u64, cluster: u64) -> Option<Geometry> {
     Some(Geometry { cluster, fat_off, fat_len, heap_off, cluster_count: cc })
 }
 
-struct Plan {
-    g: Geometry,
-    bitmap_clusters: u64,
-    upcase_clusters: u64,
-    root_cluster: u32,
-    used_end: u64, // first never-used cluster index
+pub(crate) struct Plan {
+    pub(crate) g: Geometry,
+    pub(crate) bitmap_clusters: u64,
+    pub(crate) upcase_clusters: u64,
+    pub(crate) root_cluster: u32,
+    pub(crate) used_end: u64, // first never-used cluster index
     /// Bytes we'll physically write (the cost the cluster-size optimizer minimizes).
-    write_bytes: u64,
+    pub(crate) write_bytes: u64,
 }
 
-fn plan(nodes: &mut [Node], g: Geometry, fat: FatMode) -> Result<Plan> {
+pub(crate) fn plan(nodes: &mut [Node], g: Geometry, fat: FatMode) -> Result<Plan> {
     let cs = g.cluster;
     let bitmap_clusters = g.cluster_count.div_ceil(8).div_ceil(cs);
     let upcase_clusters = (UPCASE.len() as u64).div_ceil(cs);
@@ -258,7 +266,9 @@ fn plan(nodes: &mut [Node], g: Geometry, fat: FatMode) -> Result<Plan> {
 
 // ───────────────────────── on-disk structures ─────────────────────────
 
-fn boot_region(g: &Geometry, part_off: u64, vol_bytes: u64, root: u32, serial: u32, pct: u8) -> Vec<u8> {
+/// Main boot region (12 sectors). `flags` is VolumeFlags (excluded from the checksum, so the
+/// backup region written with other flags still matches).
+fn boot_region(g: &Geometry, part_off: u64, vol_bytes: u64, root: u32, serial: u32, pct: u8, flags: u16) -> Vec<u8> {
     let mut r = vec![0u8; 12 * 512];
     let b = &mut r[..512];
     b[0..3].copy_from_slice(&[0xEB, 0x76, 0x90]);
@@ -272,6 +282,7 @@ fn boot_region(g: &Geometry, part_off: u64, vol_bytes: u64, root: u32, serial: u
     b[96..100].copy_from_slice(&root.to_le_bytes());
     b[100..104].copy_from_slice(&serial.to_le_bytes());
     b[104..106].copy_from_slice(&0x0100u16.to_le_bytes());
+    b[106..108].copy_from_slice(&flags.to_le_bytes());
     b[108] = 9;
     b[109] = (g.cluster / SECTOR).trailing_zeros() as u8;
     b[110] = 1;
@@ -426,6 +437,8 @@ pub(crate) struct SeqWriter {
     /// Write lengths and skips are rounded to this (4096 for O_DIRECT, 1 for buffered I/O,
     /// where padding would overwrite bytes that are not ours).
     align: usize,
+    /// Device offset of stream offset 0 (see [`SeqWriter::set_device_offset`]).
+    base: u64,
 }
 
 /// A full buffer and its spans: (offset in buf, device offset, length).
@@ -493,7 +506,24 @@ impl SeqWriter {
             io: Some(io),
             written: 0,
             align,
+            base: 0,
         }
+    }
+    /// Makes buffer flushes (the big writes) end on absolute DEVICE multiples of [`IO_CHUNK`]
+    /// when the stream's offset 0 sits at byte `dev_off` of the whole device (a partition's
+    /// start). Ignored unless `dev_off` keeps every flush aligned (a multiple of `align`).
+    pub(crate) fn set_device_offset(&mut self, dev_off: u64) {
+        if dev_off.is_multiple_of(self.align as u64) && self.fill == 0 {
+            self.base = dev_off;
+        }
+    }
+    /// Bytes that fit before the buffer is full or the next absolute IO_CHUNK boundary.
+    fn room(&self) -> usize {
+        let to_boundary = IO_CHUNK - ((self.cur() + self.base) % IO_CHUNK as u64) as usize;
+        (IO_CHUNK - self.fill).min(to_boundary)
+    }
+    fn at_boundary(&self) -> bool {
+        self.fill == IO_CHUNK || (self.fill > 0 && (self.cur() + self.base).is_multiple_of(IO_CHUNK as u64))
     }
     fn flush(&mut self) -> Result<()> {
         if self.fill == 0 {
@@ -529,11 +559,11 @@ impl SeqWriter {
     }
     pub(crate) fn write(&mut self, mut d: &[u8]) -> Result<()> {
         while !d.is_empty() {
-            let n = d.len().min(IO_CHUNK - self.fill);
+            let n = d.len().min(self.room());
             self.buf.as_mut()[self.fill..self.fill + n].copy_from_slice(&d[..n]);
             self.fill += n;
             d = &d[n..];
-            if self.fill == IO_CHUNK {
+            if self.at_boundary() {
                 self.flush()?;
             }
         }
@@ -542,12 +572,12 @@ impl SeqWriter {
     /// Read a file straight into the I/O buffers (no intermediate copy).
     pub(crate) fn write_from(&mut self, f: &mut File, mut left: u64) -> Result<()> {
         while left > 0 {
-            let n = (IO_CHUNK - self.fill).min(left as usize);
+            let n = self.room().min(left as usize);
             let dst = &mut self.buf.as_mut()[self.fill..self.fill + n];
             f.read_exact(dst)?;
             self.fill += n;
             left -= n as u64;
-            if self.fill == IO_CHUNK {
+            if self.at_boundary() {
                 self.flush()?;
             }
         }
@@ -958,17 +988,35 @@ pub fn build(src: &Path, target: &Path, o: &BuildOpts, sink: Sink<'_>) -> Result
 
 /// [`build`] onto a [`TargetSpec`] (a path, or an inherited block-device fd).
 pub fn build_to(src: &Path, target: &TargetSpec, o: &BuildOpts, sink: Sink<'_>) -> Result<BuildStats> {
-    let t0 = Instant::now();
-    let mut tick = Ticker::new(sink);
-    let upc = upcase_map();
     let label: Vec<u16> = o.label.encode_utf16().collect();
     ensure!(label.len() <= 11, "label is at most 11 characters");
-    let mut nodes = scan_tree(src, &upc)?;
+    let nodes = scan_tree(src, &upcase_map())?;
     let tgt = target.open_rw()?;
+    build_target(nodes, tgt, o, sink)
+}
 
-    // Cluster-size optimizer: pick the size that minimizes bytes physically written
-    // (FAT + bitmap + per-file slack). Small files want small clusters; huge drives in
-    // Full FAT mode want bigger ones.
+/// Test hook: abort the process (as if killed) once this many bytes have been handed to the
+/// device in the data stream. Used by the `optimize` crash tests.
+const ABORT_AT_ENV: &str = "FLASHCP_TEST_BUILD_ABORT_AT";
+
+/// Volume bytes used on a target of `bytes`: rounded down to 4 KB, so that no write (O_DIRECT
+/// pads to 4 KB) can reach past the end. An image file therefore never changes size.
+pub(crate) fn usable_bytes(bytes: u64) -> u64 {
+    bytes / 4096 * 4096
+}
+
+/// The target's absolute byte offset on its whole device (partition start), or 0.
+pub(crate) fn device_offset(tgt: &Target) -> u64 {
+    tgt.part_off * SECTOR
+}
+
+/// Cluster-size optimizer: plans every candidate cluster size and returns the cheapest plan
+/// (with `nodes` laid out for it). An explicit `o.cluster` is the only candidate.
+pub(crate) fn choose_cluster(nodes: &mut [Node], tgt: &Target, o: &BuildOpts) -> Result<Plan> {
+    let vol_bytes = usable_bytes(tgt.bytes);
+    let dev_off = device_offset(tgt);
+    // Pick the size that minimizes bytes physically written (FAT + bitmap + per-file slack).
+    // Small files want small clusters; huge drives in Full FAT mode want bigger ones.
     let candidates: Vec<u64> = match o.cluster {
         Some(c) => {
             ensure!(
@@ -981,14 +1029,25 @@ pub fn build_to(src: &Path, target: &TargetSpec, o: &BuildOpts, sink: Sink<'_>) 
     };
     let mut best: Option<Plan> = None;
     for c in candidates {
-        let Some(g) = geometry(tgt.bytes, c) else { continue };
-        let Ok(p) = plan(&mut nodes, g, o.fat) else { continue };
+        let Some(g) = geometry(vol_bytes, c, dev_off) else { continue };
+        let Ok(p) = plan(nodes, g, o.fat) else { continue };
         if best.as_ref().is_none_or(|b| p.write_bytes < b.write_bytes) {
             best = Some(p);
         }
     }
     let Some(best) = best else { bail!("data does not fit, or volume size is unsupported") };
-    let p = plan(&mut nodes, best.g, o.fat)?; // re-plan so nodes hold the winner's layout
+    plan(nodes, best.g, o.fat) // re-plan so nodes hold the winner's layout
+}
+
+/// [`build`] of an already scanned tree onto an already opened (exclusively held) target.
+pub(crate) fn build_target(mut nodes: Vec<Node>, tgt: Target, o: &BuildOpts, sink: Sink<'_>) -> Result<BuildStats> {
+    let t0 = Instant::now();
+    let mut tick = Ticker::new(sink);
+    let upc = upcase_map();
+    let label: Vec<u16> = o.label.encode_utf16().collect();
+    ensure!(label.len() <= 11, "label is at most 11 characters");
+    let p = choose_cluster(&mut nodes, &tgt, o)?;
+    let vol_bytes = usable_bytes(tgt.bytes);
     let g = p.g;
     let cs = g.cluster;
     let files = nodes.iter().filter(|n| !n.is_dir).count();
@@ -1036,13 +1095,22 @@ pub fn build_to(src: &Path, target: &TargetSpec, o: &BuildOpts, sink: Sink<'_>) 
     let mut pending: std::collections::BTreeMap<usize, Item> = Default::default();
 
     let dev = Arc::new(tgt.file);
-    let mut w = SeqWriter::new(dev);
+    let mut w = SeqWriter::new(dev.clone());
+    w.set_device_offset(tgt.part_off * SECTOR);
+    let abort_at: Option<u64> = std::env::var(ABORT_AT_ENV).ok().and_then(|v| v.parse().ok());
+    let check_abort = |w: &SeqWriter| {
+        if abort_at.is_some_and(|a| w.written >= a) {
+            std::process::abort();
+        }
+    };
     let serial = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u32;
     let pct = ((p.used_end - 2) * 100 / g.cluster_count).min(100) as u8;
 
-    // 1. Boot region + backup.
-    let boot = boot_region(&g, tgt.part_off, tgt.bytes / SECTOR * SECTOR, p.root_cluster, serial, pct);
-    w.write(&boot)?;
+    // 1. Boot region + backup. The main boot sector says VolumeDirty until the very end, so a
+    // build that is interrupted leaves a volume every checker (and `optimize`) sees as unfinished.
+    let boot = boot_region(&g, tgt.part_off, vol_bytes, p.root_cluster, serial, pct, 0);
+    let dirty_boot = boot_region(&g, tgt.part_off, vol_bytes, p.root_cluster, serial, pct, FLAG_VOLUME_DIRTY);
+    w.write(&dirty_boot)?;
     w.write(&boot)?;
     // 2. FAT: every allocated object is one contiguous chain.
     w.zeros_to(g.fat_off * SECTOR)?;
@@ -1115,8 +1183,14 @@ pub fn build_to(src: &Path, target: &TargetSpec, o: &BuildOpts, sink: Sink<'_>) 
         w.zeros_to(at + n.clusters * cs)?;
         bytes_done += n.size;
         tick.progress((empty_files + k + 1) as u64, bytes_done, false);
+        check_abort(&w);
     }
-    let written = w.finish()?;
+    let written = w.finish()?; // syncs
+    // Everything is on the device: now the main boot sector may say "clean".
+    let mut head = AlignedBuf::new(4096);
+    head.as_mut()[..4096].copy_from_slice(&boot[..4096]);
+    dev.write_all_at(head.as_ref(), 0).context("write boot sector")?;
+    dev.sync_all().context("sync boot sector")?;
     tick.progress(files as u64, data, true);
     tick.emit(Event::Done { files: files as u64, bytes: data, secs: t0.elapsed().as_secs_f64() });
     if !tgt.direct {
@@ -1373,8 +1447,8 @@ mod tests {
 
     #[test]
     fn boot_region_layout_and_checksum() {
-        let g = geometry(32 << 20, 4096).unwrap();
-        let r = boot_region(&g, 0, 32 << 20, 5, 0x1234, 0);
+        let g = geometry(32 << 20, 4096, 0).unwrap();
+        let r = boot_region(&g, 0, 32 << 20, 5, 0x1234, 0, 0);
         assert_eq!(r.len(), 12 * 512);
         assert_eq!(&r[3..11], b"EXFAT   ");
         for s in 0..=8 {
@@ -1523,15 +1597,15 @@ mod tests {
     #[test]
     fn geometry_rejects_bad_clusters_and_small_volumes() {
         for c in [0, 100, 256, 3000, 64 << 20] {
-            assert!(geometry(1 << 30, c).is_none(), "cluster {c}");
+            assert!(geometry(1 << 30, c, 0).is_none(), "cluster {c}");
         }
         for v in [0, 512, 1 << 20, 4 << 20] {
-            assert!(geometry(v, 512).is_none(), "volume {v}");
-            assert!(geometry(v, 4096).is_none(), "volume {v}");
+            assert!(geometry(v, 512, 0).is_none(), "volume {v}");
+            assert!(geometry(v, 4096, 0).is_none(), "volume {v}");
         }
-        assert!(geometry(1 << 30, 512).is_some());
-        assert!(geometry(32 << 20, 512).is_some());
-        assert!(geometry(1 << 30, 32 << 20).is_some());
+        assert!(geometry(1 << 30, 512, 0).is_some());
+        assert!(geometry(32 << 20, 512, 0).is_some());
+        assert!(geometry(1 << 30, 32 << 20, 0).is_some());
     }
 
     #[test]
@@ -1541,7 +1615,7 @@ mod tests {
         let mut some = 0;
         for &v in &vols {
             for &c in &clusters {
-                let Some(g) = geometry(v, c) else { continue };
+                let Some(g) = geometry(v, c, 0) else { continue };
                 some += 1;
                 let cc = g.cluster_count;
                 assert_eq!(g.fat_off * SECTOR, 1 << 20);
@@ -1558,15 +1632,15 @@ mod tests {
     #[test]
     fn geometry_huge_volume() {
         let four_pib = 4u64 << 50;
-        assert!(geometry(four_pib, 512).is_none());
-        assert!(geometry(four_pib, 32 << 20).is_some());
+        assert!(geometry(four_pib, 512, 0).is_none());
+        assert!(geometry(four_pib, 32 << 20, 0).is_some());
     }
 
     // ───── planning ─────
 
     #[test]
     fn plan_lays_out_dirs_then_files() {
-        let g = geometry(64 << 20, 4096).unwrap();
+        let g = geometry(64 << 20, 4096, 0).unwrap();
         let mut nodes = sample_tree();
         let p = plan(&mut nodes, g, FatMode::Prefix).unwrap();
         assert_eq!(p.bitmap_clusters, 1);
@@ -1587,7 +1661,7 @@ mod tests {
 
     #[test]
     fn plan_write_bytes_depend_on_fat_mode() {
-        let g = geometry(64 << 20, 4096).unwrap();
+        let g = geometry(64 << 20, 4096, 0).unwrap();
         let mut nodes = sample_tree();
         let prefix = plan(&mut nodes, g, FatMode::Prefix).unwrap();
         let full = plan(&mut nodes, g, FatMode::Full).unwrap();
@@ -1598,7 +1672,7 @@ mod tests {
 
     #[test]
     fn plan_rejects_data_that_does_not_fit() {
-        let g = geometry(64 << 20, 4096).unwrap();
+        let g = geometry(64 << 20, 4096, 0).unwrap();
         let mut nodes = sample_tree();
         nodes[1].size = 64 << 20;
         let err = plan(&mut nodes, g, FatMode::Prefix).err().expect("should not fit");
@@ -1608,7 +1682,7 @@ mod tests {
     #[test]
     fn dir_bytes_root_has_label_bitmap_upcase_entries() {
         let upc = upcase_map();
-        let g = geometry(64 << 20, 4096).unwrap();
+        let g = geometry(64 << 20, 4096, 0).unwrap();
         let mut nodes = sample_tree();
         let p = plan(&mut nodes, g, FatMode::Prefix).unwrap();
         let label = utf16("TEST");
