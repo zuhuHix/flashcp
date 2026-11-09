@@ -64,8 +64,8 @@ pub struct PullOpts {
     pub skip_existing: bool,
     /// Replace files that already exist in the destination.
     pub overwrite: bool,
-    /// Largest single device read, in bytes.
-    pub chunk: usize,
+    /// Largest single device read, in bytes (None: chosen per device, see [`Strategy`]).
+    pub chunk: Option<usize>,
     /// Gaps between extents up to this many bytes are read through rather than skipped
     /// (None: chosen per device, see [`Strategy`]).
     pub gap: Option<u64>,
@@ -83,7 +83,7 @@ impl Default for PullOpts {
             from: None,
             skip_existing: false,
             overwrite: false,
-            chunk: 8 << 20,
+            chunk: None,
             gap: None,
             inflight: None,
             buffered: None,
@@ -137,15 +137,18 @@ pub struct Strategy {
     /// stream, and sequential bandwidth.
     pub overhead_ms: Option<f64>,
     pub mbps: Option<f64>,
+    /// Largest single read, in bytes.
+    pub chunk: usize,
 }
 
 impl Strategy {
     pub fn to_json(&self) -> String {
         let f = |v: Option<f64>| v.map_or("null".to_string(), |v| format!("{v:.3}"));
         format!(
-            r#"{{"transport":{},"gap_kb":{},"inflight":{},"direct":{},"overhead_ms":{},"mbps":{}}}"#,
+            r#"{{"transport":{},"gap_kb":{},"chunk_kb":{},"inflight":{},"direct":{},"overhead_ms":{},"mbps":{}}}"#,
             crate::events::json_str(&self.transport),
             self.gap >> 10,
+            self.chunk >> 10,
             self.inflight,
             self.direct,
             f(self.overhead_ms),
@@ -158,6 +161,8 @@ impl Strategy {
 /// so only small gaps are worth reading through (measured on a UAS SSD: 16–64 KB best).
 const QUEUED_GAP: u64 = 32 << 10;
 const QUEUED_INFLIGHT: usize = 32;
+const QUEUED_CHUNK: usize = 8 << 20;
+const MIN_CHUNK: usize = 4 * ALIGN as usize;
 /// Bulk-Only Transport executes one command at a time; a second request only keeps the next
 /// command ready (measured on a USB 2 stick: 2 ≈ 4 > 1).
 const BOT_INFLIGHT: usize = 2;
@@ -199,11 +204,23 @@ fn micro_probe(file: &File, v: &Vol) -> Option<(f64, f64)> {
 fn choose_strategy(file: &File, v: &Vol, o: &PullOpts) -> Strategy {
     let dev = file.metadata().map(|m| if m.file_type().is_block_device() { m.rdev() } else { m.dev() }).unwrap_or(0);
     let transport = crate::probe::device_info_of(dev).transport.unwrap_or_else(|| "other".into());
-    let mut s =
-        Strategy { transport, gap: QUEUED_GAP, inflight: QUEUED_INFLIGHT, direct: true, overhead_ms: None, mbps: None };
+    let info = crate::probe::device_info_of(dev);
+    let mut s = Strategy {
+        transport,
+        gap: QUEUED_GAP,
+        inflight: QUEUED_INFLIGHT,
+        direct: true,
+        overhead_ms: None,
+        mbps: None,
+        chunk: QUEUED_CHUNK,
+    };
     if s.transport == "usb-storage" {
         s.inflight = BOT_INFLIGHT;
         s.gap = 0;
+        // One read per hardware request: measured on a USB 2 stick (120 KB max request, 4 KB
+        // flashcp layout), 120 KB reads 15.9 s vs 8 MB reads 17.6 s for the same 208 MB.
+        let hw = info.max_sectors_kb.as_deref().and_then(|k| k.parse::<usize>().ok()).unwrap_or(0) << 10;
+        s.chunk = (hw / ALIGN as usize * ALIGN as usize).clamp(MIN_CHUNK, QUEUED_CHUNK);
         let bdev = crate::devprofile::block_dev_of(file);
         let cached = || bdev.and_then(crate::devprofile::load).and_then(|p| Some((p.read_cmd_s?, p.seq_read_bps?)));
         let measure = || {
@@ -235,6 +252,9 @@ fn choose_strategy(file: &File, v: &Vol, o: &PullOpts) -> Strategy {
     }
     if let Some(b) = o.buffered {
         s.direct = !b;
+    }
+    if let Some(c) = o.chunk {
+        s.chunk = c;
     }
     s
 }
@@ -613,7 +633,7 @@ struct Plan {
 /// and the planned data can never exceed the cluster heap.
 fn plan(v: &mut Vol, start: Vec<Child>, seen: &mut [u8], root: Option<&OwnedFd>, o: &PullOpts) -> Result<Plan> {
     // Aligning a chunk's start down and its end up adds less than 2 × ALIGN.
-    let max = o.chunk as u64 - 2 * ALIGN;
+    let max = o.chunk.unwrap_or(QUEUED_CHUNK) as u64 - 2 * ALIGN;
     // Reads stop at the last aligned offset of the volume; the rest is read buffered.
     let cut = v.vol_bytes / ALIGN * ALIGN;
     let capacity = v.cc * v.cs;
@@ -832,7 +852,7 @@ fn pull_inner(
     let t0 = Instant::now();
     ensure!(!(o.skip_existing && o.overwrite), "--skip-existing and --overwrite are mutually exclusive");
     ensure!(
-        o.chunk >= 4 * ALIGN as usize && o.chunk.is_multiple_of(ALIGN as usize) && o.chunk <= 1 << 30,
+        o.chunk.is_none_or(|c| c >= MIN_CHUNK && c.is_multiple_of(ALIGN as usize) && c <= 1 << 30),
         "chunk must be a multiple of 4 KB, between 16 KB and 1 GB"
     );
     let mut tick = Ticker::new(sink);
@@ -892,6 +912,9 @@ fn pull_inner(
     };
     let start: Vec<Child> = std::mem::take(&mut cur.children).into_values().collect();
     drop(cur);
+    // The strategy fixes the read size, which bounds how the plan splits extents.
+    let strat = choose_strategy(&file, &v, o);
+    let o = &PullOpts { chunk: Some(strat.chunk), ..o.clone() };
     let mut p = plan(&mut v, start, &mut seen, root.as_ref(), o)?;
     drop(seen);
     if !p.collisions.is_empty() {
@@ -907,8 +930,7 @@ fn pull_inner(
     p.exts.sort_unstable_by_key(|e| e.phys);
     let cut = v.vol_bytes / ALIGN * ALIGN;
     let tail_at = p.exts.partition_point(|e| e.phys < cut);
-    let strat = choose_strategy(&file, &v, o);
-    let chunks = coalesce(&p.exts[..tail_at], o.chunk, strat.gap);
+    let chunks = coalesce(&p.exts[..tail_at], strat.chunk, strat.gap);
     let tail_bytes = p.exts[tail_at..].iter().map(|e| e.phys + e.len as u64).max().map_or(0, |e| e - cut);
     let read_bytes: u64 = chunks.iter().map(|c| c.len as u64).sum::<u64>() + tail_bytes;
     let data_bytes: u64 = p.jobs.iter().map(|j| j.len).sum();
@@ -938,7 +960,7 @@ fn pull_inner(
         if p.skipped > 0 { format!(" ({} existing skipped)", p.skipped) } else { String::new() },
         human_bytes(read_bytes as f64),
         chunks.len() + usize::from(tail_bytes > 0),
-        human_bytes(o.chunk as f64),
+        human_bytes(strat.chunk as f64),
         human_bytes(cs as f64),
         strat.transport,
         human_bytes(strat.gap as f64),

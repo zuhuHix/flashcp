@@ -123,9 +123,9 @@ enum Cmd {
         /// Replace files that already exist in DEST
         #[arg(long)]
         overwrite: bool,
-        /// Largest device read in KB
-        #[arg(long, default_value_t = 8192, hide = true)]
-        chunk_kb: usize,
+        /// Largest device read in KB (default: chosen per device)
+        #[arg(long, hide = true)]
+        chunk_kb: Option<usize>,
         /// Read through gaps between files up to this many KB (default: chosen per device)
         #[arg(long, hide = true)]
         gap_kb: Option<u64>,
@@ -346,7 +346,7 @@ fn run(cmd: Cmd) -> Result<()> {
                 from,
                 skip_existing,
                 overwrite,
-                chunk: chunk_kb << 10,
+                chunk: chunk_kb.map(|c| c << 10),
                 gap: gap_kb.map(|g| g << 10),
                 buffered,
                 inflight,
