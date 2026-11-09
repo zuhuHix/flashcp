@@ -62,7 +62,11 @@ def main(argv):
     state = {k: dict(v) for k, v in base["entries"].items()}
 
     protected = {gen_tree.BIG_FILE, *gen_tree.TIMESTAMP_FILES}
-    candidates = sorted(k for k, v in state.items() if v["type"] == "file" and k not in protected)
+    # Deletes and the rename touch ASCII names only, and never accents/: how each OS handles
+    # deleting and renaming non-ASCII names is measured separately by nfc_probe.py, which runs
+    # after this and is report-only.
+    candidates = sorted(k for k, v in state.items() if v["type"] == "file" and k not in protected
+                        and k.isascii() and not k.startswith("accents/"))
     for rel in sorted(rng.sample(candidates, DELETE_COUNT)):
         os.remove(fs_path(mount, rel))
         del state[rel]
@@ -74,7 +78,8 @@ def main(argv):
         return any(t.startswith(d + "/") for t in gen_tree.TIMESTAMP_FILES)
 
     top_dirs = sorted(k for k, v in state.items()
-                      if v["type"] == "dir" and "/" not in k and holds_files(k) and not holds_timestamps(k))
+                      if v["type"] == "dir" and "/" not in k and k.isascii() and k != "accents"
+                      and holds_files(k) and not holds_timestamps(k))
     old = rng.choice(top_dirs)
     new = old + "-renamed"
     if new in state:

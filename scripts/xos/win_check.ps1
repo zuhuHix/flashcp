@@ -83,13 +83,15 @@ try {
   python "$here/verify.py" $Manifest "$($letter):\" --label "windows:$Label" 2>&1 | Tee-Object -FilePath (Join-Path $LogDir "verify-$Label.txt")
   if ($LASTEXITCODE -ne 0) { Report "- ``$Label`` verify: **FAIL** (see verify-$Label.txt)"; $ok = $false } else { Report "- ``$Label`` verify: OK" }
 
+  $after = Join-Path $LogDir "after-$Label.json"
+  python "$here/write_test.py" "$($letter):\" $Manifest $after 2>&1 | Tee-Object -FilePath (Join-Path $LogDir "writetest-$Label.txt")
+  if ($LASTEXITCODE -ne 0) { Report "- ``$Label`` write test: **FAIL**"; $ok = $false } else { Report "- ``$Label`` write test: OK" }
+
+  # Report-only; mutates accents/ (see nfc_probe.py), so it runs after the write test.
   $probe = python "$here/nfc_probe.py" "$($letter):\" "windows:$Label" 2>&1
   $probe | Set-Content -Path (Join-Path $LogDir "nfcprobe-$Label.txt") -Encoding utf8
   $probe | ForEach-Object { Report "  - $_" }
 
-  $after = Join-Path $LogDir "after-$Label.json"
-  python "$here/write_test.py" "$($letter):\" $Manifest $after 2>&1 | Tee-Object -FilePath (Join-Path $LogDir "writetest-$Label.txt")
-  if ($LASTEXITCODE -ne 0) { Report "- ``$Label`` write test: **FAIL**"; $ok = $false } else { Report "- ``$Label`` write test: OK" }
   Write-VolumeCache -DriveLetter $letter
 
   if (-not (Run-Chkdsk $letter "after-write")) { $ok = $false }
