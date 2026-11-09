@@ -39,6 +39,8 @@ pub(crate) struct Child {
     /// Byte offset and length of this child's entry set inside its parent's data.
     pub(crate) set_off: usize,
     pub(crate) set_len: usize,
+    /// FileAttributes (ReadOnly 0x01, Hidden 0x02, System 0x04, Directory 0x10, Archive 0x20).
+    pub(crate) attrs: u16,
 }
 
 pub(crate) struct Dir {
@@ -616,6 +618,56 @@ pub(crate) fn claim(refd: &mut [u8], bitmap: &[u8], c: u32, what: &dyn Fn() -> S
     Ok(())
 }
 
+/// The name of the on-volume journal of a running `flashcp sync` (see [`crate::journal`]): a
+/// regular file in the root directory, Hidden | System | Archive.
+pub(crate) const SYNC_JOURNAL_NAME: &str = ".flashcp-sync-journal";
+pub(crate) const SYNC_JOURNAL_ATTRS: u16 = 0x02 | 0x04 | 0x20;
+
+/// Whether `ch`, a child of the ROOT directory, is the on-volume sync journal: that exact name,
+/// a file, Hidden and System. Every command that lists user files skips it.
+pub(crate) fn is_sync_journal(ch: &Child) -> bool {
+    !ch.is_dir && ch.attrs & 0x06 == 0x06 && ch.name.iter().copied().eq(SYNC_JOURNAL_NAME.encode_utf16())
+}
+
+/// Whether an entry set's SetChecksum is right.
+pub(crate) fn checksum_ok_set(set: &[u8]) -> bool {
+    set.len() >= 64 && checksum16(set, true) == le16(set, 2)
+}
+
+/// Whether a raw, live entry set (file entry first) is the on-volume sync journal's: a file,
+/// Hidden and System, named exactly [`SYNC_JOURNAL_NAME`].
+pub(crate) fn is_sync_journal_set(set: &[u8]) -> bool {
+    let name: Vec<u16> = SYNC_JOURNAL_NAME.encode_utf16().collect();
+    let entries = name.len().div_ceil(15);
+    if set.len() != 32 * (2 + entries) || set[0] != 0x85 || set[1] as usize != 1 + entries || set[32] != 0xC0 {
+        return false;
+    }
+    if le16(set, 4) & 0x16 != 0x06 || set[35] as usize != name.len() {
+        return false;
+    }
+    (0..entries).all(|k| set[64 + 32 * k] == 0xC1)
+        && name.iter().enumerate().all(|(i, &c)| le16(set, 64 + 32 * (i / 15) + 2 + 2 * (i % 15)) == c)
+}
+
+/// Refuses a source tree that would put an entry named like the sync journal (any case) into
+/// the volume's root: `to` is the destination inside the volume ("" or None for the root).
+pub(crate) fn refuse_journal_name(src: &std::path::Path, to: Option<&str>) -> Result<()> {
+    if to.unwrap_or("").split('/').any(|c| !c.is_empty() && c != ".") {
+        return Ok(());
+    }
+    let Ok(rd) = std::fs::read_dir(src) else { return Ok(()) };
+    for e in rd.flatten() {
+        if e.file_name().to_str().is_some_and(|n| n.eq_ignore_ascii_case(SYNC_JOURNAL_NAME)) {
+            bail!(
+                "{} would be written to the volume's root as {SYNC_JOURNAL_NAME}, the name flashcp sync keeps its \
+                 on-volume journal under; rename it (nothing was written)",
+                e.path().display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Children of a directory by up-cased name.
 pub(crate) type Children = HashMap<Vec<u16>, Child>;
 
@@ -789,6 +841,7 @@ pub(crate) fn parse_dir(
                     mtime: (le32(set, 12), set[21], set[23]),
                     set_off: i,
                     set_len: len,
+                    attrs: le16(set, 4),
                 });
                 i += len;
                 continue;

@@ -1103,7 +1103,12 @@ fn pull_inner(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("stat {}", dest.display())),
     };
-    let start: Vec<Child> = std::mem::take(&mut cur.children).into_values().collect();
+    // flashcp sync's own journal (root only) is not a user file: never copied.
+    let at_root = cur.entry.is_none();
+    let start: Vec<Child> = std::mem::take(&mut cur.children)
+        .into_values()
+        .filter(|c| !(at_root && crate::volume::is_sync_journal(c)))
+        .collect();
     drop(cur);
     // The strategy fixes the read size, which bounds how the plan splits extents.
     let strat = choose_strategy(&file, &v, o);

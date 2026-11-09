@@ -1667,6 +1667,7 @@ mod tests {
                 mtime: (t, t10, 0x80),
                 set_off: off,
                 set_len: 96,
+                attrs: 0x20,
             }
         };
         let best = |members: &[Child], w: Option<&Want<'_>>| {

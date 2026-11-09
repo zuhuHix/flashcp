@@ -631,7 +631,7 @@ pub(crate) fn choose_gap_policy(
 // ───────────────────────── patches ─────────────────────────
 
 /// Small writes for one metadata phase; committed ascending and coalesced, then synced.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Patches(Vec<(u64, Vec<u8>)>);
 
 impl Patches {
@@ -657,6 +657,17 @@ impl Patches {
     }
     pub(crate) fn bytes(&self) -> u64 {
         self.0.iter().map(|p| p.1.len() as u64).sum()
+    }
+    /// Replaces, in every write, the bytes that device range [off, off + src.len()) covers.
+    pub(crate) fn overlay(&mut self, off: u64, src: &[u8]) {
+        let end = off + src.len() as u64;
+        for (at, b) in &mut self.0 {
+            let (lo, hi) = (off.max(*at), end.min(*at + b.len() as u64));
+            if lo < hi {
+                b[(lo - *at) as usize..(hi - *at) as usize]
+                    .copy_from_slice(&src[(lo - off) as usize..(hi - off) as usize]);
+            }
+        }
     }
     /// The writes, as (device offset, bytes), in the order they were added.
     pub(crate) fn into_inner(self) -> Vec<(u64, Vec<u8>)> {
@@ -896,6 +907,7 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
         fs::metadata(src).with_context(|| format!("source {}", src.display()))?.is_dir(),
         "source must be a directory"
     );
+    crate::volume::refuse_journal_name(src, o.to.as_deref())?;
     let tgt = target.open_rw()?;
     // An empty volume with coarse clusters (a fresh stick) is written as a build instead.
     let tgt = match crate::add_build::empty_as_build(src, tgt, o.to.as_deref(), o.readers, o.dry_run, tick.sink())? {
@@ -1334,6 +1346,9 @@ pub fn info_of(target: &TargetSpec) -> Result<VolumeInfo> {
     let mut stack: Vec<Dir> = vec![v.dirs.pop().ok_or_else(|| anyhow!("no root directory"))?];
     while let Some(d) = stack.pop() {
         for ch in d.children.values() {
+            if d.entry.is_none() && crate::volume::is_sync_journal(ch) {
+                continue; // flashcp sync's own journal, not a user file
+            }
             if ch.is_dir {
                 dirs += 1;
                 // Every directory owns at least one cluster, so more means a cycle.

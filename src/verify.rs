@@ -368,6 +368,9 @@ pub(crate) fn walk(v: &mut Vol) -> Result<VolTree> {
     while let Some((kids, di, depth)) = stack.pop() {
         let parent = t.dirs[di as usize].path.clone();
         for ch in kids {
+            if di == 0 && crate::volume::is_sync_journal(&ch) {
+                continue; // flashcp sync's own journal, not a user file
+            }
             entries += 1;
             ensure!(entries <= MAX_ENTRIES, "the volume has more than {MAX_ENTRIES} files and directories");
             let name = component(&ch.name, &parent)?;
