@@ -287,8 +287,8 @@ fn boot_region(g: &Geometry, part_off: u64, vol_bytes: u64, root: u32, serial: u
 
 /// exFAT timestamp (UTC) + 10 ms increment.
 fn ts(secs: i64, nsec: u32) -> (u32, u8) {
-    // exFAT years run 1980..=2107. Out-of-range times saturate to the nearest end with
-    // no sub-second part, matching what the Linux driver writes.
+    // exFAT years run 1980..=2107. Earlier times become exactly 1980-01-01 00:00:00 (what
+    // the Linux driver writes); later ones become the last representable instant.
     const MIN: i64 = 315_532_800; // 1980-01-01 00:00:00
     const MAX: i64 = 4_354_819_199; // 2107-12-31 23:59:59
     let (secs, nsec) = if secs < MIN {
@@ -798,4 +798,441 @@ pub fn build(src: &Path, target: &Path, o: &BuildOpts) -> Result<BuildStats> {
         eprintln!("note: target does not support O_DIRECT, used buffered writes");
     }
     Ok(BuildStats { files, dirs, data_bytes: data, written, cluster: cs, secs: t0.elapsed().as_secs_f64() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BOOT: &[u8] = include_bytes!("testdata/mkfs_boot.bin");
+    const Y1980: i64 = 315_532_800;
+    const KERNEL_FILE_SET: &str = "850213b4200000004d5a695da86d5d58a86d5d589e8980808000000000000000c003000f86fd0000050000000000000000000000060000000500000000000000c1004800e9006c006c006f0020005700f60072006c0064002e00740078007400";
+    const KERNEL_DIR_SET: &str = "85023e63100000004d5a695d00002100000021009f0080808000000000000000c003000688890000001000000000000000000000070000000010000000000000c1004400690072005f00c600d800000000000000000000000000000000000000";
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    fn utf16(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    fn u32_at(b: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
+    }
+
+    fn u64_at(b: &[u8], off: usize) -> u64 {
+        u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
+    }
+
+    fn node(name: &str, is_dir: bool, size: u64, mtime: (i64, u32), first: u32, clusters: u64) -> Node {
+        Node {
+            name: utf16(name),
+            src: PathBuf::from(name),
+            is_dir,
+            size,
+            mtime,
+            children: vec![],
+            first_cluster: first,
+            clusters,
+        }
+    }
+
+    /// Root with children [big.bin (10000 B), empty.txt (0 B), sub/ (empty dir)].
+    fn sample_tree() -> Vec<Node> {
+        let mut root = node("", true, 0, (0, 0), 0, 0);
+        root.children = vec![1, 2, 3];
+        vec![
+            root,
+            node("big.bin", false, 10_000, (0, 0), 0, 0),
+            node("empty.txt", false, 0, (0, 0), 0, 0),
+            node("sub", true, 0, (0, 0), 0, 0),
+        ]
+    }
+
+    /// (year-1980, month, day, hour, minute, seconds/2, 10 ms) of an exFAT timestamp.
+    fn parts(t: (u32, u8)) -> [u32; 7] {
+        let v = t.0;
+        [v >> 25, (v >> 21) & 0xF, (v >> 16) & 0x1F, (v >> 11) & 0x1F, (v >> 5) & 0x3F, v & 0x1F, t.1 as u32]
+    }
+
+    /// Two entry sets must agree on everything except the checksum and the create/access
+    /// times; our own checksum must be valid.
+    fn assert_sets_match(ours: &[u8], kernel: &[u8]) {
+        assert_eq!(ours.len(), kernel.len());
+        assert_eq!(ours[0..2], kernel[0..2]);
+        assert_eq!(ours[4..6], kernel[4..6]);
+        assert_eq!(ours[12..16], kernel[12..16]);
+        assert_eq!(ours[21..25], kernel[21..25]);
+        assert_eq!(ours[32..], kernel[32..]);
+        assert_eq!(u16::from_le_bytes([ours[2], ours[3]]), checksum16(ours, true));
+    }
+
+    /// Every byte except `skip` must influence the checksum, and the skipped ones must not.
+    fn assert_checksum_skips(data: &[u8], skip: &[usize]) {
+        let base = checksum32(data, skip, 0);
+        for i in 0..data.len() {
+            let mut m = data.to_vec();
+            m[i] = m[i].wrapping_add(1);
+            let changed = checksum32(&m, skip, 0) != base;
+            assert_eq!(changed, !skip.contains(&i), "byte {i}");
+        }
+    }
+
+    fn validate(name: &str, seen: &mut HashSet<Vec<u16>>, upc: &[u16]) -> Result<()> {
+        validate_name(&utf16(name), upc, seen, Path::new("f"))
+    }
+
+    fn assert_rejected(name: &str, needle: &str) {
+        let upc = upcase_map();
+        let err = validate(name, &mut HashSet::new(), &upc).expect_err("name should be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(needle), "message was: {msg}");
+    }
+
+    // ───── checksums and up-case table ─────
+
+    #[test]
+    fn boot_checksum_matches_mkfs_reference() {
+        let c = checksum32(&BOOT[..11 * 512], &[106, 107, 112], 0);
+        assert_eq!(c, 0xc224_8af6);
+        assert!(BOOT[11 * 512..].as_chunks::<4>().0.iter().all(|w| *w == c.to_le_bytes()));
+        assert_eq!(BOOT[11 * 512..].len(), 512);
+    }
+
+    #[test]
+    fn boot_checksum_ignores_only_flags_and_percent() {
+        assert_checksum_skips(&BOOT[..11 * 512], &[106, 107, 112]);
+    }
+
+    #[test]
+    fn checksum16_reproduces_kernel_entry_checksums() {
+        let file = hex(KERNEL_FILE_SET);
+        assert_eq!(checksum16(&file, true), 0xb413);
+        let dir = hex(KERNEL_DIR_SET);
+        assert_eq!(checksum16(&dir, true), 0x633e);
+    }
+
+    #[test]
+    fn upcase_table_matches_spec_checksum() {
+        assert_eq!(UPCASE.len(), 5836);
+        assert_eq!(checksum32(UPCASE, &[], 0), UPCASE_CHECKSUM);
+    }
+
+    #[test]
+    fn upcase_map_maps_letters() {
+        let m = upcase_map();
+        assert_eq!(m.len(), 0x10000);
+        for c in b'a'..=b'z' {
+            assert_eq!(m[c as usize], (c - 32) as u16);
+        }
+        assert_eq!(m[0xE9], 0xC9);
+        assert_eq!(m[0x3C9], 0x3A9);
+        assert_eq!(m[0x430], 0x410);
+        for c in ['A', '0', ' '] {
+            assert_eq!(m[c as usize], c as u16);
+        }
+        assert_eq!(m[0xD83D], 0xD83D);
+    }
+
+    // ───── boot region ─────
+
+    #[test]
+    fn boot_region_layout_and_checksum() {
+        let g = geometry(32 << 20, 4096).unwrap();
+        let r = boot_region(&g, 0, 32 << 20, 5, 0x1234, 0);
+        assert_eq!(r.len(), 12 * 512);
+        assert_eq!(&r[3..11], b"EXFAT   ");
+        for s in 0..=8 {
+            assert_eq!(r[s * 512 + 510..s * 512 + 512], [0x55, 0xAA]);
+        }
+        let c = checksum32(&r[..11 * 512], &[106, 107, 112], 0);
+        let sector = &r[11 * 512..];
+        assert_eq!(sector.len(), 512);
+        assert!(sector.as_chunks::<4>().0.iter().all(|w| *w == c.to_le_bytes()));
+        assert_eq!(u64_at(&r, 64), 0);
+        assert_eq!(u64_at(&r, 72), (32 << 20) / 512);
+        assert_eq!(u32_at(&r, 80) as u64, g.fat_off);
+        assert_eq!(u32_at(&r, 84) as u64, g.fat_len);
+        assert_eq!(u32_at(&r, 88) as u64, g.heap_off);
+        assert_eq!(u32_at(&r, 92) as u64, g.cluster_count);
+        assert_eq!(u32_at(&r, 96), 5);
+        assert_checksum_skips(&r[..11 * 512], &[106, 107, 112]);
+    }
+
+    // ───── timestamps ─────
+
+    #[test]
+    fn ts_kernel_timestamp() {
+        assert_eq!(ts(1_709_214_317, 370_000_000), (0x585d_6da8, 137));
+        assert_eq!(parts(ts(1_709_214_317, 370_000_000)), [44, 2, 29, 13, 45, 8, 137]);
+    }
+
+    #[test]
+    fn ts_epoch_and_pre_1980_clamp_to_epoch() {
+        assert_eq!(ts(Y1980, 0), (0x0021_0000, 0));
+        for (s, n) in [(0, 0), (-1, 999_999_999), (-1_000_000_000, 5), (Y1980 - 1, 999_999_999)] {
+            assert_eq!(ts(s, n), (0x0021_0000, 0), "secs {s}");
+        }
+    }
+
+    #[test]
+    fn ts_saturates_after_2107() {
+        const MAX: i64 = 4_354_819_199;
+        let expect = [127, 12, 31, 23, 59, 29, 199];
+        assert_eq!(parts(ts(MAX, 999_999_999)), expect);
+        assert_eq!(parts(ts(MAX + 1, 0)), expect);
+        assert_eq!(parts(ts(i64::MAX, 0)), expect);
+    }
+
+    #[test]
+    fn ts_leap_days_and_century_rule() {
+        assert_eq!(parts(ts(951_782_400, 0)), [20, 2, 29, 0, 0, 0, 0]); // 2000-02-29
+        assert_eq!(parts(ts(1_582_934_400, 0)), [40, 2, 29, 0, 0, 0, 0]); // 2020-02-29
+        // 2100 is not a leap year: 02-28 is followed directly by 03-01.
+        assert_eq!(parts(ts(4_107_456_000, 0)), [120, 2, 28, 0, 0, 0, 0]);
+        assert_eq!(parts(ts(4_107_542_400, 0)), [120, 3, 1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn ts_millennium_rollover() {
+        assert_eq!(parts(ts(946_684_799, 0)), [19, 12, 31, 23, 59, 29, 100]);
+        assert_eq!(parts(ts(946_684_800, 0)), [20, 1, 1, 0, 0, 0, 0]);
+    }
+
+    // ───── entry sets ─────
+
+    #[test]
+    fn entry_set_matches_kernel_file() {
+        let kernel = hex(KERNEL_FILE_SET);
+        assert_eq!(kernel.len(), 96);
+        assert_eq!(u16::from_le_bytes([kernel[36], kernel[37]]), 0xfd86);
+        assert_eq!(u32_at(&kernel, 12), 0x585d_6da8);
+        assert_eq!(kernel[21], 137);
+        let upc = upcase_map();
+        let n = node("Héllo Wörld.txt", false, 5, (1_709_214_317, 370_000_000), 6, 1);
+        let ours = finish_set(entry_set(&n, &upc), 5, 5);
+        assert_sets_match(&ours, &kernel);
+    }
+
+    #[test]
+    fn entry_set_matches_kernel_dir() {
+        let kernel = hex(KERNEL_DIR_SET);
+        assert_eq!(kernel.len(), 96);
+        assert_eq!(u16::from_le_bytes([kernel[36], kernel[37]]), 0x8988);
+        assert_eq!(u32_at(&kernel, 12), 0x0021_0000);
+        assert_eq!(kernel[21], 0);
+        let upc = upcase_map();
+        let n = node("Dir_ÆØ", true, 4096, (157_766_400, 0), 7, 1);
+        let ours = finish_set(entry_set(&n, &upc), 4096, 4096);
+        assert_sets_match(&ours, &kernel);
+    }
+
+    #[test]
+    fn set_bytes_matches_entry_set_length() {
+        let upc = upcase_map();
+        for len in [1, 15, 16, 30, 31, 255] {
+            let n = node(&"a".repeat(len), false, 0, (0, 0), 0, 0);
+            assert_eq!(set_bytes(&n), entry_set(&n, &upc).len() as u64, "name length {len}");
+        }
+    }
+
+    // ───── names ─────
+
+    #[test]
+    fn name_length_limits() {
+        let upc = upcase_map();
+        assert!(validate(&"a".repeat(255), &mut HashSet::new(), &upc).is_ok());
+        assert_rejected(&"a".repeat(256), "too long");
+        assert_rejected("", "too long");
+        assert_rejected(&"😀".repeat(128), "too long");
+        let s = format!("{}a", "😀".repeat(127));
+        assert_eq!(utf16(&s).len(), 255);
+        assert!(validate(&s, &mut HashSet::new(), &upc).is_ok());
+    }
+
+    #[test]
+    fn name_forbidden_characters() {
+        for c in ['"', '*', '/', ':', '<', '>', '?', '\\', '|'] {
+            assert_rejected(&format!("a{c}b"), "not allowed");
+        }
+        for c in 0u8..=0x1F {
+            assert_rejected(&format!("a{}b", char::from(c)), "not allowed");
+        }
+    }
+
+    #[test]
+    fn name_unicode_accepted() {
+        let upc = upcase_map();
+        assert!(validate("naïve résumé 日本語", &mut HashSet::new(), &upc).is_ok());
+    }
+
+    #[test]
+    fn name_case_insensitive_duplicates_rejected_per_dir() {
+        let upc = upcase_map();
+        let mut seen = HashSet::new();
+        validate("README.txt", &mut seen, &upc).unwrap();
+        let err = validate("readme.TXT", &mut seen, &upc).unwrap_err();
+        assert!(format!("{err:#}").contains("differ only by case"));
+
+        let mut seen = HashSet::new();
+        validate("é.txt", &mut seen, &upc).unwrap();
+        let err = validate("É.TXT", &mut seen, &upc).unwrap_err();
+        assert!(format!("{err:#}").contains("differ only by case"));
+
+        // A different directory has its own namespace.
+        validate("README.txt", &mut HashSet::new(), &upc).unwrap();
+    }
+
+    // ───── geometry ─────
+
+    #[test]
+    fn geometry_rejects_bad_clusters_and_small_volumes() {
+        for c in [0, 100, 256, 3000, 64 << 20] {
+            assert!(geometry(1 << 30, c).is_none(), "cluster {c}");
+        }
+        for v in [0, 512, 1 << 20, 4 << 20] {
+            assert!(geometry(v, 512).is_none(), "volume {v}");
+            assert!(geometry(v, 4096).is_none(), "volume {v}");
+        }
+        assert!(geometry(1 << 30, 512).is_some());
+        assert!(geometry(32 << 20, 512).is_some());
+        assert!(geometry(1 << 30, 32 << 20).is_some());
+    }
+
+    #[test]
+    fn geometry_invariants_hold_across_sweep() {
+        let vols = [5u64 << 20, 8 << 20, 64 << 20, 1 << 30, 1 << 40, 64 << 40];
+        let clusters = [512u64, 4096, 32 << 10, 128 << 10, 32 << 20];
+        let mut some = 0;
+        for &v in &vols {
+            for &c in &clusters {
+                let Some(g) = geometry(v, c) else { continue };
+                some += 1;
+                let cc = g.cluster_count;
+                assert_eq!(g.fat_off * SECTOR, 1 << 20);
+                assert_eq!((g.heap_off * SECTOR) % ALIGN, 0);
+                assert!(g.heap_off >= g.fat_off + g.fat_len);
+                assert!(g.fat_len * SECTOR >= (cc + 2) * 4);
+                assert!(g.heap_off * SECTOR + cc * c <= v, "vol {v} cluster {c}");
+                assert!((16..=0xFFFF_FFF5).contains(&cc));
+            }
+        }
+        assert!(some >= 15, "sweep produced only {some} geometries");
+    }
+
+    #[test]
+    fn geometry_huge_volume() {
+        let four_pib = 4u64 << 50;
+        assert!(geometry(four_pib, 512).is_none());
+        assert!(geometry(four_pib, 32 << 20).is_some());
+    }
+
+    // ───── planning ─────
+
+    #[test]
+    fn plan_lays_out_dirs_then_files() {
+        let g = geometry(64 << 20, 4096).unwrap();
+        let mut nodes = sample_tree();
+        let p = plan(&mut nodes, g, FatMode::Prefix).unwrap();
+        assert_eq!(p.bitmap_clusters, 1);
+        assert_eq!(p.upcase_clusters, 2);
+        let base = 2 + p.bitmap_clusters + p.upcase_clusters;
+        assert_eq!(p.root_cluster as u64, base);
+        assert_eq!(nodes[0].first_cluster as u64, base);
+        assert_eq!(nodes[0].clusters, 1);
+        assert_eq!(nodes[3].first_cluster as u64, base + nodes[0].clusters);
+        assert_eq!(nodes[3].clusters, 1);
+        let big = &nodes[1];
+        assert_eq!(big.clusters, 3);
+        assert_eq!(big.first_cluster as u64, base + nodes[0].clusters + nodes[3].clusters);
+        assert_eq!((nodes[2].first_cluster, nodes[2].clusters), (0, 0));
+        assert_eq!(p.used_end, base + 5);
+        assert_eq!(p.used_end, big.first_cluster as u64 + big.clusters);
+    }
+
+    #[test]
+    fn plan_write_bytes_depend_on_fat_mode() {
+        let g = geometry(64 << 20, 4096).unwrap();
+        let mut nodes = sample_tree();
+        let prefix = plan(&mut nodes, g, FatMode::Prefix).unwrap();
+        let full = plan(&mut nodes, g, FatMode::Full).unwrap();
+        assert!(full.write_bytes > prefix.write_bytes);
+        let used = prefix.used_end;
+        assert_eq!(prefix.write_bytes, 24 * SECTOR + (used * 4).div_ceil(4096) * 4096 + (used - 2) * 4096);
+    }
+
+    #[test]
+    fn plan_rejects_data_that_does_not_fit() {
+        let g = geometry(64 << 20, 4096).unwrap();
+        let mut nodes = sample_tree();
+        nodes[1].size = 64 << 20;
+        let err = plan(&mut nodes, g, FatMode::Prefix).err().expect("should not fit");
+        assert!(format!("{err:#}").contains("does not fit"));
+    }
+
+    #[test]
+    fn dir_bytes_root_has_label_bitmap_upcase_entries() {
+        let upc = upcase_map();
+        let g = geometry(64 << 20, 4096).unwrap();
+        let mut nodes = sample_tree();
+        let p = plan(&mut nodes, g, FatMode::Prefix).unwrap();
+        let label = utf16("TEST");
+        let out = dir_bytes(&nodes, 0, &p, &label, &upc);
+        assert_eq!(out.len() as u64, nodes[0].clusters * g.cluster);
+
+        assert_eq!((out[0], out[1]), (0x83, 4));
+        let want: Vec<u8> = label.iter().flat_map(|c| c.to_le_bytes()).collect();
+        assert_eq!(out[2..10], want[..]);
+
+        assert_eq!(out[32], 0x81);
+        assert_eq!(u32_at(&out, 32 + 20), 2);
+        assert_eq!(u64_at(&out, 32 + 24), g.cluster_count.div_ceil(8));
+
+        assert_eq!(out[64], 0x82);
+        assert_eq!(u32_at(&out, 64 + 4), UPCASE_CHECKSUM);
+        assert_eq!(u32_at(&out, 64 + 20) as u64, 2 + p.bitmap_clusters);
+        assert_eq!(u64_at(&out, 64 + 24), 5836);
+
+        assert_eq!(out[96], 0x85, "first child entry set");
+    }
+
+    // ───── mounts and sysfs ─────
+
+    #[test]
+    fn mounted_dev_matches_listed_devices() {
+        let info = "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n\
+                    30 22 7:3 / /media/x rw - exfat /dev/loop3 rw\n";
+        let devs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(mounted_dev(info, &devs(&["8:0", "8:1"])), Some(("8:1".into(), "/".into())));
+        assert_eq!(mounted_dev(info, &devs(&["7:3"])), Some(("7:3".into(), "/media/x".into())));
+        assert_eq!(mounted_dev(info, &devs(&["8:0"])), None);
+        assert_eq!(mounted_dev("", &devs(&["8:0"])), None);
+    }
+
+    /// Read-only sysfs probe: the first disk that has a partition, as ("maj:min" of disk, "maj:min" of partition).
+    fn partitioned_disk() -> Option<(String, String)> {
+        for disk in fs::read_dir("/sys/block").ok()?.flatten().map(|e| e.path()) {
+            let Ok(disk_dev) = fs::read_to_string(disk.join("dev")) else { continue };
+            for sub in fs::read_dir(&disk).ok()?.flatten().map(|e| e.path()) {
+                if !sub.join("partition").exists() {
+                    continue;
+                }
+                if let Ok(part_dev) = fs::read_to_string(sub.join("dev")) {
+                    return Some((disk_dev.trim().to_string(), part_dev.trim().to_string()));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn related_devs_includes_disk_and_partition() {
+        let Some((disk, part)) = partitioned_disk() else { return };
+        let (maj, min) =
+            disk.split_once(':').map(|(a, b)| (a.parse::<u32>().unwrap(), b.parse::<u32>().unwrap())).unwrap();
+        let devs = related_devs(maj, min);
+        assert!(devs.contains(&disk), "{devs:?}");
+        assert!(devs.contains(&part), "{devs:?}");
+    }
 }
