@@ -1126,7 +1126,7 @@ pub fn info(target: &Path) -> Result<VolumeInfo> {
     let len = if md.file_type().is_block_device() {
         let mut size: u64 = 0;
         // BLKGETSIZE64 = _IOR(0x12, 114, size_t)
-        let r = unsafe { libc::ioctl(f.as_raw_fd(), 0x80081272, &mut size) };
+        let r = unsafe { libc::ioctl(f.as_raw_fd(), crate::exfat::BLKGETSIZE64 as _, &mut size) };
         ensure!(r == 0, "BLKGETSIZE64 failed on {}", target.display());
         size
     } else if md.is_file() {
