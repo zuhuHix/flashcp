@@ -573,31 +573,20 @@ struct Target {
 }
 
 fn open_target(path: &Path) -> Result<Target> {
-    let md = fs::metadata(path).with_context(|| format!("{}", path.display()))?;
-    let is_blk = md.file_type().is_block_device();
-    if is_blk {
-        // Friendly check first, so the error can name the mount point: the device itself,
-        // any partition, or any (stacked) holder such as LVM / dm-crypt / md.
-        let (maj, min) = (libc::major(md.rdev()), libc::minor(md.rdev()));
-        let devs = related_devs(Path::new(SYS_BLOCK), &format!("{maj}:{min}"))?;
-        let mounts = fs::read_to_string("/proc/self/mountinfo")?;
-        if let Some((dev, at)) = mounted_dev(&mounts, &devs) {
-            bail!("{} is in use: device {dev} is mounted at {at}; unmount it first", path.display());
-        }
-    }
-    // For block devices, O_EXCL (without O_CREAT) is an exclusive claim on Linux: it fails
-    // with EBUSY if the device, a partition or a holder is mounted or claimed, and while we
-    // hold the fd (for the whole build) nobody can mount it. This closes the race between
-    // the mountinfo check above and the writes.
+    // Open first, then trust only what the opened fd says (fstat), so a path that changes
+    // underneath us (a file swapped for a device node, a /dev/disk/by-* link retargeted)
+    // cannot make the checks below refer to a different object than the one we write.
+    //
+    // O_EXCL is always passed, so the claim is atomic with the open. Without O_CREAT, Linux
+    // treats it as an exclusive claim on block devices: it fails with EBUSY if the device, a
+    // partition or a holder is mounted or claimed (LVM, dm, md), and nobody can mount it while
+    // we hold the fd (for the whole build). For regular files Linux ignores it.
     let open = |direct: bool| {
-        let mut o = OpenOptions::new();
-        o.write(true).read(true);
-        let mut flags = if is_blk { libc::O_EXCL } else { 0 };
+        let mut flags = libc::O_EXCL;
         if direct {
             flags |= libc::O_DIRECT;
         }
-        o.custom_flags(flags);
-        o.open(path)
+        OpenOptions::new().write(true).read(true).custom_flags(flags).open(path)
     };
     let busy = |e: std::io::Error| -> anyhow::Error {
         if e.raw_os_error() == Some(libc::EBUSY) {
@@ -611,20 +600,31 @@ fn open_target(path: &Path) -> Result<Target> {
         Err(e) if e.raw_os_error() == Some(libc::EBUSY) => return Err(busy(e)),
         Err(_) => (open(false).map_err(busy)?, false),
     };
-    if is_blk {
+    let md = file.metadata().with_context(|| format!("fstat {}", path.display()))?;
+    let ft = md.file_type();
+    if ft.is_block_device() {
+        // Friendlier message naming the mount point. Sound after the open: the O_EXCL claim
+        // already blocks new mounts, so this cannot go stale.
+        let (maj, min) = (libc::major(md.rdev()), libc::minor(md.rdev()));
+        let devs = related_devs(Path::new(SYS_BLOCK), &format!("{maj}:{min}"))?;
+        let mounts = fs::read_to_string("/proc/self/mountinfo")?;
+        if let Some((dev, at)) = mounted_dev(&mounts, &devs) {
+            bail!("{} is in use: device {dev} is mounted at {at}; unmount it first", path.display());
+        }
         let mut size: u64 = 0;
         // BLKGETSIZE64 = _IOR(0x12, 114, size_t)
         let r = unsafe { libc::ioctl(std::os::unix::io::AsRawFd::as_raw_fd(&file), 0x80081272, &mut size) };
         ensure!(r == 0, "BLKGETSIZE64 failed");
-        let (maj, min) = (libc::major(md.rdev()), libc::minor(md.rdev()));
         let start = fs::read_to_string(format!("{SYS_BLOCK}/{maj}:{min}/start"))
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0u64);
         Ok(Target { file, bytes: size, part_off: start, direct })
-    } else {
+    } else if ft.is_file() {
         ensure!(md.len() > 0, "image file is empty; create it first, e.g. truncate -s 8G image.img");
         Ok(Target { file, bytes: md.len(), part_off: 0, direct })
+    } else {
+        bail!("{} is neither a block device nor a regular image file", path.display())
     }
 }
 
@@ -648,10 +648,14 @@ fn related_devs(sys: &Path, target: &str) -> Result<Vec<String>> {
             continue;
         }
         let node = sys.join(&dev);
-        // Partitions are subdirectories that contain a `partition` file.
+        // Partitions are real subdirectories (not symlinks) that contain a `partition` file.
         for e in fs::read_dir(&node).with_context(|| format!("cannot inspect {} in sysfs", node.display()))? {
-            let p = e.with_context(|| format!("reading {}", node.display()))?.path();
-            if p.join("partition").exists() {
+            let e = e.with_context(|| format!("reading {}", node.display()))?;
+            let p = e.path();
+            if !e.file_type().with_context(|| format!("reading {}", p.display()))?.is_dir() {
+                continue;
+            }
+            if is_partition(&p)? {
                 stack.push(read_dev(&p)?);
             }
         }
@@ -668,6 +672,16 @@ fn related_devs(sys: &Path, target: &str) -> Result<Vec<String>> {
         seen.push(dev);
     }
     Ok(seen)
+}
+
+/// Whether a sysfs block-node subdirectory is a partition (has a `partition` file). Fails
+/// closed: only "not found" means no; any other error (EACCES, EIO, …) is returned.
+fn is_partition(p: &Path) -> Result<bool> {
+    match fs::symlink_metadata(p.join("partition")) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("checking {}", p.join("partition").display())),
+    }
 }
 
 /// First mountinfo line whose device ("maj:min", field 3) is in `devs`: (device, mount point).
@@ -1358,6 +1372,18 @@ mod tests {
         f.node("8:0");
         fs::create_dir_all(f.0.join("8:0/holders/dm-0")).unwrap();
         assert!(f.related("8:0").is_err());
+        // An unreadable partition marker must not be taken as "not a partition".
+        f.node("8:48").partition("8:48", "sdd1", "8:49");
+        let part = f.0.join("8:48/sdd1");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&part, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = fs::symlink_metadata(part.join("partition")).is_err(); // false when running as root
+        let r = f.related("8:48");
+        fs::set_permissions(&part, fs::Permissions::from_mode(0o755)).unwrap();
+        if denied {
+            let e = r.unwrap_err();
+            assert!(format!("{e:#}").contains("sdd1/partition"), "{e:#}");
+        }
         // A node with no holders dir at all is fine.
         f.node("8:32");
         assert_eq!(f.related("8:32").unwrap(), sorted(&["8:32"]));

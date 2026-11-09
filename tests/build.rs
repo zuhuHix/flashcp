@@ -353,3 +353,16 @@ fn mount_busy_device_is_refused() {
     drop(guard);
     fs::remove_dir_all(&dir).expect("remove scratch dir");
 }
+
+/// Only block devices and regular image files are accepted, judged from the opened fd.
+#[test]
+fn err_target_not_block_or_regular_file() {
+    let dir = test_dir("err_char_device");
+    let src = dir.join("src");
+    write_file(&src.join("a.txt"), b"hello");
+    let out = flashcp().arg("build").arg(&src).arg("/dev/null").arg("--yes-erase").output().expect("run flashcp");
+    assert!(!out.status.success(), "build onto /dev/null succeeded");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("neither a block device nor a regular image file"), "stderr: {err}");
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
