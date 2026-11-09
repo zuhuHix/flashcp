@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>flashcp: fast small-file copies to USB drives</title>
+  <meta name="description" content="flashcp builds a normal exFAT volume in one sequential pass, so thousands of small files copy up to 10x faster to USB sticks and external drives.">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script>
+    // Apply a saved theme before first paint. Guarded: storage can be blocked.
+    try {
+      var savedTheme = localStorage.getItem('flashcp-theme');
+      if (savedTheme === 'light' || savedTheme === 'dark') {
+        document.documentElement.dataset.theme = savedTheme;
+      }
+    } catch (e) { /* storage unavailable: follow the system setting */ }
+  </script>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand" href="#top">flashcp</a>
+    <nav aria-label="Page sections">
+      <ul class="nav-list">
+        <li><a href="#benchmarks">Benchmarks</a></li>
+        <li><a href="#writes">Writes</a></li>
+        <li><a href="#journey">Journey</a></li>
+        <li><a href="#limits">Limits</a></li>
+        <li><a href="#roadmap">Roadmap</a></li>
+      </ul>
+    </nav>
+    <button type="button" class="chip theme-toggle" id="theme-toggle" aria-pressed="false">Dark mode</button>
+  </div>
+</header>
+
+<main>
+
+  <!-- 1. Hero -->
+  <section class="hero" id="top">
+    <div class="container hero-grid">
+      <div class="hero-text">
+        <p class="eyebrow">Rust CLI &middot; exFAT &middot; GPL-3.0-or-later</p>
+        <h1>flashcp</h1>
+        <p class="pitch">Copy thousands of small files to a USB drive up to 10&times; faster, as normal loose files.</p>
+
+        <div class="cta-row">
+          <a class="btn btn-primary" href="https://github.com/zuhuHix/flashcp">GitHub repo</a>
+          <a class="btn" href="https://buymeacoffee.com/zuhuHix" target="_blank" rel="noopener">&#9749; Buy me a coffee</a>
+        </div>
+
+        <pre class="command"><code>flashcp build ./photos /dev/sdX --yes-erase</code></pre>
+
+        <p class="safety" role="note">
+          <strong>Safety:</strong> <code>flashcp build</code> erases the whole target device. Check the device path twice before you press enter.
+        </p>
+      </div>
+
+      <figure class="hero-media">
+        <video src="flashcp.mp4" autoplay muted loop playsinline aria-label="Short demo of flashcp building a drive"></video>
+        <p class="media-fallback" id="video-fallback" hidden>The demo video is not available yet. The command next to it is the whole interface.</p>
+      </figure>
+    </div>
+  </section>
+
+  <!-- 2. Benchmark explorer -->
+  <section class="section" id="benchmarks" aria-labelledby="benchmarks-title">
+    <div class="container">
+      <h2 id="benchmarks-title">Benchmarks</h2>
+      <p class="lede">
+        Measured 2026-11-09 on an MSI DATAMAG 20Gbps USB SSD (UAS, 10&nbsp;Gb/s link), 1&nbsp;TB exFAT, Linux 7.0.
+        Shorter bars are faster. Every number on this page comes from the measured tables.
+      </p>
+
+      <div class="tabs" role="group" aria-label="Benchmark view">
+        <button type="button" class="chip" id="tab-main" aria-pressed="true" data-panel="panel-main">Main results</button>
+        <button type="button" class="chip" id="tab-early" aria-pressed="false" data-panel="panel-early">Earlier experiments</button>
+      </div>
+
+      <div class="panel" id="panel-main">
+        <div class="controls">
+          <fieldset class="control-group">
+            <legend>Dataset</legend>
+            <div class="chip-row" id="dataset-buttons">
+              <button type="button" class="chip" data-dataset="all" aria-pressed="true">All</button>
+              <button type="button" class="chip" data-dataset="20k" aria-pressed="false">20k files / 169 MB</button>
+              <button type="button" class="chip" data-dataset="100k" aria-pressed="false">100k files / 413 MB</button>
+              <button type="button" class="chip" data-dataset="8k" aria-pressed="false">8.4k mixed / 1.4 GB</button>
+            </div>
+          </fieldset>
+
+          <fieldset class="control-group">
+            <legend>Methods</legend>
+            <div class="check-row" id="method-checks">
+              <label class="check"><input type="checkbox" value="0" checked> mkfs + cp (baseline)</label>
+              <label class="check"><input type="checkbox" value="1" checked> mkfs + smart copy</label>
+              <label class="check"><input type="checkbox" value="2" checked> build, prefix FAT (default)</label>
+              <label class="check"><input type="checkbox" value="3" checked> build, full FAT</label>
+            </div>
+          </fieldset>
+        </div>
+
+        <div class="bars" id="bars-main" aria-live="polite"></div>
+
+        <ul class="legend" aria-label="Colour key">
+          <li><span class="swatch sw-copy"></span> copy variant</li>
+          <li><span class="swatch sw-normal"></span> baseline (mkfs + cp)</li>
+          <li><span class="swatch sw-flash"></span> flashcp build</li>
+          <li><span class="swatch sw-flash2"></span> flashcp build, full FAT</li>
+        </ul>
+        <p class="note">
+          Speedup = baseline time &divide; method time, computed from the table. Bars are scaled within each dataset, so compare the numbers, not the lengths, across datasets.
+          Baseline is mkfs.exfat, mount, <code>cp -r</code>, sync. flashcp times include formatting.
+          Every build passed <code>fsck.exfat</code> and a byte-for-byte <code>diff -r</code> after a kernel mount.
+        </p>
+      </div>
+
+      <div class="panel" id="panel-early" hidden>
+        <p class="lede">
+          Copies onto an already-mounted volume. Bars show speedup against naive <code>cp</code>-style copying (1&times;, marked by the vertical line). Scale 0&ndash;5&times;.
+        </p>
+        <div class="bars" id="bars-early"></div>
+        <p class="note">
+          Smart copy barely helps (1.08&ndash;1.17&times; on 20k files) because the kernel already batches small writes. The remaining cost is per-file work in the driver, which reordering in userspace does not remove.
+          Pack is fast (4.31&ndash;4.93&times; on 20k files), but it writes a tar archive, not loose files.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. Writes visualiser -->
+  <section class="section section-alt" id="writes" aria-labelledby="writes-title">
+    <div class="container">
+      <h2 id="writes-title">How many writes?</h2>
+      <p class="badge">Illustrative model, not a measurement.</p>
+      <p class="lede">Move the sliders to change the dataset. Both scales are logarithmic.</p>
+
+      <div class="sliders">
+        <div class="slider">
+          <label for="files-range">File count</label>
+          <input type="range" id="files-range" min="0" max="1000" step="1" value="697">
+          <output id="files-out" for="files-range">20,000 files</output>
+        </div>
+        <div class="slider">
+          <label for="size-range">Average file size</label>
+          <input type="range" id="size-range" min="0" max="1000" step="1" value="225">
+          <output id="size-out" for="size-range">8 KB</output>
+        </div>
+      </div>
+
+      <div class="counts">
+        <div class="count count-normal">
+          <span class="count-label">Normal copy</span>
+          <span class="count-value num" id="normal-count">&ndash;</span>
+          <span class="count-unit">writes</span>
+        </div>
+        <div class="ratio num" id="ratio" aria-live="polite">&ndash;</div>
+        <div class="count count-flash">
+          <span class="count-label">flashcp build</span>
+          <span class="count-value num" id="flash-count">&ndash;</span>
+          <span class="count-unit">writes</span>
+        </div>
+      </div>
+
+      <figure class="strip-figure">
+        <canvas id="head-strip" role="img" aria-label="Schematic of write-head movement. Normal copy jumps back and forth between the metadata area and the data area. flashcp sweeps once across the drive in ascending order."></canvas>
+        <figcaption class="note">Schematic: the pattern of head movement, not to scale and not a timing.</figcaption>
+      </figure>
+
+      <ul class="model-notes">
+        <li><strong>Normal copy:</strong> at least 3 separate small writes per file (2 metadata writes for the directory entry and allocation bitmap/FAT, plus file data). Large files add one data write per 1&nbsp;MB, as a rough page-cache flush unit. Each metadata-to-data hop is typically a seek.</li>
+        <li><strong>flashcp:</strong> <span class="num">ceil(total bytes / 8&nbsp;MB)</span> large sequential writes, plus 4 for the boot region and tables.</li>
+        <li><strong>Not modelled:</strong> kernel merging of small writes (which real copies do get, see Earlier experiments), queue depth, device firmware. This is a count, not a time prediction.</li>
+      </ul>
+
+      <p class="why">
+        Flash memory is programmed and erased in large blocks, so a long ascending run lets the controller fill blocks in order instead of rewriting them for each scattered update.
+        Each USB command also costs a round trip, so a few 8&nbsp;MB requests spend far less time on overhead than thousands of small ones.
+      </p>
+    </div>
+  </section>
+
+  <!-- 4. The journey -->
+  <section class="section" id="journey" aria-labelledby="journey-title">
+    <div class="container">
+      <h2 id="journey-title">The journey</h2>
+      <p class="lede">Each step was measured before the next one was built. Here is what each one bought, and what it cost.</p>
+
+      <ol class="steps">
+        <li class="step">
+          <span class="step-num num">1</span>
+          <div>
+            <h3>Probe the drive</h3>
+            <p>999&nbsp;MB/s sequential at 8&nbsp;MB writes, 97&nbsp;MB/s at 4&nbsp;KB writes, about 9k small files/s. Small files run 27&times; slower than sequential, so the work is about the number of writes, not the number of bytes.</p>
+          </div>
+        </li>
+        <li class="step">
+          <span class="step-num num">2</span>
+          <div>
+            <h3>Smart copy</h3>
+            <p>1.08&ndash;1.17&times; on 20k files (1.08&times; smart, 1.17&times; smart-w4). The kernel already batches writes, and the cost left is per-file work in the driver. Reordering in userspace barely moves it.</p>
+          </div>
+        </li>
+        <li class="step">
+          <span class="step-num num">3</span>
+          <div>
+            <h3>Pack</h3>
+            <p>4.31&ndash;4.93&times; on 20k files (tar, with adaptive zstd for pack-auto). Fast, but the result is one archive, not the loose files you asked for.</p>
+          </div>
+        </li>
+        <li class="step step-final">
+          <span class="step-num num">4</span>
+          <div>
+            <h3>Build the volume</h3>
+            <p>Plan the whole exFAT volume in memory and write it as one ascending stream. <span class="num">6.7&times; / 10.3&times; / 2.2&times;</span> against mkfs + cp on the three datasets. Each build passed <code>fsck.exfat</code> and a byte-for-byte diff, and the result is a normal drive with normal loose files.</p>
+          </div>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- 5. Honest limits -->
+  <section class="section section-alt" id="limits" aria-labelledby="limits-title">
+    <div class="container">
+      <h2 id="limits-title">Honest limits</h2>
+      <ul class="plain-list">
+        <li><strong>Build erases the target.</strong> It writes a whole new volume over the device. Nothing on it survives.</li>
+        <li><strong>Linux only, so far.</strong> Windows and macOS compatibility is not yet verified.</li>
+        <li><strong>One drive tested.</strong> Results are from a UAS USB SSD. Cheap BOT USB sticks are not measured yet and may behave very differently.</li>
+        <li><strong>No append mode.</strong> Build writes a fresh volume. You cannot add to a drive that already has files yet.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 6. Roadmap -->
+  <section class="section" id="roadmap" aria-labelledby="roadmap-title">
+    <div class="container">
+      <h2 id="roadmap-title">Roadmap</h2>
+      <p class="lede">Planned, in no fixed order. No dates are promised.</p>
+      <ul class="roadmap">
+        <li><span class="tag">Planned</span> Append mode, so a drive can keep its files and gain more.</li>
+        <li><span class="tag">Planned</span> Windows and macOS verification.</li>
+        <li><span class="tag">Planned</span> Benchmarks on cheap BOT USB sticks.</li>
+        <li><span class="tag">Planned</span> A Tauri GUI.</li>
+        <li><span class="tag">Planned</span> A supporter edition for Buy Me a Coffee supporters. Contents not yet decided.</li>
+      </ul>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="container footer-inner">
+    <p>flashcp is free software, licensed under GPL-3.0-or-later.</p>
+    <p>
+      <a href="https://github.com/zuhuHix/flashcp">Source on GitHub</a>
+      &middot;
+      <a href="https://buymeacoffee.com/zuhuHix" target="_blank" rel="noopener">Buy me a coffee</a>
+    </p>
+  </div>
+</footer>
+
+<script src="app.js" defer></script>
+</body>
+</html>
