@@ -75,7 +75,7 @@ A WWN is a placeholder if it is missing or its hex digits are one repeated digit
 The rules live in one dependency-free file, `gui/helper/src/weak.rs`, which the GUI compiles
 too (`#[path]`). So both sides always agree on the key and on which drives can't be trusted. For
 those drives the app explains why and points to the command line (`sudo flashcp add <folder>
-/dev/sdX`). There is deliberately no "use once" path in the app.
+/dev/sdXN`). There is deliberately no "use once" path in the app.
 
 The GUI shows udisks' `Drive.Serial`/`WWN`/`Model`/`Size`, applies the same key rule and passes
 the whole tuple to `flashcp-trust`. Values containing a TAB, newline or any other control

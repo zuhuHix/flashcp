@@ -244,7 +244,7 @@ export function trustNotice(drive) {
     case "trusted":
       return "";
     case "untrustable":
-      return "This drive doesn't report a usable serial number or WWN, so flashcp can't remember it safely. You can still copy to it from the command line: sudo flashcp add <folder> /dev/sdX";
+      return "This drive doesn't report a usable serial number or WWN, so flashcp can't remember it safely. You can still copy to it from the command line: sudo flashcp add <folder> /dev/sdXN";
     default:
       return "flashcp hasn't been allowed to write to this drive yet.";
   }
@@ -255,14 +255,38 @@ export function trustNotice(drive) {
  * @param {Drive|null} drive
  * @returns {{label: string, value: string}[]}
  */
+/** Exact byte count with thousands separators, e.g. "1,000,204,886,016". */
+function groupDigits(n) {
+  return String(Math.trunc(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+/**
+ * The rows of the trust confirmation: exactly the identity tuple flashcp-trust checks
+ * (drive.identity, the same object the backend builds its --expect/--wwn/--model/--size from),
+ * one row per checked field. The friendly vendor+model and the partition size are shown on
+ * the drive card, never here.
+ */
 export function trustDetails(drive) {
-  if (!drive) return [];
-  return [
-    { label: "Model", value: drive.model || "—" },
-    { label: "Size", value: formatBytes(drive.size) },
-    { label: "Serial", value: drive.serial || "—" },
-    { label: "Device", value: drive.device || "—" },
+  const id = drive && drive.identity;
+  if (!id || !id.key) return [];
+  const rows = [
+    { label: id.keyKind === "wwn" ? "WWN" : "Serial", value: id.key },
+    { label: "Model", value: id.model },
+    {
+      label: "Disk size (whole disk)",
+      value: `${formatBytes(id.diskSize)} (${groupDigits(id.diskSize)} bytes)`,
+    },
   ];
+  if (id.keyKind === "serial" && id.wwn && id.wwn !== "-") {
+    rows.push({ label: "WWN", value: id.wwn });
+  }
+  return rows;
+}
+
+/** The values flashcp-trust receives for this drive (mirrors runner::trust_args). */
+export function trustArgs(drive) {
+  const id = drive.identity;
+  return { expect: id.key, wwn: id.wwn, model: id.model, size: String(id.diskSize) };
 }
 
 /**

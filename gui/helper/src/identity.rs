@@ -39,7 +39,7 @@ fn first_non_empty<'a>(props: &'a [(String, String)], keys: &[&str]) -> Option<&
 
 /// Shown (via the GUI) when a drive has only a placeholder serial and no usable WWN.
 pub const UNTRUSTABLE: &str = "this drive reports a placeholder serial number and no WWN, so flashcp can't \
-     remember it safely. Copy to it with the command line instead: sudo flashcp add <folder> /dev/sdX";
+     remember it safely. Copy to it with the command line instead: sudo flashcp add <folder> /dev/sdXN";
 
 /// udisks' `Drive.Model`: `ID_MODEL_ENC` with its `\xHH` escapes decoded and whitespace trimmed,
 /// falling back to `ID_MODEL` with `_` turned back into spaces. `-` when there is none.
@@ -152,10 +152,22 @@ mod tests {
 
     #[test]
     fn wwn_fallback_and_defaults() {
-        let id = identity_from(&props(&[("ID_WWN", "0x5001")]), 2).unwrap();
-        assert_eq!(id, Identity { key: "0x5001".into(), wwn: "0x5001".into(), model: "-".into(), size: 1024 });
-        let id = identity_from(&props(&[("ID_WWN_WITH_EXTENSION", "0x5002x"), ("ID_WWN", "0x5002")]), 2).unwrap();
-        assert_eq!((id.key.as_str(), id.wwn.as_str()), ("0x5002x", "0x5002x"));
+        let id = identity_from(&props(&[("ID_WWN", "0x50014ee2b5a1c3d7")]), 2).unwrap();
+        assert_eq!(
+            id,
+            Identity {
+                key: "0x50014ee2b5a1c3d7".into(),
+                wwn: "0x50014ee2b5a1c3d7".into(),
+                model: "-".into(),
+                size: 1024
+            }
+        );
+        let id = identity_from(
+            &props(&[("ID_WWN_WITH_EXTENSION", "0x50014ee2b5a1c3d8x"), ("ID_WWN", "0x50014ee2b5a1c3d8")]),
+            2,
+        )
+        .unwrap();
+        assert_eq!((id.key.as_str(), id.wwn.as_str()), ("0x50014ee2b5a1c3d8x", "0x50014ee2b5a1c3d8x"));
         let id = identity_from(&props(&[("ID_SERIAL_SHORT", "SER1")]), 2).unwrap();
         assert_eq!((id.wwn.as_str(), id.model.as_str()), ("-", "-"));
     }

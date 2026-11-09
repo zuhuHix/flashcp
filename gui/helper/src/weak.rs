@@ -41,14 +41,23 @@ pub fn is_weak_serial(serial: &str) -> bool {
         || JUNK_SERIALS.contains(&lower.as_str())
 }
 
-/// True when a WWN is missing or a placeholder (all-zero / one repeated digit after `0x`).
+/// A real WWN (NAA type + 24-bit vendor OUI + vendor-assigned id) has plenty of different
+/// digits; placeholders like `0x0000000000000001` don't.
+const MIN_DISTINCT_NONZERO_WWN_DIGITS: usize = 4;
+
+/// True when a WWN is missing or a placeholder: all-zero / one repeated digit after `0x`, or
+/// fewer than [`MIN_DISTINCT_NONZERO_WWN_DIGITS`] distinct nonzero hex digits.
 pub fn is_weak_wwn(wwn: &str) -> bool {
     let w = wwn.trim();
     if w.is_empty() || w == "-" {
         return true;
     }
     let hex = w.strip_prefix("0x").or_else(|| w.strip_prefix("0X")).unwrap_or(w);
-    is_weak_serial(hex)
+    let mut distinct: Vec<char> =
+        hex.chars().filter(|c| c.is_ascii_hexdigit() && *c != '0').map(|c| c.to_ascii_lowercase()).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    is_weak_serial(hex) || distinct.len() < MIN_DISTINCT_NONZERO_WWN_DIGITS
 }
 
 /// The key a drive is remembered by: its serial if that is real, else its WWN if that is real,
@@ -105,6 +114,15 @@ mod tests {
         assert!(is_weak_wwn("0x0000000000000000"));
         assert!(is_weak_wwn("0xffffffffffffffff"));
         assert!(!is_weak_wwn("0x500014a000000001"));
+        assert!(!is_weak_wwn("0x50014ee2b5a1c3d7"));
+        // Fewer than 4 distinct nonzero hex digits: placeholder-ish.
+        for w in ["0x0000000000000001", "0x1000000000000001", "0x5000000000000012", "0x0101010101010101", "0x5000CCA0"]
+        {
+            assert!(is_weak_wwn(w), "{w} should be weak");
+        }
+        // Exactly 4 distinct nonzero digits is enough; case doesn't matter.
+        assert!(!is_weak_wwn("0x5000000000001234"));
+        assert!(!is_weak_wwn("0X5000A0B0C0000000"));
     }
 
     #[test]
@@ -116,6 +134,7 @@ mod tests {
         // Placeholder serial and no (or a junk) WWN: not trustable.
         assert_eq!(identity_key("000000000000", "-"), None);
         assert_eq!(identity_key("0123456789ABCDEF", "0x0000000000000000"), None);
+        assert_eq!(identity_key("000000000000", "0x0000000000000001"), None);
         assert_eq!(identity_key("", ""), None);
     }
 }

@@ -49,6 +49,7 @@ const DEMO_DRIVES = [
     model: "SanDisk Ultra",
     wholeDisk: false,
     serial: "FAKE0001",
+    identity: { keyKind: "serial", key: "FAKE0001", wwn: "-", model: "Ultra", diskSize: 32_015_122_432 },
     trusted: true,
   },
   {
@@ -62,6 +63,13 @@ const DEMO_DRIVES = [
     model: "Kingston DataTraveler",
     wholeDisk: false,
     serial: "OLD0002",
+    identity: {
+      keyKind: "serial",
+      key: "OLD0002",
+      wwn: "0x50014ee2b5a1c3d7",
+      model: "DataTraveler",
+      diskSize: 8_004_829_184,
+    },
     trusted: false,
   },
 ];

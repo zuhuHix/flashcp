@@ -17,6 +17,7 @@ import {
   canTrust,
   trustNotice,
   trustDetails,
+  trustArgs,
   selectDrive,
   openTrust,
   closeTrust,
@@ -48,6 +49,7 @@ const exfat = (over = {}) => ({
   model: "SanDisk Ultra",
   wholeDisk: false,
   serial: "FAKE0001",
+  identity: { keyKind: "serial", key: "FAKE0001", wwn: "-", model: "Ultra", diskSize: 32_015_122_432 },
   trusted: true,
   ...over,
 });
@@ -62,6 +64,13 @@ const vfat = (over = {}) => ({
   model: "Kingston",
   wholeDisk: false,
   serial: "OLD0002",
+  identity: {
+    keyKind: "serial",
+    key: "OLD0002",
+    wwn: "0x50014ee2b5a1c3d7",
+    model: "DataTraveler",
+    diskSize: 8_004_829_184,
+  },
   trusted: false,
   ...over,
 });
@@ -253,17 +262,44 @@ describe("drive labels and confirmation", () => {
     assert.equal(trustNotice(vfat()), "flashcp hasn't been allowed to write to this drive yet.");
     assert.equal(
       trustNotice(vfat({ serial: "" })),
-      "This drive doesn't report a usable serial number or WWN, so flashcp can't remember it safely. You can still copy to it from the command line: sudo flashcp add <folder> /dev/sdX",
+      "This drive doesn't report a usable serial number or WWN, so flashcp can't remember it safely. You can still copy to it from the command line: sudo flashcp add <folder> /dev/sdXN",
     );
   });
-  test("trustDetails lists model, size, serial and device", () => {
+  test("trustDetails shows exactly the checked identity tuple", () => {
     assert.deepEqual(trustDetails(vfat()), [
-      { label: "Model", value: "Kingston" },
-      { label: "Size", value: "8.0 GB" },
       { label: "Serial", value: "OLD0002" },
-      { label: "Device", value: "/dev/sdy1" },
+      { label: "Model", value: "DataTraveler" },
+      { label: "Disk size (whole disk)", value: "8.0 GB (8,004,829,184 bytes)" },
+      { label: "WWN", value: "0x50014ee2b5a1c3d7" },
     ]);
+    // Not the friendly vendor+model, not the partition size.
+    const shown = trustDetails(vfat()).map((r) => r.value).join("|");
+    assert.ok(!shown.includes("Kingston"));
+    assert.ok(!shown.includes("8,000,000,000"));
+    // A WWN key is labelled as such, and isn't repeated.
+    const wwnKeyed = vfat({
+      identity: { keyKind: "wwn", key: "0x5001", wwn: "0x5001", model: "-", diskSize: 1000 },
+    });
+    assert.deepEqual(
+      trustDetails(wwnKeyed).map((r) => r.label),
+      ["WWN", "Model", "Disk size (whole disk)"],
+    );
     assert.deepEqual(trustDetails(null), []);
+    assert.deepEqual(trustDetails(vfat({ identity: { keyKind: "", key: "", wwn: "-", model: "-", diskSize: 1 } })), []);
+  });
+  test("every value flashcp-trust receives is shown in the dialog, one to one", () => {
+    for (const d of [exfat(), vfat()]) {
+      const rows = trustDetails(d);
+      const byLabel = Object.fromEntries(rows.map((r) => [r.label, r.value]));
+      const args = trustArgs(d);
+      assert.equal(byLabel[d.identity.keyKind === "wwn" ? "WWN" : "Serial"], args.expect);
+      assert.equal(byLabel.Model, args.model);
+      assert.ok(byLabel["Disk size (whole disk)"].includes(`(${Number(args.size).toLocaleString("en-US")} bytes)`));
+      if (args.wwn !== "-") assert.equal(byLabel.WWN, args.wwn);
+      else assert.equal(byLabel.WWN, undefined);
+      // Nothing else: one row per checked field.
+      assert.equal(rows.length, args.wwn !== "-" ? 4 : 3);
+    }
   });
   test("driveTitle falls back to Untitled", () => {
     assert.equal(driveTitle(exfat()), "FAKEUSB");
