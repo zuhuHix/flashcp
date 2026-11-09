@@ -1207,8 +1207,13 @@ pub(crate) fn choose_cluster(nodes: &mut [Node], tgt: &Target, o: &BuildOpts) ->
     };
     let gate = small_clusters_gate(&stats);
     let low = if gate.is_ok() { 9 } else { 12 };
+    // Lifetime cap: the cluster size outlives this build. On a small removable stick every
+    // later add and pull pays for big clusters (slack written and read per file), so even a
+    // tree of big files never gets more than 4 KB there.
+    let capped = vol_bytes <= LIFETIME_CAP_BYTES && is_removable(&tgt.file);
+    let high = if capped { 12 } else { 17 };
     let mut best: Option<(f64, Plan)> = None;
-    for c in (low..=17).map(|s| 1u64 << s) {
+    for c in (low..=high).map(|s| 1u64 << s) {
         let Some(g) = geometry(vol_bytes, c, dev_off) else { continue };
         let Ok(p) = plan(nodes, g, o.fat) else { continue };
         let cost = plan_cost(&p, o.fat, bps, skip_s);
@@ -1217,8 +1222,24 @@ pub(crate) fn choose_cluster(nodes: &mut [Node], tgt: &Target, o: &BuildOpts) ->
         }
     }
     let Some((cost, best)) = best else { bail!("data does not fit, or volume size is unsupported") };
-    let why = format!("auto: est. {cost:.1} s, {model}; {}", gate.unwrap_or_else(|e| e));
+    let why = format!(
+        "auto: est. {cost:.1} s, {model}; {}{}",
+        gate.unwrap_or_else(|e| e),
+        if capped { "; ≤ 4 KB on a small removable drive" } else { "" }
+    );
     Ok((plan(nodes, best.g, o.fat)?, why)) // re-plan so nodes hold the winner's layout
+}
+
+/// Removable drives up to this size never get clusters above 4 KB (see [`choose_cluster`]).
+const LIFETIME_CAP_BYTES: u64 = 64 << 30;
+
+/// Whether `f` is a block device on a removable or USB disk (sysfs `removable`, or the
+/// usb-storage / uas driver: many USB sticks and card readers report removable = 0).
+fn is_removable(f: &File) -> bool {
+    let Some(dev) = crate::devprofile::block_dev_of(f) else { return false };
+    let info = crate::probe::device_info_of(dev);
+    let usb = matches!(info.transport.as_deref(), Some("usb-storage" | "uas"));
+    usb || info.sysfs.is_some_and(|p| fs::read_to_string(p.join("removable")).is_ok_and(|r| r.trim() == "1"))
 }
 
 /// [`build`] of an already scanned tree onto an already opened (exclusively held) target.
