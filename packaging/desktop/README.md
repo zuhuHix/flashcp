@@ -51,9 +51,11 @@ Uninstall with `sudo apt remove flashcp-gui`.
 | `/etc/flashcp/trusted-drives` | created at runtime | Drives an admin trusted (root-owned, 0644); not shipped in the package |
 | `/usr/share/applications/flashcp-gui.desktop` | `flashcp-gui.desktop` (Tauri template) | Application menu entry |
 | `/etc/xdg/autostart/flashcp-gui.desktop` | `flashcp-gui-autostart.desktop` | Starts the tray at login (`--tray`) |
-| `/usr/share/nemo/actions/flashcp.nemo_action` | `flashcp.nemo_action` | Nemo context menu entry |
-| `/usr/share/nautilus-python/extensions/flashcp_nautilus.py` | `flashcp_nautilus.py` | Nautilus context menu entry (needs `python3-nautilus`) |
-| `/usr/share/kio/servicemenus/flashcp.desktop` | `flashcp-dolphin.desktop` | Dolphin (KDE) context menu entry |
+| `/usr/share/nemo/actions/flashcp.nemo_action` | `flashcp.nemo_action` | Nemo: "Fast copy to USB" on selected files and folders |
+| `/usr/share/nemo/actions/flashcp-pull.nemo_action` | `flashcp-pull.nemo_action` | Nemo: "Fast copy from USB" on one selected folder |
+| `/usr/share/nautilus-python/extensions/flashcp_nautilus.py` | `flashcp_nautilus.py` | Nautilus: both copy entries (needs `python3-nautilus`) |
+| `/usr/share/kio/servicemenus/flashcp.desktop` | `flashcp-dolphin.desktop` | Dolphin (KDE): "Fast copy to USB" |
+| `/usr/share/kio/servicemenus/flashcp-pull.desktop` | `flashcp-dolphin-pull.desktop` | Dolphin (KDE): "Fast copy from USB" on one folder |
 | `/usr/share/icons/hicolor/scalable/apps/flashcp-gui.svg` | `flashcp-gui.svg` | Scalable icon |
 | `/usr/share/icons/hicolor/*/apps/flashcp-gui.png` | `gui/src-tauri/icons` | Raster icons, placed by the Tauri bundler |
 | `/usr/share/doc/flashcp-gui/SECURITY-NOTES.md` | `SECURITY-NOTES.md` | What the privileged path can and cannot do |
@@ -73,6 +75,16 @@ Check the real file list with `dpkg -c gui/target/release/bundle/deb/flashcp-gui
   the drive's label, or its serial number if it has no exFAT label.
 - Context menus: "Fast copy to USB (flashcp)" passes the selected paths to
   `flashcp-gui`, which opens with those files queued.
+- Context menus: "Fast copy from USB (flashcp)" runs `flashcp-gui --pull <folder>`
+  for a folder on a USB exFAT drive. The menu entries are only
+  a filter. The app resolves the path itself and reports "That folder is not on
+  a USB exFAT drive flashcp can see" if it does not match. Nautilus
+  shows it for one selected folder, or on the background of the current folder,
+  only when that folder is on an exFAT mount whose partition sits on a USB bus
+  (checked through `/proc/self/mountinfo` and `/sys/class/block`). Nemo and
+  Dolphin cannot filter by file system, so they offer it for any single selected
+  folder. (There is no Nemo background entry for the same reason: it would show
+  on every folder.)
 - Nemo needs a restart to pick up a new action: `nemo -q`.
 - Nautilus needs `python3-nautilus` installed, then `nautilus -q`.
 - Dolphin picks up the service menu automatically.
@@ -115,7 +127,12 @@ prints the JSON event stream and writes nothing. Add `--tray` to start hidden.
 ```sh
 cd gui && cargo test
 cd .. && node --test "gui/ui/tests/*.test.mjs"
+python3 -m unittest discover -s packaging/desktop -p 'test_*.py'
 ```
+
+The Nautilus unit tests need no `gi`. Use `discover -s` rather than
+`unittest packaging/desktop/test_flashcp_nautilus.py`: the file path form
+imports the `packaging` pip library instead of this directory on some systems.
 
 ## Why there is no AppImage
 

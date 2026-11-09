@@ -31,7 +31,7 @@
     "targets": ["deb"],
     "category": "Utility",
     "shortDescription": "Fast copy to USB drives with flashcp",
-    "longDescription": "Tray app for flashcp: notices USB exFAT drives, offers a fast one-pass copy, and adds \"Fast copy to USB (flashcp)\" to the Nemo, Nautilus and Dolphin context menus.",
+    "longDescription": "Tray app for flashcp: notices USB exFAT drives, offers a fast one-pass copy to a drive, and copies folders back from a USB drive. Adds \"Fast copy to USB (flashcp)\" and \"Fast copy from USB (flashcp)\" to the Nemo, Nautilus and Dolphin context menus.",
     "license": "GPL-3.0-or-later",
     "homepage": "https://github.com/zuhuHix/flashcp",
     "publisher": "zuhu",
@@ -54,8 +54,10 @@
           "/usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.helper.policy": "../../packaging/desktop/io.github.zuhuhix.flashcp.helper.policy",
           "/etc/xdg/autostart/flashcp-gui.desktop": "../../packaging/desktop/flashcp-gui-autostart.desktop",
           "/usr/share/nemo/actions/flashcp.nemo_action": "../../packaging/desktop/flashcp.nemo_action",
+          "/usr/share/nemo/actions/flashcp-pull.nemo_action": "../../packaging/desktop/flashcp-pull.nemo_action",
           "/usr/share/nautilus-python/extensions/flashcp_nautilus.py": "../../packaging/desktop/flashcp_nautilus.py",
           "/usr/share/kio/servicemenus/flashcp.desktop": "../../packaging/desktop/flashcp-dolphin.desktop",
+          "/usr/share/kio/servicemenus/flashcp-pull.desktop": "../../packaging/desktop/flashcp-dolphin-pull.desktop",
           "/usr/share/icons/hicolor/scalable/apps/flashcp-gui.svg": "../../packaging/desktop/flashcp-gui.svg",
           "/usr/share/doc/flashcp-gui/SECURITY-NOTES.md": "../../packaging/desktop/SECURITY-NOTES.md"
         }
