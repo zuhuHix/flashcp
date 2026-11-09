@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install exfatprogs
+        run: sudo apt-get update && sudo apt-get install -y exfatprogs
+      - name: cargo test
+        env:
+          FLASHCP_REQUIRE_FSCK: "1"
+        run: cargo test --locked
+
+  image:
+    name: build image, fsck, mount, diff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install exfatprogs
+        run: sudo apt-get update && sudo apt-get install -y exfatprogs
+      - run: cargo build --release --locked
+      - name: Generate source tree
+        run: |
+          set -eux
+          ./target/release/flashcp gen src-tree --profile tiny
+          mkdir -p "src-tree/ünïcødé 日本語/deep/er/and/deeper/still" src-tree/empty-dir
+          echo "hello exFAT" > "src-tree/ünïcødé 日本語/deep/er/and/deeper/still/😀.txt"
+          : > src-tree/empty-file
+          head -c 40000000 /dev/urandom > src-tree/big.bin
+      - name: Build, fsck, mount, diff (both FAT modes)
+        run: |
+          set -eux
+          for fat in prefix full; do
+            rm -f vol.img
+            truncate -s 256M vol.img
+            ./target/release/flashcp build src-tree vol.img --fat "$fat" --yes-erase
+            fsck.exfat -n vol.img
+            sudo mkdir -p /mnt/flashcp
+            sudo mount -o loop,ro vol.img /mnt/flashcp
+            sudo diff -r src-tree /mnt/flashcp
+            sudo umount /mnt/flashcp
+          done
+      - name: Mount-and-diff integration test
+        env:
+          FLASHCP_MOUNT_TESTS: "1"
+          FLASHCP_REQUIRE_FSCK: "1"
+          # Only the test binary runs as root (it needs mount -o loop); cargo itself does not.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
+        run: cargo test --locked --test build mount
