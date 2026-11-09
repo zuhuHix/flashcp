@@ -300,10 +300,10 @@ export const CopyVsBuild: React.FC<{theme: Theme}> = ({theme}) => {
             fontSize={44}
             fontWeight={600}
             fill={P.coral}
-            opacity={keep}
+            opacity={keep * ramp(f, NORMAL_END, NORMAL_END + 6)}
             style={{fontVariantNumeric: 'tabular-nums'}}
           >
-            {`${(NORMAL_REAL * normalProg).toFixed(2)} s`}
+            {`${NORMAL_REAL.toFixed(2)} s`}
           </text>
           <text
             x={TIMER_X}
@@ -315,13 +315,11 @@ export const CopyVsBuild: React.FC<{theme: Theme}> = ({theme}) => {
             opacity={zeroA}
             style={{fontVariantNumeric: 'tabular-nums'}}
           >
-            0.00 s
           </text>
-          <text x={TIMER_X} y={NORMAL_GY + 80} fontSize={22} fill={P.muted} opacity={keep} style={{fontVariantNumeric: 'tabular-nums'}}>
-            {`files ${fmtInt(20000 * normalProg)}`}
+          <text x={TIMER_X} y={NORMAL_GY + 80} fontSize={22} fill={P.muted} opacity={keep * ramp(f, NORMAL_END, NORMAL_END + 6)} style={{fontVariantNumeric: 'tabular-nums'}}>
+            {`${fmtInt(20000)} files`}
           </text>
           <text x={TIMER_X} y={NORMAL_GY + 80} fontSize={22} fill={P.muted} opacity={zeroA} style={{fontVariantNumeric: 'tabular-nums'}}>
-            files 0
           </text>
         </g>
         <g>
@@ -332,10 +330,10 @@ export const CopyVsBuild: React.FC<{theme: Theme}> = ({theme}) => {
             fontSize={44}
             fontWeight={600}
             fill={P.teal}
-            opacity={keep}
+            opacity={keep * ramp(f, FLASH_END, FLASH_END + 6)}
             style={{fontVariantNumeric: 'tabular-nums'}}
           >
-            {`${(FLASH_REAL * flashProg).toFixed(2)} s`}
+            {`${FLASH_REAL.toFixed(2)} s`}
           </text>
           <text
             x={TIMER_X}
@@ -347,13 +345,11 @@ export const CopyVsBuild: React.FC<{theme: Theme}> = ({theme}) => {
             opacity={zeroA}
             style={{fontVariantNumeric: 'tabular-nums'}}
           >
-            0.00 s
           </text>
-          <text x={TIMER_X} y={FLASH_GY + 80} fontSize={22} fill={P.muted} opacity={keep} style={{fontVariantNumeric: 'tabular-nums'}}>
-            {`files ${fmtInt(20000 * flashProg)}`}
+          <text x={TIMER_X} y={FLASH_GY + 80} fontSize={22} fill={P.muted} opacity={keep * ramp(f, FLASH_END, FLASH_END + 6)} style={{fontVariantNumeric: 'tabular-nums'}}>
+            {`${fmtInt(20000)} files`}
           </text>
           <text x={TIMER_X} y={FLASH_GY + 80} fontSize={22} fill={P.muted} opacity={zeroA} style={{fontVariantNumeric: 'tabular-nums'}}>
-            files 0
           </text>
         </g>
 

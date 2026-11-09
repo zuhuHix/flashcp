@@ -106,10 +106,10 @@ const PageView: React.FC<{page: Page; f: number; P: Palette; fps: number}> = ({p
               fontFamily={MONO}
               fontSize={24}
               fill={P.text}
-              opacity={ramp(f, s, s + 6)}
+              opacity={ramp(coralP, 0.9, 1)}
               style={{fontVariantNumeric: 'tabular-nums'}}
             >
-              {`${(row.base * coralP).toFixed(cDec)} s`}
+              {`${row.base.toFixed(cDec)} s`}
             </text>
 
             <rect x={X0} y={top + 44} width={tLen} height={36} rx={4} fill={P.teal} />
@@ -119,10 +119,10 @@ const PageView: React.FC<{page: Page; f: number; P: Palette; fps: number}> = ({p
               fontFamily={MONO}
               fontSize={24}
               fill={P.text}
-              opacity={ramp(f, s + 6, s + 12)}
+              opacity={ramp(tealP, 0.9, 1)}
               style={{fontVariantNumeric: 'tabular-nums'}}
             >
-              {`${(row.flash * tealP).toFixed(tDec)} s`}
+              {`${row.flash.toFixed(tDec)} s`}
             </text>
 
             <g transform={`translate(${pillCx} ${pillCy}) scale(${pillScale}) translate(${-pillCx} ${-pillCy})`}>

@@ -324,10 +324,10 @@ export const PullSweep: React.FC<{theme: Theme}> = ({theme}) => {
           fontSize={40}
           fontWeight={600}
           fill={P.coral}
-          opacity={live}
+          opacity={live * ramp(normalProg, 0.98, 1)}
           style={{fontVariantNumeric: 'tabular-nums'}}
         >
-          {`${(6.01 * normalProg).toFixed(2)} s`}
+          {'6.01 s'}
         </text>
         <text
           x={TIMER_X}
@@ -339,13 +339,11 @@ export const PullSweep: React.FC<{theme: Theme}> = ({theme}) => {
           opacity={zeroA}
           style={{fontVariantNumeric: 'tabular-nums'}}
         >
-          0.00 s
         </text>
-        <text x={TIMER_X} y={NORMAL_GY + 80} fontSize={22} fill={P.muted} opacity={live} style={{fontVariantNumeric: 'tabular-nums'}}>
-          {`files ${fmtInt(20000 * normalProg)}`}
+        <text x={TIMER_X} y={NORMAL_GY + 80} fontSize={22} fill={P.muted} opacity={live * ramp(normalProg, 0.98, 1)} style={{fontVariantNumeric: 'tabular-nums'}}>
+          {`${fmtInt(20000)} files`}
         </text>
         <text x={TIMER_X} y={NORMAL_GY + 80} fontSize={22} fill={P.muted} opacity={zeroA} style={{fontVariantNumeric: 'tabular-nums'}}>
-          files 0
         </text>
 
         <text
@@ -355,10 +353,10 @@ export const PullSweep: React.FC<{theme: Theme}> = ({theme}) => {
           fontSize={40}
           fontWeight={600}
           fill={P.teal}
-          opacity={live}
+          opacity={live * ramp(flashProg, 0.98, 1)}
           style={{fontVariantNumeric: 'tabular-nums'}}
         >
-          {`${(0.66 * flashProg).toFixed(2)} s`}
+          {'0.66 s'}
         </text>
         <text
           x={TIMER_X}
@@ -370,13 +368,11 @@ export const PullSweep: React.FC<{theme: Theme}> = ({theme}) => {
           opacity={zeroA}
           style={{fontVariantNumeric: 'tabular-nums'}}
         >
-          0.00 s
         </text>
-        <text x={TIMER_X} y={FLASH_GY + 80} fontSize={22} fill={P.muted} opacity={live} style={{fontVariantNumeric: 'tabular-nums'}}>
-          {`files ${fmtInt(20000 * flashProg)}`}
+        <text x={TIMER_X} y={FLASH_GY + 80} fontSize={22} fill={P.muted} opacity={live * ramp(flashProg, 0.98, 1)} style={{fontVariantNumeric: 'tabular-nums'}}>
+          {`${fmtInt(20000)} files`}
         </text>
         <text x={TIMER_X} y={FLASH_GY + 80} fontSize={22} fill={P.muted} opacity={zeroA} style={{fontVariantNumeric: 'tabular-nums'}}>
-          files 0
         </text>
 
         {/* speed-up pill at the end of the flashcp run */}
@@ -391,7 +387,7 @@ export const PullSweep: React.FC<{theme: Theme}> = ({theme}) => {
           measured on a USB SSD, 20k files
         </text>
         <text x={60} y={566} fontSize={18} fill={P.muted}>
-          grid and file count are schematic; the timers are scaled to the measured times
+          grid and file count are schematic; the motion is scaled to the measured times
         </text>
       </svg>
     </AbsoluteFill>
