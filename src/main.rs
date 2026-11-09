@@ -127,10 +127,10 @@ enum Cmd {
         #[arg(long, default_value_t = 8, hide = true)]
         chunk_mb: usize,
         /// Read through gaps between files up to this many KB
-        #[arg(long, default_value_t = 1024, hide = true)]
+        #[arg(long, default_value_t = 32, hide = true)]
         gap_kb: u64,
         /// Device reads in flight
-        #[arg(long, default_value_t = 4, hide = true)]
+        #[arg(long, default_value_t = 32, hide = true)]
         inflight: usize,
         /// Destination writer threads
         #[arg(long, default_value_t = 4, hide = true)]

@@ -31,9 +31,12 @@ use crossbeam_channel::{RecvTimeoutError, bounded};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Read buffers in use (read and not yet written out) never exceed this many bytes.
+pub const READ_BUDGET: usize = 64 << 20;
 
 /// Alignment of every device read (O_DIRECT needs the logical block size; 4 KB covers it).
 const ALIGN: u64 = 4096;
@@ -50,7 +53,7 @@ pub struct PullOpts {
     pub chunk: usize,
     /// Gaps between extents up to this many bytes are read through rather than skipped.
     pub gap: u64,
-    /// Device reads in flight.
+    /// Device reads in flight (at most [`READ_BUDGET`] bytes of them).
     pub inflight: usize,
     /// Threads writing destination files.
     pub writers: usize,
@@ -63,8 +66,8 @@ impl Default for PullOpts {
             skip_existing: false,
             overwrite: false,
             chunk: 8 << 20,
-            gap: 1 << 20,
-            inflight: 4,
+            gap: 32 << 10,
+            inflight: 32,
             writers: 4,
         }
     }
@@ -227,6 +230,64 @@ fn raise_nofile() {
             r.rlim_cur = r.rlim_max;
             libc::setrlimit(libc::RLIMIT_NOFILE, &r);
         }
+    }
+}
+
+/// Aligned read buffers in power-of-two size classes, reused, with at most `budget` bytes
+/// handed out at a time (one buffer is always allowed, whatever its size).
+struct Pool {
+    st: Mutex<PoolState>,
+    cv: Condvar,
+    budget: usize,
+}
+
+#[derive(Default)]
+struct PoolState {
+    used: usize,
+    free: Vec<AlignedBuf>,
+    free_bytes: usize,
+    closed: bool,
+}
+
+impl Pool {
+    fn new(budget: usize) -> Pool {
+        Pool { st: Mutex::new(PoolState::default()), cv: Condvar::new(), budget }
+    }
+
+    /// A buffer of at least `len` bytes; None once the pool is closed.
+    fn get(&self, len: usize) -> Option<AlignedBuf> {
+        let cap = len.next_power_of_two().max(64 << 10);
+        let mut g = self.st.lock().unwrap();
+        while !g.closed && g.used > 0 && g.used + cap > self.budget {
+            g = self.cv.wait(g).unwrap();
+        }
+        if g.closed {
+            return None;
+        }
+        g.used += cap;
+        if let Some(i) = g.free.iter().position(|b| b.as_ref().len() == cap) {
+            g.free_bytes -= cap;
+            return Some(g.free.swap_remove(i));
+        }
+        drop(g);
+        Some(AlignedBuf::new(cap))
+    }
+
+    fn put(&self, b: AlignedBuf) {
+        let mut g = self.st.lock().unwrap();
+        let cap = b.as_ref().len();
+        g.used -= cap;
+        if g.free_bytes + cap <= self.budget {
+            g.free_bytes += cap;
+            g.free.push(b);
+        }
+        drop(g);
+        self.cv.notify_all();
+    }
+
+    fn close(&self) {
+        self.st.lock().unwrap().closed = true;
+        self.cv.notify_all();
     }
 }
 
@@ -489,20 +550,17 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let pool = Pool::new(READ_BUDGET);
     let fail = |e: anyhow::Error| {
         failed.store(true, Ordering::Relaxed);
         first_err.lock().unwrap().get_or_insert(e);
+        pool.close();
     };
-    let nbuf = o.inflight.max(1) + o.writers.max(1);
-    let (free_tx, free_rx) = bounded::<AlignedBuf>(nbuf);
-    for _ in 0..nbuf.min(chunks.len()) {
-        free_tx.send(AlignedBuf::new(o.chunk)).unwrap();
-    }
-    let (full_tx, full_rx) = bounded::<(usize, AlignedBuf)>(nbuf);
+    let (full_tx, full_rx) = bounded::<(usize, AlignedBuf)>(o.inflight.max(1));
     let (alive_tx, alive_rx) = bounded::<()>(0);
     std::thread::scope(|s| {
         for _ in 0..o.inflight.max(1) {
-            let (free_rx, full_tx, alive) = (free_rx.clone(), full_tx.clone(), alive_tx.clone());
+            let (full_tx, alive, pool) = (full_tx.clone(), alive_tx.clone(), &pool);
             let (file, chunks, next, failed, direct, fail) = (&file, &chunks, &next, &failed, &direct, &fail);
             let exts = &p.exts;
             s.spawn(move || {
@@ -510,7 +568,7 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
                 while !failed.load(Ordering::Relaxed) {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(c) = chunks.get(i) else { return };
-                    let Ok(mut buf) = free_rx.recv() else { return };
+                    let Some(mut buf) = pool.get(c.len) else { return };
                     let need = exts[c.exts.clone()].iter().map(|e| e.phys + e.len as u64).max().unwrap() - c.start;
                     let mut r = read_full(file, &mut buf.as_mut()[..c.len], c.start);
                     if matches!(&r, Err(e) if e.raw_os_error() == Some(libc::EINVAL))
@@ -538,7 +596,7 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
         }
         drop(full_tx);
         for _ in 0..o.writers.max(1) {
-            let (full_rx, free_tx, alive) = (full_rx.clone(), free_tx.clone(), alive_tx.clone());
+            let (full_rx, alive, pool) = (full_rx.clone(), alive_tx.clone(), &pool);
             let (chunks, failed, fail, jobs, exts) = (&chunks, &failed, &fail, &p.jobs, &p.exts);
             let (files_done, bytes_done) = (&files_done, &bytes_done);
             let overwrite = o.overwrite;
@@ -571,12 +629,12 @@ pub fn pull_from(target: &TargetSpec, dest: &Path, o: &PullOpts, sink: Sink<'_>)
                             return fail(e);
                         }
                     }
-                    let _ = free_tx.send(buf);
+                    pool.put(buf);
                 }
             });
         }
         // Only the threads hold channel ends now, so a side that stops unblocks the other.
-        drop((alive_tx, free_tx, free_rx, full_rx));
+        drop((alive_tx, full_rx));
         loop {
             match alive_rx.recv_timeout(Duration::from_millis(100)) {
                 Err(RecvTimeoutError::Disconnected) => break,
