@@ -8,9 +8,9 @@ use std::io::Write;
 use std::path::Path;
 
 const WORDS: &[&str] = &[
-    "the", "flash", "block", "erase", "sector", "file", "copy", "fast", "data", "write",
-    "cluster", "table", "entry", "usb", "stick", "rust", "fn", "let", "mut", "struct",
-    "impl", "return", "config", "value", "index", "{", "}", "(", ")", ";", "\n",
+    "the", "flash", "block", "erase", "sector", "file", "copy", "fast", "data", "write", "cluster", "table", "entry",
+    "usb", "stick", "rust", "fn", "let", "mut", "struct", "impl", "return", "config", "value", "index", "{", "}", "(",
+    ")", ";", "\n",
 ];
 
 fn fill_text(rng: &mut Rng, buf: &mut Vec<u8>, len: usize) {
@@ -62,11 +62,11 @@ pub fn generate(dir: &Path, profile: &str, seed: u64) -> Result<()> {
     for (count, lo, hi) in &spec.groups {
         for _ in 0..*count {
             let d = dir.join(format!("d{:04}", idx / spec.files_per_dir));
-            if idx % spec.files_per_dir == 0 {
+            if idx.is_multiple_of(spec.files_per_dir) {
                 fs::create_dir_all(&d)?;
             }
             let size = rng.range(*lo, *hi) as usize;
-            let compressible = rng.next() % 2 == 0;
+            let compressible = rng.next().is_multiple_of(2);
             let name = if compressible { format!("f{idx:06}.txt") } else { format!("f{idx:06}.bin") };
             let mut f = fs::File::create(d.join(name))?;
             let mut left = size;
