@@ -1,0 +1,188 @@
+name: Release
+
+# Tag pushes (v*) build, smoke-test and publish a GitHub release.
+# Dispatch runs build and smoke-test everything but never publish.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run. Dispatch runs never publish a release, whatever this is set to."
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read crate version and check tag
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -eu
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="flashcp") | .version')
+          if [ "$EVENT" = "push" ] && [ "${GITHUB_REF_NAME#v}" != "$VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $VERSION (expected tag v$VERSION)"
+            exit 1
+          fi
+          echo "Crate version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            deb_arch: amd64
+          # Native arm runner instead of qemu: the smoke tests run natively.
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            deb_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+      DEB_ARCH: ${{ matrix.deb_arch }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # zig is the C cross-compiler for the zstd C code (zstdmt) on musl.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild,cargo-deb
+
+      - name: Build static binary
+        run: cargo zigbuild --release --locked --target "$TARGET"
+
+      - name: Verify static linkage
+        run: |
+          set -eux
+          BIN="target/$TARGET/release/flashcp"
+          file "$BIN"
+          file "$BIN" | grep -Eq 'statically linked|static-pie linked'
+          out=$(ldd "$BIN" 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -Eq 'not a dynamic executable|statically linked'
+
+      # Native runner, so the binary is executed directly.
+      - name: Smoke test (build an exFAT image and fsck it)
+        run: |
+          set -eux
+          BIN="target/$TARGET/release/flashcp"
+          "$BIN" --help
+          sudo apt-get update
+          sudo apt-get install -y exfatprogs
+          mkdir -p smoke
+          rm -rf smoke/src-tree
+          "$BIN" gen smoke/src-tree --profile tiny
+          rm -f smoke/vol.img
+          truncate -s 256M smoke/vol.img
+          "$BIN" build smoke/src-tree smoke/vol.img --yes-erase
+          fsck.exfat -n smoke/vol.img
+
+      - name: Package tarball and .deb
+        run: |
+          set -eux
+          BIN="target/$TARGET/release/flashcp"
+          STAGE="flashcp-$VERSION-$TARGET"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE" dist
+          cp "$BIN" LICENSE README.md "$STAGE/"
+          tar -czf "dist/$STAGE.tar.gz" "$STAGE"
+          # --no-build: reuse the zigbuild output. cargo-deb maps target/release
+          # to target/$TARGET/release because --target is given.
+          cargo deb --no-build --no-strip --target "$TARGET" -o "dist/flashcp_${VERSION}_${DEB_ARCH}.deb"
+          dpkg-deb --info "dist/flashcp_${VERSION}_${DEB_ARCH}.deb"
+          dpkg-deb --contents "dist/flashcp_${VERSION}_${DEB_ARCH}.deb"
+
+      - name: Install .deb and check it
+        run: |
+          set -eux
+          sudo apt-get install -y "./dist/flashcp_${VERSION}_${DEB_ARCH}.deb"
+          test "$(command -v flashcp)" = "/usr/bin/flashcp"
+          flashcp --help
+          sudo apt-get remove -y flashcp
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        run: |
+          set -eux
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          ls -l .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Dry run summary
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          {
+            echo "Dry run: no release published"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create GitHub release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "flashcp $GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag \
+            --repo "$GITHUB_REPOSITORY"
