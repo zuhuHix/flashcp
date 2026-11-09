@@ -25,22 +25,44 @@
  * @property {string|null} mountPoint
  * @property {string|null} [dest]     pull: the local destination folder
  * @property {string|null} [warning]  pull: set when the remount failed after a good copy
+ * @property {number|null} [clusterBytes]  add: the stick's cluster size after the copy
  */
 
 /**
  * @typedef {Object} JobUpdate
  * @property {"starting"|"unmounting"|"authorizing"|"running"|"remounting"|"done"|"error"} stage
- *   "starting" is client-only: set locally before start_copy/start_erase is invoked.
- * @property {"add"|"build"|"pull"} op
+ *   "starting" is client-only: set locally before start_copy/start_erase/start_optimize is invoked.
+ * @property {"add"|"build"|"pull"|"optimize"} op
  * @property {boolean} [conflict]  pull: the copy stopped because the destination already has files
  * @property {number} index
  * @property {number} total
- * @property {number} filesDone
- * @property {number} bytesDone
+ * @property {number} filesDone     optimize: within the current phase
+ * @property {number} bytesDone     optimize: within the current phase
  * @property {number} planFiles
  * @property {number} planBytes
  * @property {string|null} message
  * @property {JobSummary|null} summary
+ * @property {"pull"|"verify"|"build"|"check"|"cleanup"|null} [phase]  optimize only
+ * @property {number} [step]     optimize only: 1-based index of the phase
+ * @property {number} [steps]    optimize only: number of phases in this run
+ * @property {string|null} [recovery]  optimize only: what to do when the stick was left half-built
+ */
+
+/**
+ * @typedef {Object} OptimizePlan
+ * @property {number} files
+ * @property {number} dirs
+ * @property {number} bytes
+ * @property {number} writeBytes
+ * @property {string|null} temp
+ * @property {number|null} oldCluster
+ * @property {number|null} newCluster
+ * @property {string} label
+ * @property {boolean} resume
+ * @property {boolean} alreadyOptimized
+ * @property {number} needBytes
+ * @property {number|null} tempFree
+ * @property {boolean} enoughSpace
  */
 
 /**
@@ -64,6 +86,11 @@
  *   subfolders of the folder named by `key` (see folderKey); null until loaded
  * @property {string|null} pullDestOverride a destination picked with Change…; null = default
  * @property {{dest: string, source: "preflight"|"conflict"}|null} pullCollision
+ * @property {{driveId: string, status: "checking"|"ready"|"error", plan: OptimizePlan|null, error: string|null}|null} optimize
+ *   the "Optimize this stick" plan panel; null when closed
+ * @property {string|null} optimizeDriveId  the drive the running or last optimize job works on
+ * @property {boolean} optimizePending      optimize_pending(): an interrupted optimize copy exists
+ * @property {string[]} tipDismissed        drive keys (serial) whose optimize tip was dismissed
  */
 
 const UNITS = ["kB", "MB", "GB", "TB"];
@@ -155,6 +182,7 @@ export function stageText(update) {
       return "Waiting for authorization…";
     case "running":
       if (update.op === "pull") return "Copying from the drive…";
+      if (update.op === "optimize") return optimizeStepText(update);
       return `Copying item ${update.index + 1} of ${update.total}…`;
     case "remounting":
       return "Remounting…";
@@ -173,6 +201,8 @@ export function stageText(update) {
  * @returns {string}
  */
 export function progressText(update) {
+  // The cleanup phase has no meaningful file or byte count to show.
+  if (update.op === "optimize" && update.phase === "cleanup") return "";
   return (
     `${update.filesDone} of ${update.planFiles} files · ` +
     `${formatBytes(update.bytesDone)} of ${formatBytes(update.planBytes)}`
@@ -420,10 +450,16 @@ export function removeSource(sources, index) {
  * @param {string|null} currentId
  * @returns {string|null}
  */
-export function defaultSelection(drives, currentId) {
+export function defaultSelection(drives, currentId, optimizePending = false) {
   if (currentId != null && drives.some((d) => d.id === currentId)) return currentId;
   const exfat = drives.filter((d) => d.isExfat === true);
-  return exfat.length === 1 ? exfat[0].id : null;
+  if (exfat.length === 1) return exfat[0].id;
+  // A stick left without a filesystem by an interrupted optimize: select it so "Resume optimize…" shows.
+  if (exfat.length === 0 && optimizePending === true) {
+    const blank = drives.filter((d) => d.fsType === "");
+    if (blank.length === 1) return blank[0].id;
+  }
+  return null;
 }
 
 /**
@@ -532,6 +568,7 @@ export function selectDrive(state, id) {
     trustError: null,
     pullFrom: "",
     pullCollision: null,
+    optimize: null,
   };
 }
 
@@ -841,4 +878,321 @@ export function applyPullRequest(state, req) {
     pullFrom: from === null ? "" : from,
     notice: error || next.notice,
   };
+}
+
+// ---- Optimize this stick -----------------------------------------------------
+
+// Speeds behind the time estimate. "fast" gives the low end, "slow USB 2" the high end.
+const OPTIMIZE_FAST = { readBps: 100e6, writeBps: 60e6, perFileSecs: 0.0002 };
+const OPTIMIZE_SLOW = { readBps: 5e6, writeBps: 4e6, perFileSecs: 0.002 };
+
+const OPTIMIZE_PHASES = {
+  pull: "Copying the stick to this computer",
+  verify: "Checking the copy",
+  build: "Rebuilding the stick",
+  check: "Checking the stick",
+  cleanup: "Removing the temporary copy",
+};
+
+export const OPTIMIZE_RISK =
+  "This takes a while. Don't unplug the stick or put the computer to sleep until it says it's done.";
+
+export const OPTIMIZE_RECOVERY_WARNING =
+  "If Windows (or another computer) offers to format this stick, say No. " +
+  "Plug it back into this computer and choose Resume optimize here.";
+
+const OPTIMIZE_WHAT =
+  "Your files are copied to this computer and checked, then the stick is erased and rebuilt " +
+  "from that verified copy, then checked again. Your files are kept.";
+
+const OPTIMIZE_LOST = "Lost: file attributes, and creation and access times.";
+
+function nonNegative(n) {
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * Rough time range for an optimize plan. A fresh run reads the data twice (copy,
+ * then check) and writes it once; a resume reads it once (check) and writes once.
+ * Every file adds a fixed cost. lowSecs is a fast drive, highSecs a slow USB 2 stick.
+ * @param {Pick<OptimizePlan, "bytes"|"writeBytes"|"files"|"resume">} plan
+ * @returns {{lowSecs: number, highSecs: number}}
+ */
+export function optimizeEstimate(plan) {
+  const bytes = nonNegative(plan && plan.bytes);
+  const writeBytes = nonNegative(plan && plan.writeBytes);
+  const files = nonNegative(plan && plan.files);
+  const reads = plan && plan.resume === true ? 1 : 2;
+  const secs = (s) => (reads * bytes) / s.readBps + writeBytes / s.writeBps + files * s.perFileSecs;
+  return { lowSecs: secs(OPTIMIZE_FAST), highSecs: secs(OPTIMIZE_SLOW) };
+}
+
+/**
+ * The phase name for the progress line. Unknown or missing phases read "Working".
+ * @param {string|null|undefined} phase
+ * @returns {string}
+ */
+export function optimizePhaseText(phase) {
+  return typeof phase === "string" && Object.prototype.hasOwnProperty.call(OPTIMIZE_PHASES, phase)
+    ? OPTIMIZE_PHASES[phase]
+    : "Working";
+}
+
+/**
+ * "Step 2 of 5: Rebuilding the stick…" (the step prefix is left out when the backend sent none).
+ * @param {JobUpdate} update
+ * @returns {string}
+ */
+export function optimizeStepText(update) {
+  const { step, steps } = update;
+  const prefix =
+    Number.isInteger(step) && step > 0 && Number.isInteger(steps) && steps > 0
+      ? `Step ${step} of ${steps}: `
+      : "";
+  return `${prefix}${optimizePhaseText(update.phase)}…`;
+}
+
+/**
+ * True when the progress bar should not show a fraction: the cleanup phase, and any
+ * optimize phase that has no bytes to count. The bar then runs as indeterminate.
+ * @param {JobUpdate} update
+ * @returns {boolean}
+ */
+export function progressIndeterminate(update) {
+  if (!update || update.op !== "optimize") return false;
+  return update.phase === "cleanup" || !(update.planBytes > 0);
+}
+
+/**
+ * The finished line: "Optimized: 20,000 files (169 MB) in 2 min 35 s." Empty without a summary.
+ * @param {JobSummary|null} summary
+ * @returns {string}
+ */
+export function optimizeSummaryText(summary) {
+  if (!summary) return "";
+  const files = summary.files === 1 ? "1 file" : `${groupDigits(summary.files)} files`;
+  return `Optimized: ${files} (${formatBytes(summary.bytes)}) in ${formatDuration(summary.secs)}.`;
+}
+
+/**
+ * The error view for a failed optimize. `recovery` is set only when the stick may have been
+ * left half-built; then the warning and the Resume button apply. Without it the message is
+ * shown as a normal error.
+ * @param {JobUpdate} update
+ * @returns {{message: string, recovery: string|null, warning: string|null, canResume: boolean}}
+ */
+export function optimizeErrorView(update) {
+  const message = (update && update.message) || "Failed.";
+  const recovery =
+    update && typeof update.recovery === "string" && update.recovery !== "" ? update.recovery : null;
+  return {
+    message,
+    recovery,
+    warning: recovery ? OPTIMIZE_RECOVERY_WARNING : null,
+    canResume: recovery !== null && update.op === "optimize",
+  };
+}
+
+/** Coarse clusters (over 4 KiB) on a stick with many small files: worth optimizing. */
+export function shouldSuggestOptimize(op, summary) {
+  if (op !== "add" || !summary) return false;
+  if (!(summary.clusterBytes > 4096)) return false;
+  if (!(summary.files >= 1000)) return false;
+  return summary.bytes / summary.files <= 256 * 1024;
+}
+
+/** The key a dismissed tip is remembered by: the drive serial, or its id when it has none. */
+export function tipKey(drive) {
+  if (!drive) return "";
+  return typeof drive.serial === "string" && drive.serial !== "" ? drive.serial : String(drive.id || "");
+}
+
+/**
+ * Whether the optimize tip shows in the done view of a finished add job.
+ * @param {JobUpdate|null} job
+ * @param {Drive|null} drive
+ * @param {string[]} dismissed  tipKey values the user dismissed
+ */
+export function shouldShowOptimizeTip(job, drive, dismissed) {
+  if (!job || job.stage !== "done" || !job.summary || !drive) return false;
+  if (drive.isExfat !== true) return false;
+  const key = tipKey(drive);
+  if (key === "" || (Array.isArray(dismissed) && dismissed.includes(key))) return false;
+  return shouldSuggestOptimize(job.op, job.summary);
+}
+
+/**
+ * The stored list of dismissed tip keys. Anything malformed reads as an empty list.
+ * @param {string|null} raw  the stored JSON text
+ * @returns {string[]}
+ */
+export function parseDismissed(raw) {
+  if (typeof raw !== "string") return [];
+  try {
+    const value = JSON.parse(raw);
+    return Array.isArray(value) ? value.filter((k) => typeof k === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** The list with `key` added (no duplicates). */
+export function addDismissed(list, key) {
+  const base = Array.isArray(list) ? list : [];
+  return base.includes(key) ? base.slice() : [...base, key];
+}
+
+/**
+ * Which optimize entry the Drive card offers: "optimize" for a trusted exFAT drive,
+ * "resume" for a trusted drive with no filesystem while an interrupted optimize is pending,
+ * null otherwise (including while a job runs).
+ * @param {AppState} state
+ * @param {boolean} pending  optimize_pending()
+ * @returns {"optimize"|"resume"|null}
+ */
+export function optimizeAction(state, pending) {
+  const drive = selectedDrive(state);
+  if (!drive || jobActive(state) || !isTrusted(drive)) return null;
+  if (drive.isExfat === true) return "optimize";
+  if (drive.fsType === "" && pending === true) return "resume";
+  return null;
+}
+
+/** True when an optimize entry applies (see optimizeAction). */
+export function canOptimize(state, pending) {
+  return optimizeAction(state, pending) !== null;
+}
+
+/** The entry button's text for an action from optimizeAction. */
+export function optimizeEntryLabel(action) {
+  if (action === "resume") return "Resume optimize…";
+  if (action === "optimize") return "Optimize this stick…";
+  return "";
+}
+
+/** "32 KB", "4 KB"; other sizes use formatBytes. */
+export function clusterText(bytes) {
+  return Number.isInteger(bytes) && bytes >= 1024 && bytes % 1024 === 0
+    ? `${bytes / 1024} KB`
+    : formatBytes(bytes);
+}
+
+/** "Usually between 10 s and 2 min 30 s, depending on the stick; slow USB 2 sticks take longest." */
+export function optimizeTimeText(plan) {
+  const { lowSecs, highSecs } = optimizeEstimate(plan);
+  return (
+    `Usually between ${formatDuration(lowSecs)} and ${formatDuration(highSecs)}, ` +
+    "depending on the stick; slow USB 2 sticks take longest."
+  );
+}
+
+/** "Needs 1.2 GB free on this computer (temporary copy in /x/y); 48.0 GB free." */
+export function optimizeSpaceText(plan) {
+  const temp = typeof plan.temp === "string" && plan.temp !== "" ? ` (temporary copy in ${plan.temp})` : "";
+  const free = Number.isFinite(plan.tempFree) ? `${formatBytes(plan.tempFree)} free` : "free space unknown";
+  return `Needs ${formatBytes(nonNegative(plan.needBytes))} free on this computer${temp}; ${free}.`;
+}
+
+/** "Kept: ... and the label “X”." */
+export function optimizeKeptText(plan) {
+  const label = typeof plan.label === "string" && plan.label !== "" ? `, and the label “${plan.label}”` : "";
+  return `Kept: file contents, file and folder names, folders, modification times${label}.`;
+}
+
+/** "Cluster size: 32 KB → 4 KB", or null when either size is unknown. */
+export function optimizeClusterText(plan) {
+  if (!(plan.oldCluster > 0) || !(plan.newCluster > 0)) return null;
+  return `Cluster size: ${clusterText(plan.oldCluster)} → ${clusterText(plan.newCluster)}`;
+}
+
+/** The explanation for a resume plan. */
+export function optimizeResumeText(plan) {
+  const where =
+    typeof plan.temp === "string" && plan.temp !== ""
+      ? `the verified copy in ${plan.temp}`
+      : "the verified copy on this computer";
+  return `An interrupted optimize of this stick was found. It will be finished from ${where}.`;
+}
+
+/**
+ * "already" (nothing to do), "refused" (not enough space: an error, no confirm),
+ * "resume" or "ready" (both can be confirmed).
+ * @param {OptimizePlan} plan
+ * @returns {"already"|"refused"|"resume"|"ready"}
+ */
+export function optimizePlanMode(plan) {
+  if (plan.alreadyOptimized === true) return "already";
+  if (plan.enoughSpace !== true) return "refused";
+  return plan.resume === true ? "resume" : "ready";
+}
+
+/**
+ * Everything the plan panel shows for a plan, in plain words.
+ * - lines: explanatory paragraphs, in order
+ * - note: the "nothing to do" sentence
+ * - error: why it cannot run (shown with role=alert)
+ * - canConfirm / confirmLabel / risk: the single confirmation and the line above it
+ * @param {OptimizePlan|null} plan
+ */
+export function optimizePlanView(plan) {
+  if (!plan || typeof plan !== "object") return null;
+  const mode = optimizePlanMode(plan);
+  const canConfirm = mode === "ready" || mode === "resume";
+  const view = {
+    mode,
+    canConfirm,
+    confirmLabel: mode === "resume" ? "Resume optimize" : "Optimize this stick",
+    risk: canConfirm ? OPTIMIZE_RISK : "",
+    lines: [],
+    note: null,
+    error: null,
+  };
+  if (mode === "already") {
+    view.note = "This stick is already optimized. Nothing to do.";
+  } else if (mode === "refused") {
+    view.error = `${optimizeSpaceText(plan)} Free up space on this computer, then check again.`;
+  } else {
+    if (mode === "resume") view.lines.push(optimizeResumeText(plan));
+    view.lines.push(OPTIMIZE_WHAT, optimizeKeptText(plan), OPTIMIZE_LOST, optimizeTimeText(plan));
+    view.lines.push(optimizeSpaceText(plan));
+    const cluster = optimizeClusterText(plan);
+    if (cluster) view.lines.push(cluster);
+  }
+  return view;
+}
+
+/**
+ * Open the plan panel for a drive while optimize_plan runs.
+ * @param {AppState} state
+ * @param {string} driveId
+ */
+export function openOptimize(state, driveId) {
+  return { ...state, optimize: { driveId, status: "checking", plan: null, error: null } };
+}
+
+/** The plan came back. */
+export function optimizePlanned(state, plan) {
+  if (!state.optimize) return state;
+  return { ...state, optimize: { ...state.optimize, status: "ready", plan, error: null } };
+}
+
+/** optimize_plan failed; the message is shown in the panel. */
+export function optimizeFailed(state, message) {
+  if (!state.optimize) return state;
+  return { ...state, optimize: { ...state.optimize, status: "error", plan: null, error: message } };
+}
+
+/** Close the plan panel. */
+export function closeOptimize(state) {
+  return { ...state, optimize: null };
+}
+
+/**
+ * Start an optimize job on a drive: the plan panel closes and the job starts in the
+ * progress view. Same as beginJob for the progress state.
+ * @param {AppState} state
+ * @param {string} driveId
+ */
+export function beginOptimize(state, driveId) {
+  return { ...beginJob(state, "optimize", 1), optimize: null, optimizeDriveId: driveId };
 }

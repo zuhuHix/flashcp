@@ -60,6 +60,32 @@ import {
   collisionText,
   pullSummaryText,
   applyPullRequest,
+  optimizeEstimate,
+  optimizePhaseText,
+  optimizeStepText,
+  progressIndeterminate,
+  optimizeSummaryText,
+  optimizeErrorView,
+  optimizeAction,
+  canOptimize,
+  optimizeEntryLabel,
+  clusterText,
+  optimizeClusterText,
+  optimizePlanMode,
+  optimizePlanView,
+  optimizeSpaceText,
+  shouldSuggestOptimize,
+  shouldShowOptimizeTip,
+  tipKey,
+  parseDismissed,
+  addDismissed,
+  openOptimize,
+  optimizePlanned,
+  optimizeFailed,
+  closeOptimize,
+  beginOptimize,
+  OPTIMIZE_RISK,
+  OPTIMIZE_RECOVERY_WARNING,
 } from "../logic.js";
 
 const exfat = (over = {}) => ({
@@ -428,6 +454,13 @@ describe("defaultSelection", () => {
     assert.equal(defaultSelection([exfat(), exfat({ id: "/x" })], null), null);
     assert.equal(defaultSelection([vfat()], null), null);
     assert.equal(defaultSelection([], null), null);
+  });
+  test("a lone blank stick is selected only while an optimize is pending", () => {
+    const blank = vfat({ id: "/blank", fsType: "", isExfat: false });
+    assert.equal(defaultSelection([blank], null, true), "/blank");
+    assert.equal(defaultSelection([blank], null, false), null);
+    assert.equal(defaultSelection([blank, exfat()], null, true), exfat().id);
+    assert.equal(defaultSelection([blank, vfat({ id: "/b2", fsType: "" })], null, true), null);
   });
 });
 
@@ -845,5 +878,299 @@ describe("applyPullRequest", () => {
     const s = baseState();
     assert.equal(applyPullRequest(s, null), s);
     assert.equal(applyPullRequest(s, "x"), s);
+  });
+});
+
+// ---- Optimize this stick -----------------------------------------------------
+
+const optPlan = (over = {}) => ({
+  files: 20000,
+  dirs: 900,
+  bytes: 169_000_000,
+  writeBytes: 169_000_000,
+  temp: "/home/zuhu/.cache/flashcp/optimize",
+  oldCluster: 32768,
+  newCluster: 4096,
+  label: "FAKEUSB",
+  resume: false,
+  alreadyOptimized: false,
+  needBytes: 1_200_000_000,
+  tempFree: 48_000_000_000,
+  enoughSpace: true,
+  ...over,
+});
+const near = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-6, `${actual} != ${expected}`);
+
+describe("optimizeEstimate", () => {
+  test("fresh plan: two reads, one write, per-file cost, fast and slow ends", () => {
+    const { lowSecs, highSecs } = optimizeEstimate(optPlan());
+    // fast: 2*169e6/100e6 + 169e6/60e6 + 20000*0.0002
+    near(lowSecs, 3.38 + 169 / 60 + 4);
+    // slow: 2*169e6/5e6 + 169e6/4e6 + 20000*0.002
+    near(highSecs, 67.6 + 42.25 + 40);
+    assert.ok(lowSecs < highSecs);
+  });
+  test("resume plan drops the copy read (one read of the data)", () => {
+    const fresh = optimizeEstimate(optPlan());
+    const resume = optimizeEstimate(optPlan({ resume: true }));
+    near(resume.lowSecs, 1.69 + 169 / 60 + 4);
+    near(resume.highSecs, 33.8 + 42.25 + 40);
+    assert.ok(resume.lowSecs < fresh.lowSecs && resume.highSecs < fresh.highSecs);
+    assert.ok(resume.lowSecs < resume.highSecs);
+  });
+  test("missing or invalid numbers count as zero", () => {
+    assert.deepEqual(optimizeEstimate({ bytes: NaN, writeBytes: -5, files: undefined }), { lowSecs: 0, highSecs: 0 });
+  });
+});
+
+describe("optimize phase and step text", () => {
+  test("each phase has its wording, unknown phases read Working", () => {
+    assert.equal(optimizePhaseText("pull"), "Copying the stick to this computer");
+    assert.equal(optimizePhaseText("verify"), "Checking the copy");
+    assert.equal(optimizePhaseText("build"), "Rebuilding the stick");
+    assert.equal(optimizePhaseText("check"), "Checking the stick");
+    assert.equal(optimizePhaseText("cleanup"), "Removing the temporary copy");
+    assert.equal(optimizePhaseText(null), "Working");
+    assert.equal(optimizePhaseText("constructor"), "Working");
+  });
+  test("step text reads Step n of m: phase", () => {
+    assert.equal(optimizeStepText({ phase: "build", step: 3, steps: 5 }), "Step 3 of 5: Rebuilding the stick…");
+    assert.equal(optimizeStepText({ phase: "check", step: null, steps: null }), "Checking the stick…");
+  });
+  test("a running optimize update shows its step in stageText", () => {
+    assert.equal(
+      stageText(upd({ op: "optimize", stage: "running", phase: "pull", step: 1, steps: 5 })),
+      "Step 1 of 5: Copying the stick to this computer…",
+    );
+  });
+  test("the progress fraction is per phase and cleanup is indeterminate", () => {
+    const verify = upd({ op: "optimize", stage: "running", phase: "verify", bytesDone: 50, planBytes: 200 });
+    assert.equal(progressFraction(verify), 0.25);
+    assert.equal(progressIndeterminate(verify), false);
+    assert.equal(progressIndeterminate(upd({ op: "optimize", stage: "running", phase: "cleanup", planBytes: 0 })), true);
+    assert.equal(progressIndeterminate(upd({ op: "optimize", stage: "running", phase: "build", planBytes: 0 })), true);
+    assert.equal(progressText(upd({ op: "optimize", phase: "cleanup", filesDone: 2, planFiles: 2 })), "");
+  });
+  test("add, build and pull progress wording is unchanged", () => {
+    assert.equal(progressIndeterminate(upd({ op: "add", planBytes: 0 })), false);
+    assert.equal(progressIndeterminate(upd({ op: "pull", phase: "cleanup", planBytes: 0 })), false);
+    assert.equal(stageText(upd({ op: "build", stage: "running", index: 0, total: 1 })), "Copying item 1 of 1…");
+    assert.equal(
+      progressText(upd({ op: "pull", phase: "cleanup", filesDone: 1, planFiles: 2, bytesDone: 0, planBytes: 10 })),
+      "1 of 2 files · 0 B of 10 B",
+    );
+  });
+});
+
+describe("optimize summary and error view", () => {
+  test("the finished line counts files with separators", () => {
+    assert.equal(
+      optimizeSummaryText({ files: 20000, bytes: 169_000_000, secs: 155, wallSecs: 170 }),
+      "Optimized: 20,000 files (169 MB) in 2 min 35 s.",
+    );
+    assert.equal(optimizeSummaryText({ files: 1, bytes: 500, secs: 3, wallSecs: 4 }), "Optimized: 1 file (500 B) in 3.00 s.");
+    assert.equal(optimizeSummaryText(null), "");
+  });
+  test("without recovery the message is a normal error and cannot resume", () => {
+    const v = optimizeErrorView({ stage: "error", op: "optimize", message: "Could not unmount the stick.", recovery: null });
+    assert.equal(v.message, "Could not unmount the stick.");
+    assert.equal(v.recovery, null);
+    assert.equal(v.warning, null);
+    assert.equal(v.canResume, false);
+    assert.equal(optimizeErrorView({ stage: "error", op: "optimize", message: null }).message, "Failed.");
+  });
+  test("with recovery: the text, the fixed warning, and resume is offered", () => {
+    const v = optimizeErrorView({
+      stage: "error",
+      op: "optimize",
+      message: "The stick was left half-built.",
+      recovery: "The verified copy is kept in /home/zuhu/.cache/flashcp/optimize.",
+    });
+    assert.equal(v.recovery, "The verified copy is kept in /home/zuhu/.cache/flashcp/optimize.");
+    assert.equal(v.warning, OPTIMIZE_RECOVERY_WARNING);
+    assert.match(v.warning, /say No\. Plug it back into this computer and choose Resume optimize here\./);
+    assert.equal(v.canResume, true);
+  });
+  test("recovery from a non-optimize job does not offer resume", () => {
+    assert.equal(optimizeErrorView({ stage: "error", op: "add", message: "x", recovery: "y" }).canResume, false);
+  });
+});
+
+describe("shouldSuggestOptimize", () => {
+  const coarse = (over = {}) => ({ files: 1000, bytes: 1000 * 256 * 1024, clusterBytes: 32768, ...over });
+  test("many small files on a coarse stick after an add", () => {
+    assert.equal(shouldSuggestOptimize("add", coarse()), true);
+  });
+  test("4096-byte clusters are not coarse", () => {
+    assert.equal(shouldSuggestOptimize("add", coarse({ clusterBytes: 4096 })), false);
+    assert.equal(shouldSuggestOptimize("add", coarse({ clusterBytes: null })), false);
+  });
+  test("999 files is not enough", () => {
+    assert.equal(shouldSuggestOptimize("add", coarse({ files: 999, bytes: 999 * 1000 })), false);
+  });
+  test("an average over 256 KiB is not enough", () => {
+    assert.equal(shouldSuggestOptimize("add", coarse({ bytes: 1000 * 256 * 1024 + 1 })), false);
+  });
+  test("only add jobs qualify, and a missing summary never does", () => {
+    for (const op of ["pull", "build", "optimize"]) assert.equal(shouldSuggestOptimize(op, coarse()), false);
+    assert.equal(shouldSuggestOptimize("add", null), false);
+  });
+});
+
+describe("optimize entry gates", () => {
+  test("a trusted exFAT drive with no job can be optimized", () => {
+    const s = baseState();
+    assert.equal(optimizeAction(s, false), "optimize");
+    assert.equal(canOptimize(s, false), true);
+  });
+  test("an untrusted drive, or a job in flight, cannot", () => {
+    assert.equal(optimizeAction(baseState({ drives: [exfat({ trusted: false })] }), false), null);
+    assert.equal(optimizeAction(baseState({ job: upd({ stage: "running", op: "add" }) }), false), null);
+    assert.equal(optimizeAction(baseState({ selectedId: null }), false), null);
+  });
+  test("a trusted drive with no filesystem offers resume only while one is pending", () => {
+    const blank = baseState({ drives: [exfat({ fsType: "", isExfat: false, label: "" })] });
+    assert.equal(optimizeAction(blank, true), "resume");
+    assert.equal(canOptimize(blank, true), true);
+    assert.equal(optimizeAction(blank, false), null);
+  });
+  test("a non-exFAT filesystem never offers resume", () => {
+    assert.equal(optimizeAction(baseState({ drives: [vfat({ trusted: true })], selectedId: "/org/block/sdy1" }), true), null);
+  });
+  test("entry labels", () => {
+    assert.equal(optimizeEntryLabel("optimize"), "Optimize this stick…");
+    assert.equal(optimizeEntryLabel("resume"), "Resume optimize…");
+    assert.equal(optimizeEntryLabel(null), "");
+  });
+});
+
+describe("optimize plan text", () => {
+  test("cluster sizes read in KB, and the line needs both", () => {
+    assert.equal(clusterText(32768), "32 KB");
+    assert.equal(clusterText(4096), "4 KB");
+    assert.equal(clusterText(512), "512 B");
+    assert.equal(optimizeClusterText(optPlan({ oldCluster: null })), null);
+    assert.equal(optimizeClusterText(optPlan()), "Cluster size: 32 KB → 4 KB");
+  });
+  test("space says what is needed, where, and what is free", () => {
+    assert.equal(
+      optimizeSpaceText(optPlan()),
+      "Needs 1.2 GB free on this computer (temporary copy in /home/zuhu/.cache/flashcp/optimize); 48.0 GB free.",
+    );
+    assert.equal(optimizeSpaceText(optPlan({ temp: null, tempFree: null })), "Needs 1.2 GB free on this computer; free space unknown.");
+  });
+  test("a ready plan lists what happens and offers one confirmation", () => {
+    const v = optimizePlanView(optPlan());
+    assert.equal(v.mode, "ready");
+    assert.equal(v.canConfirm, true);
+    assert.equal(v.confirmLabel, "Optimize this stick");
+    assert.equal(v.risk, OPTIMIZE_RISK);
+    assert.equal(v.risk, "This takes a while. Don't unplug the stick or put the computer to sleep until it says it's done.");
+    assert.equal(v.note, null);
+    assert.equal(v.error, null);
+    assert.ok(v.lines.some((l) => l.includes("Your files are copied to this computer and checked")));
+    assert.ok(v.lines.some((l) => l.startsWith("Kept:") && l.includes("modification times") && l.includes("FAKEUSB")));
+    assert.ok(v.lines.some((l) => l.startsWith("Lost:") && l.includes("access times")));
+    assert.ok(v.lines.some((l) => l.startsWith("Usually between ") && l.includes("slow USB 2 sticks take longest.")));
+    assert.ok(v.lines.includes("Cluster size: 32 KB → 4 KB"));
+  });
+  test("not enough space is refused: an error and no confirmation", () => {
+    const v = optimizePlanView(optPlan({ enoughSpace: false, tempFree: 300_000_000 }));
+    assert.equal(v.mode, "refused");
+    assert.equal(v.canConfirm, false);
+    assert.equal(v.risk, "");
+    assert.deepEqual(v.lines, []);
+    assert.match(v.error, /^Needs 1\.2 GB free on this computer/);
+  });
+  test("an already optimized stick only says so", () => {
+    const v = optimizePlanView(optPlan({ alreadyOptimized: true, enoughSpace: false }));
+    assert.equal(v.mode, "already");
+    assert.equal(v.canConfirm, false);
+    assert.equal(v.note, "This stick is already optimized. Nothing to do.");
+    assert.deepEqual(v.lines, []);
+    assert.equal(v.error, null);
+  });
+  test("a resume plan names the verified copy and uses the resume label", () => {
+    const v = optimizePlanView(optPlan({ resume: true }));
+    assert.equal(v.mode, "resume");
+    assert.equal(v.canConfirm, true);
+    assert.equal(v.confirmLabel, "Resume optimize");
+    assert.equal(
+      v.lines[0],
+      "An interrupted optimize of this stick was found. It will be finished from the verified copy in /home/zuhu/.cache/flashcp/optimize.",
+    );
+  });
+  test("a resume plan with no temp folder says the copy is on this computer", () => {
+    const v = optimizePlanView(optPlan({ resume: true, temp: null }));
+    assert.equal(v.lines[0], "An interrupted optimize of this stick was found. It will be finished from the verified copy on this computer.");
+  });
+  test("no plan, no view", () => {
+    assert.equal(optimizePlanView(null), null);
+    assert.equal(optimizePlanMode(optPlan({ enoughSpace: undefined })), "refused");
+  });
+});
+
+describe("optimize panel and job state", () => {
+  test("open, plan, fail and close", () => {
+    let s = openOptimize(baseState(), "/org/block/sdz1");
+    assert.deepEqual(s.optimize, { driveId: "/org/block/sdz1", status: "checking", plan: null, error: null });
+    s = optimizePlanned(s, optPlan());
+    assert.equal(s.optimize.status, "ready");
+    assert.equal(s.optimize.plan.files, 20000);
+    s = optimizeFailed(openOptimize(baseState(), "x"), "no place for the temporary copy");
+    assert.equal(s.optimize.status, "error");
+    assert.equal(s.optimize.error, "no place for the temporary copy");
+    assert.equal(closeOptimize(s).optimize, null);
+  });
+  test("a plan or failure without an open panel changes nothing", () => {
+    const s = baseState();
+    assert.equal(optimizePlanned(s, optPlan()), s);
+    assert.equal(optimizeFailed(s, "x"), s);
+  });
+  test("starting an optimize closes the panel and starts the job for that drive", () => {
+    const s = beginOptimize(openOptimize(baseState(), "/org/block/sdz1"), "/org/block/sdz1");
+    assert.equal(s.optimize, null);
+    assert.equal(s.optimizeDriveId, "/org/block/sdz1");
+    assert.equal(s.job.op, "optimize");
+    assert.equal(s.job.stage, "starting");
+    assert.equal(jobActive(s), true);
+  });
+  test("choosing another drive closes the optimize panel", () => {
+    const s = selectDrive(openOptimize(baseState(), "/org/block/sdz1"), vfat().id);
+    assert.equal(s.optimize, null);
+  });
+});
+
+describe("optimize tip and dismissal", () => {
+  const doneAdd = (over = {}) =>
+    upd({
+      stage: "done",
+      op: "add",
+      summary: { files: 4000, bytes: 400_000_000, secs: 20, wallSecs: 25, mountPoint: null, clusterBytes: 32768 },
+      ...over,
+    });
+  test("tip shows after a coarse add on exFAT, keyed by serial", () => {
+    assert.equal(tipKey(exfat()), "FAKE0001");
+    assert.equal(tipKey(exfat({ serial: "" })), "/org/block/sdz1");
+    assert.equal(shouldShowOptimizeTip(doneAdd(), exfat(), []), true);
+  });
+  test("dismissal hides it for that drive only", () => {
+    assert.equal(shouldShowOptimizeTip(doneAdd(), exfat(), ["FAKE0001"]), false);
+    assert.equal(shouldShowOptimizeTip(doneAdd(), exfat({ serial: "OTHER" }), ["FAKE0001"]), true);
+  });
+  test("no tip while running, without a coarse summary, or on a non-exFAT drive", () => {
+    assert.equal(shouldShowOptimizeTip(doneAdd({ stage: "running", summary: null }), exfat(), []), false);
+    assert.equal(shouldShowOptimizeTip(doneAdd({ summary: { ...doneAdd().summary, clusterBytes: 4096 } }), exfat(), []), false);
+    assert.equal(shouldShowOptimizeTip(doneAdd(), vfat(), []), false);
+  });
+  test("stored dismissals parse safely and add without duplicates", () => {
+    assert.deepEqual(parseDismissed('["A","B",3]'), ["A", "B"]);
+    assert.deepEqual(parseDismissed("not json"), []);
+    assert.deepEqual(parseDismissed(null), []);
+    assert.deepEqual(parseDismissed('{"A":1}'), []);
+    const list = ["A"];
+    assert.deepEqual(addDismissed(list, "A"), ["A"]);
+    assert.deepEqual(addDismissed(list, "B"), ["A", "B"]);
+    assert.deepEqual(list, ["A"]);
   });
 });
