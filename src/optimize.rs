@@ -635,7 +635,7 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
     let label = v.label.clone();
     let old_cs = v.cs;
     let (mut nodes, refs) = nodes_of(&t).map_err(untouched)?;
-    let p = choose_cluster(&mut nodes, &tgt, &build_opts(&label))
+    let (p, _why) = choose_cluster(&mut nodes, &tgt, &build_opts(&label))
         .context("flashcp build cannot lay out this data on the drive")
         .map_err(untouched)?;
     let already = in_layout(&v, &t, &nodes, &refs, &p, &tgt);
@@ -913,8 +913,9 @@ fn resume(
         })?;
     let (files, dirs, data) = (saved.files.len() as u64, saved.dirs.len() as u64, saved.bytes());
     // What a rebuild from the copy would write (a damaged copy fails later, with the hint).
-    let planned = scan_tree(&tree, &upcase_map())
-        .and_then(|mut n| choose_cluster(&mut n, &tgt, &build_opts(&st.label)).map(|p| (p.g.cluster, p.write_bytes)));
+    let planned = scan_tree(&tree, &upcase_map()).and_then(|mut n| {
+        choose_cluster(&mut n, &tgt, &build_opts(&st.label)).map(|(p, _)| (p.g.cluster, p.write_bytes))
+    });
     let (cluster, write_bytes) = planned.as_ref().map_or((0, 0), |x| *x);
     run.tick.emit(Event::Plan {
         op: Op::Optimize,
