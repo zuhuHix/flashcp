@@ -1,0 +1,98 @@
+name: Cross-OS
+
+# Builds flashcp volumes on Linux and checks that Windows (chkdsk) and macOS (fsck_exfat) accept
+# them, read every file back correctly and can write to them. See TESTING.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  images:
+    name: build images (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install exfatprogs
+        run: sudo apt-get update && sudo apt-get install -y exfatprogs
+      - run: cargo build --release --locked
+      - name: Build volumes, fsck.exfat + Linux mount + verify, wrap in MBR / VHD
+        run: scripts/xos/build_images.sh target/release/flashcp out
+      - uses: actions/upload-artifact@v4
+        with: { name: xos-prefix-auto, path: out/prefix-auto, retention-days: 3, compression-level: 1 }
+      - uses: actions/upload-artifact@v4
+        with: { name: xos-full-auto, path: out/full-auto, retention-days: 3, compression-level: 1 }
+      - uses: actions/upload-artifact@v4
+        with: { name: xos-prefix-4k, path: out/prefix-4k, retention-days: 3, compression-level: 1 }
+      - uses: actions/upload-artifact@v4
+        with: { name: xos-prefix-128k, path: out/prefix-128k, retention-days: 3, compression-level: 1 }
+      - uses: actions/upload-artifact@v4
+        with: { name: xos-prefix-1g, path: out/prefix-1g, retention-days: 3, compression-level: 1 }
+      - uses: actions/upload-artifact@v4
+        with: { name: xos-superfloppy, path: out/superfloppy, retention-days: 3, compression-level: 1 }
+
+  windows:
+    name: windows chkdsk (${{ matrix.vol }})
+    needs: images
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        vol: [prefix-auto, full-auto, prefix-4k, prefix-128k, prefix-1g, superfloppy]
+    # The superfloppy (no partition table) variant is report-only: it never fails the build.
+    continue-on-error: ${{ matrix.vol == 'superfloppy' }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: "xos-${{ matrix.vol }}", path: vol }
+      # A non-UTC zone makes a mishandled exFAT UTC-offset field show up as a 5:30 h mtime error.
+      - run: Set-TimeZone -Id "India Standard Time"; Get-TimeZone
+      - name: Attach, chkdsk, verify, write test, chkdsk, dismount
+        run: >
+          scripts/xos/win_check.ps1 -Vhd "vol/${{ matrix.vol }}.vhd" -Manifest vol/manifest.json
+          -Label "${{ matrix.vol }}" -LogDir logs ${{ matrix.vol == 'superfloppy' && '-Superfloppy' || '' }}
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: "logs-windows-${{ matrix.vol }}", path: logs, retention-days: 14 }
+
+  macos:
+    name: macos fsck_exfat (${{ matrix.vol }})
+    needs: images
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        vol: [prefix-auto, full-auto, prefix-4k, prefix-128k, prefix-1g, superfloppy]
+    continue-on-error: ${{ matrix.vol == 'superfloppy' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: "xos-${{ matrix.vol }}", path: vol }
+      - name: Use a non-UTC time zone
+        run: sudo ln -sf /usr/share/zoneinfo/Asia/Kolkata /etc/localtime && date
+      - name: Attach, fsck_exfat, mount, verify, write test, unmount, fsck_exfat
+        run: >
+          scripts/xos/mac_check.sh "vol/${{ matrix.vol }}.img" vol/manifest.json "${{ matrix.vol }}" logs
+          ${{ matrix.vol == 'superfloppy' && 'superfloppy' || '' }}
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: "logs-macos-${{ matrix.vol }}", path: logs, retention-days: 14 }
