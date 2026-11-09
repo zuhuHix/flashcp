@@ -183,3 +183,34 @@ fn sim_run_replays_a_trace_without_touching_it() {
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains(r#""profile":"sandisk""#) && s.contains(r#""profile":"msi""#), "{s}");
 }
+
+#[test]
+fn a_panicking_run_leaves_a_trace_that_is_rejected_by_default() {
+    let d = test_dir("sim_trace_panic");
+    let src = d.join("src");
+    gen_tiny(&src);
+    let (img, tr) = (d.join("v.img"), d.join("t.jsonl"));
+    make_image(&img, 64 << 20);
+    let out = flashcp()
+        .arg("build")
+        .arg(&src)
+        .arg(&img)
+        .arg("--yes-erase")
+        .arg("--trace")
+        .arg(&tr)
+        .env("FLASHCP_TEST_TRACE_PANIC_AFTER", "6")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the forced panic did not fail the run");
+    let t = fs::read_to_string(&tr).unwrap();
+    // The records before the panic were drained, then marked aborted (no clean end).
+    assert!(t.lines().filter(|l| l.contains(r#""ev":"io""#)).count() >= 1, "{t}");
+    assert!(t.contains(r#""ev":"aborted""#) && !t.contains(r#""ev":"end""#), "{t}");
+    let run = |extra: &[&str]| {
+        flashcp().args(["sim", "run"]).arg(&tr).args(["--profile", "sandisk"]).args(extra).output().unwrap()
+    };
+    let out = run(&[]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("truncated"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_success(&run(&["--allow-truncated"]), "sim run --allow-truncated");
+}

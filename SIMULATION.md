@@ -48,7 +48,8 @@ Which ops can overlap is part of the format:
 - Within a group, op k waits for op k − qd of the same group.
 - `seq` is the issuing code's own order. Racing threads may write lines of one group out of order, so the replay sorts by `seq`.
 - `i` is the global issue order: an atomic counter taken when the op is issued. Each thread buffers its records in its own buffer and writes them in 64 KB batches, so threads issuing I/O in parallel never wait for each other per op, and the reader restores the order from `i`. Timestamps are monotonic (`Instant`) and are taken around the syscall, outside any lock.
-- **Limits** (`src/sim/replay.rs`): the reader streams the file and refuses a line longer than 64 KB, more than 20 M events (≈1.2 GB in memory) or a file larger than 4 GiB, with a clear error. A 100k-file pull is ~100k events.
+- **Limits** (`src/sim/replay.rs`): the reader streams the file and refuses a line longer than 64 KB, more than 20 M events including notes (≈1.2 GB in memory), more than 16 MiB of retained note text, or a file larger than 4 GiB, with a clear error. A 100k-file pull is ~100k events.
+- **Truncation:** a run that panics drains every thread's buffer from a panic hook and ends the trace with an `aborted` record instead of `end`. Readers reject a trace without a clean `end` (a panic, a kill, a full disk); `flashcp sim run --allow-truncated` replays such a trace as far as it goes.
 
 The hooks sit in flashcp's own I/O layer:
 
