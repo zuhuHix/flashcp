@@ -4,7 +4,7 @@ import {FONT, MONO, Palette, PALETTES, Theme, ramp} from './shared';
 
 // 1200 x 640, 30 fps, 390 frames (13 s). Two pages in sequence with an eased slide:
 // the USB SSD, then the cheap USB 2.0 stick. Each page has its own seconds axis.
-// Every number comes from the measured table (never the PR #9 provisional ones).
+// Every number comes from the measured tables (README / merged PR bodies).
 const W = 1200;
 const H = 640;
 const X0 = 300; // x of 0 s
@@ -17,8 +17,8 @@ const PAGE2_T0 = 222;
 const FADE_A = 368;
 const FADE_B = 389;
 
-type Row = {name: string; sub: string; base: number; flash: number; baseLabel: string; flashLabel: string; pill: string};
-type Page = {title: string; axisMax: number; ticks: number[]; rows: Row[]; note: string; t0: number};
+type Row = {name: string; sub: string; base: number; baseMax?: number; flash: number; baseLabel: string; flashLabel: string; pill: string};
+type Page = {title: string; axisMax: number; xEnd?: number; ticks: number[]; rows: Row[]; note: string; t0: number};
 
 const PAGES: Page[] = [
   {
@@ -35,10 +35,12 @@ const PAGES: Page[] = [
   },
   {
     title: 'Cheap USB 2.0 stick (SanDisk Cruzer Blade, BOT) · 20k small files',
-    axisMax: 86.3,
-    ticks: [0, 20, 40, 60, 80],
+    axisMax: 179.6,
+    xEnd: 770,
+    ticks: [0, 50, 100, 150],
     rows: [
-      {name: 'build', sub: 'erase + format', base: 86.3, flash: 34.6, baseLabel: '86.3', flashLabel: '34.6', pill: '2.5×'},
+      // mkfs + cp varied from 110.4 s to 179.6 s across runs on this stick: drawn as a solid bar plus a faint range
+      {name: 'build', sub: 'erase + format', base: 110.4, baseMax: 179.6, flash: 33.6, baseLabel: '110.4–179.6', flashLabel: '33.6', pill: '3.3–5.3×'},
       {name: 'pull', sub: 'kernel-filled stick', base: 30.86, flash: 29.52, baseLabel: '30.86', flashLabel: '29.52', pill: '1.05× on par'},
       {name: 'pull', sub: 'flashcp-built stick', base: 32.78, flash: 16.38, baseLabel: '32.78', flashLabel: '16.38', pill: '2.0×'},
     ],
@@ -47,11 +49,10 @@ const PAGES: Page[] = [
   },
 ];
 
-const decimalsOf = (label: string) => (label.includes('.') ? label.split('.')[1].length : 0);
 
 const PageView: React.FC<{page: Page; f: number; P: Palette; fps: number}> = ({page, f: fAbs, P, fps}) => {
   const f = fAbs - page.t0;
-  const px = (X_END - X0) / page.axisMax;
+  const px = ((page.xEnd ?? X_END) - X0) / page.axisMax;
   return (
     <g>
       <text x={60} y={58} fontSize={28} fontWeight={700} fill={P.text}>
@@ -86,9 +87,8 @@ const PageView: React.FC<{page: Page; f: number; P: Palette; fps: number}> = ({p
         const pillW = Math.max(100, row.pill.length * 15 + 36);
         const pillCx = 1170 - pillW / 2;
         const pillCy = top + 40;
-        const cDec = decimalsOf(row.baseLabel);
-        const tDec = decimalsOf(row.flashLabel);
         const cLen = row.base * px * coralP;
+        const rLen = (row.baseMax ?? row.base) * px * coralP;
         const tLen = row.flash * px * tealP;
         return (
           <g key={r}>
@@ -99,9 +99,10 @@ const PageView: React.FC<{page: Page; f: number; P: Palette; fps: number}> = ({p
               {row.sub}
             </text>
 
+            {row.baseMax ? <rect x={X0} y={top} width={rLen} height={36} rx={4} fill={P.coral} opacity={0.35} /> : null}
             <rect x={X0} y={top} width={cLen} height={36} rx={4} fill={P.coral} />
             <text
-              x={X0 + cLen + 12}
+              x={X0 + rLen + 12}
               y={top + 26}
               fontFamily={MONO}
               fontSize={24}
@@ -109,7 +110,7 @@ const PageView: React.FC<{page: Page; f: number; P: Palette; fps: number}> = ({p
               opacity={ramp(coralP, 0.9, 1)}
               style={{fontVariantNumeric: 'tabular-nums'}}
             >
-              {`${row.base.toFixed(cDec)} s`}
+              {`${row.baseLabel} s`}
             </text>
 
             <rect x={X0} y={top + 44} width={tLen} height={36} rx={4} fill={P.teal} />
@@ -122,7 +123,7 @@ const PageView: React.FC<{page: Page; f: number; P: Palette; fps: number}> = ({p
               opacity={ramp(tealP, 0.9, 1)}
               style={{fontVariantNumeric: 'tabular-nums'}}
             >
-              {`${row.flash.toFixed(tDec)} s`}
+              {`${row.flashLabel} s`}
             </text>
 
             <g transform={`translate(${pillCx} ${pillCy}) scale(${pillScale}) translate(${-pillCx} ${-pillCy})`}>

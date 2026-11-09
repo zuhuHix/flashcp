@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>flashcp: fast small-file copies to and from USB drives</title>
-  <meta name="description" content="flashcp builds, adds to and pulls from exFAT USB drives as normal loose files. Measured up to 10.3x faster writes and 26.8x faster reads than mount + cp on a USB SSD under Linux; about 2-2.5x on a cheap USB 2.0 stick. Results vary by drive.">
+  <meta name="description" content="flashcp builds, adds to and pulls from exFAT USB drives as normal loose files. Measured up to 10.3x faster writes and 26.8x faster reads than mount + cp on a USB SSD under Linux; up to 5.7x on a cheap USB 2.0 stick. Results vary by drive.">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
   <script>
@@ -45,7 +45,7 @@
       <div class="hero-text">
         <p class="eyebrow">Rust CLI &middot; exFAT &middot; GPL-3.0-or-later</p>
         <h1>flashcp</h1>
-        <p class="pitch">Copy thousands of small files to and from USB drives as normal loose files. Measured up to 10.3&times; faster writes and up to 26.8&times; faster reads than <code>mount</code> + <code>cp</code> on a USB SSD under Linux, and up to 2.5&times; on a cheap USB 2.0 stick. Results vary by drive. <a href="#benchmarks">See the benchmarks</a>.</p>
+        <p class="pitch">Copy thousands of small files to and from USB drives as normal loose files. Measured up to 10.3&times; faster writes and up to 26.8&times; faster reads than <code>mount</code> + <code>cp</code> on a USB SSD under Linux, and up to 5.7&times; on a cheap USB 2.0 stick. Results vary by drive. <a href="#benchmarks">See the benchmarks</a>.</p>
 
         <div class="cta-row">
           <a class="btn btn-primary" href="https://github.com/zuhuHix/flashcp">GitHub repo</a>
@@ -60,6 +60,8 @@
           <pre class="command"><code>flashcp add ./photos /dev/sdX1</code></pre>
           <p class="cmd-label">Pull files off a drive</p>
           <pre class="command"><code>flashcp pull /dev/sdX1 ./photos-back</code></pre>
+          <p class="cmd-label">Make a stick that was filled file by file fast (files kept)</p>
+          <pre class="command"><code>flashcp optimize /dev/sdX1 --yes</code></pre>
         </div>
 
         <p class="safety" role="note">
@@ -81,7 +83,7 @@
       <p class="lede">
         Measured 2026-11-09 on Linux 7.0, medians of 3 runs, on an MSI DATAMAG 20Gbps USB SSD (UAS, 10&nbsp;Gb/s link, 1&nbsp;TB exFAT) and a SanDisk Cruzer Blade 8&nbsp;GB USB 2.0 stick.
         Each normal-copy baseline is the manual route: <code>mkfs.exfat</code> + <code>cp -r</code> + <code>sync</code> for build, and mount + <code>cp -r</code> + <code>sync</code> + unmount for add and pull. For build, flashcp times include its own formatting.
-        Shorter bars are faster. Cheap sticks vary a lot: the same mkfs + cp took 110&ndash;180&nbsp;s across runs.
+        Shorter bars are faster. Cheap sticks vary a lot: the same mkfs + cp took 110.4&nbsp;s in one run and 179.6&nbsp;s in another, so the stick's build baseline is shown as that range; single-run rows on the stick are labelled.
       </p>
 
       <div class="tabs" role="group" aria-label="Benchmark view">
@@ -159,8 +161,8 @@
         <h3>Two kinds of drives</h3>
         <div class="kinds">
           <div class="kind">
-            <p class="kind-title"><strong>Cheap USB 2.0 stick: about 2&ndash;2.5&times;</strong></p>
-            <p>The stick measured 6.5&nbsp;MB/s for sequential 8&nbsp;MB writes (2.5&nbsp;MB/s at 4&nbsp;KB) and about 11&nbsp;MB/s for sequential reads; a model fit puts its write ceiling at an estimated &asymp;6.9&nbsp;MB/s. The chip is the limit, so there flashcp gains about 2&ndash;2.5&times;, and pulling from a stick another system filled is on par with <code>cp</code>.</p>
+            <p class="kind-title"><strong>Cheap USB 2.0 stick: about 2&ndash;5&times;</strong></p>
+            <p>The stick measured 6.5&nbsp;MB/s for sequential 8&nbsp;MB writes (2.5&nbsp;MB/s at 4&nbsp;KB) and about 11&nbsp;MB/s for sequential reads; a model fit puts its write ceiling at an estimated &asymp;6.9&nbsp;MB/s. The chip is the limit, so there flashcp gains about 2&ndash;5&times; (build 3.3&ndash;5.3&times;, add 2.5&times;, or 5.7&times; after <code>optimize</code>). Pulling from a stick another system filled is on par with <code>cp</code> until you run <code>optimize</code> once. Big files don't get slower: a 512&nbsp;MB file copied onto an optimized stick in 86.0&nbsp;s, against 107.7&nbsp;s onto a mkfs-default one.</p>
           </div>
           <div class="kind">
             <p class="kind-title"><strong>Fast USB SSD: up to 26.8&times;</strong></p>
@@ -276,7 +278,7 @@
           <span class="step-num num">7</span>
           <div>
             <h3>What the speed council concluded</h3>
-            <p>A 10-agent speed council concluded that the next big win is not the drive's physics. It is not re-sending data you already copied. That is sync, which is planned.</p>
+            <p>A 10-agent speed council worked through the stick, and each fix was measured: pull reads now merge adjacent files and match the stick's maximum request size (1&nbsp;KB layout 39.5&nbsp;s to 15.9&nbsp;s, 4&nbsp;KB layout 22.1&nbsp;s to 16.6&nbsp;s), <code>optimize</code> reads the stick only once (81&ndash;103&nbsp;s), and the first copy onto an empty stick runs as a build (104.3&nbsp;s to 34.9&nbsp;s). Its conclusion: the next big win is not the drive's physics. It is not re-sending data you already copied. That is sync, which is planned.</p>
           </div>
         </li>
       </ol>
@@ -306,7 +308,8 @@
         <li><strong>exFAT only.</strong></li>
         <li><strong>Build erases the target.</strong> It writes a whole new volume over the device. Nothing on it survives.</li>
         <li><strong>Add refuses what it does not fully understand.</strong> Volumes that are TexFAT, dirty, or mounted are refused.</li>
-        <li><strong>Cheap sticks are chip-bound.</strong> Expect about 2&ndash;2.5&times; there, not the up to 26.8&times; of a fast SSD.</li>
+        <li><strong>Cheap sticks are chip-bound.</strong> Expect about 2&ndash;5&times; there, not the up to 26.8&times; of a fast SSD.</li>
+        <li><strong>Optimize needs local disk space</strong> for a full copy of the stick (never tmpfs or other volatile storage). If an optimize is interrupted, Windows may offer to format the stick: decline, and run the same optimize again on Linux.</li>
         <li><strong>Unmount first.</strong> The device must be unmounted for build and add. The desktop app handles that.</li>
       </ul>
     </div>
@@ -318,7 +321,7 @@
       <h2 id="roadmap-title">Roadmap</h2>
       <p class="lede">In no fixed order. No dates are promised.</p>
       <ul class="roadmap">
-        <li><span class="tag tag-review">In review</span> Automatic cluster size and <code>flashcp optimize</code>, which rewrites a stick into the fast layout without losing data.</li>
+        <li><span class="tag tag-shipped">Shipped</span> <code>flashcp optimize</code> (rewrites a stick into the fast layout, files kept: copy, verify, rebuild, verify; resumable), automatic cluster size, a per-device speed profile, the device-aware add gap policy, and the first copy onto an empty stick running as a build.</li>
         <li><span class="tag">Planned</span> <code>flashcp sync</code> and <code>pull --update</code>, so repeat copies take seconds.</li>
         <li><span class="tag tag-explore">Exploring</span> Drive mode: a native FUSE mount, so every app's copies get faster. A spike is running.</li>
         <li><span class="tag">Planned</span> Write-behind and one-click jobs.</li>
