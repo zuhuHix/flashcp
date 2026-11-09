@@ -69,6 +69,8 @@ struct Handle {
 struct State {
     target: PathBuf,
     vol: Vol,
+    /// Free clusters of `vol` (counting the bitmap per write was ~1 ms on a 1 TB volume).
+    vol_free: u64,
     uid: u32,
     gid: u32,
     // inode table: ino → key; key → ino. Never shrinks (spike).
@@ -225,7 +227,7 @@ impl State {
 
     fn free_bytes(&self) -> u64 {
         let cs = self.vol.cs;
-        (self.vol.free_clusters() * cs).saturating_sub(self.staged_bytes.div_ceil(cs) * cs)
+        (self.vol_free * cs).saturating_sub(self.staged_bytes.div_ceil(cs) * cs)
     }
 
     /// Registers a new staged object and the merge chain of its parents.
@@ -340,6 +342,7 @@ impl State {
         match r {
             Ok(s) => {
                 self.vol = open_vol(&self.target)?;
+                self.vol_free = self.vol.free_clusters();
                 for s in self.staged.values() {
                     if !s.is_dir {
                         let _ = fs::remove_file(&s.path);
@@ -370,6 +373,7 @@ impl State {
                 // The volume may have been partially written (phases before linking): re-read.
                 if let Ok(v) = open_vol(&self.target) {
                     self.vol = v;
+                    self.vol_free = self.vol.free_clusters();
                     self.clusters.clear();
                 }
                 Err(e)
@@ -986,6 +990,7 @@ pub fn mount(target: &Path, mountpoint: &Path, o: &MountOpts) -> Result<()> {
     fs::create_dir_all(&disk_dir)?;
     let st = State {
         target: target.to_path_buf(),
+        vol_free: vol.free_clusters(),
         vol,
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
