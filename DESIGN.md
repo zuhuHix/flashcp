@@ -15,7 +15,7 @@ no libfuse needed) serves the volume:
 - **Reads** of committed files go through the validating parser in `volume.rs`. Directories
   are parsed on first use. When a third file of one directory is opened for reading (a bulk
   copy, not browsing), the directory's remaining contiguous files are read in physical order
-  in a few large reads (runs up to 64 MB, gaps up to 1 MB read through, 256 MB cache cap).
+  in a few large reads (runs up to 64 MB, gaps up to 16 KB read through, 256 MB cache cap).
 - **Writes** create staged files: in `/dev/shm` (RAM) until 512 MB are staged, then in
   `~/.cache/flashcp/stage-<pid>`. Nothing on the device changes while data is staged.
 - **Commit**: the staged tree (new dirs and files, merged into existing directories) is handed to
@@ -28,6 +28,9 @@ no libfuse needed) serves the volume:
   only), statfs. Anything else gets fuser's ENOSYS; changing committed files gets EOPNOTSUPP.
 
 ### Missing in the spike (on purpose)
+
+- `flashcp mount` must run as a user that can open the device read-write (the uaccess ACL
+  on removable drives was enough for both test drives; no root needed).
 
 - Overwriting, appending to, truncating, renaming or deleting **committed** files and dirs
   (EOPNOTSUPP). Renaming a non-empty staged directory (EOPNOTSUPP).
@@ -96,7 +99,55 @@ opened) it is 1.4–1.9 s.
 
 ### USB devices
 
-DEVICE_PLACEHOLDER
+Interleaved on the real drives, wiped before every step, `flashcp gen --profile small`
+(5 rounds) and 20,000 empty files in one directory (3 rounds). Kernel = udisks mount of the
+kernel exfat driver; durable = cp + `sync -f` + unmount. Median (min–max), seconds.
+
+**MSI DATAMAG 20Gbps (UAS SSD, 1 TB partition)**
+
+| | kernel exfat | flashcp mount | gain |
+|---|---:|---:|---:|
+| `small`: cp returns | 0.57 (0.54–0.69) | 0.91 (0.75–1.00) | 0.62× (slower) |
+| `small`: **durable** | 1.83 (1.78–2.02) | **1.45 (1.28–1.55)** | **1.27×** |
+| `small`: durable via idle commit | — | 3.01 (2.91–3.22) | |
+| `small`: read back (cold) | 5.25 (4.95–5.46) | 4.37 (4.20–4.52) | 1.20× |
+| 20k files, one dir: cp returns | 17.62 (17.58–17.89) | 0.43 (0.38–0.54) | 41× |
+| 20k files, one dir: **durable** | 17.89 (17.86–18.17) | **0.51 (0.46–0.64)** | **35×** |
+
+**SanDisk Cruzer Blade (USB 2.0 BOT stick, 7.3 GB)**
+
+| | kernel exfat | flashcp mount | gain |
+|---|---:|---:|---:|
+| `small`: cp returns | 0.62 (0.52–0.92) | 0.85 (0.82–0.90) | 0.73× (slower) |
+| `small`: **durable** | 206 (127–247) | **132 (107–155)** | **1.56×** |
+| `small`: durable via idle commit | — | 109 (108–146) | 1.9× |
+| `small`: read back (cold) | 29.9 (29.1–30.4) | 52.9 (52.8–53.3) → 33–39 with a 16 KB gap | 0.57× → ~0.85× |
+| 20k files, one dir: cp returns | 17.44 (17.43–17.46) | 0.41 (0.40–0.46) | 43× |
+| 20k files, one dir: **durable** | 18.04 (18.00–18.10) | **0.68 (0.67–0.96)** | **27×** |
+
+Every flashcp run passed `fsck.exfat` and a byte-for-byte diff of the read-back. Both drives
+were left as empty exFAT ("MSI DATAMAG", "SANDISK"), mounted through udisks.
+
+Reading the numbers:
+
+- **Durable time is what improves**: 1.27× on the fast SSD, 1.56× (unmount) to 1.9× (idle
+  commit) on the stick. On the stick the commit is 106–154 s for 215 MB written, i.e. the
+  stick's own sequential write speed (the same bound `flashcp add`/`build` hit), against
+  127–247 s for the kernel's scattered writes.
+- **cp returns later** (0.85–0.91 s against 0.57–0.62 s): `cp` lands in the kernel's page
+  cache with the kernel driver, but pays ~18 µs per file of FUSE round trips with drive mode.
+  The user sees "done" sooner with the kernel, though the data is not on the drive.
+- **Big folders**: the kernel driver is quadratic in directory size; one folder of 20k files
+  takes ~18 s on either drive (CPU, not I/O). Drive mode is 27–43× faster there. Camera
+  folders, `node_modules`, and dataset dumps hit this.
+- **Reads**: 1.2× faster on the UAS SSD. On the BOT stick, reading through cluster slack
+  (32 KB clusters, 8 KB files: 3.7× the bytes) made readahead 1.8× *slower* than the kernel;
+  with a 16 KB gap it is 33–39 s against the kernel's 30 s. A real version should reuse
+  `pull`'s per-transport strategy (gap from a latency × bandwidth probe, several reads in
+  flight, O_DIRECT) instead of the spike's serial buffered reads.
+- A bug found only on the 1 TB drive: counting free space from the bitmap on every write cost
+  ~1 ms per write (cp took 17 s); the spike now caches the count. Large volumes need every
+  per-op path to be O(1).
 
 
 ## What full drive mode needs
@@ -119,7 +170,7 @@ DEVICE_PLACEHOLDER
    for exFAT USB partitions) plus a systemd user service that claims new devices and runs
    `flashcp mount` at `/media/$USER/LABEL`, so file managers still see a removable drive.
    Unprivileged access to the block device is needed (the uaccess ACL already gives it to the
-   seat user, which the spike used on images; the device ACLs `user:zuhu:rw` are present).
+   seat user; the spike mounted both test drives that way, without root).
    A fallback to the kernel driver for anything flashcp refuses (dirty volume, TexFAT, a
    damaged volume).
 4. **Eject guard / inhibitor.** "Eject" in Nemo must wait for the final commit:
@@ -155,7 +206,32 @@ DEVICE_PLACEHOLDER
 
 ## Recommendation
 
-RECOMMENDATION_PLACEHOLDER
+**Conditional GO, as an opt-in per drive, not (yet) as a replacement for the kernel driver.**
+
+The mechanism works and is safe: copies through the FUSE mount landed byte-for-byte, fsck was
+clean every time, and a SIGKILL mid-commit never damaged pre-existing files. The gains are
+real but moderate for ordinary trees (durable 1.27× on a fast SSD, 1.6–1.9× on a USB 2 stick)
+and very large for big folders (27–43×, where the kernel driver is quadratic). The costs:
+`cp` *returns* ~0.3 s later per 20k files (FUSE round trips), reads need `pull`'s tuning to
+beat the kernel on BOT sticks, and on a fast local disk the kernel driver wins outright.
+
+The deciding factor is scope, not speed: "every copy from any app" needs a complete,
+crash-ordered, read-write exFAT implementation in userspace (item 1 above) plus the eject
+guard and tray status (items 4–5), without which drive mode is *less* safe than today
+because `cp` returns before anything is on the drive. Suggested path:
+
+1. Ship drive mode as an opt-in "fast drive" toggle per drive (tray/GUI), using the spike's
+   architecture: new-file batches via add's engine, physical-order reads via pull's strategy.
+2. Before that ships: modify/delete/rename of committed objects with their own crash order
+   (slow path is fine; correctness first), an eject guard that commits before the unmount
+   completes, an inhibitor while data is staged, fsync/syncfs honored, and an fsck-based
+   fallback to the kernel driver for anything flashcp refuses.
+3. Make it the default only after it has survived a fuzzing/compatibility campaign (Windows
+   and macOS reading the result, power-cut tests on real sticks).
+
+If the owner does not want to own a userspace filesystem driver, the NO-GO alternative is
+to keep flashcp as an explicit tool (`add` / `pull` behind the existing "Fast copy to/from
+USB" file-manager entries), which already gets the sequential-write gain without the risk.
 
 ## Appendix: how the numbers were taken
 

@@ -105,8 +105,10 @@ struct State {
     dir_reads: HashMap<Key, u32>,
 }
 
-/// Readahead: files of one directory closer than RA_GAP on the device are read as one run.
-const RA_GAP: u64 = 1 << 20;
+/// Readahead: files of one directory closer than RA_GAP on the device are read as one run
+/// (16 KB: on a USB 2 stick with 32 KB clusters, reading through slack made reads 1.5x
+/// slower; `FLASHCP_RA_GAP_KB` overrides it for experiments).
+const RA_GAP: u64 = 16 << 10;
 const RA_RUN_MAX: u64 = 64 << 20;
 const RA_CAP: u64 = 256 << 20;
 const RA_TRIGGER: u32 = 3;
@@ -402,10 +404,12 @@ impl State {
             .filter(|&(a, _)| !self.ra.iter().any(|(o, b)| a >= *o && a < *o + b.len() as u64))
             .collect();
         spans.sort();
+        let gap =
+            std::env::var("FLASHCP_RA_GAP_KB").ok().and_then(|v| v.parse::<u64>().ok()).map_or(RA_GAP, |k| k << 10);
         let mut runs: Vec<(u64, u64)> = Vec::new();
         for (a, b) in spans {
             match runs.last_mut() {
-                Some(r) if a <= r.1 + RA_GAP && b - r.0 <= RA_RUN_MAX => r.1 = r.1.max(b),
+                Some(r) if a <= r.1 + gap && b - r.0 <= RA_RUN_MAX => r.1 = r.1.max(b),
                 _ => runs.push((a, b)),
             }
         }
