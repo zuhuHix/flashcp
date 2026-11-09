@@ -13,7 +13,8 @@ small programs run as root via pkexec. Source for both: `gui/helper/`.
 flashcp only writes to drives that an administrator explicitly trusted (by stable identity),
 that are currently attached over USB, that are idle, and that do not carry the running system.
 It only reads (`pull`, `info`) drives that pass the same checks. Files copied off a drive land
-only where the invoking user could write anyway.
+only where the invoking user could write anyway (for `optimize`, in the user's own
+`~/.cache/flashcp/optimize`).
 
 What this does not claim: that internal disks are unreachable. "Attached over USB" is a
 property of the kernel's device topology, not proof that a drive is external. An internal
@@ -138,6 +139,7 @@ flashcp-helper add   <dev> --expect <key> [--skip-existing] --item <src-dir> <to
 flashcp-helper build <dev> --expect <key> --confirm <text> [--label <L>] <src-dir>
 flashcp-helper info  <dev> --expect <key>
 flashcp-helper pull  <dev> --expect <key> [--from <rel>] [--skip-existing | --overwrite] <dest>
+flashcp-helper optimize <dev> --expect <key> [--dry-run]
 ```
 
 1. **Fixed argv shapes only.** Unknown ops and flags, duplicate flags, `--flag=value`, missing
@@ -145,7 +147,10 @@ flashcp-helper pull  <dev> --expect <key> [--from <rel>] [--skip-existing | --ov
    are refused, and so are `pull` with both `--skip-existing` and `--overwrite`, or without a
    destination. The helper builds every flashcp argv itself from the parsed values. Nothing is
    forwarded verbatim. `pull` always becomes `flashcp pull --target-fd 3 <dest> [--from <rel>]
-   [--skip-existing|--overwrite] --json`.
+   [--skip-existing|--overwrite] --json`. `optimize` takes no path and no other flag (no
+   `--temp`, `--temp-volatile-i-accept-data-loss`, `--force`); it always becomes `flashcp
+   optimize --target-fd 3 --temp <home>/.cache/flashcp/optimize --yes [--dry-run] --json`, see
+   "optimize: the temporary copy" below.
 2. **Value checks.** Sources must be absolute (so they never parse as a flag), at most 4096
    bytes, no NUL. Destinations start with `/`, have no `..` component and no control
    characters, and are at most 1024 bytes. `--label` is 1-15 characters with no control
@@ -158,7 +163,7 @@ flashcp-helper pull  <dev> --expect <key> [--from <rel>] [--skip-existing | --ov
    see "The pull destination" below for why nothing else is checked. `<dev>` is matched exactly,
    with no normalisation, so `/dev/../dev/sda`, `/dev/disk/by-id/...` and trailing spaces fail.
 3. **Open once.** `<dev>` is opened once per job: `O_RDWR|O_EXCL|O_NOFOLLOW|O_CLOEXEC` for
-   `add`/`build`, `O_RDONLY|O_EXCL|O_NOFOLLOW|O_CLOEXEC` for `pull`, `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`
+   `add`/`build`/`optimize` (its dry run too: flashcp requires a read-write fd for optimize), `O_RDONLY|O_EXCL|O_NOFOLLOW|O_CLOEXEC` for `pull`, `O_RDONLY|O_NOFOLLOW|O_CLOEXEC`
    for `info`. With `O_EXCL` the kernel refuses
    a device that is mounted or claimed exclusively (by LVM, md, dm), and keeps others from
    claiming it while the helper holds it. Every check below runs on this fd, and flashcp gets
@@ -227,6 +232,42 @@ code, or a process that takes the fd over, cannot modify the stick. It is still 
 - A read-only open does not make udev re-probe the device on close (that follows
   `IN_CLOSE_WRITE`), so a pull leaves no trace on the drive or in udev.
 
+### optimize: the temporary copy
+
+`optimize` copies the whole volume to a local directory, verifies it, erases and rebuilds the
+drive from it, verifies the drive and deletes the copy. While the drive is being rebuilt that
+copy is the only complete one, so where it lives matters for both safety and privacy.
+
+- **Who picks it: the helper, not the caller.** The request has no path in it. The helper
+  builds `<home>/.cache/flashcp/optimize` from the invoking user's **passwd** home directory
+  (the same `getpwuid_r` entry the privilege drop uses), never from argv or the environment
+  (pkexec scrubs it anyway, and `XDG_CACHE_HOME` is deliberately not honoured). A home that is
+  not absolute, is `/`, has `.`/`..`/empty components or control characters, or is over 3072
+  bytes is refused before the device is opened.
+- **Root never touches it.** Like the pull destination, the helper never stats, creates,
+  chowns or resolves that path; it is one argv string. flashcp creates it (`mkdir -p`, the job
+  directory itself `0700`) after the privilege drop, so the kernel applies the user's own
+  rights, and a symlink planted there can only lead to places the user could write anyway.
+  flashcp also refuses a job directory not owned by the user, one on the drive being
+  optimized, and one on a filesystem not known to be disk-backed (tmpfs, ramfs, overlayfs,
+  zram, network): the helper never passes `--temp-volatile-i-accept-data-loss`, so a home on
+  RAM makes the real run refuse instead of risking the only copy.
+- **Why the home and not `/var/tmp` (flashcp's own first default).** The copy is private (in
+  the user's home, under their quota, the job directory `0700`) instead of sitting in a shared
+  sticky directory; `systemd-tmpfiles` ages out `/var/tmp` and clears `/tmp`, but not
+  `~/.cache`; and the location is fixed, so every run of every drive, and above all every
+  resume, finds an interrupted job in the same place regardless of the session's environment.
+- **Resume is just the same request again.** flashcp detects an interrupted job in that
+  directory itself and only continues onto the very volume it was building (job id, geometry,
+  device identity), or onto the untouched original. The helper needs no extra mode and allows
+  no extra flag for it; a stick left without a filesystem passes the same device, idle and
+  trust checks as any other (none of them looks at the filesystem). A job started from the
+  command line with flashcp's default temp location is resumed from the command line.
+- **No typed confirmation.** Unlike `build`, `optimize` keeps the data, so the helper does not
+  require `--confirm`; the app asks for one click after showing the dry-run plan. Malware in
+  the session could start it (see Residual risks), which costs time and local disk space but
+  not the drive's files.
+
 ### The pull destination
 
 The destination is chosen by the user and is the only path in a helper request that points at
@@ -286,7 +327,16 @@ the process that holds the device.
   user's flashcp holds a read-only fd to the whole device, so it can read deleted-but-not-
   overwritten data on that drive too. The drive is one an administrator trusted and the user
   could usually mount anyway; the polkit authentication is the same as for a copy to it.
-- `add`, `pull`, `info` and the confirmation run parse an existing, untrusted exFAT volume. A malicious
+- **A compromised session can start an optimize.** Same preconditions as an erase. It keeps
+  the files (a verified copy is made first and the drive is checked against it), but it
+  rewrites the drive and needs free space in the user's home. An interrupted optimize leaves
+  the drive unreadable until it is resumed on this computer; Windows may offer to format it,
+  which would erase it while the only other copy is the one in `~/.cache/flashcp/optimize`.
+  The app says so in the plan and in every error that carries flashcp's recovery text.
+- **The temporary copy holds the drive's files in the user's home** until optimize finishes
+  (or, after a refused resume, until the user deletes it). They are files the user could
+  already read off the drive.
+- `add`, `pull`, `info`, `optimize` and the confirmation run parse an existing, untrusted exFAT volume. A malicious
   stick could exploit a flashcp parser bug, but only as the unprivileged user, with no new
   privileges.
 - Opening a device read-write (even one that is then refused) makes udev re-probe it when the

@@ -53,6 +53,46 @@ jobs:
       - name: UI tests
         working-directory: gui
         run: node --test "ui/tests/*.test.mjs"
+      - name: Helper argv smoke test (unprivileged, no device is opened)
+        working-directory: gui
+        run: |
+          set -eu
+          cargo build --locked -p flashcp-helper --bin flashcp-helper
+          helper=target/debug/flashcp-helper
+          # expect <exit code> <text in the JSON error line> <argv...>
+          expect() {
+            want="$1"; text="$2"; shift 2
+            set +e; out="$("$helper" "$@")"; code=$?; set -e
+            echo "flashcp-helper $* -> $code $out"
+            test "$code" -eq "$want" || { echo "::error::exit $code, expected $want: $*"; exit 1; }
+            case "$out" in *"$text"*) ;; *) echo "::error::missing \"$text\": $*"; exit 1 ;; esac
+          }
+          # Well-formed optimize requests parse, then stop at the root check.
+          expect 3 "must be started via pkexec" optimize /dev/sdb1 --expect SER1
+          expect 3 "must be started via pkexec" optimize /dev/sdb1 --expect SER1 --dry-run
+          # The temp dir and the dangerous flags can never come from the caller.
+          for extra in "--temp /tmp" "--temp-volatile-i-accept-data-loss" "--force" "--yes" "--json" \
+                       "--target-fd 5" "/home/u"; do
+            # shellcheck disable=SC2086
+            expect 3 "unexpected argument for optimize" optimize /dev/sdb1 --expect SER1 $extra
+          done
+          expect 3 "duplicate flag --dry-run" optimize /dev/sdb1 --expect SER1 --dry-run --dry-run
+          expect 3 "optimize requires --expect" optimize /dev/sdb1 --dry-run
+          expect 3 "device must look like" optimize /dev/nvme0n1 --expect SER1
+      - name: Packaging docs and fakes match the helper
+        run: |
+          set -eux
+          # Every op the helper accepts is documented in the security notes.
+          for op in add build info pull optimize; do
+            grep -qE "^flashcp-helper ${op} +<dev> --expect <key>" packaging/desktop/SECURITY-NOTES.md
+          done
+          grep -qF '.cache/flashcp/optimize' packaging/desktop/SECURITY-NOTES.md
+          # The dev/test fake CLI is a valid, executable shell script that speaks optimize.
+          test -x gui/tests/fake-flashcp
+          sh -n gui/tests/fake-flashcp
+          out="$(gui/tests/fake-flashcp optimize --target-fd 3 --temp /x --yes --dry-run --json)"
+          echo "$out" | grep -q '"event":"plan","op":"optimize"'
+          echo "$out" | tail -n1 | grep -q '"event":"done"'
       - name: Validate desktop entries
         run: |
           set -eux
@@ -138,6 +178,16 @@ jobs:
           for bin in flashcp-helper flashcp-trust; do
             grep -qE "^-rwxr-xr-x (root/root|0/0) .* (\./)?usr/libexec/$bin\$" contents.txt
           done
+          # The packaged helper knows optimize and refuses a caller-chosen temp dir.
+          mkdir pkg && dpkg-deb -x "$deb" pkg
+          set +e
+          ok="$(pkg/usr/libexec/flashcp-helper optimize /dev/sdb1 --expect S --dry-run)"; ok_code=$?
+          bad="$(pkg/usr/libexec/flashcp-helper optimize /dev/sdb1 --expect S --temp /tmp)"; bad_code=$?
+          set -e
+          test "$ok_code" -eq 3
+          echo "$ok" | grep -q "must be started via pkexec"
+          test "$bad_code" -eq 3
+          echo "$bad" | grep -q "unexpected argument for optimize"
           # The package must pull in the CLI.
           dpkg-deb -f "$deb" Depends | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -qx 'flashcp'
       - uses: actions/upload-artifact@v4
