@@ -557,7 +557,9 @@ fn mount_target_fd_inherited_from_helper() {
     drop(held);
 
     fsck_strict(Path::new(&dev));
-    let vol = read_back(Path::new(&dev));
+    // The test reader sizes its input with metadata().len() (0 for a block device), so read
+    // the backing image; flashcp's fsync on the loop device reached it.
+    let vol = read_back(&img);
     let mut want = read_source_tree(&src);
     want.extend(rebase(&read_source_tree(&more), "more/"));
     let more_dir = vol.tree.get("more").expect("more/ missing");
