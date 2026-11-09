@@ -155,9 +155,16 @@ enum Cmd {
         #[arg(long, value_name = "N")]
         target_fd: Option<i32>,
         /// Directory for the temporary copy (default: the first disk-backed one with room of
-        /// $FLASHCP_TMPDIR, /var/tmp, $TMPDIR or /tmp, $XDG_CACHE_HOME or ~/.cache)
+        /// $FLASHCP_TMPDIR, /var/tmp, $TMPDIR or /tmp, $XDG_CACHE_HOME or ~/.cache). It must be
+        /// on a disk filesystem: tmpfs, ramfs, overlayfs and unknown filesystems are refused
+        /// (see --temp-volatile-i-accept-data-loss). The copy is made read-only once pulled
         #[arg(long, value_name = "DIR")]
         temp: Option<PathBuf>,
+        /// Allow --temp on tmpfs, ramfs, overlayfs or a filesystem flashcp does not know to be
+        /// disk-backed. DANGER: the drive is erased while its only other copy is there, so a power
+        /// loss or crash during the rebuild LOSES THE STICK'S DATA
+        #[arg(long = "temp-volatile-i-accept-data-loss", requires = "temp")]
+        temp_volatile: bool,
         /// Only print the plan
         #[arg(long)]
         dry_run: bool,
@@ -369,7 +376,7 @@ fn run(cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Optimize { target, target_fd, temp, dry_run, yes, force, json } => {
+        Cmd::Optimize { target, target_fd, temp, temp_volatile, dry_run, yes, force, json } => {
             let target = spec(target, target_fd);
             anyhow::ensure!(
                 dry_run || yes,
@@ -377,7 +384,7 @@ fn run(cmd: Cmd) -> Result<()> {
                  changed. Pass --yes to confirm, or --dry-run to see the plan",
                 target.describe()
             );
-            let o = optimize::OptimizeOpts { temp, dry_run, force };
+            let o = optimize::OptimizeOpts { temp, dry_run, force, temp_volatile };
             let mut human = |e: &Event| match e {
                 Event::Plan { detail, .. } => println!("{detail}"),
                 Event::Phase { phase, step, steps, .. } => println!("[{step}/{steps}] {phase}"),

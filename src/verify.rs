@@ -179,6 +179,58 @@ fn hash_blocks(data: &[u8], k0: u64) -> u128 {
     data.chunks(BLOCK as usize).enumerate().fold(0u128, |a, (i, b)| a.wrapping_add(block_hash(b, k0 + i as u64)))
 }
 
+/// The hash of a file fed front to back in pieces of any length (what `build` reads for the
+/// device, so `optimize` can check the very bytes it writes against the manifest). Equal to
+/// what [`hash_tree`] computes for the same content.
+#[derive(Clone)]
+pub(crate) struct BlockSum {
+    /// Index of the block being filled.
+    k: u64,
+    part: [u8; BLOCK as usize],
+    plen: usize,
+    sum: u128,
+    pub(crate) len: u64,
+}
+
+impl Default for BlockSum {
+    fn default() -> Self {
+        BlockSum { k: 0, part: [0; BLOCK as usize], plen: 0, sum: 0, len: 0 }
+    }
+}
+
+impl BlockSum {
+    pub(crate) fn update(&mut self, mut d: &[u8]) {
+        self.len += d.len() as u64;
+        if self.plen > 0 {
+            let n = (BLOCK as usize - self.plen).min(d.len());
+            self.part[self.plen..self.plen + n].copy_from_slice(&d[..n]);
+            self.plen += n;
+            d = &d[n..];
+            if self.plen < BLOCK as usize {
+                return;
+            }
+            self.sum = self.sum.wrapping_add(block_hash(&self.part, self.k));
+            self.k += 1;
+            self.plen = 0;
+        }
+        let whole = d.len() / BLOCK as usize * BLOCK as usize;
+        self.sum = self.sum.wrapping_add(hash_blocks(&d[..whole], self.k));
+        self.k += (whole / BLOCK as usize) as u64;
+        let rest = &d[whole..];
+        self.part[..rest.len()].copy_from_slice(rest);
+        self.plen = rest.len();
+    }
+
+    /// (bytes fed, hash).
+    pub(crate) fn finish(&self) -> (u64, u128) {
+        let mut h = self.sum;
+        if self.plen > 0 {
+            h = h.wrapping_add(block_hash(&self.part[..self.plen], self.k));
+        }
+        (self.len, h)
+    }
+}
+
 /// Sum over the all-zero blocks of a file of `len` bytes from byte `valid` (ValidDataLength) on.
 /// The block holding `valid` itself (if it is mid-block) is not included: it is hashed with the
 /// extent that ends there, padded with zeros.
@@ -633,6 +685,24 @@ mod tests {
         assert_eq!(h, reference(&c));
         assert_eq!(zero_tail(0, 0), 0);
         assert_eq!(hash_extent(&content[..700], 0, 700), reference(&content[..700]));
+    }
+
+    #[test]
+    fn block_sum_in_any_pieces_matches_the_file_hash() {
+        let data: Vec<u8> = (0..5000u32).map(|i| (i * 31 + i / 7) as u8).collect();
+        let mut buf = vec![0u8; 1024];
+        let p = std::env::temp_dir().join(format!("flashcp-blocksum-{}", std::process::id()));
+        for len in [0usize, 1, 511, 512, 513, 1024, 4999, 5000] {
+            fs::write(&p, &data[..len]).unwrap();
+            let want = hash_file(&p, &mut buf, &Progress::default()).unwrap();
+            assert_eq!(want.1, reference(&data[..len]));
+            for step in [1usize, 7, 300, 512, 700, 4096] {
+                let mut s = BlockSum::default();
+                data[..len].chunks(step).for_each(|c| s.update(c));
+                assert_eq!(s.finish(), want, "len {len} step {step}");
+            }
+        }
+        fs::remove_file(&p).unwrap();
     }
 
     #[test]

@@ -1170,7 +1170,7 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
                     let take = (n.size - off).min(s.len);
                     match &mut cur.as_mut().unwrap().1 {
                         Cur::Data(d) => w.write(&d[off as usize..(off + take) as usize])?,
-                        Cur::Stream(f) => w.write_from(f, take)?,
+                        Cur::Stream(f) => w.write_from(f, take, None)?,
                     }
                     if off + take == n.size {
                         // Pad to the I/O alignment (or the policy's unit); the rest of the

@@ -17,16 +17,23 @@
 //! 1. **pull** into `<tmp>/tree` (synced), then `state=pulled`. The device is only read, and
 //!    only once: pull hashes every extent it reads (the very bytes it writes to the copy) into
 //!    the device's manifest (path, size, order-independent block hash, mtime; see
-//!    [`crate::verify`]).
+//!    [`crate::verify`]). The tree is then made read-only (files 0400, directories 0500; the
+//!    temp dir itself, which holds state, manifest and lock, is 0700), and stays so until the
+//!    cleanup (or a removal of the dir) gives the owner write permission back.
 //! 2. **verify**: that manifest must list exactly what the metadata walk of the device lists,
 //!    and equal the manifest of `<tmp>/tree` (hashed from the local disk); saved to
 //!    `<tmp>/manifest`, `state=verified`, all fsynced. Only if pull had to retry a device read
 //!    is the device's data read again for this (in physical order, with pull's planner and
 //!    strategy). Until here an error or crash leaves the device untouched, and the temp dir is
 //!    deleted (on a crash: by the next run).
-//! 3. **build**: re-scan the tree and run the cluster optimizer (fails before any write if
-//!    build would refuse), fsync `state=building`, then `build` onto the held target. `build`
-//!    marks the volume dirty until its very last write. From here until the check passes, the
+//! 3. **build**: re-scan the tree (it must list exactly the manifest) and run the cluster
+//!    optimizer (fails before any write if build would refuse), `syncfs` the temp filesystem
+//!    (copy, directories, modes, manifest), fsync `state=building`, then build onto the held
+//!    target with a [`Guard`]: every file is hashed as it is read for the device and must
+//!    match the manifest, or the build stops at once (the copy changed after it was verified:
+//!    the user is told to restore it and re-run). The main boot region is written last (zeros
+//!    until then; the backup boot region with our serial but an invalid checksum first), so
+//!    an interrupted build is never a mountable volume. From here until the check passes, the
 //!    verified temp copy is the copy; it is never deleted on error.
 //! 4. **check**: the device, re-parsed, must be a clean volume with the same label whose
 //!    manifest (read in physical order with pull's planner and strategy) equals
@@ -42,8 +49,9 @@
 //! partition's start sector; for an image its inode) and resumes: no state, `pulled` or
 //! `verified` (device never written) or `done` (checked) → the dir is discarded and a fresh run
 //! starts. `building` → judged by the raw boot sector:
-//! - our saved serial (main or backup boot sector): a dirty / unparsable volume is our
-//!   half-written build → re-verify the temp tree against the manifest and rebuild; a clean one
+//! - our saved serial (main or backup boot sector): a dirty / unparsable volume (a zeroed main
+//!   boot sector) is our half-written build → re-verify the temp tree against the manifest and
+//!   rebuild; a clean one
 //!   whose manifest equals the saved one is the finished build → clean up; a clean one with
 //!   other content was written since → refused.
 //! - the original boot sector (flags aside), clean, content equal to the manifest: the build
@@ -52,13 +60,14 @@
 //! - anything else (another filesystem, another exFAT volume, another card) → refused.
 //!
 //! A refusal keeps the temp dir and explains what is where; user data is never erased
-//! automatically. Image targets are re-checked for a loop device right before the build and
+//! automatically. An explicit `--temp` on a filesystem that may not survive a power loss
+//! (tmpfs, ramfs, overlayfs, unknown) is refused unless `--temp-volatile-i-accept-data-loss`. Image targets are re-checked for a loop device right before the build and
 //! the check (loop devices ignore our flock).
 
 use crate::events::{Event, Op, Sink, Ticker};
 use crate::exfat::{
-    BuildOpts, FatMode, FlagGuard, Node, SECTOR, SYS_BLOCK, Target, TargetSpec, build_target, choose_cluster,
-    related_devs, scan_tree, set_direct, upcase_map, usable_bytes, validate_name,
+    BuildOpts, FatMode, FlagGuard, Guard, Node, SECTOR, SYS_BLOCK, SourceChanged, Target, TargetSpec,
+    build_target_guarded, choose_cluster, related_devs, scan_tree, set_direct, upcase_map, usable_bytes, validate_name,
 };
 use crate::pull::{PullOpts, Strategy, pull_file_hashed, read_strategy};
 use crate::util::human_bytes;
@@ -127,6 +136,9 @@ pub struct OptimizeOpts {
     pub dry_run: bool,
     /// Rebuild even if the volume is already in the flashcp layout.
     pub force: bool,
+    /// Allow an explicit `temp` on a filesystem that may not survive a power loss (tmpfs,
+    /// ramfs, overlayfs, unknown): a power loss or crash during the rebuild then loses the data.
+    pub temp_volatile: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -396,11 +408,21 @@ fn not_disk_backed(t: i64) -> Option<String> {
     }
 }
 
+/// Flag that allows an explicit --temp on a filesystem not known to be disk-backed.
+pub const VOLATILE_FLAG: &str = "--temp-volatile-i-accept-data-loss";
+
 /// Picks the first candidate that is disk-backed (one of [`DISK_FS`]; tmpfs, overlayfs, zram
 /// and the like may be gone after a power loss while the drive is erased; allowed only when
-/// given explicitly), not on the drive being optimized, writable, and has `need` bytes free.
-/// Lists every rejection otherwise.
-fn pick_base(cands: &[(PathBuf, bool)], need: u64, avoid: &[String], what: &str) -> Result<PathBuf> {
+/// given explicitly AND `volatile` (or for a dry run, with a warning), not on the drive being
+/// optimized, writable, and has `need` bytes free. Lists every rejection otherwise.
+fn pick_base(
+    cands: &[(PathBuf, bool)],
+    need: u64,
+    avoid: &[String],
+    what: &str,
+    volatile: bool,
+    dry_run: bool,
+) -> Result<PathBuf> {
     let explicit = cands.len() == 1 && cands[0].1;
     let mut why = Vec::new();
     for (p, create) in cands {
@@ -421,8 +443,17 @@ fn pick_base(cands: &[(PathBuf, bool)], need: u64, avoid: &[String], what: &str)
                 && !explicit
             {
                 return Ok(Err(format!(
-                    "{why}: the copy could be lost on a power loss while the drive is rebuilt; pass it with --temp \
-                     to use it anyway"
+                    "{why}: the copy could be lost on a power loss while the drive is rebuilt (only an explicit \
+                     --temp DIR with {VOLATILE_FLAG} can use it)"
+                )));
+            }
+            if let Some(why) = &ram
+                && !volatile
+                && !dry_run
+            {
+                return Ok(Err(format!(
+                    "{why}: a power loss or crash while the drive is rebuilt would lose this copy, and with it the \
+                     drive's data; use a directory on a disk, or add {VOLATILE_FLAG} to accept that risk"
                 )));
             }
             let c = CString::new(at.as_os_str().as_bytes())?;
@@ -435,8 +466,10 @@ fn pick_base(cands: &[(PathBuf, bool)], need: u64, avoid: &[String], what: &str)
             }
             if let Some(why) = ram {
                 eprintln!(
-                    "warning: {} {why}: if the power fails while the drive is rebuilt, the copy may be lost",
-                    p.display()
+                    "warning: {} {why}: if the power fails or the computer crashes while the drive is rebuilt, the \
+                     copy and with it the drive's data are lost{}",
+                    p.display(),
+                    if volatile { String::new() } else { format!(" (a real run refuses it without {VOLATILE_FLAG})") }
                 );
             }
             Ok(Ok(()))
@@ -469,6 +502,105 @@ fn check_ours(p: &Path) -> Result<()> {
         "{} exists but is not a directory owned by you; remove it (or pass --temp elsewhere) and run again",
         p.display()
     );
+    Ok(())
+}
+
+// ───────────────────────── the copy is read-only ─────────────────────────
+
+/// Makes the copy in `tree` read-only (files 0400, directories 0500, the tree itself too), so
+/// that nothing changes it by accident between verify and the rebuild (the build still hashes
+/// every byte it reads, see [`crate::exfat::Guard`]). Only regular files and directories are
+/// allowed in it. The temp dir above it stays 0700 (it holds the state file).
+fn seal(tree: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut stack = vec![tree.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).with_context(|| format!("read directory {}", d.display()))? {
+            let p = e.with_context(|| format!("read directory {}", d.display()))?.path();
+            let md = fs::symlink_metadata(&p).with_context(|| format!("stat {}", p.display()))?;
+            if md.is_dir() {
+                stack.push(p);
+            } else if md.is_file() {
+                fs::set_permissions(&p, fs::Permissions::from_mode(0o400))
+                    .with_context(|| format!("make {} read-only", p.display()))?;
+            } else {
+                bail!("{} is neither a regular file nor a directory", p.display());
+            }
+        }
+        // After its entries were listed (0500 still allows listing and reading).
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o500))
+            .with_context(|| format!("make {} read-only", d.display()))?;
+    }
+    Ok(())
+}
+
+/// Gives the owner write permission again on everything in `tree` (before it is deleted).
+/// A missing tree is fine; symlinks (which [`seal`] never leaves) are not followed.
+fn unseal(tree: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut stack = vec![tree.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let md = match fs::symlink_metadata(&d) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            r => r.with_context(|| format!("stat {}", d.display()))?,
+        };
+        if !md.is_dir() {
+            continue;
+        }
+        // Before its entries are listed (a dir without u+rx could not be).
+        fs::set_permissions(&d, fs::Permissions::from_mode(md.mode() & 0o7777 | 0o700))
+            .with_context(|| format!("make {} writable", d.display()))?;
+        for e in fs::read_dir(&d).with_context(|| format!("read directory {}", d.display()))? {
+            let p = e.with_context(|| format!("read directory {}", d.display()))?.path();
+            let md = fs::symlink_metadata(&p).with_context(|| format!("stat {}", p.display()))?;
+            if md.is_dir() {
+                stack.push(p);
+            } else if md.is_file() {
+                fs::set_permissions(&p, fs::Permissions::from_mode(md.mode() & 0o7777 | 0o600))
+                    .with_context(|| format!("make {} writable", p.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Deletes a temp dir (its tree read-only or not).
+fn remove_temp(tmp: &Path) -> Result<()> {
+    unseal(&tmp.join("tree"))?;
+    fs::remove_dir_all(tmp).with_context(|| format!("remove {}", tmp.display()))
+}
+
+/// How to delete a kept copy by hand.
+fn rm_hint(tmp: &Path) -> String {
+    format!("`chmod -R u+w {0} && rm -rf {0}`; the copy is read-only", tmp.display())
+}
+
+/// Test hook: changes the first byte of `<tree>/<rel>`, keeping its size, mode and mtime (so
+/// only the contents differ from the manifest), like another process could.
+const TAMPER_ENV: &str = "FLASHCP_TEST_OPTIMIZE_TAMPER";
+
+fn tamper(tree: &Path, rel: &str) {
+    use std::os::unix::fs::{FileExt, PermissionsExt};
+    let p = tree.join(rel);
+    let md = fs::metadata(&p).expect("tamper: stat");
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).expect("tamper: chmod");
+    let f = fs::OpenOptions::new().read(true).write(true).open(&p).expect("tamper: open");
+    let mut b = [0u8];
+    f.read_exact_at(&mut b, 0).expect("tamper: read");
+    f.write_all_at(&[b[0] ^ 0x5A], 0).expect("tamper: write");
+    f.set_modified(md.modified().expect("tamper: mtime")).expect("tamper: set mtime");
+    drop(f);
+    fs::set_permissions(&p, md.permissions()).expect("tamper: chmod back");
+}
+
+/// Writes every dirty page of the temp dir's filesystem (the copy, its directories and modes,
+/// the manifest) to disk. Called before anything on the device is erased.
+fn sync_temp(tmp: &Path) -> Result<()> {
+    let d = File::open(tmp).with_context(|| format!("open {}", tmp.display()))?;
+    crate::dirfd::syncfs(std::os::fd::AsFd::as_fd(&d)).with_context(|| format!("syncfs {}", tmp.display()))?;
+    if std::env::var_os(TRACE_READS_ENV).is_some() {
+        eprintln!("flashcp-temp-synced");
+    }
     Ok(())
 }
 
@@ -793,7 +925,7 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
             _ => {
                 // The device was never written by that run (or the run finished and checked).
                 eprintln!("note: discarding {} from an earlier run (the drive was not changed by it)", dir.display());
-                fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display())).map_err(untouched)?;
+                remove_temp(&dir).map_err(untouched)?;
             }
         }
     }
@@ -869,7 +1001,7 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
         return Ok(stats);
     }
     let need = data + (files + dirs) * PER_ENTRY + MARGIN;
-    let base = pick_base(&cands, need, &avoid, &what).map_err(untouched)?;
+    let base = pick_base(&cands, need, &avoid, &what, o.temp_volatile, o.dry_run).map_err(untouched)?;
     let tmp = base.join(temp_name(&key));
     let detail = format!(
         "optimize: {files} files, {dirs} dirs, {} of data on {what} (label {label:?}, cluster {}) → rebuilt as one \
@@ -925,6 +1057,9 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
             std::os::unix::fs::FileExt::read_exact_at(&f, &mut b, 0)?;
             std::os::unix::fs::FileExt::write_all_at(&f, &[b[0] ^ 0xFF], 0)?;
         }
+        // Read-only from here on, before it is hashed: what verify proves is what the build
+        // reads (which hashes it again as it reads it).
+        seal(&tree)?;
         save_state(&tmp, &State { phase: Phase::Pulled, ..st.clone() })?;
         hook("pull")?;
 
@@ -981,7 +1116,7 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
     let manifest = match copied {
         Ok(m) => m,
         Err(e) => {
-            let _ = fs::remove_dir_all(&tmp);
+            let _ = remove_temp(&tmp);
             return Err(e.context(format!(
                 "optimize stopped before writing anything: your data on {what} is untouched (the temporary copy \
                  in {} was deleted)",
@@ -1015,16 +1150,29 @@ fn rebuild(
     let hint = || recovery(what, tmp, base, &st.label, ctx.fd);
     let tree = tmp.join("tree");
     run.phase("build");
-    // Re-scan the copy exactly as build will, and plan it, before the device is touched.
-    let prepared = (|| -> Result<Vec<Node>> {
+    // Re-scan the copy exactly as build will, check that it lists exactly the manifest, plan
+    // it, and put the copy (data, directories, modes, manifest) on disk, all before the device
+    // is touched.
+    let prepared = (|| -> Result<(Vec<Node>, Expected)> {
+        seal(&tree)?; // (already, unless a resumed copy predates it)
         let mut nodes = scan_tree(&tree, &upcase_map()).context("scan the temporary copy")?;
+        let (listed, expect) = expected(&nodes, &tree, manifest)?;
+        let d = manifest.without_hashes().diff(&listed, "the manifest", "the temporary copy");
+        ensure!(
+            d.is_empty(),
+            "the temporary copy {} no longer lists what was verified ({} differences): {}",
+            tree.display(),
+            d.len(),
+            first_diffs(&d)
+        );
         choose_cluster(&mut nodes, &tgt, &build_opts(&st.label, None)).context("plan the rebuild")?;
-        Ok(nodes)
+        sync_temp(tmp)?;
+        Ok((nodes, expect))
     })();
-    let nodes = match prepared {
+    let (nodes, expect) = match prepared {
         Ok(n) => n,
         Err(e) if fresh => {
-            let _ = fs::remove_dir_all(tmp);
+            let _ = remove_temp(tmp);
             return Err(e.context(format!(
                 "optimize stopped before writing anything: your data on {what} is untouched (the temporary copy \
                  was deleted)"
@@ -1033,15 +1181,53 @@ fn rebuild(
         Err(e) => return Err(e.context(hint())),
     };
     if fresh && let Err(e) = save_state(tmp, &State { phase: Phase::Building, ..st.clone() }) {
-        let _ = fs::remove_dir_all(tmp);
+        let _ = remove_temp(tmp);
         return Err(e.context(format!("optimize stopped before writing anything: your data on {what} is untouched")));
     }
     // From here on the verified copy in <tmp> is never deleted until the check passes.
     hook("building").map_err(|e| e.context(hint()))?;
     not_looped(ctx, "build").map_err(|e| e.context(hint()))?;
+    // Test hook: change the copy now ("REL"), or after N files went to the device ("N:REL").
+    let tampering = std::env::var(TAMPER_ENV).ok();
+    let (tamper_after, tamper_rel) = match tampering.as_deref().map(|t| t.split_once(':')) {
+        Some(Some((n, rel))) => (n.parse::<usize>().ok(), Some(rel.to_string())),
+        Some(None) => (None, tampering.clone()),
+        None => (None, None),
+    };
+    if let (None, Some(rel)) = (tamper_after, &tamper_rel) {
+        tamper(&tree, rel);
+    }
+    let after_file: Option<Box<dyn FnMut(usize)>> = match (tamper_after, tamper_rel) {
+        (Some(n), Some(rel)) => {
+            let tree = tree.clone();
+            Some(Box::new(move |k| {
+                if k == n {
+                    tamper(&tree, &rel)
+                }
+            }))
+        }
+        _ => None,
+    };
+    if std::env::var_os(TRACE_READS_ENV).is_some() {
+        eprintln!("flashcp-device-write");
+    }
     set_direct(&tgt.file, tgt.direct);
-    build_target(nodes, tgt, &build_opts(&st.label, Some(st.serial)), &mut forward(&mut run.tick))
-        .map_err(|e| e.context(hint()))?;
+    let guard = Guard { expect, after_file };
+    build_target_guarded(nodes, tgt, &build_opts(&st.label, Some(st.serial)), &mut forward(&mut run.tick), Some(guard))
+        .map_err(|e| match e.downcast_ref::<SourceChanged>() {
+            Some(SourceChanged(p)) => {
+                let rel = p.strip_prefix(&tree).unwrap_or(p).display().to_string();
+                e.context(format!(
+                    "the temporary copy in {} changed after it was verified ({rel}); the rebuild of {what} was \
+                     stopped and left unfinished (not mountable). The copy was NOT deleted: restore it, then re-run \
+                     `flashcp optimize` (it resumes), or copy it back with `flashcp add {} {}` after formatting",
+                    tmp.display(),
+                    tree.display(),
+                    if ctx.fd { "<target>" } else { what.as_str() }
+                ))
+            }
+            None => e.context(hint()),
+        })?;
     hook("build").map_err(|e| e.context(hint()))?;
 
     run.phase("check");
@@ -1072,6 +1258,30 @@ fn rebuild(
     Ok(std::mem::take(&mut run.phases))
 }
 
+/// Per node: (size, hash) its content must have.
+type Expected = Vec<(u64, u128)>;
+
+/// The listing of the scanned copy (hashes 0) and, per node, the (size, hash) the manifest
+/// says its content must have (directories: (0, 0)).
+fn expected(nodes: &[Node], tree: &Path, m: &Manifest) -> Result<(Manifest, Expected)> {
+    let mut listed = Manifest::default();
+    let mut expect = Vec::with_capacity(nodes.len());
+    for n in nodes {
+        let rel = n.src.strip_prefix(tree).context("scanned path outside the copy")?;
+        let rel = rel.to_str().ok_or_else(|| anyhow!("{}: name is not UTF-8", n.src.display()))?.to_string();
+        if rel.is_empty() {
+            expect.push((0, 0)); // the root
+        } else if n.is_dir {
+            listed.dirs.insert(rel, Some(n.mtime));
+            expect.push((0, 0));
+        } else {
+            expect.push(m.files.get(&rel).map_or((u64::MAX, 0), |f| (f.len, f.hash)));
+            listed.files.insert(rel, crate::verify::FileSum { len: n.size, hash: 0, mtime: Some(n.mtime) });
+        }
+    }
+    Ok((listed, expect))
+}
+
 /// state=done first (a crash from here on is "finished"), then the tree, the manifest, the
 /// state file and the directory.
 fn cleanup(tmp: &Path) -> Result<()> {
@@ -1079,6 +1289,7 @@ fn cleanup(tmp: &Path) -> Result<()> {
     save_state(tmp, &State { phase: Phase::Done, ..st })?;
     let tree = tmp.join("tree");
     if tree.exists() {
+        unseal(&tree)?;
         fs::remove_dir_all(&tree).with_context(|| format!("remove {}", tree.display()))?;
     }
     hook("cleanup")?;
@@ -1177,13 +1388,15 @@ fn resume(
     let s0 = read_raw(&ctx.held, 0, 4096.min(ctx.dev_len));
     let bps = if is_exfat(&s0) && (9..=12).contains(&s0[108]) { 1usize << s0[108] } else { SECTOR as usize };
     let original = is_exfat(&s0) && s0.len() >= bps && fingerprint(&s0[..bps]) == st.orig;
-    // build writes the main and the backup boot sector (12 × 512 bytes in) first; either one
-    // with our serial means our build had started.
+    // build writes the backup boot sector (12 × 512 bytes in) first, and the main one last
+    // (zeros until then): either one with our serial means our build had started.
     let backup = read_raw(&ctx.held, 12 * SECTOR, SECTOR);
     let ours = [&s0, &backup].iter().any(|s| is_exfat(s) && serial_of(s) == st.serial);
     let keep = format!(
-        "The temporary copy in {} is kept; it holds the files as they were when that optimize started",
-        tmp.display()
+        "The temporary copy in {} is kept; it holds the files as they were when that optimize started (to delete \
+         it: {})",
+        tmp.display(),
+        rm_hint(tmp)
     );
     match walked {
         Ok((v, t)) if original || ours => {
@@ -1239,8 +1452,8 @@ fn resume(
              written to, after the interrupted optimize made its copy, so the drive may hold newer data than the \
              copy. flashcp will not erase it. Plug it into a computer, let it check the drive (or run fsck.exfat), \
              eject it safely, and run optimize again: if its files are unchanged it continues, otherwise keep the \
-             drive and delete the stale copy {}",
-            tmp.display()
+             drive and delete the stale copy ({})",
+            rm_hint(tmp)
         ),
         _ => bail!(
             "{what} holds neither the original volume nor the one the interrupted optimize was writing (reformatted, \
@@ -1254,6 +1467,7 @@ fn resume(
     }
     planned.with_context(hint)?;
     run.phase("verify");
+    seal(&tree).with_context(hint)?;
     let local = hash_local(run, &tree).with_context(hint)?;
     let d = saved.diff(&local, "the saved manifest", "the temporary copy");
     ensure!(

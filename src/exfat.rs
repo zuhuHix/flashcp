@@ -676,12 +676,21 @@ impl SeqWriter {
         }
         Ok(())
     }
-    /// Read a file straight into the I/O buffers (no intermediate copy).
-    pub(crate) fn write_from(&mut self, f: &mut File, mut left: u64) -> Result<()> {
+    /// Read a file straight into the I/O buffers (no intermediate copy). With `sum`, every byte
+    /// read is also hashed (see [`crate::verify::BlockSum`]).
+    pub(crate) fn write_from(
+        &mut self,
+        f: &mut File,
+        mut left: u64,
+        mut sum: Option<&mut crate::verify::BlockSum>,
+    ) -> Result<()> {
         while left > 0 {
             let n = self.room().min(left as usize);
             let dst = &mut self.buf.as_mut()[self.fill..self.fill + n];
             f.read_exact(dst)?;
+            if let Some(s) = sum.as_deref_mut() {
+                s.update(dst);
+            }
             self.fill += n;
             left -= n as u64;
             if self.at_boundary() {
@@ -719,6 +728,14 @@ impl SeqWriter {
             Some(Ok(Err(e))) => e,
             Some(Err(_)) => anyhow::anyhow!("I/O thread panicked"),
             Some(Ok(Ok(()))) | None => anyhow::anyhow!("I/O thread stopped"),
+        }
+    }
+    /// Stops without writing what is still buffered; waits until the I/O thread has finished
+    /// the writes already handed to it, so nothing reaches the device after this returns.
+    pub(crate) fn abandon(mut self) {
+        drop(self.tx.take());
+        if let Some(h) = self.io.take() {
+            let _ = h.join();
         }
     }
     pub(crate) fn finish(mut self) -> Result<u64> {
@@ -1242,8 +1259,55 @@ fn is_removable(f: &File) -> bool {
     usb || info.sysfs.is_some_and(|p| fs::read_to_string(p.join("removable")).is_ok_and(|r| r.trim() == "1"))
 }
 
+/// What `optimize` adds to a build ([`build_target_guarded`]).
+pub(crate) struct Guard<'a> {
+    /// Per node (same index as the nodes): the (size, [`crate::verify::BlockSum`] hash) every
+    /// file's content must have; directory entries are ignored.
+    pub(crate) expect: Vec<(u64, u128)>,
+    /// Called after each file was handed to the device stream, with the number so far (a
+    /// test hook).
+    pub(crate) after_file: Option<Box<dyn FnMut(usize) + 'a>>,
+}
+
+/// A file read for a guarded build is not what it must be (see [`Guard::expect`]).
+#[derive(Debug)]
+pub(crate) struct SourceChanged(pub(crate) PathBuf);
+
+impl std::fmt::Display for SourceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} does not hold what was verified (its contents changed); the build was stopped", self.0.display())
+    }
+}
+
+impl std::error::Error for SourceChanged {}
+
 /// [`build`] of an already scanned tree onto an already opened (exclusively held) target.
-pub(crate) fn build_target(mut nodes: Vec<Node>, tgt: Target, o: &BuildOpts, sink: Sink<'_>) -> Result<BuildStats> {
+pub(crate) fn build_target(nodes: Vec<Node>, tgt: Target, o: &BuildOpts, sink: Sink<'_>) -> Result<BuildStats> {
+    build_target_guarded(nodes, tgt, o, sink, None)
+}
+
+/// [`build_target`], and with a [`Guard`] (`optimize`):
+/// - every file is hashed AS IT IS READ for the device stream (the very bytes written) and
+///   must match `guard.expect`; on a mismatch the build stops at once with [`SourceChanged`],
+///   writing nothing more (the volume stays unmountable, see below);
+/// - the main boot region is written LAST. First the backup boot region (our serial, but its
+///   checksum sector zeroed, so no fsck can "restore" a half-written volume from it), sync,
+///   then the main boot region zeroed, sync, then everything else, sync, then the valid
+///   backup, sync, then the main boot region, sync. An interrupted build is never a volume
+///   anything mounts; `optimize` still recognizes it by the serial in the backup.
+///
+/// Without a guard (plain `build`) nothing is hashed, and the main boot sector says
+/// VolumeDirty until the end instead.
+pub(crate) fn build_target_guarded(
+    mut nodes: Vec<Node>,
+    tgt: Target,
+    o: &BuildOpts,
+    sink: Sink<'_>,
+    mut guard: Option<Guard<'_>>,
+) -> Result<BuildStats> {
+    if let Some(g) = &guard {
+        ensure!(g.expect.len() == nodes.len(), "internal error: expected hashes do not match the tree");
+    }
     let t0 = Instant::now();
     let mut tick = Ticker::new(sink);
     let upc = upcase_map();
@@ -1315,17 +1379,32 @@ pub(crate) fn build_target(mut nodes: Vec<Node>, tgt: Target, o: &BuildOpts, sin
     };
     let pct = ((p.used_end - 2) * 100 / g.cluster_count).min(100) as u8;
 
-    // 1. Boot region + backup. The main boot sector says VolumeDirty until the very end, so a
-    // build that is interrupted leaves a volume every checker (and `optimize`) sees as unfinished.
+    // 1. Boot region + backup. Written and synced BEFORE anything else, so no device write
+    // cache can store the new FAT/heap while the old (clean) boot sector still says the old
+    // volume is intact.
     let boot = boot_region(&g, tgt.part_off, vol_bytes, p.root_cluster, serial, pct, 0);
-    let dirty_boot = boot_region(&g, tgt.part_off, vol_bytes, p.root_cluster, serial, pct, FLAG_VOLUME_DIRTY);
-    // Written and synced BEFORE anything else, so no device write cache can store the new
-    // FAT/heap while the old (clean) boot sector still says the old volume is intact.
-    let mut head = AlignedBuf::new(2 * boot.len());
-    head.as_mut()[..boot.len()].copy_from_slice(&dirty_boot);
-    head.as_mut()[boot.len()..].copy_from_slice(&boot);
-    dev.write_all_at(head.as_ref(), 0).context("write boot regions")?;
-    dev.sync_all().context("sync boot regions")?;
+    let bl = boot.len();
+    let mut head = AlignedBuf::new(2 * bl);
+    if guard.is_some() {
+        // Boot last (see build_target_guarded): the backup first (checksum sector zeroed),
+        // the old main region kept until that is on the medium, then the main region zeroed.
+        dev.read_exact_at(head.as_mut(), 0).context("read boot regions")?;
+        head.as_mut()[bl..bl + 11 * SECTOR as usize].copy_from_slice(&boot[..11 * SECTOR as usize]);
+        head.as_mut()[bl + 11 * SECTOR as usize..].fill(0);
+        dev.write_all_at(head.as_ref(), 0).context("write backup boot region")?;
+        dev.sync_all().context("sync backup boot region")?;
+        head.as_mut()[..bl].fill(0);
+        dev.write_all_at(head.as_ref(), 0).context("clear main boot region")?;
+        dev.sync_all().context("sync boot regions")?;
+    } else {
+        // The main boot sector says VolumeDirty until the very end, so a build that is
+        // interrupted leaves a volume every checker sees as unfinished.
+        let dirty_boot = boot_region(&g, tgt.part_off, vol_bytes, p.root_cluster, serial, pct, FLAG_VOLUME_DIRTY);
+        head.as_mut()[..bl].copy_from_slice(&dirty_boot);
+        head.as_mut()[bl..].copy_from_slice(&boot);
+        dev.write_all_at(head.as_ref(), 0).context("write boot regions")?;
+        dev.sync_all().context("sync boot regions")?;
+    }
     w.skip_to(head.as_ref().len() as u64)?;
     // 2. FAT: every allocated object is one contiguous chain.
     w.zeros_to(g.fat_off * SECTOR)?;
@@ -1383,29 +1462,60 @@ pub(crate) fn build_target(mut nodes: Vec<Node>, tgt: Target, o: &BuildOpts, sin
             pending.insert(idx, item);
         }
         let item = pending.remove(&k).unwrap();
+        let want = guard.as_ref().map(|g| g.expect[i]);
+        let changed = || anyhow::Error::new(SourceChanged(n.src.clone()));
         match item {
             Item::Data(v) => {
                 ensure!(v.len() as u64 == n.size, "{} changed size while copying", n.src.display());
+                if let Some(want) = want {
+                    let mut s = crate::verify::BlockSum::default();
+                    s.update(&v);
+                    if s.finish() != want {
+                        w.abandon(); // not one byte of it reaches the device
+                        return Err(changed());
+                    }
+                }
                 w.write(&v)?;
                 release(&budget, n.size.min(256 << 20));
             }
             Item::Stream => {
                 let mut f = File::open(&n.src)?;
                 crate::util::fadvise_sequential(&f);
-                w.write_from(&mut f, n.size)?;
+                let mut sum = want.map(|_| crate::verify::BlockSum::default());
+                w.write_from(&mut f, n.size, sum.as_mut())?;
+                if let (Some(want), Some(s)) = (want, sum)
+                    && s.finish() != want
+                {
+                    w.abandon(); // nothing more is written (the main boot region is still zeros)
+                    return Err(changed());
+                }
             }
         }
         w.zeros_to(at + n.clusters * cs)?;
         bytes_done += n.size;
         tick.progress((empty_files + k + 1) as u64, bytes_done, false);
+        if let Some(f) = guard.as_mut().and_then(|g| g.after_file.as_mut()) {
+            f(k + 1);
+        }
         w = abort_if_due(w);
     }
     let written = w.finish()?; // syncs
-    // Everything is on the device: now the main boot sector may say "clean".
-    let mut head = AlignedBuf::new(4096);
-    head.as_mut()[..4096].copy_from_slice(&boot[..4096]);
-    dev.write_all_at(head.as_ref(), 0).context("write boot sector")?;
-    dev.sync_all().context("sync boot sector")?;
+    if guard.is_some() {
+        // Everything is on the device: the valid backup boot region, then the main one.
+        head.as_mut()[..bl].fill(0);
+        head.as_mut()[bl..].copy_from_slice(&boot);
+        dev.write_all_at(head.as_ref(), 0).context("write backup boot region")?;
+        dev.sync_all().context("sync backup boot region")?;
+        head.as_mut()[..bl].copy_from_slice(&boot);
+        dev.write_all_at(head.as_ref(), 0).context("write boot region")?;
+        dev.sync_all().context("sync boot region")?;
+    } else {
+        // Everything is on the device: now the main boot sector may say "clean".
+        let mut head = AlignedBuf::new(4096);
+        head.as_mut()[..4096].copy_from_slice(&boot[..4096]);
+        dev.write_all_at(head.as_ref(), 0).context("write boot sector")?;
+        dev.sync_all().context("sync boot sector")?;
+    }
     tick.progress(files as u64, data, true);
     tick.emit(Event::Done { files: files as u64, bytes: data, secs: t0.elapsed().as_secs_f64() });
     if !tgt.direct {
@@ -2303,7 +2413,7 @@ mod tests {
         std::io::Write::write_all(&mut src_w, &piece).unwrap();
         drop(src_w);
         let mut src = File::open(&src_p).unwrap();
-        w.write_from(&mut src, piece.len() as u64).unwrap();
+        w.write_from(&mut src, piece.len() as u64, None).unwrap();
         expect.extend_from_slice(&piece);
         assert_eq!(w.cur(), expect.len() as u64);
         w.finish().unwrap();
