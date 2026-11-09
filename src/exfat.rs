@@ -11,6 +11,7 @@
 //! Spec: Microsoft "exFAT file system specification" (2019, public).
 
 use crate::events::{Event, Op, Sink, Ticker};
+use crate::sim::trace::{self, Op as TOp};
 use crate::util::{AlignedBuf, human_bytes};
 use anyhow::{Context, Result, bail, ensure};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -535,6 +536,7 @@ impl Pool {
     fn new(dev: Arc<File>, n: usize) -> Pool {
         let (tx, rx) = bounded::<Job>(n);
         let state: PoolState = Arc::new((Mutex::new((0, None)), Condvar::new(), AtomicBool::new(false)));
+        let grp = trace::group();
         let workers = (0..n)
             .map(|_| {
                 let (rx, dev, st) = (rx.clone(), dev.clone(), state.clone());
@@ -542,7 +544,12 @@ impl Pool {
                     for (sh, bo, off, len) in rx {
                         let mut done = Done(&st, None);
                         // After a failure the remaining jobs are drained without writing.
-                        done.1 = Some(if st.2.load(Relaxed) { Ok(()) } else { write_span(&dev, &sh, bo, off, len) });
+                        done.1 = Some(if st.2.load(Relaxed) {
+                            Ok(())
+                        } else {
+                            // seq = offset: spans are submitted in ascending order.
+                            trace::io(TOp::Write, off, len as u64, n, grp, off, || write_span(&dev, &sh, bo, off, len))
+                        });
                         drop(sh); // the buffer may go back before the job is marked done
                     }
                 })
@@ -594,7 +601,7 @@ fn io_loop(dev: Arc<File>, rx: Receiver<Batch>, btx: Sender<AlignedBuf>, infligh
                 if let Some(p) = &pool {
                     p.wait_idle()?;
                 }
-                write_span(&dev, &sh, bo, off, len)?;
+                trace::serial(TOp::Write, off, len as u64, || write_span(&dev, &sh, bo, off, len))?;
             } else {
                 let n = inflight.load(Relaxed).clamp(1, crate::devprofile::MAX_WRITE_QD);
                 pool.get_or_insert_with(|| Pool::new(dev.clone(), n)).submit(&sh, bo, off, len)?;
@@ -604,7 +611,7 @@ fn io_loop(dev: Arc<File>, rx: Receiver<Batch>, btx: Sender<AlignedBuf>, infligh
     if let Some(p) = &pool {
         p.wait_idle()?;
     }
-    dev.sync_all()?;
+    trace::sync(|| dev.sync_all())?;
     Ok(())
 }
 
@@ -916,7 +923,11 @@ pub(crate) fn set_direct(f: &File, on: bool) -> bool {
         return false;
     }
     let want = if on { fl | libc::O_DIRECT } else { fl & !libc::O_DIRECT };
-    want == fl || unsafe { libc::fcntl(fd, libc::F_SETFL, want) } == 0
+    let ok = want == fl || unsafe { libc::fcntl(fd, libc::F_SETFL, want) } == 0;
+    if ok && want != fl {
+        trace::direct(on);
+    }
+    ok
 }
 
 /// Block device size in bytes (BLKGETSIZE64).
@@ -978,7 +989,8 @@ pub(crate) fn open_target(path: &Path) -> Result<Target> {
         ensure!(md.len() > 0, "image file is empty; create it first, e.g. truncate -s 8G image.img");
         let _flags = FlagGuard::new(&file)?;
         let direct = set_direct(&file, true);
-        Ok(Target { file, bytes: md.len(), part_off: 0, direct, _flags })
+        let part_off = crate::sim::device::sim_device().map_or(0, |d| d.part_start_sectors);
+        Ok(Target { file, bytes: md.len(), part_off, direct, _flags })
     } else {
         bail!("{} is neither a block device nor a regular image file", path.display())
     }
@@ -1276,6 +1288,9 @@ const LIFETIME_CAP_BYTES: u64 = 64 << 30;
 /// Whether `f` is a block device on a removable or USB disk (sysfs `removable`, or the
 /// usb-storage / uas driver: many USB sticks and card readers report removable = 0).
 fn is_removable(f: &File) -> bool {
+    if let Some(d) = crate::sim::device::sim_device() {
+        return d.removable;
+    }
     let Some(dev) = crate::devprofile::block_dev_of(f) else { return false };
     let info = crate::probe::device_info_of(dev);
     let usb = matches!(info.transport.as_deref(), Some("usb-storage" | "uas"));
@@ -1407,18 +1422,22 @@ pub(crate) fn build_target_guarded(
     // volume is intact.
     let boot = boot_region(&g, tgt.part_off, vol_bytes, p.root_cluster, serial, pct, 0, o.job.as_ref());
     let bl = boot.len();
+    trace::phase("boot");
     let mut head = AlignedBuf::new(2 * bl);
     if guard.is_some() {
         // Boot last (see build_target_guarded): the backup first (checksum sector zeroed),
         // the old main region kept until that is on the medium, then the main region zeroed.
-        dev.read_exact_at(head.as_mut(), 0).context("read boot regions")?;
+        trace::serial(TOp::Read, 0, head.as_ref().len() as u64, || dev.read_exact_at(head.as_mut(), 0))
+            .context("read boot regions")?;
         head.as_mut()[bl..bl + 11 * SECTOR as usize].copy_from_slice(&boot[..11 * SECTOR as usize]);
         head.as_mut()[bl + 11 * SECTOR as usize..].fill(0);
-        dev.write_all_at(head.as_ref(), 0).context("write backup boot region")?;
-        dev.sync_all().context("sync backup boot region")?;
+        trace::serial(TOp::Write, 0, head.as_ref().len() as u64, || dev.write_all_at(head.as_ref(), 0))
+            .context("write backup boot region")?;
+        trace::sync(|| dev.sync_all()).context("sync backup boot region")?;
         head.as_mut()[..bl].fill(0);
-        dev.write_all_at(head.as_ref(), 0).context("clear main boot region")?;
-        dev.sync_all().context("sync boot regions")?;
+        trace::serial(TOp::Write, 0, head.as_ref().len() as u64, || dev.write_all_at(head.as_ref(), 0))
+            .context("clear main boot region")?;
+        trace::sync(|| dev.sync_all()).context("sync boot regions")?;
     } else {
         // The main boot sector says VolumeDirty until the very end, so a build that is
         // interrupted leaves a volume every checker sees as unfinished.
@@ -1426,9 +1445,11 @@ pub(crate) fn build_target_guarded(
             boot_region(&g, tgt.part_off, vol_bytes, p.root_cluster, serial, pct, FLAG_VOLUME_DIRTY, o.job.as_ref());
         head.as_mut()[..bl].copy_from_slice(&dirty_boot);
         head.as_mut()[bl..].copy_from_slice(&boot);
-        dev.write_all_at(head.as_ref(), 0).context("write boot regions")?;
-        dev.sync_all().context("sync boot regions")?;
+        trace::serial(TOp::Write, 0, head.as_ref().len() as u64, || dev.write_all_at(head.as_ref(), 0))
+            .context("write boot regions")?;
+        trace::sync(|| dev.sync_all()).context("sync boot regions")?;
     }
+    trace::phase("stream");
     w.skip_to(head.as_ref().len() as u64)?;
     // 2. FAT: every allocated object is one contiguous chain.
     w.zeros_to(g.fat_off * SECTOR)?;
@@ -1524,21 +1545,25 @@ pub(crate) fn build_target_guarded(
         w = abort_if_due(w);
     }
     let written = w.finish()?; // syncs
+    trace::phase("boot-final");
     if guard.is_some() {
         // Everything is on the device: the valid backup boot region, then the main one.
         head.as_mut()[..bl].fill(0);
         head.as_mut()[bl..].copy_from_slice(&boot);
-        dev.write_all_at(head.as_ref(), 0).context("write backup boot region")?;
-        dev.sync_all().context("sync backup boot region")?;
+        trace::serial(TOp::Write, 0, head.as_ref().len() as u64, || dev.write_all_at(head.as_ref(), 0))
+            .context("write backup boot region")?;
+        trace::sync(|| dev.sync_all()).context("sync backup boot region")?;
         head.as_mut()[..bl].copy_from_slice(&boot);
-        dev.write_all_at(head.as_ref(), 0).context("write boot region")?;
-        dev.sync_all().context("sync boot region")?;
+        trace::serial(TOp::Write, 0, head.as_ref().len() as u64, || dev.write_all_at(head.as_ref(), 0))
+            .context("write boot region")?;
+        trace::sync(|| dev.sync_all()).context("sync boot region")?;
     } else {
         // Everything is on the device: now the main boot sector may say "clean".
         let mut head = AlignedBuf::new(4096);
         head.as_mut()[..4096].copy_from_slice(&boot[..4096]);
-        dev.write_all_at(head.as_ref(), 0).context("write boot sector")?;
-        dev.sync_all().context("sync boot sector")?;
+        trace::serial(TOp::Write, 0, head.as_ref().len() as u64, || dev.write_all_at(head.as_ref(), 0))
+            .context("write boot sector")?;
+        trace::sync(|| dev.sync_all()).context("sync boot sector")?;
     }
     tick.progress(files as u64, data, true);
     tick.emit(Event::Done { files: files as u64, bytes: data, secs: t0.elapsed().as_secs_f64() });

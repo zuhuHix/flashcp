@@ -105,7 +105,8 @@ impl Vol {
             "volume structure at byte {off} lies outside the device"
         );
         let mut v = vec![0u8; len as usize];
-        self.dev.read_exact_at(&mut v, off).with_context(|| format!("read {len} bytes at {off}"))?;
+        crate::sim::trace::serial(crate::sim::trace::Op::Read, off, len, || self.dev.read_exact_at(&mut v, off))
+            .with_context(|| format!("read {len} bytes at {off}"))?;
         Ok(v)
     }
 
@@ -115,7 +116,8 @@ impl Vol {
     pub(crate) fn open(dev: File, dev_len: u64, allow_dirty: bool, read_bitmap: bool) -> Result<Vol> {
         ensure!(dev_len >= 24 * 512, "target is too small to hold an exFAT volume");
         let mut s0 = vec![0u8; 512];
-        dev.read_exact_at(&mut s0, 0).context("read boot sector")?;
+        crate::sim::trace::serial(crate::sim::trace::Op::Read, 0, 512, || dev.read_exact_at(&mut s0, 0))
+            .context("read boot sector")?;
         ensure!(&s0[3..11] == b"EXFAT   ", "target does not hold an exFAT volume (no EXFAT signature)");
         ensure!(s0[11..64].iter().all(|&b| b == 0), "boot sector MustBeZero area is not zero");
         ensure!(s0[510..512] == [0x55, 0xAA], "boot sector has no 0x55AA signature");
@@ -129,7 +131,9 @@ impl Vol {
         let cs = bps << spc_shift;
         ensure!(dev_len >= 12 * bps, "target is too small for its boot region");
         let mut region = vec![0u8; 12 * bps as usize];
-        dev.read_exact_at(&mut region, 0).context("read boot region")?;
+        let rl = region.len() as u64;
+        crate::sim::trace::serial(crate::sim::trace::Op::Read, 0, rl, || dev.read_exact_at(&mut region, 0))
+            .context("read boot region")?;
         let want = checksum32(&region[..11 * bps as usize], &[106, 107, 112], 0);
         for w in region[11 * bps as usize..].as_chunks::<4>().0 {
             ensure!(u32::from_le_bytes(*w) == want, "boot region checksum mismatch; refusing to modify this volume");
@@ -310,8 +314,8 @@ impl Vol {
                 off.checked_add(want).is_some_and(|e| e <= self.dev_len),
                 "volume structure at byte {off} lies outside the device"
             );
-            self.dev
-                .read_exact_at(&mut out[done..done + want as usize], off)
+            let dst = &mut out[done..done + want as usize];
+            crate::sim::trace::serial(crate::sim::trace::Op::Read, off, want, || self.dev.read_exact_at(dst, off))
                 .with_context(|| format!("read {want} bytes at {off}"))?;
             done += want as usize;
             i = j;

@@ -23,3 +23,4 @@ pub use add::{AddOpts, AddStats, VolumeInfo, add, add_to, info, info_of};
 pub use events::{Event, Op};
 pub use exfat::{BuildOpts, BuildStats, FatMode, TargetSpec, build, build_to};
 pub use pull::{PullOpts, PullStats, pull, pull_from};
+pub mod sim;

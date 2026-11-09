@@ -31,6 +31,12 @@ pub fn device_info(path: &Path) -> DeviceInfo {
 /// [`device_info`] of a block device number (st_rdev of a device node, or st_dev of a file).
 pub fn device_info_of(dev: u64) -> DeviceInfo {
     let mut info = DeviceInfo::default();
+    if let Some(d) = crate::sim::device::sim_device() {
+        info.model = Some(format!("simulated {}", d.name));
+        info.transport = d.profile.transport.clone();
+        info.max_sectors_kb = d.max_sectors_kb.map(|k| k.to_string());
+        return info;
+    }
     let (maj, min) = (libc::major(dev), libc::minor(dev));
     let Ok(mut p) = fs::canonicalize(format!("/sys/dev/block/{maj}:{min}")) else { return info };
     if p.join("partition").exists() {

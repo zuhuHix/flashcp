@@ -1,0 +1,89 @@
+# Real end-to-end measurements the simulator is calibrated and validated against.
+# Every number was measured on the physical drive (sources: merged PR bodies, `gh pr view N`).
+# One scenario per line, space-separated key=value; `,` separates list items in args/env.
+#
+#   id      unique name (drive prefix: sd- SanDisk Cruzer Blade 8 GB USB 2 BOT, msi- MSI DATAMAG UAS)
+#   drive   sandisk | msi (the built-in profile name is sandisk-cruzer-usb2 / msi-datamag-uas)
+#   op      build | add | pull | micro (micro = a synthetic probe-like trace, see `kind`)
+#   data    dataset to write/read: small | smallB (small, seed 7) | many | mixed | file512m | none
+#   layout  what the image holds before the op:
+#             blank            nothing (build)
+#             mkfs<C>          mkfs.exfat -c <C> (empty volume), e.g. mkfs32k
+#             flashcp:<D>[:<C>] `flashcp build <D>` (optionally --cluster <C>)
+#             kernel<C>:<D>    mkfs.exfat -c <C> + `flashcp add <D>` with FLASHCP_TEST_NO_ADD_BUILD
+#                              (approximates a kernel `cp -r` layout: no root/loop mount needed)
+#   args    extra flashcp arguments (comma-separated), env  extra environment (comma-separated)
+#   real    measured seconds (median where runs ≥ 3; mid-range where only a range is known)
+#   lo,hi   measured range when known (run-to-run spread)
+#   src     where the number comes from
+#   pairs   validated rankings are listed at the end as `pair faster=<id> slower=<id>`
+#
+# micro scenarios (from `flashcp probe` on the drive): kind=seqw|randw|flush|seqr, bs=<bytes>,
+# qd=<n>, bytes=<total>; `real` is the time those bytes took at the measured rate.
+
+# ── SanDisk Cruzer Blade 8 GB, USB 2.0, usb-storage (BOT), max request 120 KB ──
+id=sd-build-small        drive=sandisk op=build data=small  layout=blank                real=33.6  src=PR9
+id=sd-build-small-512    drive=sandisk op=build data=small  layout=blank   args=--cluster,512   real=28.5 src=PR9
+id=sd-build-small-1k     drive=sandisk op=build data=small  layout=blank   args=--cluster,1024  real=29.6 src=PR9-council
+id=sd-build-512mb        drive=sandisk op=build data=file512m layout=blank              real=87.5  src=PR9
+id=sd-build-512mb-512    drive=sandisk op=build data=file512m layout=blank args=--cluster,512 real=86.7 src=PR9
+id=sd-pull-flashcp       drive=sandisk op=pull  data=small  layout=flashcp:small        real=16.0  lo=15.6 hi=16.6 src=PR9
+id=sd-pull-flashcp-8m    drive=sandisk op=pull  data=small  layout=flashcp:small args=--chunk-kb,8192 real=17.6 lo=17.6 hi=22.1 src=PR9-council
+id=sd-pull-flashcp-qd4   drive=sandisk op=pull  data=small  layout=flashcp:small args=--chunk-kb,8192,--inflight,4 real=27.9 src=PR7
+id=sd-pull-flashcp-1k    drive=sandisk op=pull  data=small  layout=flashcp:small:1024   real=15.2  src=PR9-council
+id=sd-pull-flashcp-512   drive=sandisk op=pull  data=small  layout=flashcp:small:512    real=14.8  src=PR9-council
+id=sd-pull-kernel        drive=sandisk op=pull  data=small  layout=kernel32k:small      real=27.0  src=PR9-council
+id=sd-pull-kernel-tail4k drive=sandisk op=pull  data=small  layout=kernel32k:small env=FLASHCP_TEST_TAIL_4K=1 real=28.7 src=PR9-council
+id=sd-pull-kernel-v1     drive=sandisk op=pull  data=small  layout=kernel32k:small args=--gap-kb,32,--inflight,32,--chunk-kb,8192 env=FLASHCP_TEST_TAIL_4K=1 real=62.9 src=PR7
+id=sd-add-32k-skip1      drive=sandisk op=add   data=smallB args=--to,B layout=kernel32k:small env=FLASHCP_TEST_GAP_POLICY=skip:1 real=105 lo=96 hi=114 src=PR9-council
+id=sd-add-32k-skip8      drive=sandisk op=add   data=smallB args=--to,B layout=kernel32k:small env=FLASHCP_TEST_GAP_POLICY=skip:8 real=138 lo=128 hi=148 src=PR9-council
+id=sd-add-32k-fill       drive=sandisk op=add   data=smallB args=--to,B layout=kernel32k:small env=FLASHCP_TEST_GAP_POLICY=fill:1 real=146 lo=120 hi=173 src=PR9-council
+id=sd-add-32k-pad16k     drive=sandisk op=add   data=smallB args=--to,B layout=kernel32k:small env=FLASHCP_TEST_GAP_POLICY=pad16384:1 real=163 lo=119 hi=207 src=PR9-council
+id=sd-add-4k             drive=sandisk op=add   data=smallB args=--to,B layout=flashcp:small        real=36.5  src=PR9
+id=sd-add-1k             drive=sandisk op=add   data=smallB args=--to,B layout=flashcp:small:1024   real=29.7  src=PR9-council
+id=sd-add-512            drive=sandisk op=add   data=smallB args=--to,B layout=flashcp:small:512    real=28.8  src=PR9-council
+id=sd-add-empty32k       drive=sandisk op=add   data=small  layout=mkfs32k              real=34.9  src=PR9-council
+id=sd-add-empty32k-nobuild drive=sandisk op=add data=small  layout=mkfs32k env=FLASHCP_TEST_NO_ADD_BUILD=1 real=64.0 src=PR9
+# flashcp probe on the stick (seq write 4K 2.5 / 64K 6.2 / 1M 6.4 / 8M 6.5 MB/s, random 4K QD1
+# 48 IOPS, flush 1.35 ms, reads ≈ 11 MB/s): 64 MB per sequential size, 512 random writes.
+id=sd-micro-seqw4k       drive=sandisk op=micro kind=seqw bs=4096    qd=1 bytes=67108864 real=26.84 src=probe
+id=sd-micro-seqw64k      drive=sandisk op=micro kind=seqw bs=65536   qd=1 bytes=67108864 real=10.82 src=probe
+id=sd-micro-seqw1m       drive=sandisk op=micro kind=seqw bs=1048576 qd=1 bytes=67108864 real=10.49 src=probe
+id=sd-micro-seqw8m       drive=sandisk op=micro kind=seqw bs=8388608 qd=1 bytes=67108864 real=10.32 src=probe
+id=sd-micro-randw4k      drive=sandisk op=micro kind=randw bs=4096   qd=1 bytes=2097152  real=10.67 src=probe
+id=sd-micro-flush        drive=sandisk op=micro kind=flush bs=4096   qd=1 bytes=409600   real=0.135 src=probe
+id=sd-micro-seqr1m       drive=sandisk op=micro kind=seqr bs=1048576 qd=1 bytes=67108864 real=6.10 src=PR7
+
+# ── MSI DATAMAG 20Gbps SSD, UAS, 1 TB (mkfs default 128 KB clusters) ──
+id=msi-build-small       drive=msi op=build data=small  layout=blank                    real=0.31  src=PR9
+id=msi-build-512mb       drive=msi op=build data=file512m layout=blank                  real=0.57  src=PR9
+id=msi-pull-flashcp      drive=msi op=pull  data=small  layout=flashcp:small            real=0.37  lo=0.36 hi=0.38 src=PR9
+id=msi-pull-kernel       drive=msi op=pull  data=small  layout=kernel128k:small         real=0.66  src=PR7
+id=msi-pull-many-flashcp drive=msi op=pull  data=many   layout=flashcp:many             real=1.17  src=PR7
+id=msi-pull-many-kernel  drive=msi op=pull  data=many   layout=kernel128k:many          real=2.27  src=PR7
+id=msi-pull-mixed-flashcp drive=msi op=pull data=mixed  layout=flashcp:mixed            real=1.68  src=PR7
+id=msi-pull-mixed-kernel drive=msi op=pull  data=mixed  layout=kernel128k:mixed         real=1.82  src=PR7
+id=msi-add-onto-flashcp  drive=msi op=add   data=smallB args=--to,B layout=flashcp:small            real=0.41  src=PR9
+id=msi-add-small-preload drive=msi op=add   data=small  layout=kernel128k:mixed args=--to,added real=0.48 src=PR6
+id=msi-add-many-preload  drive=msi op=add   data=many   layout=kernel128k:mixed args=--to,added real=1.75 src=PR6
+id=msi-add-mixed-preload drive=msi op=add   data=mixed  layout=kernel128k:mixed args=--to,added real=1.57 src=PR6
+id=msi-add-empty128k     drive=msi op=add   data=small  layout=mkfs128k                 real=0.41  src=PR9
+# probe: 999 MB/s at 8 MB writes, 97 MB/s at 4 KB writes.
+id=msi-micro-seqw8m      drive=msi op=micro kind=seqw bs=8388608 qd=1 bytes=1073741824 real=1.075 src=probe
+id=msi-micro-seqw4k      drive=msi op=micro kind=seqw bs=4096    qd=1 bytes=268435456  real=2.767 src=probe
+
+# ── rankings measured on hardware (faster first); the simulator must get every one right ──
+pair faster=sd-pull-flashcp     slower=sd-pull-flashcp-8m
+pair faster=sd-pull-flashcp-8m  slower=sd-pull-flashcp-qd4
+pair faster=sd-pull-kernel      slower=sd-pull-kernel-v1
+pair faster=sd-pull-kernel      slower=sd-pull-kernel-tail4k
+pair faster=sd-pull-flashcp     slower=sd-pull-kernel
+pair faster=sd-add-32k-skip1    slower=sd-add-32k-skip8
+pair faster=sd-add-32k-skip1    slower=sd-add-32k-fill
+pair faster=sd-add-32k-skip1    slower=sd-add-32k-pad16k
+pair faster=sd-add-4k           slower=sd-add-32k-skip1
+pair faster=sd-add-empty32k     slower=sd-add-empty32k-nobuild
+pair faster=sd-build-small-512  slower=sd-build-small
+pair faster=msi-pull-flashcp    slower=msi-pull-kernel
+pair faster=msi-pull-many-flashcp slower=msi-pull-many-kernel
+pair faster=msi-pull-mixed-flashcp slower=msi-pull-mixed-kernel

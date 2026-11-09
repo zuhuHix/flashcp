@@ -29,6 +29,7 @@ use crate::exfat::{
     Item, Node, SeqWriter, TargetSpec, entry_set, finish_set, open_target_fd, ordered_reader, release, scan_tree,
     set_bytes, set_direct, validate_name,
 };
+use crate::sim::trace::{self, Op as TOp};
 use crate::util::human_bytes;
 use crate::volume::*;
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -405,7 +406,7 @@ fn run_trial(dev: &File, writes: &[(u64, u64)], qd: usize, buf: &[u8], limit: f6
                     return None;
                 }
                 let n = (end - off).min(buf.len() as u64);
-                dev.write_all_at(&buf[..n as usize], off).ok()?;
+                trace::serial(TOp::Write, off, n, || dev.write_all_at(&buf[..n as usize], off)).ok()?;
                 off += n;
             }
             k += 1;
@@ -414,6 +415,7 @@ fn run_trial(dev: &File, writes: &[(u64, u64)], qd: usize, buf: &[u8], limit: f6
         let j = k + writes[k..].iter().position(|w| w.1 >= PROBE_SOLO).unwrap_or(writes.len() - k);
         let small = &writes[k..j];
         let (next, stop) = (AtomicUsize::new(0), AtomicBool::new(false));
+        let grp = trace::group();
         let ok = std::thread::scope(|s| {
             let hs: Vec<_> = (0..qd.min(small.len()))
                 .map(|_| {
@@ -428,7 +430,8 @@ fn run_trial(dev: &File, writes: &[(u64, u64)], qd: usize, buf: &[u8], limit: f6
                                 stop.store(true, Relaxed);
                                 return true;
                             }
-                            if dev.write_all_at(&buf[..len as usize], off).is_err() {
+                            let w = || dev.write_all_at(&buf[..len as usize], off);
+                            if trace::io(TOp::Write, off, len, qd, grp, off, w).is_err() {
                                 stop.store(true, Relaxed);
                                 return false;
                             }
@@ -443,7 +446,7 @@ fn run_trial(dev: &File, writes: &[(u64, u64)], qd: usize, buf: &[u8], limit: f6
         }
         k = j;
     }
-    dev.sync_all().ok()?;
+    trace::sync(|| dev.sync_all()).ok()?;
     let secs = t.elapsed().as_secs_f64();
     (secs <= limit).then_some(secs)
 }
@@ -598,8 +601,13 @@ fn choose_gap_policy(dev: &File, direct: bool, v: &Vol, dev_off: u64, dry_run: b
         return unmeasured("no O_DIRECT");
     }
     let payload: u64 = segs.iter().map(|s| s.payload).sum();
-    let measured = probe_in_situ(dev, segs, v, dev_off, payload, tq);
+    trace::phase("probe");
+    let mut measured = probe_in_situ(dev, segs, v, dev_off, payload, tq);
     set_direct(dev, false);
+    // Recording for a simulated device: the image's timing says nothing about that device.
+    if let (Some(c), Some(m)) = (crate::sim::device::sim_device().and_then(|d| d.probe_choice), measured.as_mut()) {
+        *m = (c, format!("simulated device: {}", mode_name(c.mode, c.qd)));
+    }
     let Some((choice, summary)) = measured else { return unmeasured("measuring failed") };
     if std::env::var_os(GAPS_ENV).is_some() {
         eprintln!("probe {key}: {summary} → {}", mode_name(choice.mode, choice.qd));
@@ -654,10 +662,11 @@ impl Patches {
                 buf.extend_from_slice(&self.0[j].1);
                 j += 1;
             }
-            dev.write_all_at(&buf, off).with_context(|| format!("write metadata at {off}"))?;
+            trace::serial(TOp::Write, off, buf.len() as u64, || dev.write_all_at(&buf, off))
+                .with_context(|| format!("write metadata at {off}"))?;
             i = j;
         }
-        dev.sync_all().context("sync")?;
+        trace::sync(|| dev.sync_all()).context("sync")?;
         Ok(())
     }
 }
@@ -684,8 +693,9 @@ fn write_flags(v: &mut Vol, flags: u16, pct: Option<u8>) -> Result<()> {
     if let Some(p) = pct {
         v.sector0[112] = p;
     }
-    v.dev.write_all_at(&v.sector0, 0).context("write boot sector")?;
-    v.dev.sync_all().context("sync")?;
+    trace::serial(TOp::Write, 0, v.sector0.len() as u64, || v.dev.write_all_at(&v.sector0, 0))
+        .context("write boot sector")?;
+    trace::sync(|| v.dev.sync_all()).context("sync")?;
     v.flags = flags;
     Ok(())
 }
@@ -1101,11 +1111,14 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
     }
 
     // ── phase 0: mark dirty ──
+    trace::note("gap_policy", || crate::events::json_str(&pol.describe()));
+    trace::phase("dirty");
     let flags = v.flags;
     write_flags(&mut v, working_flags(flags), None)?;
     stop_after("dirty")?;
 
     // ── phase 1: data, one ascending stream ──
+    trace::phase("data");
     let empty_files = (files as usize - file_order.len()) as u64;
     tick.progress(empty_files, 0, true);
     if !segs.is_empty() {
@@ -1197,16 +1210,19 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
     stop_after("data")?;
 
     // ── phase 2: bitmap + new chains ──
+    trace::phase("alloc");
     p2.commit(&v.dev)?;
     v.bitmap = bm;
     stop_after("alloc")?;
 
     // ── phase 3: link into existing chains, then directory entries ──
+    trace::phase("fat+dir");
     p3_fat.commit(&v.dev)?;
     stop_after("fat")?;
     p3_dir.commit(&v.dev)?;
 
     // ── phase 4: clean ──
+    trace::phase("clean");
     let used = v.cc - v.free_clusters();
     let pct = (used * 100 / v.cc).min(100) as u8;
     write_flags(&mut v, clean_flags(flags), Some(pct))?;

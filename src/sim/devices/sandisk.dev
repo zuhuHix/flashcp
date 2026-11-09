@@ -1,0 +1,19 @@
+flashcp-devprofile 1
+# What flashcp's profile cache and sysfs say about the SanDisk Cruzer Blade 8 GB (USB 2.0, BOT),
+# used to RECORD traces on an image as if the stick were the target (FLASHCP_SIM_DEVICE).
+# Write model and read probe as cached on the real stick (probe: 6.5 MB/s at 8 MB; pull's
+# micro-probe: ~0.03 ms per extra request at 11-14 MB/s, hence gap 0).
+seq_write_bps=6500000
+write_skip_s=0.00105
+seq_read_bps=13800000
+read_cmd_s=0.00003
+transport=usb-storage
+sim.name=sandisk-cruzer-usb2
+sim.max_sectors_kb=120
+sim.logical_block=512
+sim.removable=1
+# add's in-situ probe chose skip-all with 1 write in flight on this stick (PR #9 council item 3).
+sim.probe_choice=skip:1
+# GUESS (not measured): partition at 1 MiB, the common factory/fdisk default.
+sim.part_start_sectors=2048
+sim.size_bytes=8004304896
