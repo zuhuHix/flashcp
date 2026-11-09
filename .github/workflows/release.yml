@@ -31,7 +31,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Read crate version and check tag
         id: version
-        env:
         run: |
           set -eu
           VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="flashcp") | .version')
