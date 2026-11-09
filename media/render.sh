@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Renders every README animation from the Remotion compositions and converts them to the
 # files the README uses:
-#   assets/*.gif   (copy-vs-build, benchmark, volume-layout; light + dark)
-#   docs/flashcp.mp4 (dark showreel of the three scenes, no audio)
+#   assets/*.gif   (copy-vs-build, add-no-erase, pull-sweep, two-drives, benchmark, volume-layout;
+#                   light + dark)
+#   docs/flashcp.mp4 (dark showreel: copy -> add -> pull -> two drives -> benchmark, no audio)
 # Intermediate MP4s go to media/out/ (untracked).
 set -euo pipefail
 
@@ -19,12 +20,18 @@ mkdir -p "$OUT" "$ASSETS" "$DOCS"
 declare -A GIF_NAME=(
   [CopyVsBuild-light]=copy-vs-build-light.gif
   [CopyVsBuild-dark]=copy-vs-build-dark.gif
+  [AddNoErase-light]=add-no-erase-light.gif
+  [AddNoErase-dark]=add-no-erase-dark.gif
+  [PullSweep-light]=pull-sweep-light.gif
+  [PullSweep-dark]=pull-sweep-dark.gif
+  [TwoDrives-light]=two-drives-light.gif
+  [TwoDrives-dark]=two-drives-dark.gif
   [BenchmarkChart-light]=benchmark-light.gif
   [BenchmarkChart-dark]=benchmark-dark.gif
   [VolumeLayout-light]=volume-layout-light.gif
   [VolumeLayout-dark]=volume-layout-dark.gif
 )
-COMPS=(CopyVsBuild-light CopyVsBuild-dark BenchmarkChart-light BenchmarkChart-dark VolumeLayout-light VolumeLayout-dark)
+COMPS=(CopyVsBuild-light CopyVsBuild-dark AddNoErase-light AddNoErase-dark PullSweep-light PullSweep-dark TwoDrives-light TwoDrives-dark BenchmarkChart-light BenchmarkChart-dark VolumeLayout-light VolumeLayout-dark)
 
 # 1. Render MP4s
 for id in "${COMPS[@]}" Showreel-dark; do
