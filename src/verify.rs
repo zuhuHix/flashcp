@@ -5,19 +5,21 @@
 //! its logical content (bytes at or past ValidDataLength read as zeros, the last block short),
 //! of `xxh3_128_with_seed(block, k)`. Because a block carries its index in the seed, swapped or
 //! shifted blocks still change the sum, but the blocks may be hashed in any order. That lets
-//! the device side read in PHYSICAL order (every file's extents sorted by device offset,
-//! coalesced into aligned reads of up to 8 MB that read through gaps of up to 1 MB, O_DIRECT,
-//! a few reads in flight): sequential even on a slow USB 2 stick, however fragmented the files
-//! are. The local side reads each file front to back. 512 bytes divides every exFAT cluster
-//! size, so an extent always starts on a block boundary and both volumes (old and new cluster
-//! size) hash identically.
+//! `pull` hash every extent as it copies it (in whatever order its reads complete), so
+//! `optimize` reads the original data only once, and lets [`hash_volume`] read in PHYSICAL
+//! order with pull's own planner and per-device strategy ([`crate::pull::plan_reads`],
+//! [`crate::pull::read_strategy`]: aligned reads of up to 8 MB, reading through only the gaps
+//! that cost less than a request, as many in flight as the transport likes). The local side
+//! reads each file front to back. 512 bytes divides every exFAT cluster size, so an extent
+//! always starts on a block boundary and both volumes (old and new cluster size) hash
+//! identically.
 //!
 //! The volume walk ([`walk`]) applies the same untrusted-volume checks as `pull` (strict
 //! UTF-16 names, single safe components, cross-link / loop / cycle detection through one
 //! visited-cluster set, DataLength bounded by the heap, entry and depth limits).
 
 use crate::exfat::set_direct;
-use crate::pull::{MAX_DEPTH, MAX_ENTRIES, MAX_EXTENTS};
+use crate::pull::{Ext, MAX_DEPTH, MAX_ENTRIES, MAX_EXTENTS, READ_BUDGET, Strategy, plan_reads};
 use crate::util::AlignedBuf;
 use crate::volume::*;
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -34,12 +36,10 @@ use xxhash_rust::xxh3::{xxh3_64, xxh3_128_with_seed};
 pub(crate) const BLOCK: u64 = 512;
 /// Largest device read; extents are split to fit one read with alignment slack.
 const CHUNK: usize = 8 << 20;
-/// Gaps between extents up to this size are read through instead of issuing a new read.
-const GAP: u64 = 1 << 20;
 /// Alignment of every device read (O_DIRECT needs the logical block size; 4 KB covers it).
 const ALIGN: u64 = 4096;
-/// Device reads in flight (each thread reads a chunk, then hashes it).
-const DEV_READERS: usize = 3;
+/// Test hook (shared with pull): print every data read ("flashcp-read OFFSET LEN") to stderr.
+const TRACE_READS_ENV: &str = "FLASHCP_TEST_TRACE_READS";
 /// Threads hashing local files.
 const LOCAL_READERS: usize = 4;
 const MANIFEST_MAGIC: &str = "flashcp-manifest 1";
@@ -70,6 +70,13 @@ pub(crate) struct Manifest {
 impl Manifest {
     pub(crate) fn bytes(&self) -> u64 {
         self.files.values().map(|f| f.len).sum()
+    }
+
+    /// The same manifest with every hash 0 (to compare listings only).
+    pub(crate) fn without_hashes(&self) -> Manifest {
+        let mut m = self.clone();
+        m.files.values_mut().for_each(|f| f.hash = 0);
+        m
     }
 
     /// Every difference between `self` (named `a`) and `other` (named `b`); empty when they
@@ -175,7 +182,7 @@ fn hash_blocks(data: &[u8], k0: u64) -> u128 {
 /// Sum over the all-zero blocks of a file of `len` bytes from byte `valid` (ValidDataLength) on.
 /// The block holding `valid` itself (if it is mid-block) is not included: it is hashed with the
 /// extent that ends there, padded with zeros.
-fn zero_tail(valid: u64, len: u64) -> u128 {
+pub(crate) fn zero_tail(valid: u64, len: u64) -> u128 {
     static ZERO: [u8; BLOCK as usize] = [0; BLOCK as usize];
     (valid.div_ceil(BLOCK)..len.div_ceil(BLOCK)).fold(0u128, |a, k| {
         let n = (len - k * BLOCK).min(BLOCK) as usize;
@@ -186,7 +193,7 @@ fn zero_tail(valid: u64, len: u64) -> u128 {
 /// Sum over one extent's bytes at file offset `foff` (a multiple of BLOCK) of a file of `len`
 /// bytes. A short last block ends at ValidDataLength; it is padded with the zeros the file
 /// holds there.
-fn hash_extent(data: &[u8], foff: u64, len: u64) -> u128 {
+pub(crate) fn hash_extent(data: &[u8], foff: u64, len: u64) -> u128 {
     debug_assert!(foff.is_multiple_of(BLOCK));
     let whole = data.len() / BLOCK as usize * BLOCK as usize;
     let mut h = hash_blocks(&data[..whole], foff / BLOCK);
@@ -224,15 +231,6 @@ pub(crate) struct VFile {
     pub(crate) mtime: Option<(i64, u32)>,
 }
 
-/// `len` bytes at device offset `phys` are bytes [foff, foff + len) of file `file`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Ext {
-    phys: u64,
-    foff: u64,
-    len: u32,
-    file: u32,
-}
-
 /// Everything a volume holds, as walked and checked; enough to hash it without the parser.
 pub(crate) struct VolTree {
     pub(crate) dirs: Vec<VDir>,
@@ -244,6 +242,18 @@ pub(crate) struct VolTree {
 impl VolTree {
     pub(crate) fn data_bytes(&self) -> u64 {
         self.files.iter().map(|f| f.len).sum()
+    }
+
+    /// The walk as a manifest without contents (every hash 0): paths, sizes and times only.
+    pub(crate) fn listing(&self) -> Manifest {
+        let mut m = Manifest::default();
+        for f in &self.files {
+            m.files.insert(f.path.clone(), FileSum { len: f.len, hash: 0, mtime: f.mtime });
+        }
+        for d in self.dirs.iter().skip(1) {
+            m.dirs.insert(d.path.clone(), d.mtime);
+        }
+        m
     }
 }
 
@@ -397,37 +407,6 @@ pub(crate) fn walk(v: &mut Vol) -> Result<VolTree> {
     Ok(t)
 }
 
-/// One device read: `len` bytes at `start` (both aligned), serving `exts`.
-struct Chunk {
-    start: u64,
-    len: usize,
-    exts: std::ops::Range<usize>,
-}
-
-/// Coalesces extents (sorted by `phys`) into aligned reads of at most CHUNK bytes, reading
-/// through gaps of up to GAP bytes.
-fn coalesce(exts: &[Ext]) -> Vec<Chunk> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < exts.len() {
-        let start = exts[i].phys / ALIGN * ALIGN;
-        let mut end = exts[i].phys + exts[i].len as u64;
-        let mut j = i + 1;
-        while j < exts.len() {
-            let e = exts[j];
-            let e_end = (e.phys + e.len as u64).max(end);
-            if e.phys.saturating_sub(end) > GAP || e_end.div_ceil(ALIGN) * ALIGN - start > CHUNK as u64 {
-                break;
-            }
-            end = e_end;
-            j += 1;
-        }
-        out.push(Chunk { start, len: (end.div_ceil(ALIGN) * ALIGN - start) as usize, exts: i..j });
-        i = j;
-    }
-    out
-}
-
 /// Reads `buf.len()` bytes at `off`, or fewer at the end of the device. Returns bytes read.
 fn read_full(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
     let mut got = 0;
@@ -442,23 +421,31 @@ fn read_full(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
     Ok(got)
 }
 
-/// Hashes every file of the walked volume on `dev`, reading in physical order.
-pub(crate) fn hash_volume(dev: &File, t: &VolTree, prog: &Progress) -> Result<Manifest> {
+/// Hashes every file of the walked volume on `dev`, reading in physical order with pull's
+/// planner and the read strategy `s` (gap, reads in flight, O_DIRECT).
+pub(crate) fn hash_volume(dev: &File, t: &VolTree, s: &Strategy, prog: &Progress) -> Result<Manifest> {
     let mut exts = t.exts.clone();
     exts.sort_unstable_by_key(|e| e.phys);
-    let chunks = coalesce(&exts);
+    let chunks = plan_reads(&exts, CHUNK, s.gap);
+    // Each reader holds one CHUNK buffer; as in pull, at most READ_BUDGET of them.
+    let readers = s.inflight.clamp(1, READ_BUDGET / CHUNK).min(chunks.len().max(1));
+    let trace = std::env::var_os(TRACE_READS_ENV).is_some();
     // Bytes still to read per file; a file is done when its count reaches zero.
     let left: Vec<AtomicU64> = t.files.iter().map(|f| AtomicU64::new(f.valid)).collect();
     prog.files.fetch_add(t.files.iter().filter(|f| f.valid == 0).count() as u64, Ordering::Relaxed);
-    let direct = AtomicBool::new(set_direct(dev, true));
+    let direct = AtomicBool::new(s.direct && set_direct(dev, true));
+    if !s.direct {
+        set_direct(dev, false);
+        unsafe { libc::posix_fadvise(std::os::fd::AsRawFd::as_raw_fd(dev), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+    }
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     // Each reader collects (file, partial sum) pairs; summed per file at the end.
     let parts: Mutex<Vec<(u32, u128)>> = Mutex::new(Vec::with_capacity(exts.len()));
-    std::thread::scope(|s| {
-        for _ in 0..DEV_READERS.min(chunks.len().max(1)) {
-            s.spawn(|| {
+    std::thread::scope(|sc| {
+        for _ in 0..readers {
+            sc.spawn(|| {
                 let mut buf = AlignedBuf::new(CHUNK);
                 let mut mine = Vec::new();
                 let r = (|| -> Result<()> {
@@ -468,6 +455,9 @@ pub(crate) fn hash_volume(dev: &File, t: &VolTree, prog: &Progress) -> Result<Ma
                         let need = exts[c.exts.clone()].iter().map(|e| e.phys + e.len as u64).max().unwrap_or(c.start)
                             - c.start;
                         let b = &mut buf.as_mut()[..c.len];
+                        if trace {
+                            eprintln!("flashcp-read {} {}", c.start, c.len);
+                        }
                         let mut r = read_full(dev, b, c.start);
                         // A device that refuses this alignment (or a short direct read at the
                         // very end): fall back to buffered reads for the rest of the run.
@@ -673,15 +663,5 @@ mod tests {
         let d = m.diff(&other, "A", "B");
         assert_eq!(d.len(), 3, "{d:?}");
         assert!(m.diff(&m, "A", "B").is_empty());
-    }
-
-    #[test]
-    fn coalesce_reads_through_gaps_up_to_1mb() {
-        let e = |phys: u64, len: u32| Ext { phys, foff: 0, len, file: 0 };
-        let exts = [e(4096, 512), e(4096 + 512 + GAP, 512), e(4096 + 1024 + 2 * GAP + 4096, 512)];
-        let c = coalesce(&exts);
-        assert_eq!(c.len(), 2);
-        assert_eq!(c[0].exts, 0..2);
-        assert!(c.iter().all(|c| c.start.is_multiple_of(ALIGN) && c.len.is_multiple_of(ALIGN as usize)));
     }
 }
