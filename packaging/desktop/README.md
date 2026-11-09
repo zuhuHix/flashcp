@@ -73,6 +73,17 @@ Check the real file list with `dpkg -c gui/target/release/bundle/deb/flashcp-gui
   you use a drive, the app asks you to trust it (admin password). Erasing and
   rebuilding a drive is a separate action under *Advanced*. It requires typing
   the drive's label, or its serial number if it has no exFAT label.
+- *Optimize this stick…* (on a trusted exFAT drive) rewrites a stick that was
+  filled file by file into flashcp's layout without losing data. The app first
+  runs a dry run and shows the plan: roughly how long it takes, how much free
+  space the temporary copy needs on this computer (it refuses if there isn't
+  enough), and that the stick is erased and rebuilt from a verified copy. One
+  click confirms; the stick must stay plugged in until it says it's done. The
+  copy lives in `~/.cache/flashcp/optimize/` and is deleted at the end. If the
+  job is interrupted, the app shows where your files are and a *Resume
+  optimize* button; if Windows offers to format the stick meanwhile, say No.
+  After a copy of many small files to a stick with clusters above 4 KB, the app
+  suggests optimizing it (the tip can be turned off per drive).
 - Context menus: "Fast copy to USB (flashcp)" passes the selected paths to
   `flashcp-gui`, which opens with those files queued.
 - Context menus: "Fast copy from USB (flashcp)" runs `flashcp-gui --pull <folder>`
@@ -104,6 +115,9 @@ starts small helpers through `pkexec`:
   with only that open device handed over as fd 3. Nothing changes owner or
   permissions. An erase also needs the drive's label (or its serial number if it
   has no exFAT label), and the helper checks that against the disk itself.
+- **Optimize**: the same helper and checks. It accepts no paths at all: the
+  temporary copy always goes to `~/.cache/flashcp/optimize` of the user who
+  asked, and `flashcp` (already running as that user) creates it.
 
 See [SECURITY-NOTES.md](SECURITY-NOTES.md) for the threat model and the limits of
 this design.
@@ -121,6 +135,11 @@ FLASHCP_GUI_FAKE_DRIVES=1 FLASHCP_GUI_DIRECT=$PWD/tests/fake-flashcp cargo run -
 `FLASHCP_GUI_FAKE_DRIVES=1` shows two fake drives, and `FLASHCP_GUI_DIRECT`
 runs the given binary directly with no pkexec or helper. `tests/fake-flashcp`
 prints the JSON event stream and writes nothing. Add `--tray` to start hidden.
+`FAKE_FLASHCP_MODE=optimize-interrupt` (or `optimize-resume`, `optimize-already`,
+`optimize-nospace`) makes the fake optimize fail half-way with a recovery text, resume
+an interrupted job, report nothing to do, or refuse for lack of space. In a plain
+browser (no Tauri), `ui/index.html?optimize=resume,recovery,nospace,already,tip`
+simulates the same cases.
 
 ## Tests
 
