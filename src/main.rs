@@ -146,6 +146,12 @@ enum Cmd {
     /// contiguous, all metadata together, the optimizer's cluster size) WITHOUT losing data:
     /// copies everything to a local temp dir, verifies it, rebuilds the volume from it, verifies
     /// the result, deletes the copy. Re-running after an interruption resumes.
+    ///
+    /// If it is interrupted (power loss, unplugged, killed) after the rebuild started, the drive
+    /// does not open anywhere until optimize finishes, and other systems (notably Windows) may
+    /// offer to FORMAT it: DECLINE (formatting erases the half-built volume while the only other
+    /// copy is the temporary one), plug it back into this Linux computer and re-run `flashcp
+    /// optimize <device>` (with the same --temp, if one was given) to resume.
     Optimize {
         /// Block device or image file (or use --target-fd)
         #[arg(required_unless_present = "target_fd", conflicts_with = "target_fd")]
@@ -237,7 +243,7 @@ fn main() {
     );
     if let Err(e) = run(cli.cmd) {
         if json {
-            println!("{}", error_json(&format!("{e:#}")));
+            println!("{}", error_json(&format!("{e:#}"), optimize::recovery_of(&e)));
         } else {
             eprintln!("Error: {e:#}");
         }
@@ -290,7 +296,7 @@ fn run(cmd: Cmd) -> Result<()> {
         Cmd::Build { src, target, target_fd, cluster, label, fat, readers, dry_run, yes_erase, json } => {
             let target = spec(target, target_fd);
             anyhow::ensure!(dry_run || yes_erase, "this ERASES {}; pass --yes-erase to confirm", target.describe());
-            let o = exfat::BuildOpts { cluster, label, fat, readers, dry_run, serial: None };
+            let o = exfat::BuildOpts { cluster, label, fat, readers, dry_run, serial: None, job: None };
             let s = exfat::build_to(&src, &target, &o, &mut sink(json))?;
             if !dry_run && !json {
                 println!(
@@ -381,8 +387,9 @@ fn run(cmd: Cmd) -> Result<()> {
             anyhow::ensure!(
                 dry_run || yes,
                 "this rebuilds the volume on {} (its files are copied off, verified and written back); nothing was \
-                 changed. Pass --yes to confirm, or --dry-run to see the plan",
-                target.describe()
+                 changed. Pass --yes to confirm, or --dry-run to see the plan. If it is interrupted: {}",
+                target.describe(),
+                optimize::FORMAT_WARNING
             );
             let o = optimize::OptimizeOpts { temp, dry_run, force, temp_volatile };
             let mut human = |e: &Event| match e {

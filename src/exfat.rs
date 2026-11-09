@@ -51,7 +51,16 @@ pub struct BuildOpts {
     pub dry_run: bool,
     /// Volume serial number to write (default: derived from the current time).
     pub serial: Option<u32>,
+    /// `optimize`'s job id, written after [`JOB_TAG`] into the boot code area of both boot
+    /// sectors (covered by the boot checksum like any other byte; readers ignore it), so a
+    /// half-written build is recognized as this very job's, not by the 32-bit serial alone.
+    pub job: Option<[u8; 16]>,
 }
+
+/// Marks the job id in the boot code area (boot sector bytes 120..): `JOB_TAG` + 16 bytes.
+pub(crate) const JOB_TAG: &[u8; 11] = b"flashcp-job";
+/// Offset of [`JOB_TAG`] in the boot sector.
+pub(crate) const JOB_TAG_OFF: usize = 120;
 
 // ───────────────────────── up-case table & checksums ─────────────────────────
 
@@ -271,7 +280,17 @@ pub(crate) fn plan(nodes: &mut [Node], g: Geometry, fat: FatMode) -> Result<Plan
 
 /// Main boot region (12 sectors). `flags` is VolumeFlags (excluded from the checksum, so the
 /// backup region written with other flags still matches).
-fn boot_region(g: &Geometry, part_off: u64, vol_bytes: u64, root: u32, serial: u32, pct: u8, flags: u16) -> Vec<u8> {
+#[allow(clippy::too_many_arguments)]
+fn boot_region(
+    g: &Geometry,
+    part_off: u64,
+    vol_bytes: u64,
+    root: u32,
+    serial: u32,
+    pct: u8,
+    flags: u16,
+    job: Option<&[u8; 16]>,
+) -> Vec<u8> {
     let mut r = vec![0u8; 12 * 512];
     let b = &mut r[..512];
     b[0..3].copy_from_slice(&[0xEB, 0x76, 0x90]);
@@ -292,6 +311,10 @@ fn boot_region(g: &Geometry, part_off: u64, vol_bytes: u64, root: u32, serial: u
     b[111] = 0x80;
     b[112] = pct;
     b[120..510].fill(0xF4);
+    if let Some(id) = job {
+        b[JOB_TAG_OFF..JOB_TAG_OFF + JOB_TAG.len()].copy_from_slice(JOB_TAG);
+        b[JOB_TAG_OFF + JOB_TAG.len()..JOB_TAG_OFF + JOB_TAG.len() + 16].copy_from_slice(id);
+    }
     b[510] = 0x55;
     b[511] = 0xAA;
     for s in 1..=8 {
@@ -1294,7 +1317,7 @@ pub(crate) fn build_target(nodes: Vec<Node>, tgt: Target, o: &BuildOpts, sink: S
 ///   checksum sector zeroed, so no fsck can "restore" a half-written volume from it), sync,
 ///   then the main boot region zeroed, sync, then everything else, sync, then the valid
 ///   backup, sync, then the main boot region, sync. An interrupted build is never a volume
-///   anything mounts; `optimize` still recognizes it by the serial in the backup.
+///   anything mounts; `optimize` still recognizes it by the serial, job id and geometry in the backup.
 ///
 /// Without a guard (plain `build`) nothing is hashed, and the main boot sector says
 /// VolumeDirty until the end instead.
@@ -1382,7 +1405,7 @@ pub(crate) fn build_target_guarded(
     // 1. Boot region + backup. Written and synced BEFORE anything else, so no device write
     // cache can store the new FAT/heap while the old (clean) boot sector still says the old
     // volume is intact.
-    let boot = boot_region(&g, tgt.part_off, vol_bytes, p.root_cluster, serial, pct, 0);
+    let boot = boot_region(&g, tgt.part_off, vol_bytes, p.root_cluster, serial, pct, 0, o.job.as_ref());
     let bl = boot.len();
     let mut head = AlignedBuf::new(2 * bl);
     if guard.is_some() {
@@ -1399,7 +1422,8 @@ pub(crate) fn build_target_guarded(
     } else {
         // The main boot sector says VolumeDirty until the very end, so a build that is
         // interrupted leaves a volume every checker sees as unfinished.
-        let dirty_boot = boot_region(&g, tgt.part_off, vol_bytes, p.root_cluster, serial, pct, FLAG_VOLUME_DIRTY);
+        let dirty_boot =
+            boot_region(&g, tgt.part_off, vol_bytes, p.root_cluster, serial, pct, FLAG_VOLUME_DIRTY, o.job.as_ref());
         head.as_mut()[..bl].copy_from_slice(&dirty_boot);
         head.as_mut()[bl..].copy_from_slice(&boot);
         dev.write_all_at(head.as_ref(), 0).context("write boot regions")?;
@@ -1834,6 +1858,7 @@ mod tests {
             readers: 1,
             dry_run: true,
             serial: None,
+            job: None,
         };
         let pick = |bytes: u64, n: usize| {
             let p = dir.join("i.img");
@@ -1916,7 +1941,7 @@ mod tests {
     #[test]
     fn boot_region_layout_and_checksum() {
         let g = geometry(32 << 20, 4096, 0).unwrap();
-        let r = boot_region(&g, 0, 32 << 20, 5, 0x1234, 0, 0);
+        let r = boot_region(&g, 0, 32 << 20, 5, 0x1234, 0, 0, None);
         assert_eq!(r.len(), 12 * 512);
         assert_eq!(&r[3..11], b"EXFAT   ");
         for s in 0..=8 {
@@ -1934,6 +1959,16 @@ mod tests {
         assert_eq!(u32_at(&r, 92) as u64, g.cluster_count);
         assert_eq!(u32_at(&r, 96), 5);
         assert_checksum_skips(&r[..11 * 512], &[106, 107, 112]);
+        assert!(r[120..510].iter().all(|&b| b == 0xF4));
+        // A job id goes into the boot code area, and the checksum covers it.
+        let id = [0xA5u8; 16];
+        let t = boot_region(&g, 0, 32 << 20, 5, 0x1234, 0, 0, Some(&id));
+        assert_eq!(&t[JOB_TAG_OFF..JOB_TAG_OFF + 11], JOB_TAG);
+        assert_eq!(&t[JOB_TAG_OFF + 11..JOB_TAG_OFF + 27], &id);
+        assert!(t[JOB_TAG_OFF + 27..510].iter().all(|&b| b == 0xF4));
+        let tc = checksum32(&t[..11 * 512], &[106, 107, 112], 0);
+        assert_ne!(tc, c);
+        assert!(t[11 * 512..].as_chunks::<4>().0.iter().all(|w| *w == tc.to_le_bytes()));
     }
 
     // ───── timestamps ─────

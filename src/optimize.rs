@@ -40,16 +40,20 @@
 //!    `<tmp>/manifest`.
 //! 5. **cleanup**: `state=done`, then the tree, the manifest, the state file, the dir.
 //!
-//! The new volume's serial number is chosen before the pull and saved in the state file with a
-//! fingerprint of the original boot sector, so a later run can tell the volume this optimize
-//! was writing from the original one and from anything else. Every run holds an exclusive
+//! The new volume's serial number, a random 128-bit job id and the planned boot sector geometry
+//! are decided before the pull and saved in the state file with a fingerprint of the original
+//! boot sector and the drive's identity and size; build writes the job id into the boot code
+//! area of both boot sectors. So a later run can tell the volume this optimize was writing from
+//! the original one and from anything else (a foreign volume with the same 32-bit serial). Every run holds an exclusive
 //! flock on `<tmp>/lock`; a temp dir locked by another run is never touched.
 //!
 //! A later run finds the temp dir by the drive's identity (USB serial / WWID plus the
 //! partition's start sector; for an image its inode) and resumes: no state, `pulled` or
 //! `verified` (device never written) or `done` (checked) → the dir is discarded and a fresh run
 //! starts. `building` → judged by the raw boot sector:
-//! - our saved serial (main or backup boot sector): a dirty / unparsable volume (a zeroed main
+//! - the saved drive identity or size differs → refused, before anything else.
+//! - our saved serial, job id and geometry (main or backup boot sector; our serial with another
+//!   job id or geometry → refused): a dirty / unparsable volume (a zeroed main
 //!   boot sector) is our half-written build → re-verify the temp tree against the manifest and
 //!   rebuild; a clean one
 //!   whose manifest equals the saved one is the finished build → clean up; a clean one with
@@ -126,7 +130,7 @@ const DISK_FS: [u32; 13] = [
     0x5265_4973,
 ];
 const OVERLAYFS_MAGIC: u32 = 0x794C_7630;
-const STATE_MAGIC: &str = "flashcp-optimize-state 2";
+const STATE_MAGIC: &str = "flashcp-optimize-state 3";
 
 #[derive(Clone, Debug, Default)]
 pub struct OptimizeOpts {
@@ -191,16 +195,124 @@ struct State {
     orig: u64,
     /// Serial number of the volume this run writes (decided before the pull).
     serial: u32,
+    /// Random id of this optimize, also written into the boot code area of the boot sectors
+    /// it builds (see [`crate::exfat::JOB_TAG`]).
+    job: [u8; 16],
+    /// The boot sector geometry this optimize planned.
+    geom: Geom,
+    /// The target's identity (see [`identity`]) and size in bytes.
+    device: String,
+    size: u64,
+}
+
+/// The geometry fields of an exFAT boot sector that a build decides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Geom {
+    vol_len: u64,
+    part_off: u64,
+    fat_off: u32,
+    fat_len: u32,
+    heap_off: u32,
+    clusters: u32,
+    shift: u8,
+}
+
+impl Geom {
+    /// What a build of `p` onto `tgt` writes.
+    fn planned(p: &crate::exfat::Plan, tgt: &Target) -> Geom {
+        Geom {
+            vol_len: usable_bytes(tgt.bytes) / SECTOR,
+            part_off: tgt.part_off,
+            fat_off: p.g.fat_off as u32,
+            fat_len: p.g.fat_len as u32,
+            heap_off: p.g.heap_off as u32,
+            clusters: p.g.cluster_count as u32,
+            shift: (p.g.cluster / SECTOR).trailing_zeros() as u8,
+        }
+    }
+
+    fn of(b: &[u8]) -> Geom {
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        Geom {
+            vol_len: u64_at(72),
+            part_off: u64_at(64),
+            fat_off: u32_at(80),
+            fat_len: u32_at(84),
+            heap_off: u32_at(88),
+            clusters: u32_at(92),
+            shift: b[109],
+        }
+    }
+
+    fn encode(&self) -> String {
+        format!(
+            "{},{},{},{},{},{},{}",
+            self.vol_len, self.part_off, self.fat_off, self.fat_len, self.heap_off, self.clusters, self.shift
+        )
+    }
+
+    fn decode(s: &str) -> Option<Geom> {
+        let v: Vec<u64> = s.split(',').map(|x| x.parse().ok()).collect::<Option<_>>()?;
+        let [vol_len, part_off, fat_off, fat_len, heap_off, clusters, shift] = v[..] else { return None };
+        Some(Geom {
+            vol_len,
+            part_off,
+            fat_off: fat_off.try_into().ok()?,
+            fat_len: fat_len.try_into().ok()?,
+            heap_off: heap_off.try_into().ok()?,
+            clusters: clusters.try_into().ok()?,
+            shift: shift.try_into().ok()?,
+        })
+    }
+
+    /// The fields that differ from `other`, for an error message.
+    fn diff(&self, other: &Geom) -> String {
+        let mut d = Vec::new();
+        let mut f = |n: &str, a: u64, b: u64| {
+            if a != b {
+                d.push(format!("{n} {b} instead of {a}"))
+            }
+        };
+        f("VolumeLength", self.vol_len, other.vol_len);
+        f("PartitionOffset", self.part_off, other.part_off);
+        f("FatOffset", self.fat_off.into(), other.fat_off.into());
+        f("FatLength", self.fat_len.into(), other.fat_len.into());
+        f("ClusterHeapOffset", self.heap_off.into(), other.heap_off.into());
+        f("ClusterCount", self.clusters.into(), other.clusters.into());
+        f("SectorsPerClusterShift", self.shift.into(), other.shift.into());
+        d.join(", ")
+    }
+}
+
+/// 16 random bytes from the kernel (getrandom, else /dev/urandom).
+fn random_id() -> Result<[u8; 16]> {
+    let mut b = [0u8; 16];
+    let n = unsafe { libc::getrandom(b.as_mut_ptr().cast(), b.len(), 0) };
+    if n != b.len() as isize {
+        use std::io::Read;
+        File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut b))
+            .context("read random bytes for the optimize job id")?;
+    }
+    Ok(b)
+}
+
+fn hex_bytes(b: &[u8]) -> String {
+    b.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex_bytes(s: &str) -> Option<Vec<u8>> {
+    s.len().is_multiple_of(2).then_some(())?;
+    (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok())).collect()
 }
 
 fn hex(s: &str) -> String {
-    s.bytes().map(|b| format!("{b:02x}")).collect()
+    hex_bytes(s.as_bytes())
 }
 
 fn unhex(s: &str) -> Option<String> {
-    let b: Option<Vec<u8>> =
-        (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok())).collect();
-    String::from_utf8(b?).ok()
+    String::from_utf8(unhex_bytes(s)?).ok()
 }
 
 impl State {
@@ -213,10 +325,14 @@ impl State {
             Phase::Done => "done",
         };
         format!(
-            "{STATE_MAGIC}\nstate={p}\nlabel={}\noriginal={:016x}\nserial={:08x}\n",
+            "{STATE_MAGIC}\nstate={p}\nlabel={}\noriginal={:016x}\nserial={:08x}\njob={}\ngeometry={}\ndevice={}\nsize={}\n",
             hex(&self.label),
             self.orig,
-            self.serial
+            self.serial,
+            hex_bytes(&self.job),
+            self.geom.encode(),
+            hex(&self.device),
+            self.size
         )
     }
 
@@ -230,6 +346,7 @@ impl State {
         let mut lines = s.lines();
         ensure!(lines.next() == Some(STATE_MAGIC), "the state file is not a flashcp optimize state");
         let (mut phase, mut label, mut orig, mut serial) = (None, None, None, None);
+        let (mut job, mut geom, mut device, mut size) = (None, None, None, None);
         for l in lines {
             match l.split_once('=') {
                 Some(("state", v)) => {
@@ -245,11 +362,17 @@ impl State {
                 Some(("label", v)) => label = unhex(v),
                 Some(("original", v)) => orig = u64::from_str_radix(v, 16).ok(),
                 Some(("serial", v)) => serial = u32::from_str_radix(v, 16).ok(),
+                Some(("job", v)) => job = unhex_bytes(v).and_then(|b| <[u8; 16]>::try_from(b).ok()),
+                Some(("geometry", v)) => geom = Geom::decode(v),
+                Some(("device", v)) => device = unhex(v),
+                Some(("size", v)) => size = v.parse().ok(),
                 _ => {}
             }
         }
-        match (phase, label, orig, serial) {
-            (Some(phase), Some(label), Some(orig), Some(serial)) => Ok(Some(State { phase, label, orig, serial })),
+        match (phase, label, orig, serial, job, geom, device, size) {
+            (Some(phase), Some(label), Some(orig), Some(serial), Some(job), Some(geom), Some(device), Some(size)) => {
+                Ok(Some(State { phase, label, orig, serial, job, geom, device, size }))
+            }
             _ => bail!("the state file is incomplete"),
         }
     }
@@ -285,6 +408,13 @@ fn serial_of(sector: &[u8]) -> u32 {
 
 fn is_exfat(sector: &[u8]) -> bool {
     sector.len() >= 512 && &sector[3..11] == b"EXFAT   " && sector[510..512] == [0x55, 0xAA]
+}
+
+/// The optimize job id in a boot sector's boot code area (see [`crate::exfat::JOB_TAG`]).
+fn job_of(sector: &[u8]) -> Option<[u8; 16]> {
+    use crate::exfat::{JOB_TAG, JOB_TAG_OFF};
+    let at = JOB_TAG_OFF + JOB_TAG.len();
+    (sector.len() >= 512 && &sector[JOB_TAG_OFF..at] == JOB_TAG).then(|| sector[at..at + 16].try_into().unwrap())
 }
 
 /// A serial for the new volume that differs from the original's (and is not 0).
@@ -698,8 +828,16 @@ fn in_layout(v: &Vol, t: &VolTree, nodes: &[Node], refs: &[Ref], p: &crate::exfa
         })
 }
 
-fn build_opts(label: &str, serial: Option<u32>) -> BuildOpts {
-    BuildOpts { cluster: None, label: label.to_string(), fat: FatMode::Prefix, readers: 12, dry_run: false, serial }
+fn build_opts(label: &str, serial: Option<u32>, job: Option<[u8; 16]>) -> BuildOpts {
+    BuildOpts {
+        cluster: None,
+        label: label.to_string(),
+        fat: FatMode::Prefix,
+        readers: 12,
+        dry_run: false,
+        serial,
+        job,
+    }
 }
 
 // ───────────────────────── running phases ─────────────────────────
@@ -796,24 +934,48 @@ fn open_walk(held: &File, dev_len: u64) -> Result<(Vol, VolTree)> {
     Ok((v, t))
 }
 
+/// What every message says once the device may be half-written.
+pub const FORMAT_WARNING: &str = "Until optimize finishes, the drive does not open anywhere, and other systems (notably \
+     Windows) may offer to FORMAT it: decline (formatting erases the half-built volume), plug it back into this Linux \
+     computer and re-run `flashcp optimize <device>` to resume";
+
+/// Context marker on an optimize error after which the device may be half-written; its text
+/// says where the data is and how to finish (`main` puts it into the JSON error event as
+/// "recovery"). See [`recovery_of`].
+#[derive(Debug)]
+pub struct Recovery(pub String);
+
+impl std::fmt::Display for Recovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Recovery {}
+
+/// The recovery text of an optimize error (see [`Recovery`]), if the device may be half-written.
+pub fn recovery_of(e: &anyhow::Error) -> Option<&str> {
+    e.downcast_ref::<Recovery>().map(|r| r.0.as_str())
+}
+
 /// What to tell the user once the device may be half-written: the copy is safe, here is how
 /// to finish.
-fn recovery(what: &str, tmp: &Path, base: &Path, label: &str, fd: bool) -> String {
+fn recovery(what: &str, tmp: &Path, base: &Path, label: &str, fd: bool) -> Recovery {
     let again = if fd {
         format!("run the same `flashcp optimize` again on this drive with --temp {}", base.display())
     } else {
         format!("run `flashcp optimize {what} --yes --temp {}` again", base.display())
     };
-    format!(
+    Recovery(format!(
         "{what} may be incomplete, but all your files are safe in {} (verified against {}). To finish, {again}: \
          it picks up where this run stopped. Or rebuild the drive yourself with `flashcp build {} {} --label {:?} \
-         --yes-erase`",
+         --yes-erase`. {FORMAT_WARNING}",
         tmp.join("tree").display(),
         tmp.join("manifest").display(),
         tmp.join("tree").display(),
         if fd { "<device>" } else { what },
         label
-    )
+    ))
 }
 
 /// Fails if the image target is attached to a loop device now. open_target refused that at the
@@ -935,6 +1097,27 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
         building.iter().map(|(_, d, _)| d.display().to_string()).collect::<Vec<_>>().join(", ")
     );
     if let Some((base, dir, st)) = building.pop() {
+        // The state must be this very drive's: the temp dir's name alone (a USB serial a
+        // reader shares, a reused maj:min or inode) is not enough.
+        let mut wrong = Vec::new();
+        if st.device != key {
+            wrong.push(format!("its identity is {key}, the copy is of {}", st.device));
+        }
+        if st.size != ctx.dev_len {
+            wrong.push(format!("its size is {} bytes, the copy's drive had {}", ctx.dev_len, st.size));
+        }
+        if !wrong.is_empty() {
+            bail!(
+                "{} holds the copy of an interrupted optimize, but {what} is not the drive it was made from ({}), \
+                 so flashcp will not write to it. Nothing was changed. The copy in {} is kept: plug in the drive that \
+                 optimize was rebuilding and run it again, or, if that copy holds nothing you still need, delete it \
+                 ({})",
+                dir.display(),
+                wrong.join("; "),
+                dir.join("tree").display(),
+                rm_hint(&dir)
+            );
+        }
         let r = resume(&mut run, ctx, tgt, &base, &dir, st, o, t0);
         drop(locks);
         return r;
@@ -952,10 +1135,11 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
     let label = v.label.clone();
     let old_cs = v.cs;
     let (mut nodes, refs) = nodes_of(&t).map_err(untouched)?;
-    let (p, _why) = choose_cluster(&mut nodes, &tgt, &build_opts(&label, None))
+    let (p, _why) = choose_cluster(&mut nodes, &tgt, &build_opts(&label, None, None))
         .context("flashcp build cannot lay out this data on the drive")
         .map_err(untouched)?;
     let already = in_layout(&v, &t, &nodes, &refs, &p, &tgt);
+    let geom = Geom::planned(&p, &tgt);
     drop(v);
     let (files, dirs, data) = (t.files.len() as u64, t.dirs.len() as u64 - 1, t.data_bytes());
     let mut stats = OptimizeStats {
@@ -1006,7 +1190,8 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
     let detail = format!(
         "optimize: {files} files, {dirs} dirs, {} of data on {what} (label {label:?}, cluster {}) → rebuilt as one \
          contiguous flashcp layout with cluster {}, writing {} │ temporary copy in {} ({} needed) │ kept: contents, \
-         names, empty dirs, modification times, label; lost: file attributes, creation and access times",
+         names, empty dirs, modification times, label; lost: file attributes, creation and access times │ if it is \
+         interrupted: {FORMAT_WARNING}",
         human_bytes(data as f64),
         human_bytes(old_cs as f64),
         human_bytes(p.g.cluster as f64),
@@ -1033,7 +1218,16 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
 
     // ── pull + verify: the device is only read; on any error the copy is deleted ──
     run.steps = 5;
-    let st = State { phase: Phase::None, label: label.clone(), orig, serial };
+    let st = State {
+        phase: Phase::None,
+        label: label.clone(),
+        orig,
+        serial,
+        job: random_id().map_err(untouched)?,
+        geom,
+        device: key.clone(),
+        size: ctx.dev_len,
+    };
     // Created here, exclusively (EEXIST if anything appeared since the lookup above): only a
     // directory this run created is ever deleted on error.
     fs::DirBuilder::new()
@@ -1165,7 +1359,15 @@ fn rebuild(
             d.len(),
             first_diffs(&d)
         );
-        choose_cluster(&mut nodes, &tgt, &build_opts(&st.label, None)).context("plan the rebuild")?;
+        let (p, _) =
+            choose_cluster(&mut nodes, &tgt, &build_opts(&st.label, None, None)).context("plan the rebuild")?;
+        let g = Geom::planned(&p, &tgt);
+        ensure!(
+            g == st.geom,
+            "the rebuild from the temporary copy would lay out the volume differently than this optimize planned \
+             ({}); not writing it",
+            st.geom.diff(&g)
+        );
         sync_temp(tmp)?;
         Ok((nodes, expect))
     })();
@@ -1213,21 +1415,28 @@ fn rebuild(
     }
     set_direct(&tgt.file, tgt.direct);
     let guard = Guard { expect, after_file };
-    build_target_guarded(nodes, tgt, &build_opts(&st.label, Some(st.serial)), &mut forward(&mut run.tick), Some(guard))
-        .map_err(|e| match e.downcast_ref::<SourceChanged>() {
-            Some(SourceChanged(p)) => {
-                let rel = p.strip_prefix(&tree).unwrap_or(p).display().to_string();
-                e.context(format!(
-                    "the temporary copy in {} changed after it was verified ({rel}); the rebuild of {what} was \
+    build_target_guarded(
+        nodes,
+        tgt,
+        &build_opts(&st.label, Some(st.serial), Some(st.job)),
+        &mut forward(&mut run.tick),
+        Some(guard),
+    )
+    .map_err(|e| match e.downcast_ref::<SourceChanged>() {
+        Some(SourceChanged(p)) => {
+            let rel = p.strip_prefix(&tree).unwrap_or(p).display().to_string();
+            e.context(Recovery(format!(
+                "the temporary copy in {} changed after it was verified ({rel}); the rebuild of {what} was \
                      stopped and left unfinished (not mountable). The copy was NOT deleted: restore it, then re-run \
-                     `flashcp optimize` (it resumes), or copy it back with `flashcp add {} {}` after formatting",
-                    tmp.display(),
-                    tree.display(),
-                    if ctx.fd { "<target>" } else { what.as_str() }
-                ))
-            }
-            None => e.context(hint()),
-        })?;
+                     `flashcp optimize` (it resumes), or copy it back with `flashcp add {} {}` after formatting it \
+                     with flashcp. {FORMAT_WARNING}",
+                tmp.display(),
+                tree.display(),
+                if ctx.fd { "<target>" } else { what.as_str() }
+            )))
+        }
+        None => e.context(hint()),
+    })?;
     hook("build").map_err(|e| e.context(hint()))?;
 
     run.phase("check");
@@ -1235,7 +1444,10 @@ fn rebuild(
         not_looped(ctx, "check")?;
         let (v, t) = open_walk(&ctx.held, ctx.dev_len).context("the rebuilt drive does not parse as a clean volume")?;
         ensure!(v.label == st.label, "the rebuilt volume's label is {:?}, not {:?}", v.label, st.label);
-        ensure!(serial_of(&v.sector0) == st.serial, "the drive does not hold the volume this optimize wrote");
+        ensure!(
+            serial_of(&v.sector0) == st.serial && job_of(&v.sector0) == Some(st.job),
+            "the drive does not hold the volume this optimize wrote"
+        );
         let strat = read_strategy(&ctx.held, &v);
         drop(v);
         let m = hash_device(run, &ctx.held, &t, &strat).context("hash the rebuilt drive")?;
@@ -1337,7 +1549,7 @@ fn resume(
     let (files, dirs, data) = (saved.files.len() as u64, saved.dirs.len() as u64, saved.bytes());
     // What a rebuild from the copy would write (a damaged copy fails later, with the hint).
     let planned = scan_tree(&tree, &upcase_map()).and_then(|mut n| {
-        choose_cluster(&mut n, &tgt, &build_opts(&st.label, None)).map(|(p, _)| (p.g.cluster, p.write_bytes))
+        choose_cluster(&mut n, &tgt, &build_opts(&st.label, None, None)).map(|(p, _)| (p.g.cluster, p.write_bytes))
     });
     let (cluster, write_bytes) = planned.as_ref().map_or((0, 0), |x| *x);
     run.tick.emit(Event::Plan {
@@ -1389,15 +1601,44 @@ fn resume(
     let bps = if is_exfat(&s0) && (9..=12).contains(&s0[108]) { 1usize << s0[108] } else { SECTOR as usize };
     let original = is_exfat(&s0) && s0.len() >= bps && fingerprint(&s0[..bps]) == st.orig;
     // build writes the backup boot sector (12 × 512 bytes in) first, and the main one last
-    // (zeros until then): either one with our serial means our build had started.
+    // (zeros until then): either one with our serial, our job id and our planned geometry
+    // means our build had started. Our serial with anything else is refused.
     let backup = read_raw(&ctx.held, 12 * SECTOR, SECTOR);
-    let ours = [&s0, &backup].iter().any(|s| is_exfat(s) && serial_of(s) == st.serial);
     let keep = format!(
         "The temporary copy in {} is kept; it holds the files as they were when that optimize started (to delete \
          it: {})",
         tmp.display(),
         rm_hint(tmp)
     );
+    let mut ours = false;
+    for (name, s) in [("main", &s0), ("backup", &backup)] {
+        if !is_exfat(s) || serial_of(s) != st.serial {
+            continue;
+        }
+        let mut wrong = Vec::new();
+        if job_of(s) != Some(st.job) {
+            wrong.push(match job_of(s) {
+                Some(j) => {
+                    format!("it was written by another optimize job ({}, not {})", hex_bytes(&j), hex_bytes(&st.job))
+                }
+                None => "it carries no flashcp optimize job id".to_string(),
+            });
+        }
+        let g = Geom::of(s);
+        if g != st.geom {
+            wrong.push(format!("its geometry differs from the planned one ({})", st.geom.diff(&g)));
+        }
+        if !wrong.is_empty() {
+            bail!(
+                "the {name} boot sector of {what} has the serial number of the volume the interrupted optimize was \
+                 writing, but {}: it is not that optimize's volume, so flashcp will not write to it. {keep}. If the \
+                 drive holds what you want, check that the copy holds nothing you still need and delete {}",
+                wrong.join("; "),
+                tmp.display()
+            );
+        }
+        ours = true;
+    }
     match walked {
         Ok((v, t)) if original || ours => {
             stats.old_cluster = v.cs;
@@ -1470,14 +1711,17 @@ fn resume(
     seal(&tree).with_context(hint)?;
     let local = hash_local(run, &tree).with_context(hint)?;
     let d = saved.diff(&local, "the saved manifest", "the temporary copy");
-    ensure!(
-        d.is_empty(),
-        "an interrupted optimize left {what} unfinished, and its temporary copy {} no longer matches its manifest \
-         ({} differences: {}). flashcp will not write that copy to the drive. It is kept as it is",
-        tree.display(),
-        d.len(),
-        first_diffs(&d)
-    );
+    if !d.is_empty() {
+        let msg = format!(
+            "an interrupted optimize left {what} unfinished, and its temporary copy {} no longer matches its \
+             manifest ({} differences: {}). flashcp will not write that copy to the drive. It is kept as it is: \
+             restore the files that changed, then run optimize again. {FORMAT_WARNING}",
+            tree.display(),
+            d.len(),
+            first_diffs(&d)
+        );
+        return Err(anyhow::Error::new(Recovery(msg)));
+    }
     stats.phases = rebuild(run, &ctx, tgt, base, tmp, &st, &saved, false)?;
     stats.written = write_bytes;
     stats.secs = t0.elapsed().as_secs_f64();
@@ -1494,20 +1738,69 @@ mod tests {
         let d = std::env::temp_dir().join(format!("flashcp-optstate-{}", std::process::id()));
         fs::create_dir_all(&d).unwrap();
         assert!(State::load(&d).unwrap().is_none());
-        let st =
-            State { phase: Phase::Building, label: "Mÿ\n=Stick".into(), orig: 0xDEAD_BEEF_0123, serial: 0x89AB_CDEF };
+        let geom =
+            Geom { vol_len: 131072, part_off: 2048, fat_off: 128, fat_len: 8, heap_off: 256, clusters: 4000, shift: 3 };
+        let st = State {
+            phase: Phase::Building,
+            label: "Mÿ\n=Stick".into(),
+            orig: 0xDEAD_BEEF_0123,
+            serial: 0x89AB_CDEF,
+            job: *b"0123456789abcdef",
+            geom,
+            device: "usb-X\n=1-p2048".into(),
+            size: 64 << 20,
+        };
         save_state(&d, &st).unwrap();
         let back = State::load(&d).unwrap().unwrap();
         assert_eq!(
-            (back.phase, back.label, back.orig, back.serial),
-            (st.phase.clone(), st.label.clone(), st.orig, st.serial)
+            (back.phase, back.label, back.orig, back.serial, back.job, back.geom, back.device, back.size),
+            (st.phase.clone(), st.label.clone(), st.orig, st.serial, st.job, st.geom, st.device.clone(), st.size)
         );
-        // A state without the serial (an older format) is not trusted.
+        // A state without the serial or the job id is not trusted.
         fs::write(d.join("state"), st.encode().replace("serial=89abcdef\n", "")).unwrap();
+        assert!(State::load(&d).is_err());
+        let enc = st.encode();
+        let job_line = enc.lines().find(|l| l.starts_with("job=")).unwrap().to_string();
+        fs::write(d.join("state"), enc.replace(&format!("{job_line}\n"), "")).unwrap();
+        assert!(State::load(&d).is_err());
+        // An older format (version 2: serial only) is unreadable.
+        fs::write(d.join("state"), enc.replace(STATE_MAGIC, "flashcp-optimize-state 2")).unwrap();
         assert!(State::load(&d).is_err());
         fs::write(d.join("state"), "garbage").unwrap();
         assert!(State::load(&d).is_err());
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn job_id_and_geometry_come_from_the_boot_sector() {
+        let a = random_id().unwrap();
+        assert_ne!(a, random_id().unwrap());
+        let mut s = vec![0xF4u8; 512];
+        assert_eq!(job_of(&s), None);
+        s[120..131].copy_from_slice(crate::exfat::JOB_TAG);
+        s[131..147].copy_from_slice(&a);
+        assert_eq!(job_of(&s), Some(a));
+        s[64..72].copy_from_slice(&2048u64.to_le_bytes());
+        s[72..80].copy_from_slice(&131072u64.to_le_bytes());
+        for (o, v) in [(80, 128u32), (84, 8), (88, 256), (92, 4000)] {
+            s[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        s[109] = 3;
+        let g =
+            Geom { vol_len: 131072, part_off: 2048, fat_off: 128, fat_len: 8, heap_off: 256, clusters: 4000, shift: 3 };
+        assert_eq!(Geom::of(&s), g);
+        assert_eq!(Geom::decode(&g.encode()), Some(g));
+        let h = Geom { fat_len: 9, ..g };
+        assert_eq!(g.diff(&h), "FatLength 9 instead of 8");
+        assert!(Geom::decode("1,2,3").is_none());
+    }
+
+    #[test]
+    fn recovery_is_found_under_more_context() {
+        let e = anyhow!("write failed").context(Recovery("re-run it".into())).context("outer");
+        assert_eq!(recovery_of(&e), Some("re-run it"));
+        assert_eq!(recovery_of(&anyhow!("other")), None);
+        assert_eq!(recovery_of(&anyhow::Error::new(Recovery("x".into()))), Some("x"));
     }
 
     #[test]

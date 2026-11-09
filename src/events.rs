@@ -115,8 +115,13 @@ impl Event {
     }
 }
 
-pub fn error_json(message: &str) -> String {
-    format!(r#"{{"event":"error","message":{}}}"#, json_str(message))
+/// The JSON error event. `recovery` (only `optimize` sets it, once the drive may be
+/// half-written) says where the data is and how to finish.
+pub fn error_json(message: &str, recovery: Option<&str>) -> String {
+    match recovery {
+        Some(r) => format!(r#"{{"event":"error","message":{},"recovery":{}}}"#, json_str(message), json_str(r)),
+        None => format!(r#"{{"event":"error","message":{}}}"#, json_str(message)),
+    }
 }
 
 /// Callback type the library calls with each event.
@@ -171,7 +176,11 @@ mod tests {
         assert_eq!(ph.to_json(), r#"{"event":"phase","op":"optimize","phase":"verify","step":2,"steps":5}"#);
         let d = Event::Done { files: 3, bytes: 10, secs: 1.5 };
         assert_eq!(d.to_json(), r#"{"event":"done","files":3,"bytes":10,"secs":1.500}"#);
-        assert_eq!(error_json("a \"b\"\n\\"), r#"{"event":"error","message":"a \"b\"\n\\"}"#);
+        assert_eq!(error_json("a \"b\"\n\\", None), r#"{"event":"error","message":"a \"b\"\n\\"}"#);
+        assert_eq!(
+            error_json("failed", Some("re-run \"it\"")),
+            r#"{"event":"error","message":"failed","recovery":"re-run \"it\""}"#
+        );
         assert_eq!(json_str("\u{1}é"), "\"\\u0001é\"");
     }
 
