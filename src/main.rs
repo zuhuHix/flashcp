@@ -542,8 +542,13 @@ fn run(cmd: Cmd) -> Result<()> {
                     String::new()
                 };
                 let deleted = if s.deleted > 0 { format!(", deleted {} extraneous", s.deleted) } else { String::new() };
+                let skipped_del = if s.skipped_deletions > 0 {
+                    format!(", {} planned deletions skipped (DEST changed since planning)", s.skipped_deletions)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "pulled: {} files, {} dirs, {} data{kept}{deleted} in {:.2}s ({:.0} files/s, {:.1} MB/s of data; read {} in {} requests)",
+                    "pulled: {} files, {} dirs, {} data{kept}{deleted}{skipped_del} in {:.2}s ({:.0} files/s, {:.1} MB/s of data; read {} in {} requests)",
                     s.files,
                     s.dirs,
                     util::human_bytes(s.data_bytes as f64),

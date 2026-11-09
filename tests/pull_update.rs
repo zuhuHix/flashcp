@@ -488,3 +488,73 @@ fn delete_into_home_or_its_ancestor_is_refused_even_with_yes() {
     assert_eq!(tree_snapshot(&home), before, "$HOME changed");
     fs::remove_dir_all(&dir).expect("remove scratch dir");
 }
+
+// ───────────────────────── j. deletes exactly the planned entries ─────────────────────────
+
+/// `flashcp pull` with a shell command that runs after planning, before anything is written.
+fn pull_after_plan(img: &Path, dest: &Path, extra: &[&str], hook: &str) -> Output {
+    flashcp()
+        .arg("pull")
+        .arg(img)
+        .arg(dest)
+        .args(extra)
+        .env("FLASHCP_TEST_AFTER_PLAN", hook)
+        .output()
+        .expect("run flashcp pull")
+}
+
+#[test]
+fn entries_changed_after_planning_survive_and_the_rest_is_deleted() {
+    let dir = test_dir("pull_update_changed");
+    let (img, dest) = stray_setup(&dir);
+    let d = dest.display();
+    // After planning: a new file in the planned stray-dir (not in the plan), and stray.txt replaced
+    // by another file of the same name (a new inode, made before the old one is gone).
+    let hook = format!(
+        "printf fresh > '{d}/stray-dir/new.txt' && printf replacement > '{d}/stray.tmp' && mv '{d}/stray.tmp' '{d}/stray.txt'"
+    );
+    let out = pull_after_plan(&img, &dest, &["--update", "--delete-extraneous", "--yes"], &hook);
+    assert_success(&out, "flashcp pull");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    // Planned: 9 entries. Removed: sub/extra.txt, link-out, a/b/c.bin, a/b, a, x.txt, into.
+    // Left: stray.txt (changed) and stray-dir (still holds the new file).
+    assert!(stdout.contains(", deleted 7 extraneous"), "expected 7 deletions:\n{stdout}");
+    assert!(stdout.contains(", 2 planned deletions skipped"), "expected 2 skipped:\n{stdout}");
+    assert!(
+        stderr.contains("warning: 2 planned deletions skipped because DEST changed since planning: "),
+        "no prominent warning:\n{stderr}"
+    );
+    assert!(stderr.contains("stray.txt (changed since planning)"), "{stderr}");
+    assert!(stderr.contains("stray-dir (still holds entries)"), "{stderr}");
+    assert!(
+        stderr.contains("not deleting") && stderr.contains("stray-dir/new.txt"),
+        "the unplanned entry is not named:\n{stderr}"
+    );
+
+    // What changed survives, with its new content.
+    assert_eq!(fs::read(dest.join("stray-dir/new.txt")).expect("new file"), b"fresh");
+    assert_eq!(fs::read(dest.join("stray.txt")).expect("replaced file"), b"replacement");
+    // The rest of the plan happened.
+    for gone in ["sub/extra.txt", "link-out", "stray-dir/a", "stray-dir/x.txt", "stray-dir/into"] {
+        assert!(fs::symlink_metadata(dest.join(gone)).is_err(), "{gone} is still in DEST");
+    }
+    assert_eq!(fs::read(dest.join("a.txt")).expect("pulled file"), b"alpha, version two, and longer now\n");
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+#[test]
+fn planned_entry_that_vanished_after_planning_is_not_an_error() {
+    let dir = test_dir("pull_update_vanished");
+    let (img, dest) = stray_setup(&dir);
+    let hook = format!("rm '{}'", dest.join("link-out").display());
+    let out = pull_after_plan(&img, &dest, &["--update", "--delete-extraneous", "--yes"], &hook);
+    assert_success(&out, "flashcp pull");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stdout.contains(", deleted 8 extraneous"), "expected 8 deletions (one was already gone):\n{stdout}");
+    assert!(!stdout.contains("skipped") && !stderr.contains("warning"), "{stdout}\n{stderr}");
+    assert!(fs::symlink_metadata(dest.join("stray.txt")).is_err(), "stray.txt survived");
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
