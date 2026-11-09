@@ -7,7 +7,7 @@
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -88,6 +88,62 @@ pub(crate) fn is_dir(st: &libc::stat) -> bool {
     st.st_mode & libc::S_IFMT == libc::S_IFDIR
 }
 
+pub(crate) fn is_regular(st: &libc::stat) -> bool {
+    st.st_mode & libc::S_IFMT == libc::S_IFREG
+}
+
+/// The names in directory `dir` (never `.` or `..`). Read through a fresh descriptor opened
+/// from `dir` with `openat(".")`, so `dir` may be an O_PATH fd, and no symlink is followed.
+pub(crate) fn list_at(dir: BorrowedFd<'_>) -> io::Result<Vec<CString>> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = cvt(unsafe { libc::openat(dir.as_raw_fd(), c".".as_ptr(), flags) })?;
+    let dp = unsafe { libc::fdopendir(fd) };
+    if dp.is_null() {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    let mut names = Vec::new();
+    let res = loop {
+        // SAFETY: errno is thread-local; clearing it tells end-of-directory from an error.
+        unsafe { *libc::__errno_location() = 0 };
+        let ent = unsafe { libc::readdir(dp) };
+        if ent.is_null() {
+            let e = unsafe { *libc::__errno_location() };
+            break if e == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(e)) };
+        }
+        // SAFETY: readdir returned a valid entry, whose d_name is NUL-terminated.
+        let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    };
+    unsafe { libc::closedir(dp) };
+    res.map(|()| names)
+}
+
+/// Removes `name` from `dir`. A directory is emptied first, recursively, through its own fd
+/// (openat with O_NOFOLLOW, then the entries are unlinked relative to it); anything else,
+/// symlinks included, is unlinked itself and never followed. Returns the entries removed,
+/// `name` included. A `name` that does not exist removes nothing.
+pub(crate) fn remove_tree_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<u64> {
+    let Some(st) = stat_at(dir, name)? else { return Ok(0) };
+    if !is_dir(&st) {
+        unlink_at(dir, name)?;
+        return Ok(1);
+    }
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = cvt(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) })?;
+    // SAFETY: openat returned a fresh descriptor that nothing else owns.
+    let sub = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut n = 0;
+    for child in list_at(sub.as_fd())? {
+        n += remove_tree_at(sub.as_fd(), &child)?;
+    }
+    cvt(unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) })?;
+    Ok(n + 1)
+}
+
 /// Creates directory `name` in `dir`; an existing real directory is fine, anything else
 /// (a file, a symlink) is an error.
 pub(crate) fn mkdir_at(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<()> {
@@ -152,5 +208,35 @@ pub(crate) fn preallocate(f: &File, len: u64) -> io::Result<()> {
             Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => return Ok(()),
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn remove_tree_at_never_follows_symlinks() {
+        let base = std::env::temp_dir().join(format!("flashcp-dirfd-unit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let outside = base.join("outside");
+        fs::create_dir_all(outside.join("keep")).unwrap();
+        fs::write(outside.join("keep/f.txt"), b"keep").unwrap();
+        let root = base.join("root");
+        fs::create_dir_all(root.join("tree/inner")).unwrap();
+        fs::write(root.join("tree/inner/a.txt"), b"a").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("tree/link")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("out-link")).unwrap();
+        let rfd = open_root(&root).unwrap();
+        assert_eq!(list_at(rfd.as_fd()).unwrap().len(), 2);
+        // tree, inner, inner/a.txt and the link itself: the symlink is unlinked, never entered.
+        assert_eq!(remove_tree_at(rfd.as_fd(), c"tree").unwrap(), 4);
+        assert_eq!(remove_tree_at(rfd.as_fd(), c"out-link").unwrap(), 1);
+        assert_eq!(remove_tree_at(rfd.as_fd(), c"missing").unwrap(), 0);
+        assert!(fs::symlink_metadata(root.join("tree")).is_err());
+        assert!(fs::symlink_metadata(root.join("out-link")).is_err());
+        assert_eq!(fs::read(outside.join("keep/f.txt")).unwrap(), b"keep", "outside target was touched");
+        let _ = fs::remove_dir_all(&base);
     }
 }

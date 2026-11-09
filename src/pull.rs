@@ -41,6 +41,7 @@ use crate::verify::{FileSum, Manifest, hash_extent, zero_tail};
 use crate::volume::*;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{RecvTimeoutError, bounded};
+use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -65,6 +66,12 @@ pub struct PullOpts {
     pub skip_existing: bool,
     /// Replace files that already exist in the destination.
     pub overwrite: bool,
+    /// Copy only files that are new or whose size or mtime differ from the volume's (the quick
+    /// check, see [`up_to_date`]); a changed file is replaced as --overwrite replaces it.
+    pub update: bool,
+    /// With `update`: remove every entry of a planned destination directory whose name the
+    /// volume does not have there, after the transfer succeeded.
+    pub delete_extraneous: bool,
     /// Largest single device read, in bytes (None: chosen per device, see [`Strategy`]).
     pub chunk: Option<usize>,
     /// Gaps between extents up to this many bytes are read through rather than skipped
@@ -84,6 +91,8 @@ impl Default for PullOpts {
             from: None,
             skip_existing: false,
             overwrite: false,
+            update: false,
+            delete_extraneous: false,
             chunk: None,
             gap: None,
             inflight: None,
@@ -97,7 +106,11 @@ impl Default for PullOpts {
 pub struct PullStats {
     pub files: u64,
     pub dirs: u64,
+    /// Files left alone: existing ones with --skip-existing, up-to-date ones with --update.
     pub skipped: u64,
+    /// Entries removed by --delete-extraneous: every file, symlink and directory removed, the
+    /// top-level ones and everything inside removed directories alike.
+    pub deleted: u64,
     /// File bytes written to the destination (DataLength, zeros past ValidDataLength included).
     pub data_bytes: u64,
     /// Bytes read from the volume in the data phase (gaps and alignment included).
@@ -660,6 +673,17 @@ struct Plan {
     exts: Vec<Ext>,
     skipped: u64,
     collisions: Vec<String>,
+    /// (parent directory index, name) of every volume entry, for --delete-extraneous.
+    keep: HashSet<(u32, Vec<u8>)>,
+}
+
+/// The --update quick check for an existing destination entry: a regular file of the same size
+/// whose mtime is the volume's at exFAT precision. A content change that keeps size and mtime
+/// is not seen (that is the check's limit, not a bug).
+fn up_to_date(st: &libc::stat, len: u64, mtime: (u32, u8, u8)) -> bool {
+    dirfd::is_regular(st)
+        && u64::try_from(st.st_size).is_ok_and(|s| s == len)
+        && same_mtime((st.st_mtime, st.st_mtime_nsec as u32), mtime)
 }
 
 /// Walks the volume from `start` (whose clusters are already in `seen`) and plans every
@@ -678,6 +702,7 @@ fn plan(v: &mut Vol, start: Vec<Child>, seen: &mut [u8], root: Option<&OwnedFd>,
         exts: Vec::new(),
         skipped: 0,
         collisions: Vec::new(),
+        keep: HashSet::new(),
     };
     // (children, dir index, volume path, depth, relative path length, exists in the destination)
     let mut stack: Vec<(Vec<Child>, u32, String, usize, usize, bool)> =
@@ -700,6 +725,9 @@ fn plan(v: &mut Vol, start: Vec<Child>, seen: &mut [u8], root: Option<&OwnedFd>,
             ensure!(entries <= MAX_ENTRIES, "the volume has more than {MAX_ENTRIES} files and directories");
             let name = component(&ch.name, &shown_dir)?;
             let cname = CString::new(name.clone()).expect("component() refuses NUL");
+            if o.delete_extraneous {
+                p.keep.insert((di, cname.as_bytes().to_vec()));
+            }
             let clen = plen + usize::from(plen > 0) + name.len();
             let what = format!("{vpath}/{name}");
             ensure!(clen <= MAX_PATH, "{what}: the path is longer than {MAX_PATH} bytes");
@@ -740,7 +768,12 @@ fn plan(v: &mut Vol, start: Vec<Child>, seen: &mut [u8], root: Option<&OwnedFd>,
                     p.skipped += 1;
                     continue;
                 }
-                if !o.overwrite {
+                if o.update {
+                    if up_to_date(st, ch.len, ch.mtime) {
+                        p.skipped += 1;
+                        continue;
+                    }
+                } else if !o.overwrite {
                     p.collisions.push(what);
                     continue;
                 }
@@ -818,6 +851,25 @@ fn dest_rel(dirs: &[DirNode], mut i: u32) -> PathBuf {
     parts.iter().rev().collect()
 }
 
+/// --delete-extraneous: in every planned directory, removes each entry whose name the volume
+/// does not have there (`keep`). Returns the entries removed (see [`PullStats::deleted`]).
+fn delete_extraneous(d: &Dest, keep: &HashSet<(u32, Vec<u8>)>) -> Result<u64> {
+    let mut cache = DirCache::default();
+    let mut deleted = 0;
+    for i in 0..d.dirs.len() as u32 {
+        let dir = cache.get(d, i)?;
+        let names = dirfd::list_at(dir).with_context(|| format!("list {}", d.path.join(d.rel(i)).display()))?;
+        for name in names {
+            if keep.contains(&(i, name.as_bytes().to_vec())) {
+                continue;
+            }
+            deleted += dirfd::remove_tree_at(dir, &name)
+                .with_context(|| format!("delete {} (not on the volume)", d.shown(i, &name)))?;
+        }
+    }
+    Ok(deleted)
+}
+
 /// Removes the temp files of replacements that never completed.
 fn cleanup_temps(jobs: &[Job], d: &Dest) {
     let mut cache = DirCache::default();
@@ -890,6 +942,9 @@ fn pull_inner(
         o.chunk.is_none_or(|c| c >= MIN_CHUNK && c.is_multiple_of(ALIGN as usize) && c <= 1 << 30),
         "chunk must be a multiple of 4 KB, between 16 KB and 1 GB"
     );
+    ensure!(!(o.update && o.overwrite), "--update and --overwrite are mutually exclusive");
+    ensure!(!(o.update && o.skip_existing), "--update and --skip-existing are mutually exclusive");
+    ensure!(o.update || !o.delete_extraneous, "--delete-extraneous requires --update");
     let mut tick = Ticker::new(sink);
     match &mounted {
         Some((dev, at, true)) => eprintln!(
@@ -990,11 +1045,18 @@ fn pull_inner(
         human_bytes(data_bytes as f64),
         human_bytes(free as f64)
     );
+    let skip_note = if o.update {
+        format!(" ({} up to date)", p.skipped)
+    } else if p.skipped > 0 {
+        format!(" ({} existing skipped)", p.skipped)
+    } else {
+        String::new()
+    };
+    let delete_note = if o.delete_extraneous { ", will delete extraneous entries" } else { "" };
     let detail = format!(
-        "pull: {files} files, {dirs} dirs, {} of data → {}{}; reading {} in {} requests of up to {} (cluster {}; {}: gap {}, {} in flight{})",
+        "pull: {files} files, {dirs} dirs, {} of data → {}{skip_note}{delete_note}; reading {} in {} requests of up to {} (cluster {}; {}: gap {}, {} in flight{})",
         human_bytes(data_bytes as f64),
         dest.display(),
-        if p.skipped > 0 { format!(" ({} existing skipped)", p.skipped) } else { String::new() },
         human_bytes(read_bytes as f64),
         chunks.len() + usize::from(tail_bytes > 0),
         human_bytes(strat.chunk as f64),
@@ -1022,6 +1084,7 @@ fn pull_inner(
     let d = Dest { root, path: dest.to_path_buf(), dirs: p.dirs };
     let jobs = p.jobs;
     let exts = p.exts;
+    let keep = p.keep;
 
     let res = transfer(&file, &d, &jobs, &exts, &chunks, tail_at, cut, &strat, o, hash, trace, &mut tick);
     let retries = match res {
@@ -1031,8 +1094,14 @@ fn pull_inner(
             return Err(e.context("pull failed; the destination holds a partial copy"));
         }
     };
+    // Only now that every file is in place: whatever the volume does not have goes.
+    let deleted = if o.delete_extraneous {
+        delete_extraneous(&d, &keep).context("--delete-extraneous failed; the destination is partly cleaned")?
+    } else {
+        0
+    };
     let hashes = hash.then(|| PullHashes { manifest: manifest_of(&d.dirs, &jobs), retries, strategy: strat.clone() });
-    // Directory mtimes last (creating entries changed them), deepest first.
+    // Directory mtimes last (creating or removing entries changed them), deepest first.
     let mut cache = DirCache::default();
     for dn in d.dirs.iter().skip(1).rev() {
         if let Some((secs, ns)) = dn.mtime {
@@ -1049,6 +1118,7 @@ fn pull_inner(
         files,
         dirs,
         skipped: p.skipped,
+        deleted,
         data_bytes,
         read_bytes,
         reads: chunks.len() as u64 + u64::from(tail_bytes > 0),
@@ -1340,6 +1410,49 @@ mod tests {
         // Overlapping extents (a cross-linked volume) stay inside one read.
         let e = [ext(0, 8192, 0), ext(4096, 100, 1)];
         assert_eq!(coalesce(&e, max, 0, ALIGN), vec![Chunk { start: 0, len: 8192, exts: 0..2 }]);
+    }
+
+    #[test]
+    fn up_to_date_needs_same_size_and_mtime() {
+        let (t, t10) = crate::exfat::ts(1_700_000_001, 123_456_789);
+        let stat = |mode: libc::mode_t, size: i64, secs: i64, ns: i64| {
+            // SAFETY: stat is plain data; every field the check reads is set below.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            st.st_mode = mode;
+            st.st_size = size;
+            st.st_mtime = secs;
+            st.st_mtime_nsec = ns;
+            st
+        };
+        let reg = libc::S_IFREG | 0o644;
+        assert!(up_to_date(&stat(reg, 10, 1_700_000_001, 125_000_000), 10, (t, t10, 0x80)));
+        assert!(!up_to_date(&stat(reg, 11, 1_700_000_001, 125_000_000), 10, (t, t10, 0x80)), "size differs");
+        assert!(!up_to_date(&stat(reg, 10, 1_700_000_002, 125_000_000), 10, (t, t10, 0x80)), "mtime differs");
+        assert!(!up_to_date(&stat(libc::S_IFLNK | 0o777, 10, 1_700_000_001, 0), 10, (t, t10, 0x80)), "not regular");
+        assert!(!up_to_date(&stat(reg, -1, 1_700_000_001, 0), 0, (t, t10, 0x80)), "negative size");
+    }
+
+    #[test]
+    fn update_flags_refuse_bad_combinations() {
+        let dir = std::env::temp_dir().join(format!("flashcp-pull-unit-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("not-an-image");
+        fs::write(&src, b"x").unwrap();
+        let dest = dir.join("out");
+        let run = |o: PullOpts| {
+            let r = pull(&src, &dest, &o, &mut |_| {});
+            format!("{:#}", r.expect_err("refused"))
+        };
+        let up = PullOpts { update: true, ..Default::default() };
+        assert!(run(PullOpts { update: true, overwrite: true, ..Default::default() }).contains("mutually exclusive"));
+        assert!(
+            run(PullOpts { update: true, skip_existing: true, ..Default::default() }).contains("mutually exclusive")
+        );
+        assert!(run(PullOpts { delete_extraneous: true, ..Default::default() }).contains("requires --update"));
+        // Accepted combinations get past the option checks (and fail later, on the file).
+        assert!(!run(up).contains("requires --update"));
+        assert!(!dest.exists(), "a refused pull created the destination");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
