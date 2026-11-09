@@ -289,6 +289,83 @@ summary {
   color: var(--accent-ink);
 }
 
+.badge.trusted {
+  background: var(--success-bg);
+  border-color: transparent;
+  color: var(--success-text);
+}
+
+.badge.untrusted {
+  background: var(--warn-bg);
+  border-color: var(--warn-border);
+  color: var(--warn-text);
+}
+
+.drive-serial {
+  color: var(--muted);
+  font-size: 12px;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+/* ---- trust panel ---- */
+
+.panel.warn {
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  border-color: var(--warn-border);
+}
+
+.panel.warn .hint {
+  color: inherit;
+  opacity: 0.85;
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.trust-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 12px;
+  margin: 0;
+}
+
+.facts dt {
+  opacity: 0.8;
+}
+
+.facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+.trust-error {
+  color: var(--error-text);
+  font-weight: 600;
+}
+
+button.accent {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+button.accent:hover:not(:disabled) {
+  background: var(--accent);
+  filter: brightness(1.05);
+}
+
 /* ---- drop zone and sources ---- */
 
 .dropzone {

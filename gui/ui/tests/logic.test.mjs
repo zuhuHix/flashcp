@@ -11,6 +11,15 @@ import {
   baseName,
   expectedConfirm,
   confirmMatches,
+  confirmHint,
+  trustState,
+  isTrusted,
+  canTrust,
+  trustNotice,
+  trustDetails,
+  selectDrive,
+  openTrust,
+  closeTrust,
   driveTitle,
   nonExfatText,
   canCopy,
@@ -38,6 +47,8 @@ const exfat = (over = {}) => ({
   mountPoint: "/run/media/zuhu/FAKEUSB",
   model: "SanDisk Ultra",
   wholeDisk: false,
+  serial: "FAKE0001",
+  trusted: true,
   ...over,
 });
 const vfat = (over = {}) => ({
@@ -50,6 +61,8 @@ const vfat = (over = {}) => ({
   mountPoint: null,
   model: "Kingston",
   wholeDisk: false,
+  serial: "OLD0002",
+  trusted: false,
   ...over,
 });
 
@@ -185,18 +198,72 @@ describe("drive labels and confirmation", () => {
     assert.equal(baseName("sdb1"), "sdb1");
     assert.equal(baseName(""), "");
   });
-  test("expectedConfirm is the label, else the device basename", () => {
+  test("expectedConfirm is the label for a labelled exFAT volume", () => {
     assert.equal(expectedConfirm(exfat()), "FAKEUSB");
-    assert.equal(expectedConfirm(vfat()), "sdy1");
+  });
+  test("expectedConfirm is the serial for an unlabelled exFAT volume", () => {
+    assert.equal(expectedConfirm(exfat({ label: "" })), "FAKE0001");
+  });
+  test("expectedConfirm is the serial for vfat, even when it has a label", () => {
+    assert.equal(expectedConfirm(vfat()), "OLD0002");
+    assert.equal(expectedConfirm(vfat({ label: "OLDSTICK" })), "OLD0002");
+  });
+  test("expectedConfirm is empty without a drive or a serial to fall back on", () => {
     assert.equal(expectedConfirm(null), "");
+    assert.equal(expectedConfirm(vfat({ serial: "" })), "");
+    assert.equal(expectedConfirm(exfat({ serial: "", label: "" })), "");
+  });
+  test("expectedConfirm uses the label of an untrustable exFAT volume", () => {
+    assert.equal(expectedConfirm(exfat({ serial: "" })), "FAKEUSB");
   });
   test("confirmMatches is exact and case-sensitive", () => {
     assert.equal(confirmMatches(exfat(), "FAKEUSB"), true);
     assert.equal(confirmMatches(exfat(), "fakeusb"), false);
     assert.equal(confirmMatches(exfat(), "FAKEUSB "), false);
     assert.equal(confirmMatches(exfat(), ""), false);
-    assert.equal(confirmMatches(vfat(), "sdy1"), true);
+    assert.equal(confirmMatches(vfat(), "OLD0002"), true);
+    assert.equal(confirmMatches(vfat(), "OLDSTICK"), false);
+    assert.equal(confirmMatches(vfat({ serial: "" }), ""), false);
     assert.equal(confirmMatches(null, ""), false);
+  });
+  test("confirmHint names the label or the serial", () => {
+    assert.equal(confirmHint(exfat()), "Type the drive name FAKEUSB to confirm");
+    assert.equal(confirmHint(exfat({ label: "" })), "Type the drive's serial number FAKE0001 to confirm");
+    assert.equal(confirmHint(vfat({ label: "OLDSTICK" })), "Type the drive's serial number OLD0002 to confirm");
+    assert.equal(confirmHint(null), "Select a drive first.");
+    assert.equal(confirmHint(vfat({ serial: "" })), "This drive has no name or serial number to type.");
+  });
+  test("trustState is trusted, untrusted or untrustable", () => {
+    assert.equal(trustState(exfat()), "trusted");
+    assert.equal(trustState(vfat()), "untrusted");
+    assert.equal(trustState(vfat({ serial: "" })), "untrustable");
+    assert.equal(trustState(exfat({ serial: "", trusted: true })), "untrustable");
+  });
+  test("isTrusted and canTrust follow trustState", () => {
+    assert.equal(isTrusted(exfat()), true);
+    assert.equal(isTrusted(vfat()), false);
+    assert.equal(isTrusted(vfat({ serial: "" })), false);
+    assert.equal(canTrust(vfat()), true);
+    assert.equal(canTrust(exfat()), false);
+    assert.equal(canTrust(vfat({ serial: "" })), false);
+    assert.equal(canTrust(null), false);
+  });
+  test("trustNotice explains an untrusted or untrustable drive", () => {
+    assert.equal(trustNotice(exfat()), "");
+    assert.equal(trustNotice(vfat()), "flashcp hasn't been allowed to write to this drive yet.");
+    assert.equal(
+      trustNotice(vfat({ serial: "" })),
+      "This drive doesn't report a serial number, so flashcp can't trust it.",
+    );
+  });
+  test("trustDetails lists model, size, serial and device", () => {
+    assert.deepEqual(trustDetails(vfat()), [
+      { label: "Model", value: "Kingston" },
+      { label: "Size", value: "8.0 GB" },
+      { label: "Serial", value: "OLD0002" },
+      { label: "Device", value: "/dev/sdy1" },
+    ]);
+    assert.deepEqual(trustDetails(null), []);
   });
   test("driveTitle falls back to Untitled", () => {
     assert.equal(driveTitle(exfat()), "FAKEUSB");
@@ -221,6 +288,10 @@ describe("canCopy", () => {
   test("blocked by an invalid destination", () => {
     assert.equal(canCopy(baseState({ destDir: "/a/../b" })), false);
   });
+  test("blocked on an untrusted or untrustable exFAT drive", () => {
+    assert.equal(canCopy(baseState({ drives: [exfat({ trusted: false })] })), false);
+    assert.equal(canCopy(baseState({ drives: [exfat({ serial: "", trusted: true })] })), false);
+  });
   test("blocked while a job is running, allowed after done or error", () => {
     const running = applyJobUpdate(baseState(), upd({ stage: "running" }));
     assert.equal(canCopy(running), false);
@@ -231,10 +302,20 @@ describe("canCopy", () => {
 
 describe("canErase", () => {
   test("needs exactly one source and the exact confirmation", () => {
-    const s = baseState({ drives: [vfat()], selectedId: vfat().id, sources: ["/home/zuhu/a"] });
-    assert.equal(canErase(s, "sdy1"), true);
-    assert.equal(canErase(s, "SDY1"), false);
+    const s = baseState({
+      drives: [vfat({ trusted: true })],
+      selectedId: vfat().id,
+      sources: ["/home/zuhu/a"],
+    });
+    assert.equal(canErase(s, "OLD0002"), true);
+    assert.equal(canErase(s, "old0002"), false);
+    assert.equal(canErase(s, "OLDSTICK"), false);
     assert.equal(canErase(s, ""), false);
+  });
+  test("requires the drive to be trusted", () => {
+    assert.equal(canErase(baseState(), "FAKEUSB"), true);
+    assert.equal(canErase(baseState({ drives: [exfat({ trusted: false })] }), "FAKEUSB"), false);
+    assert.equal(canErase(baseState({ drives: [exfat({ serial: "", trusted: true })] }), "FAKEUSB"), false);
   });
   test("blocked with zero or several sources", () => {
     const none = baseState({ sources: [] });
@@ -415,6 +496,32 @@ describe("eraseSourceHint", () => {
   test("empty for exactly one, explains otherwise", () => {
     assert.equal(eraseSourceHint(1), "");
     assert.match(eraseSourceHint(0), /Add exactly one folder/);
-    assert.match(eraseSourceHint(3), /but 3 are selected/);
+    assert.match(eraseSourceHint(3), /exactly one folder, but 3 items are selected/);
+  });
+});
+
+describe("selectDrive, openTrust and closeTrust", () => {
+  test("choosing another drive closes trust and clears the typed confirmation", () => {
+    const s = baseState({ eraseTyped: "FAKE", trustOpen: true, trustError: "x" });
+    const next = selectDrive(s, vfat().id);
+    assert.equal(next.selectedId, vfat().id);
+    assert.equal(next.eraseTyped, "");
+    assert.equal(next.trustOpen, false);
+    assert.equal(next.trustError, null);
+  });
+  test("re-selecting the same drive keeps everything", () => {
+    const s = baseState({ eraseTyped: "FAKE", trustOpen: true });
+    assert.equal(selectDrive(s, s.selectedId), s);
+  });
+  test("openTrust shows the panel with no stale error", () => {
+    const s = openTrust(baseState({ trustError: "old" }));
+    assert.equal(s.trustOpen, true);
+    assert.equal(s.trustError, null);
+  });
+  test("closeTrust hides the panel and clears busy and error", () => {
+    const s = closeTrust(baseState({ trustOpen: true, trustBusy: true, trustError: "denied" }));
+    assert.equal(s.trustOpen, false);
+    assert.equal(s.trustBusy, false);
+    assert.equal(s.trustError, null);
   });
 });

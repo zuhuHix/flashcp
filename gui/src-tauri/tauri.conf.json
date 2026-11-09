@@ -49,6 +49,8 @@
         "desktopTemplate": "../../packaging/desktop/flashcp-gui.desktop",
         "files": {
           "/usr/libexec/flashcp-helper": "../target/release/flashcp-helper",
+          "/usr/libexec/flashcp-trust": "../target/release/flashcp-trust",
+          "/usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.trust.policy": "../../packaging/desktop/io.github.zuhuhix.flashcp.trust.policy",
           "/usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.helper.policy": "../../packaging/desktop/io.github.zuhuhix.flashcp.helper.policy",
           "/etc/xdg/autostart/flashcp-gui.desktop": "../../packaging/desktop/flashcp-gui-autostart.desktop",
           "/usr/share/nemo/actions/flashcp.nemo_action": "../../packaging/desktop/flashcp.nemo_action",

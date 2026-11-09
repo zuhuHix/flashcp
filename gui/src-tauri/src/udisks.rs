@@ -1,8 +1,10 @@
 //! udisks2 over the system bus (blocking zbus). Lists USB drives, unmounts, rescans, mounts,
 //! and watches for devices appearing or disappearing.
 
-use crate::drives::{select_drives, Drive, RawBlock, RawDrive};
+use crate::drives::{fake_drives, select_drives, Drive, RawBlock, RawDrive};
+use crate::trust;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -102,6 +104,9 @@ fn raw_drive(ifaces: &HashMap<String, HashMap<String, OwnedValue>>) -> Option<Ra
         media_removable: prop_bool(drive, "MediaRemovable"),
         vendor: prop_string(drive, "Vendor"),
         model: prop_string(drive, "Model"),
+        serial: prop_string(drive, "Serial"),
+        wwn: prop_string(drive, "WWN"),
+        drive_size: prop_u64(drive, "Size"),
     })
 }
 
@@ -134,10 +139,10 @@ pub fn snapshot() -> Result<Snapshot, String> {
 /// is unavailable.
 pub fn list_drives() -> Vec<Drive> {
     if fake_mode() {
-        return crate::drives::fake_drives();
+        return fake_drives();
     }
     match snapshot() {
-        Ok(snap) => select_drives(&snap.blocks, &snap.drives),
+        Ok(snap) => select_drives(&snap.blocks, &snap.drives, &trust::load(Path::new(trust::TRUST_FILE))),
         Err(e) => {
             eprintln!("flashcp-gui: cannot list drives: {e}");
             Vec::new()

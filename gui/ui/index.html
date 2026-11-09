@@ -26,6 +26,25 @@
       <div id="nonexfat" class="notice warn" hidden></div>
     </section>
 
+    <section id="trust" class="card panel warn" aria-live="polite" hidden>
+      <p id="trust-text" class="stage"></p>
+      <div id="trust-open-row" class="button-row">
+        <button id="trust-open" type="button">Trust this drive…</button>
+      </div>
+      <div id="trust-confirm" class="trust-confirm" hidden>
+        <dl id="trust-facts" class="facts"></dl>
+        <p class="hint">
+          Only trust drives you own and plug in yourself. After an administrator confirms,
+          flashcp may write to this drive (with your password) whenever it's plugged in.
+        </p>
+        <div class="button-row">
+          <button id="trust-yes" class="accent" type="button">Trust this drive</button>
+          <button id="trust-cancel" type="button">Cancel</button>
+        </div>
+      </div>
+      <p id="trust-error" class="trust-error" role="alert" hidden></p>
+    </section>
+
     <section class="card" aria-labelledby="files-heading">
       <h2 id="files-heading">Files</h2>
       <div id="dropzone" class="dropzone">
@@ -85,9 +104,7 @@
         exFAT volume that contains exactly the selected folder. There is no undo.
       </p>
       <p id="erase-hint" class="hint"></p>
-      <label for="erase-confirm" class="field-label">
-        Type <span id="erase-expected" class="code">drive name</span> to confirm
-      </label>
+      <label id="erase-label" for="erase-confirm" class="field-label"></label>
       <input id="erase-confirm" type="text" autocomplete="off" spellcheck="false" disabled>
       <button id="erase" class="danger" type="button" disabled>Erase and copy</button>
     </details>

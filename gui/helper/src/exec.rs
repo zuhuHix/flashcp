@@ -1,17 +1,16 @@
-//! Lend the device to the invoking user, run flashcp as that user, take the device back.
+//! Run flashcp as the invoking user, holding exactly one extra fd: the device, as fd 3.
 //!
-//! Root is used for exactly one thing: changing the owner of one validated device node for the
-//! duration of the run. flashcp itself never runs privileged.
+//! The helper opened and validated that fd itself; the child gets it via `dup2` and nothing else
+//! (every other fd >= 4 is closed at exec). No device ownership or permission is changed, so
+//! there is nothing to restore if the helper dies.
 
-use std::ffi::CString;
-use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::io::{self, Read};
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 
-use crate::device::NodeStat;
+use crate::args::TARGET_FD;
 
 /// The flashcp binary. Overridable only when the helper is compiled, never at run time.
 pub const FLASHCP: &str = match option_env!("FLASHCP_HELPER_FLASHCP_PATH") {
@@ -19,8 +18,8 @@ pub const FLASHCP: &str = match option_env!("FLASHCP_HELPER_FLASHCP_PATH") {
     None => "/usr/bin/flashcp",
 };
 
-/// Signals held back in the helper (so it always gets to restore ownership) and forwarded to the
-/// child instead.
+/// Signals held back in the helper and forwarded to the running child instead, so a Ctrl-C or
+/// hangup stops flashcp cleanly and no further run is started.
 const HELD_SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
 /// The invoking user, resolved from the passwd database.
@@ -32,6 +31,12 @@ pub struct Creds {
     pub home: String,
 }
 
+/// Most bytes of captured stdout kept (the rest is drained and dropped).
+const MAX_CAPTURE: u64 = 64 * 1024;
+
+/// `close_range(2)` flag: mark the range close-on-exec instead of closing it now.
+const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+
 /// What to run and how. `drop: None` skips the privilege drop (tests only; production always
 /// passes the invoking user's credentials).
 #[derive(Debug, Clone)]
@@ -40,6 +45,8 @@ pub struct ExecPlan {
     pub args: Vec<String>,
     pub drop: Option<Creds>,
     pub env: Vec<(String, String)>,
+    /// Handed to the child as fd 3 (rewound to offset 0 first). `None`: the child gets no fd >= 3.
+    pub target_fd: Option<RawFd>,
 }
 
 /// The complete environment flashcp gets. Nothing from the caller's environment survives, so
@@ -131,19 +138,105 @@ fn check(rc: libc::c_int) -> io::Result<()> {
     }
 }
 
-/// Block the held signals in the (single-threaded) helper. Called before the device is granted,
-/// so a Ctrl-C or hangup can never interrupt us between granting and restoring.
+/// Block the held signals in the (single-threaded) helper; they are forwarded to the child while
+/// one runs, and stay pending otherwise (see [`take_pending_signal`]).
 pub fn block_signals() -> io::Result<()> {
     let set = held_set();
     // SAFETY: valid set pointer; old mask not needed.
     check(unsafe { libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) })
 }
 
-/// Runs in the forked child before exec: become the user for good, then unblock signals.
-/// Only async-signal-safe syscalls, and no allocation (errors are raw errno values).
-fn child_setup(drop: Option<&Creds>, set: &libc::sigset_t) -> io::Result<()> {
+/// A held signal that arrived while no child was running (consumed), so the caller can stop
+/// before starting the next run.
+pub fn take_pending_signal() -> Option<libc::c_int> {
+    let set = held_set();
+    let ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: valid pointers; zero timeout polls.
+    let sig = unsafe { libc::sigtimedwait(&set, std::ptr::null_mut(), &ts) };
+    (sig > 0).then_some(sig)
+}
+
+/// Mark every fd >= `first` close-on-exec, so the exec drops them all. Marking instead of
+/// closing keeps std's internal exec-error pipe working until the exec itself (closing it early
+/// would turn a failed privilege drop into a silent abort). Async-signal-safe, no allocation.
+fn cloexec_from(first: libc::c_uint) -> io::Result<()> {
+    // SAFETY: plain syscall with integer arguments.
+    let rc = unsafe { libc::syscall(libc::SYS_close_range, first, libc::c_uint::MAX, CLOSE_RANGE_CLOEXEC) };
+    if rc == 0 {
+        return Ok(());
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        // No close_range (< 5.9) or no CLOSE_RANGE_CLOEXEC (< 5.11): walk /proc/self/fd.
+        Some(libc::ENOSYS) | Some(libc::EINVAL) => cloexec_from_procfs(first),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// Fallback for [`cloexec_from`]: getdents64 over /proc/self/fd into a stack buffer.
+pub(crate) fn cloexec_from_procfs(first: libc::c_uint) -> io::Result<()> {
+    // SAFETY: raw syscalls on a stack buffer we own; dirfd is closed before returning.
+    unsafe {
+        let dir = libc::open(c"/proc/self/fd".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC);
+        if dir < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buf = [0u8; 2048];
+        let res = loop {
+            let n = libc::syscall(libc::SYS_getdents64, dir, buf.as_mut_ptr(), buf.len());
+            if n < 0 {
+                break Err(io::Error::last_os_error());
+            }
+            if n == 0 {
+                break Ok(());
+            }
+            let mut off = 0usize;
+            while off + 19 < n as usize {
+                // struct linux_dirent64 { u64 ino; i64 off; u16 reclen; u8 type; char name[]; }
+                let reclen = u16::from_ne_bytes([buf[off + 16], buf[off + 17]]) as usize;
+                let mut fd: u64 = 0;
+                let mut digits = 0;
+                for &b in &buf[off + 19..off + reclen] {
+                    if !b.is_ascii_digit() {
+                        break;
+                    }
+                    fd = fd.saturating_mul(10).saturating_add(u64::from(b - b'0'));
+                    digits += 1;
+                }
+                if digits > 0 && fd >= u64::from(first) && fd != dir as u64 && fd <= i32::MAX as u64 {
+                    libc::fcntl(fd as libc::c_int, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+                if reclen == 0 {
+                    break;
+                }
+                off += reclen;
+            }
+        };
+        libc::close(dir);
+        res
+    }
+}
+
+/// Runs in the forked child before exec: install the target as fd 3, drop every other fd >= 4,
+/// become the user for good, then unblock signals. Only async-signal-safe syscalls, and no
+/// allocation (errors are raw errno values).
+fn child_setup(target: Option<RawFd>, drop: Option<&Creds>, set: &libc::sigset_t) -> io::Result<()> {
     // SAFETY: plain syscalls on memory allocated before fork.
     unsafe {
+        let first_closed = match target {
+            Some(fd) if fd == TARGET_FD => {
+                check(libc::fcntl(TARGET_FD, libc::F_SETFD, 0))?;
+                TARGET_FD + 1
+            }
+            Some(fd) => {
+                // dup2 leaves the new fd without FD_CLOEXEC.
+                if libc::dup2(fd, TARGET_FD) != TARGET_FD {
+                    return Err(io::Error::last_os_error());
+                }
+                TARGET_FD + 1
+            }
+            None => TARGET_FD,
+        };
+        cloexec_from(first_closed as libc::c_uint)?;
         if let Some(c) = drop {
             check(libc::setgroups(c.groups.len(), c.groups.as_ptr()))?;
             check(libc::setresgid(c.gid, c.gid, c.gid))?;
@@ -160,10 +253,39 @@ fn child_setup(drop: Option<&Creds>, set: &libc::sigset_t) -> io::Result<()> {
     Ok(())
 }
 
-/// Spawn the plan (no shell, absolute program path, scrubbed env, cwd /, stdin null) and wait
-/// for it, forwarding held signals. Spawn rather than exec: the helper must outlive flashcp to
-/// give the device back.
-pub fn run(plan: &ExecPlan, stdout: Stdio) -> io::Result<ExitStatus> {
+/// Make sure fd 3 is occupied in the parent while spawning, so std's internal exec-error pipe can
+/// never be allocated as fd 3 (the child's dup2 onto 3 would clobber it). Returns the fd the
+/// child should dup from, and a guard to keep alive until the spawn returned.
+fn occupy_fd3(fd: RawFd) -> io::Result<(RawFd, Option<OwnedFd>)> {
+    if fd < TARGET_FD {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    // SAFETY: F_GETFD/F_DUPFD_CLOEXEC on integer fds; the duplicate is owned below.
+    unsafe {
+        if fd == TARGET_FD || libc::fcntl(TARGET_FD, libc::F_GETFD) >= 0 {
+            return Ok((fd, None));
+        }
+        let d = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, TARGET_FD);
+        if d < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let guard = OwnedFd::from_raw_fd(d);
+        Ok((if d == TARGET_FD { d } else { fd }, Some(guard)))
+    }
+}
+
+fn spawn(plan: &ExecPlan, stdout: Stdio) -> io::Result<std::process::Child> {
+    let (target, guard) = match plan.target_fd {
+        Some(fd) => {
+            // SAFETY: lseek on an integer fd.
+            if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let (t, g) = occupy_fd3(fd)?;
+            (Some(t), g)
+        }
+        None => (None, None),
+    };
     let mut cmd = Command::new(&plan.program);
     cmd.args(&plan.args)
         .env_clear()
@@ -172,13 +294,20 @@ pub fn run(plan: &ExecPlan, stdout: Stdio) -> io::Result<ExitStatus> {
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(Stdio::inherit());
-    let drop = plan.drop.clone();
+    let creds = plan.drop.clone();
     let set = held_set();
     // SAFETY: child_setup is async-signal-safe (see its doc comment).
     unsafe {
-        cmd.pre_exec(move || child_setup(drop.as_ref(), &set));
+        cmd.pre_exec(move || child_setup(target, creds.as_ref(), &set));
     }
-    let mut child = cmd.spawn()?;
+    let child = cmd.spawn();
+    drop(guard);
+    child
+}
+
+/// Wait for `child`, forwarding held signals to it.
+fn wait(child: &mut std::process::Child) -> io::Result<ExitStatus> {
+    let set = held_set();
     let pid = child.id() as libc::pid_t;
     loop {
         if let Some(st) = child.try_wait()? {
@@ -194,113 +323,121 @@ pub fn run(plan: &ExecPlan, stdout: Stdio) -> io::Result<ExitStatus> {
     }
 }
 
+/// Spawn the plan (no shell, absolute program path, scrubbed env, cwd /, stdin null, stdout as
+/// given, stderr inherited) and wait for it, forwarding held signals.
+pub fn run(plan: &ExecPlan, stdout: Stdio) -> io::Result<ExitStatus> {
+    let mut child = spawn(plan, stdout)?;
+    wait(&mut child)
+}
+
+/// Like [`run`], but capture stdout (at most 64 KiB is kept) instead of passing it through.
+pub fn run_capture(plan: &ExecPlan) -> io::Result<(ExitStatus, Vec<u8>)> {
+    let mut child = spawn(plan, Stdio::piped())?;
+    let mut out = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let read =
+            (&mut pipe).take(MAX_CAPTURE).read_to_end(&mut out).and_then(|_| io::copy(&mut pipe, &mut io::sink()));
+        if let Err(e) = read {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    }
+    Ok((wait(&mut child)?, out))
+}
+
 /// flashcp's exit code, or 128+signal like a shell.
 pub fn exit_code(st: ExitStatus) -> i32 {
     st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0))
-}
-
-/// A device node opened with O_PATH|O_NOFOLLOW. Every later operation goes through this fd, so
-/// a rename/replace of the path after validation cannot redirect us to another node.
-pub struct PinnedNode {
-    fd: OwnedFd,
-    st: libc::stat,
-}
-
-impl PinnedNode {
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        // SAFETY: valid C string; returned fd is owned below.
-        let raw = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: raw is a fresh fd we own.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: valid fd and out-pointer.
-        check(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) })?;
-        Ok(PinnedNode { fd, st })
-    }
-
-    pub fn stat(&self) -> NodeStat {
-        NodeStat::from_libc(&self.st)
-    }
-
-    /// Make `uid` the owner (group and mode untouched, normally root:disk 0660 → uid:disk 0660)
-    /// until the returned guard is dropped.
-    pub fn grant(self, uid: libc::uid_t) -> io::Result<DeviceGrant> {
-        let (uid0, gid0) = (self.st.st_uid, self.st.st_gid);
-        chown_fd(&self.fd, uid, libc::gid_t::MAX)?;
-        Ok(DeviceGrant { fd: self.fd, uid: uid0, gid: gid0 })
-    }
-}
-
-fn chown_fd(fd: &OwnedFd, uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
-    // SAFETY: AT_EMPTY_PATH with "" operates on the fd itself.
-    check(unsafe { libc::fchownat(fd.as_raw_fd(), c"".as_ptr(), uid, gid, libc::AT_EMPTY_PATH) })
-}
-
-/// Restores the node's original owner when dropped (normal return, error return or unwind).
-pub struct DeviceGrant {
-    fd: OwnedFd,
-    uid: libc::uid_t,
-    gid: libc::gid_t,
-}
-
-impl Drop for DeviceGrant {
-    fn drop(&mut self) {
-        if let Err(e) = chown_fd(&self.fd, self.uid, self.gid) {
-            eprintln!("flashcp-helper: could not restore device ownership: {e}");
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
 
-    fn fake_flashcp() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fake-flashcp")
-    }
-
-    /// Run `sh <script> args...` with output captured to a file.
-    fn run_sh(script: &str, args: &[&str]) -> (ExitStatus, String) {
-        let t = tempfile::tempdir().unwrap();
-        let s = t.path().join("s.sh");
-        fs::write(&s, script).unwrap();
-        run_prog("/bin/sh", &[&[s.to_str().unwrap()], args].concat(), &t)
-    }
-
-    fn run_prog(prog: &str, args: &[&str], t: &tempfile::TempDir) -> (ExitStatus, String) {
-        let out = t.path().join("out");
-        let plan = ExecPlan {
+    fn plan(prog: &str, args: &[&str], target_fd: Option<RawFd>) -> ExecPlan {
+        ExecPlan {
             program: prog.into(),
             args: args.iter().map(|s| s.to_string()).collect(),
             drop: None,
             env: user_env("/home/someone"),
-        };
-        let st = run(&plan, Stdio::from(fs::File::create(&out).unwrap())).unwrap();
-        (st, fs::read_to_string(&out).unwrap())
+            target_fd,
+        }
+    }
+
+    /// `/bin/sh -c <script>` (no script file, so the shell holds no extra fds), stdout captured.
+    fn sh(script: &str, target_fd: Option<RawFd>) -> (ExitStatus, String) {
+        let (st, out) = run_capture(&plan("/bin/sh", &["-c", script], target_fd)).unwrap();
+        (st, String::from_utf8(out).unwrap())
+    }
+
+    fn fd_list(out: &str) -> Vec<String> {
+        out.lines().skip_while(|l| *l != "FDS").skip(1).take_while(|l| *l != "END").map(String::from).collect()
+    }
+
+    const LIST_FDS: &str = "echo FDS; ls /proc/$$/fd; echo END";
+
+    #[test]
+    fn target_is_fd3_readable_rewound_and_nothing_else_leaks() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"hello-fd3").unwrap();
+        // A deliberately inheritable (no CLOEXEC) fd in the parent must not reach the child.
+        let leak = unsafe { libc::dup(f.as_file().as_raw_fd()) };
+        assert!(leak > 3);
+        let script = format!("readlink /proc/$$/fd/3; cat <&3; echo; {LIST_FDS}");
+        for _ in 0..2 {
+            // The write above left the offset at the end; each run starts at 0 again.
+            let (st, out) = sh(&script, Some(f.as_file().as_raw_fd()));
+            assert!(st.success(), "{out}");
+            let mut lines = out.lines();
+            assert_eq!(lines.next().unwrap(), f.path().to_str().unwrap());
+            assert_eq!(lines.next().unwrap(), "hello-fd3");
+            assert_eq!(fd_list(&out), ["0", "1", "2", "3"], "{out}");
+        }
+        unsafe { libc::close(leak) };
     }
 
     #[test]
-    fn fake_flashcp_output_passes_through() {
-        let t = tempfile::tempdir().unwrap();
-        let fake = fake_flashcp();
-        let (st, out) = run_prog("/bin/sh", &[fake.to_str().unwrap(), "info", "/dev/sdz1", "--json"], &t);
+    fn no_target_means_no_fd3() {
+        let (st, out) = sh(LIST_FDS, None);
         assert!(st.success());
-        assert!(out.starts_with("{\"label\":\"FAKEUSB\""), "{out}");
-        let (st, out) = run_prog("/bin/sh", &[fake.to_str().unwrap(), "add", "/x", "/dev/sdz1", "--json"], &t);
+        assert_eq!(fd_list(&out), ["0", "1", "2"], "{out}");
+    }
+
+    #[test]
+    fn target_already_at_fd3_keeps_working() {
+        // occupy_fd3 picks whichever fd it can; either way the child must see the file at 3.
+        let f = tempfile::NamedTempFile::new().unwrap();
+        fs::write(f.path(), "x3").unwrap();
+        let (fd, guard) = occupy_fd3(f.as_file().as_raw_fd()).unwrap();
+        assert!(fd >= 3);
+        let (st, out) = sh("cat <&3", Some(fd));
         assert!(st.success());
-        assert!(out.lines().last().unwrap().starts_with("{\"event\":\"done\""), "{out}");
+        assert_eq!(out, "x3");
+        drop(guard);
+        assert!(occupy_fd3(2).is_err());
+    }
+
+    #[test]
+    fn procfs_fallback_marks_fds_cloexec() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let leak = unsafe { libc::dup(f.as_file().as_raw_fd()) };
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", LIST_FDS]).stdout(Stdio::piped());
+        unsafe { cmd.pre_exec(|| cloexec_from_procfs(3)) };
+        let out = String::from_utf8(cmd.output().unwrap().stdout).unwrap();
+        assert_eq!(fd_list(&out), ["0", "1", "2"], "{out}");
+        unsafe { libc::close(leak) };
     }
 
     #[test]
     fn env_is_sanitized_and_cwd_is_root() {
         // cargo always sets CARGO_MANIFEST_DIR for the test process; it must not leak.
         assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some());
-        let (st, out) = run_sh("env; echo cwd=$(pwd); read x && echo stdin-had-data; true", &[]);
+        let (st, out) = sh("env; echo cwd=$(pwd); read x && echo stdin-had-data; true", None);
         assert!(st.success());
         let mut keys: Vec<&str> = out.lines().filter_map(|l| l.split_once('=')).map(|(k, _)| k).collect();
         keys.sort();
@@ -313,38 +450,47 @@ mod tests {
     }
 
     #[test]
-    fn exit_codes_and_signals() {
-        let (st, _) = run_sh("exit 7", &[]);
+    fn capture_and_exit_codes() {
+        let (st, out) = sh("echo '{\"label\":\"X\"}'; exit 7", None);
         assert_eq!(exit_code(st), 7);
-        let (st, _) = run_sh("kill -TERM $$", &[]);
+        assert_eq!(out, "{\"label\":\"X\"}\n");
+        let (st, _) = sh("kill -TERM $$", None);
         assert_eq!(exit_code(st), 128 + libc::SIGTERM);
-        let t = tempfile::tempdir().unwrap();
-        let (st, out) = run_prog("/bin/sh", &[fake_flashcp().to_str().unwrap(), "bogus"], &t);
-        assert_eq!(exit_code(st), 2);
-        assert!(out.contains("\"event\":\"error\""));
+        // Output beyond the cap is drained (the child is not blocked) and dropped.
+        let (st, out) = sh("head -c 200000 /dev/zero", None);
+        assert!(st.success());
+        assert_eq!(out.len() as u64, MAX_CAPTURE);
+        let st = run(&plan("/bin/sh", &["-c", "exit 0"], None), Stdio::null()).unwrap();
+        assert!(st.success());
     }
 
     #[test]
     fn missing_program_is_an_error() {
-        let plan = ExecPlan { program: "/nonexistent/flashcp".into(), args: vec![], drop: None, env: vec![] };
-        assert!(run(&plan, Stdio::null()).is_err());
+        assert!(run(&plan("/nonexistent/flashcp", &[], None), Stdio::null()).is_err());
+        let f = tempfile::tempfile().unwrap();
+        assert!(run(&plan("/nonexistent/flashcp", &[], Some(f.as_raw_fd())), Stdio::null()).is_err());
     }
 
     #[test]
     fn failed_privilege_drop_aborts_spawn() {
         // Unprivileged, setgroups() fails with EPERM even for our own groups. That failure must
-        // abort the spawn (fail closed) instead of running the program with whatever ids it had.
+        // abort the spawn (fail closed) instead of running the program with whatever ids it had,
+        // and must be reported as an error even with the fd juggling in place.
         let uid = unsafe { libc::getuid() };
         let me = lookup_user(uid).unwrap();
         assert_eq!(me.uid, uid);
         assert!(me.groups.contains(&me.gid));
-        let t = tempfile::tempdir().unwrap();
-        let out = t.path().join("out");
-        let plan = ExecPlan { program: "/usr/bin/id".into(), args: vec!["-u".into()], drop: Some(me), env: vec![] };
-        let r = run(&plan, Stdio::from(fs::File::create(&out).unwrap()));
+        let f = tempfile::tempfile().unwrap();
+        let p = ExecPlan { drop: Some(me), ..plan("/usr/bin/id", &["-u"], Some(f.as_raw_fd())) };
+        let r = run(&p, Stdio::null());
         if uid != 0 {
             assert!(r.is_err());
         }
+    }
+
+    #[test]
+    fn pending_signal_is_taken() {
+        assert_eq!(take_pending_signal(), None);
     }
 
     #[test]
@@ -356,24 +502,6 @@ mod tests {
             assert!(invoking_uid(bad, Some("1000")).is_err(), "{bad:?}");
         }
         assert!(invoking_uid(None, None).is_err());
-    }
-
-    #[test]
-    fn pinned_node_and_grant_restore() {
-        let t = tempfile::tempdir().unwrap();
-        let f = t.path().join("node");
-        fs::write(&f, "").unwrap();
-        // Symlinks are opened as themselves (O_NOFOLLOW|O_PATH), so they show up as links.
-        std::os::unix::fs::symlink("/dev/null", t.path().join("link")).unwrap();
-        assert!(PinnedNode::open(&t.path().join("link")).unwrap().stat().is_symlink);
-        let n = PinnedNode::open(&f).unwrap();
-        assert!(!n.stat().is_block);
-        // chown to ourselves is allowed unprivileged: exercises grant + restore through the fd.
-        let uid = unsafe { libc::getuid() };
-        let g = n.grant(uid).unwrap();
-        drop(g);
-        use std::os::unix::fs::MetadataExt;
-        assert_eq!(fs::metadata(&f).unwrap().uid(), uid);
     }
 
     #[test]

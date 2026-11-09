@@ -6,7 +6,12 @@ import {
   progressText,
   stageText,
   baseName,
-  expectedConfirm,
+  confirmHint,
+  trustState,
+  isTrusted,
+  canTrust,
+  trustNotice,
+  trustDetails,
   driveTitle,
   nonExfatText,
   selectedDrive,
@@ -23,6 +28,9 @@ import {
   dismissJob,
   resetForm,
   eraseSourceHint,
+  selectDrive,
+  openTrust,
+  closeTrust,
 } from "./logic.js";
 
 const tauri = window.__TAURI__ || null;
@@ -40,17 +48,21 @@ const DEMO_DRIVES = [
     mountPoint: "/run/media/demo/FAKEUSB",
     model: "SanDisk Ultra",
     wholeDisk: false,
+    serial: "FAKE0001",
+    trusted: true,
   },
   {
     id: "/demo/block/sdy1",
     device: "/dev/sdy1",
-    label: "",
+    label: "OLDSTICK",
     fsType: "vfat",
     isExfat: false,
     size: 8_000_000_000,
     mountPoint: null,
     model: "Kingston DataTraveler",
     wholeDisk: false,
+    serial: "OLD0002",
+    trusted: false,
   },
 ];
 const DEMO_PATHS = ["/home/demo/Photos", "/home/demo/notes.txt"];
@@ -67,14 +79,19 @@ let state = {
   settings: { autostart: false, notifyOnPlug: false },
   eraseTyped: "",
   notice: null,
+  trustOpen: false,
+  trustBusy: false,
+  trustError: null,
 };
 
 const ids = [
-  "banner", "drives", "drives-empty", "nonexfat", "dropzone", "add-files", "add-folder",
+  "banner", "drives", "drives-empty", "nonexfat", "trust", "trust-text", "trust-open-row",
+  "trust-open", "trust-confirm", "trust-facts", "trust-yes", "trust-cancel", "trust-error",
+  "dropzone", "add-files", "add-folder",
   "sources-head", "sources-count", "clear-sources", "sources", "dest", "dest-hint",
   "skip-existing", "copy", "progress", "stage", "bar", "progress-text", "done", "summary",
   "wall", "copy-more", "error", "error-message", "dismiss", "notice", "advanced",
-  "erase-hint", "erase-expected", "erase-confirm", "erase", "settings", "set-autostart",
+  "erase-hint", "erase-label", "erase-confirm", "erase", "settings", "set-autostart",
   "set-notify",
 ];
 const els = Object.fromEntries(ids.map((id) => [id, document.getElementById(id)]));
@@ -117,6 +134,14 @@ async function demoInvoke(cmd, args) {
     case "start_erase":
       runDemoJob(1, "build");
       return null;
+    case "trust_drive": {
+      // Simulated: the real helper asks for admin authentication here.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const drive = DEMO_DRIVES.find((d) => d.id === args.driveId);
+      if (!drive) throw new Error("Preview mode: unknown drive");
+      drive.trusted = true;
+      return null;
+    }
     default:
       throw new Error(`Preview mode: ${cmd} is not simulated`);
   }
@@ -188,7 +213,8 @@ function failJob(message) {
 async function refreshDrives() {
   try {
     const drives = await call("list_drives");
-    setState({ ...state, drives, selectedId: defaultSelection(drives, state.selectedId) });
+    const next = selectDrive({ ...state, drives }, defaultSelection(drives, state.selectedId));
+    setState(next);
   } catch (err) {
     setNotice(`Could not list drives: ${messageOf(err)}`);
   }
@@ -246,6 +272,30 @@ async function startErase() {
   }
 }
 
+function showTrustPanel() {
+  const drive = selectedDrive(state);
+  if (!canTrust(drive) || jobActive(state) || state.trustBusy) return;
+  setState(openTrust(state));
+}
+
+function cancelTrust() {
+  if (state.trustBusy) return;
+  setState(closeTrust(state));
+}
+
+async function startTrust() {
+  const drive = selectedDrive(state);
+  if (!canTrust(drive) || jobActive(state) || state.trustBusy) return;
+  setState({ ...state, trustBusy: true, trustError: null });
+  try {
+    await call("trust_drive", { driveId: drive.id });
+    setState(closeTrust(state));
+    await refreshDrives();
+  } catch (err) {
+    setState({ ...state, trustBusy: false, trustError: messageOf(err) });
+  }
+}
+
 async function changeSetting(patch) {
   const settings = { ...state.settings, ...patch };
   setState({ ...state, settings });
@@ -292,6 +342,9 @@ function render() {
   els["skip-existing"].checked = state.skipExisting;
   els["skip-existing"].disabled = busy;
 
+  // Trust: shown while the selected drive is not trusted
+  renderTrust(drive, busy);
+
   // Copy button
   els.copy.textContent = drive ? `Fast copy to ${driveTitle(drive)}` : "Fast copy";
   els.copy.disabled = !canCopy(state);
@@ -324,9 +377,9 @@ function render() {
 
   // Advanced: erase
   els["erase-hint"].textContent = eraseSourceHint(state.sources.length);
-  els["erase-expected"].textContent = drive ? expectedConfirm(drive) || "the drive name" : "select a drive first";
+  els["erase-label"].textContent = confirmHint(drive);
   if (els["erase-confirm"].value !== state.eraseTyped) els["erase-confirm"].value = state.eraseTyped;
-  els["erase-confirm"].disabled = !drive || busy;
+  els["erase-confirm"].disabled = !drive || busy || !isTrusted(drive);
   els.erase.textContent = drive ? `Erase ${driveTitle(drive)} and copy` : "Erase and copy";
   els.erase.disabled = !canErase(state, state.eraseTyped);
 
@@ -336,6 +389,36 @@ function render() {
 
   // Preview banner
   els.banner.hidden = hasTauri;
+}
+
+function renderTrust(drive, busy) {
+  const needsTrust = !!drive && trustState(drive) !== "trusted";
+  els.trust.hidden = !needsTrust;
+  if (!needsTrust) return;
+
+  els["trust-text"].textContent = trustNotice(drive);
+  const offered = canTrust(drive);
+  const confirming = offered && state.trustOpen;
+  els["trust-open-row"].hidden = !offered || confirming;
+  els["trust-open"].disabled = busy || state.trustBusy;
+
+  els["trust-confirm"].hidden = !confirming;
+  if (confirming) {
+    const rows = trustDetails(drive).flatMap((row) => {
+      const dt = document.createElement("dt");
+      dt.textContent = row.label;
+      const dd = document.createElement("dd");
+      dd.textContent = row.value;
+      return [dt, dd];
+    });
+    els["trust-facts"].replaceChildren(...rows);
+  }
+  els["trust-yes"].disabled = busy || state.trustBusy;
+  els["trust-yes"].textContent = state.trustBusy ? "Trusting…" : "Trust this drive";
+  els["trust-cancel"].disabled = state.trustBusy;
+
+  els["trust-error"].hidden = !state.trustError;
+  els["trust-error"].textContent = state.trustError || "";
 }
 
 function renderDrives() {
@@ -356,7 +439,7 @@ function renderDrives() {
     radio.checked = d.id === state.selectedId;
     radio.disabled = busy;
     radio.addEventListener("change", () => {
-      if (radio.checked) setState({ ...state, selectedId: d.id, eraseTyped: "" });
+      if (radio.checked) setState(selectDrive(state, d.id));
     });
 
     const body = document.createElement("span");
@@ -370,6 +453,10 @@ function renderDrives() {
     device.className = "drive-device";
     device.textContent = d.device;
 
+    const serial = document.createElement("span");
+    serial.className = "drive-serial";
+    serial.textContent = d.serial ? `Serial ${d.serial}` : "No serial number";
+
     const meta = document.createElement("span");
     meta.className = "drive-meta";
     const size = document.createElement("span");
@@ -377,9 +464,13 @@ function renderDrives() {
     const badge = document.createElement("span");
     badge.className = d.isExfat ? "badge exfat" : "badge";
     badge.textContent = d.fsType ? d.fsType.toUpperCase() : "NO FS";
-    meta.append(size, badge);
+    const trust = document.createElement("span");
+    const trusted = trustState(d) === "trusted";
+    trust.className = trusted ? "badge trusted" : "badge untrusted";
+    trust.textContent = trusted ? "Trusted" : "Not trusted";
+    meta.append(size, badge, trust);
 
-    body.append(title, device, meta);
+    body.append(title, device, serial, meta);
     if (d.mountPoint) {
       const mounted = document.createElement("span");
       mounted.className = "drive-mounted";
@@ -464,6 +555,10 @@ function wire() {
     render();
   });
   els.erase.addEventListener("click", startErase);
+
+  els["trust-open"].addEventListener("click", showTrustPanel);
+  els["trust-cancel"].addEventListener("click", cancelTrust);
+  els["trust-yes"].addEventListener("click", startTrust);
 
   els["set-autostart"].addEventListener("change", () =>
     changeSetting({ autostart: els["set-autostart"].checked }),

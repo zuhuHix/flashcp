@@ -67,6 +67,7 @@ jobs:
           set -eux
           python3 -m py_compile packaging/desktop/flashcp_nautilus.py
           xmllint --noout packaging/desktop/io.github.zuhuhix.flashcp.helper.policy
+          xmllint --noout packaging/desktop/io.github.zuhuhix.flashcp.trust.policy
 
   deb:
     name: build .deb
@@ -101,6 +102,8 @@ jobs:
           cat contents.txt
           for path in \
             ./usr/libexec/flashcp-helper \
+            ./usr/libexec/flashcp-trust \
+            ./usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.trust.policy \
             ./usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.helper.policy \
             ./etc/xdg/autostart/flashcp-gui.desktop \
             ./usr/share/nemo/actions/flashcp.nemo_action \
@@ -111,7 +114,9 @@ jobs:
             awk '{print $NF}' contents.txt | sed 's#^\./##' | grep -qxF "${path#./}" || { echo "::error::missing $path"; exit 1; }
           done
           # The helper runs as root through pkexec, so it must be root-owned and not writable by others.
-          grep -qE '^-rwxr-xr-x (root/root|0/0) .* (\./)?usr/libexec/flashcp-helper$' contents.txt
+          for bin in flashcp-helper flashcp-trust; do
+            grep -qE "^-rwxr-xr-x (root/root|0/0) .* (\./)?usr/libexec/$bin\$" contents.txt
+          done
           # The package must pull in the CLI.
           dpkg-deb -f "$deb" Depends | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -qx 'flashcp'
       - uses: actions/upload-artifact@v4

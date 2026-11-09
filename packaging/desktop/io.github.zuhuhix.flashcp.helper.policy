@@ -8,10 +8,12 @@
   <icon_name>flashcp-gui</icon_name>
 
   <!-- Install to /usr/share/polkit-1/actions/. pkexec only runs /usr/libexec/flashcp-helper
-       under this action; the helper validates every argument itself (see SECURITY-NOTES.md). -->
+       under this action. The helper validates every argument itself and only writes to drives
+       an administrator trusted beforehand via io.github.zuhuhix.flashcp.trust
+       (see SECURITY-NOTES.md). -->
   <action id="io.github.zuhuhix.flashcp.helper">
     <description>Write files to a USB drive with flashcp</description>
-    <message>Authentication is required to let flashcp write to the USB drive</message>
+    <message>Authentication is required to let flashcp write to the trusted USB drive</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
