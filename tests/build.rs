@@ -289,3 +289,67 @@ fn mount_roundtrip_gated() {
     result.expect("mounted volume differs from the source tree");
     fs::remove_dir_all(&dir).expect("remove scratch dir");
 }
+
+/// Detaches the loop device (and unmounts `mnt` if mounted) even when an assertion fails.
+struct LoopDev {
+    dev: String,
+    mnt: std::path::PathBuf,
+}
+
+impl Drop for LoopDev {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("umount").arg(&self.mnt).output();
+        let _ = std::process::Command::new("losetup").args(["-d", &self.dev]).output();
+    }
+}
+
+/// Building onto a block device that is claimed (O_EXCL by another process) or mounted must be
+/// refused. Needs root for losetup/mount, so it only runs with FLASHCP_MOUNT_TESTS=1 as root
+/// (CI runs the test binary under sudo).
+#[test]
+fn mount_busy_device_is_refused() {
+    if std::env::var("FLASHCP_MOUNT_TESTS").as_deref() != Ok("1") {
+        eprintln!("SKIP busy-device test: set FLASHCP_MOUNT_TESTS=1 to run it");
+        return;
+    }
+    if run_checked("id", &["-u"]).trim() != "0" {
+        eprintln!("SKIP busy-device test: needs root (losetup, mount, writing /dev/loopN)");
+        return;
+    }
+    let dir = test_dir("busy_device");
+    let src = dir.join("src");
+    write_file(&src.join("a.txt"), b"hello");
+    let img = dir.join("disk.img");
+    make_image(&img, 64 * MB);
+    let img_s = img.to_str().expect("UTF-8 path").to_string();
+    let dev = run_checked("losetup", &["-f", "--show", &img_s]).trim().to_string();
+    let mnt = dir.join("mnt");
+    fs::create_dir_all(&mnt).expect("create mount point");
+    let guard = LoopDev { dev: dev.clone(), mnt: mnt.clone() };
+    let build = || flashcp().arg("build").arg(&src).arg(&dev).arg("--yes-erase").output().expect("run flashcp");
+    let stderr = |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).to_string();
+
+    // 1. Claimed exclusively by someone else (like an LVM PV or a mount would): EBUSY.
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_EXCL: i32 = 0o200; // Linux, all mainstream architectures
+        let _claim = fs::OpenOptions::new().read(true).custom_flags(O_EXCL).open(&dev).expect("claim loop device");
+        let out = build();
+        assert!(!out.status.success(), "build onto a claimed device succeeded");
+        assert!(stderr(&out).contains("is in use (mounted or held by LVM/dm/md)"), "stderr: {}", stderr(&out));
+    }
+
+    // 2. Mounted: refused, and the message names the mount point.
+    assert_success(&build(), "build onto the free loop device");
+    run_checked("mount", &["-o", "ro", &dev, mnt.to_str().expect("UTF-8 path")]);
+    let out = build();
+    assert!(!out.status.success(), "build onto a mounted device succeeded");
+    assert!(stderr(&out).contains("is mounted at"), "stderr: {}", stderr(&out));
+    run_checked("umount", &[mnt.to_str().expect("UTF-8 path")]);
+
+    // 3. Free again: the build works and the volume is clean.
+    assert_success(&build(), "build onto the released loop device");
+    common::fsck_clean(Path::new(&dev));
+    drop(guard);
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}

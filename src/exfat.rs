@@ -574,34 +574,53 @@ struct Target {
 
 fn open_target(path: &Path) -> Result<Target> {
     let md = fs::metadata(path).with_context(|| format!("{}", path.display()))?;
+    let is_blk = md.file_type().is_block_device();
+    if is_blk {
+        // Friendly check first, so the error can name the mount point: the device itself,
+        // any partition, or any (stacked) holder such as LVM / dm-crypt / md.
+        let (maj, min) = (libc::major(md.rdev()), libc::minor(md.rdev()));
+        let devs = related_devs(Path::new(SYS_BLOCK), &format!("{maj}:{min}"))?;
+        let mounts = fs::read_to_string("/proc/self/mountinfo")?;
+        if let Some((dev, at)) = mounted_dev(&mounts, &devs) {
+            bail!("{} is in use: device {dev} is mounted at {at}; unmount it first", path.display());
+        }
+    }
+    // For block devices, O_EXCL (without O_CREAT) is an exclusive claim on Linux: it fails
+    // with EBUSY if the device, a partition or a holder is mounted or claimed, and while we
+    // hold the fd (for the whole build) nobody can mount it. This closes the race between
+    // the mountinfo check above and the writes.
     let open = |direct: bool| {
         let mut o = OpenOptions::new();
         o.write(true).read(true);
+        let mut flags = if is_blk { libc::O_EXCL } else { 0 };
         if direct {
-            o.custom_flags(libc::O_DIRECT);
+            flags |= libc::O_DIRECT;
         }
+        o.custom_flags(flags);
         o.open(path)
+    };
+    let busy = |e: std::io::Error| -> anyhow::Error {
+        if e.raw_os_error() == Some(libc::EBUSY) {
+            anyhow::anyhow!("{} is in use (mounted or held by LVM/dm/md); unmount it first", path.display())
+        } else {
+            anyhow::Error::new(e).context(format!("open {}", path.display()))
+        }
     };
     let (file, direct) = match open(true) {
         Ok(f) => (f, true),
-        Err(_) => (open(false)?, false),
+        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => return Err(busy(e)),
+        Err(_) => (open(false).map_err(busy)?, false),
     };
-    if md.file_type().is_block_device() {
+    if is_blk {
         let mut size: u64 = 0;
         // BLKGETSIZE64 = _IOR(0x12, 114, size_t)
         let r = unsafe { libc::ioctl(std::os::unix::io::AsRawFd::as_raw_fd(&file), 0x80081272, &mut size) };
         ensure!(r == 0, "BLKGETSIZE64 failed");
         let (maj, min) = (libc::major(md.rdev()), libc::minor(md.rdev()));
-        let start = fs::read_to_string(format!("/sys/dev/block/{maj}:{min}/start"))
+        let start = fs::read_to_string(format!("{SYS_BLOCK}/{maj}:{min}/start"))
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0u64);
-        // Refuse to touch anything that is mounted: the device itself, any of its
-        // partitions (a whole disk whose /dev/sdX1 is mounted), or a holder (dm, md).
-        let mounts = fs::read_to_string("/proc/self/mountinfo")?;
-        if let Some((dev, at)) = mounted_dev(&mounts, &related_devs(maj, min)) {
-            bail!("{} is in use: device {dev} is mounted at {at}; unmount it first", path.display());
-        }
         Ok(Target { file, bytes: size, part_off: start, direct })
     } else {
         ensure!(md.len() > 0, "image file is empty; create it first, e.g. truncate -s 8G image.img");
@@ -609,24 +628,46 @@ fn open_target(path: &Path) -> Result<Target> {
     }
 }
 
-/// "maj:min" of a block device, its partitions and its holders, read from sysfs.
-fn related_devs(maj: u32, min: u32) -> Vec<String> {
-    let base = PathBuf::from(format!("/sys/dev/block/{maj}:{min}"));
-    let mut v = vec![format!("{maj}:{min}")];
-    let mut add = |dir: PathBuf, need_partition: bool| {
-        for e in fs::read_dir(dir).into_iter().flatten().flatten() {
-            let p = e.path();
-            if need_partition && !p.join("partition").exists() {
-                continue;
-            }
-            if let Ok(d) = fs::read_to_string(p.join("dev")) {
-                v.push(d.trim().to_string());
+const SYS_BLOCK: &str = "/sys/dev/block";
+
+/// Every "maj:min" related to `target`: itself, its partitions and its holders, recursively
+/// (a partition's LVM PV → dm-0 → dm-crypt …), with cycle protection. `sys` is the
+/// /sys/dev/block directory (a parameter so tests can use a fake tree). Fails closed: any
+/// sysfs read error is an error, except a node that has no `holders` directory.
+fn related_devs(sys: &Path, target: &str) -> Result<Vec<String>> {
+    let read_dev = |p: &Path| -> Result<String> {
+        Ok(fs::read_to_string(p.join("dev"))
+            .with_context(|| format!("reading {}", p.join("dev").display()))?
+            .trim()
+            .to_string())
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let mut stack = vec![target.to_string()];
+    while let Some(dev) = stack.pop() {
+        if seen.contains(&dev) {
+            continue;
+        }
+        let node = sys.join(&dev);
+        // Partitions are subdirectories that contain a `partition` file.
+        for e in fs::read_dir(&node).with_context(|| format!("cannot inspect {} in sysfs", node.display()))? {
+            let p = e.with_context(|| format!("reading {}", node.display()))?.path();
+            if p.join("partition").exists() {
+                stack.push(read_dev(&p)?);
             }
         }
-    };
-    add(base.clone(), true);
-    add(base.join("holders"), false);
-    v
+        match fs::read_dir(node.join("holders")) {
+            Ok(rd) => {
+                for e in rd {
+                    let p = e.with_context(|| format!("reading {}/holders", node.display()))?.path();
+                    stack.push(read_dev(&p)?);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("reading {}/holders", node.display())),
+        }
+        seen.push(dev);
+    }
+    Ok(seen)
 }
 
 /// First mountinfo line whose device ("maj:min", field 3) is in `devs`: (device, mount point).
@@ -1229,10 +1270,96 @@ mod tests {
     #[test]
     fn related_devs_includes_disk_and_partition() {
         let Some((disk, part)) = partitioned_disk() else { return };
-        let (maj, min) =
-            disk.split_once(':').map(|(a, b)| (a.parse::<u32>().unwrap(), b.parse::<u32>().unwrap())).unwrap();
-        let devs = related_devs(maj, min);
+        let devs = related_devs(Path::new(SYS_BLOCK), &disk).unwrap();
         assert!(devs.contains(&disk), "{devs:?}");
         assert!(devs.contains(&part), "{devs:?}");
+    }
+
+    /// A fake /sys/dev/block: node "maj:min" dirs, partitions as subdirs with a `partition`
+    /// file, holders as `holders/<name>/dev`.
+    struct FakeSys(PathBuf);
+
+    impl FakeSys {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("flashcp-fakesys-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            FakeSys(root)
+        }
+        fn node(&self, dev: &str) -> &Self {
+            fs::create_dir_all(self.0.join(dev)).unwrap();
+            fs::write(self.0.join(dev).join("dev"), format!("{dev}\n")).unwrap();
+            self
+        }
+        fn partition(&self, disk: &str, name: &str, dev: &str) -> &Self {
+            let p = self.0.join(disk).join(name);
+            fs::create_dir_all(&p).unwrap();
+            fs::write(p.join("partition"), "1\n").unwrap();
+            fs::write(p.join("dev"), format!("{dev}\n")).unwrap();
+            self.node(dev)
+        }
+        fn holder(&self, dev: &str, name: &str, holder: &str) -> &Self {
+            let p = self.0.join(dev).join("holders").join(name);
+            fs::create_dir_all(&p).unwrap();
+            fs::write(p.join("dev"), format!("{holder}\n")).unwrap();
+            self.node(holder)
+        }
+        fn related(&self, dev: &str) -> Result<Vec<String>> {
+            related_devs(&self.0, dev).map(|mut v| {
+                v.sort();
+                v
+            })
+        }
+    }
+
+    impl Drop for FakeSys {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sorted(v: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = v.iter().map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn related_devs_follows_holders_of_partitions_recursively() {
+        // sda → sda1 → LVM PV held by dm-0 → dm-crypt dm-1; sda2 plain; sda itself held by md0.
+        let f = FakeSys::new("nested");
+        f.node("8:0").partition("8:0", "sda1", "8:1").partition("8:0", "sda2", "8:2");
+        f.holder("8:1", "dm-0", "253:0").holder("253:0", "dm-1", "253:1").holder("8:0", "md0", "9:0");
+        assert_eq!(f.related("8:0").unwrap(), sorted(&["8:0", "8:1", "8:2", "253:0", "253:1", "9:0"]));
+        // From the partition: only its own stack, not the sibling or the disk.
+        assert_eq!(f.related("8:1").unwrap(), sorted(&["8:1", "253:0", "253:1"]));
+        // The friendly mount check now sees a mounted dm-1 on top of sda1.
+        let info = "40 1 253:1 / /mnt/secret rw - ext4 /dev/mapper/x rw\n";
+        assert_eq!(mounted_dev(info, &f.related("8:0").unwrap()), Some(("253:1".into(), "/mnt/secret".into())));
+    }
+
+    #[test]
+    fn related_devs_survives_cycles() {
+        let f = FakeSys::new("cycle");
+        f.node("8:0").partition("8:0", "sda1", "8:1");
+        f.holder("8:1", "dm-0", "253:0").holder("253:0", "dm-1", "253:1");
+        // Pathological: dm-1 claims to be held by the disk and by dm-0 again.
+        f.holder("253:1", "sda", "8:0").holder("253:1", "dm-0", "253:0");
+        assert_eq!(f.related("8:0").unwrap(), sorted(&["8:0", "8:1", "253:0", "253:1"]));
+    }
+
+    #[test]
+    fn related_devs_fails_closed() {
+        let f = FakeSys::new("closed");
+        // Target node missing from sysfs: must be an error, not "nothing related".
+        let e = f.related("8:16").unwrap_err();
+        assert!(format!("{e:#}").contains("8:16"), "{e:#}");
+        // A holder entry without a readable `dev` file is an error too.
+        f.node("8:0");
+        fs::create_dir_all(f.0.join("8:0/holders/dm-0")).unwrap();
+        assert!(f.related("8:0").is_err());
+        // A node with no holders dir at all is fine.
+        f.node("8:32");
+        assert_eq!(f.related("8:32").unwrap(), sorted(&["8:32"]));
     }
 }
