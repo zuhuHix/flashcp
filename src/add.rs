@@ -301,12 +301,25 @@ pub fn add(src: &Path, target: &Path, o: &AddOpts, sink: Sink<'_>) -> Result<Add
 
 /// [`add`] onto a [`TargetSpec`] (a path, or an inherited block-device fd).
 pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> Result<AddStats> {
-    let t0 = Instant::now();
-    let mut tick = Ticker::new(sink);
     ensure!(
         fs::metadata(src).with_context(|| format!("source {}", src.display()))?.is_dir(),
         "source must be a directory"
     );
+    add_tree(target, o, sink, |upc| scan_tree(src, upc))
+}
+
+/// [`add_to`] with the source tree supplied by `tree` (called with the volume's up-case table
+/// once it is parsed) instead of scanned from a directory. Node 0 is the root; every file
+/// node's `src` is a readable regular file of exactly `size` bytes (used by drive mode, whose
+/// staged files live in a staging directory).
+pub(crate) fn add_tree(
+    target: &TargetSpec,
+    o: &AddOpts,
+    sink: Sink<'_>,
+    tree: impl FnOnce(&[u16]) -> Result<Vec<Node>>,
+) -> Result<AddStats> {
+    let t0 = Instant::now();
+    let mut tick = Ticker::new(sink);
     let tgt = target.open_rw()?;
     // The one open file description (exclusively claimed: O_EXCL / flock) is used for
     // everything and stays open until we return, so nobody can mount the device mid-way.
@@ -316,7 +329,7 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
     set_direct(&excl, false);
     let mut v = Vol::open(excl.try_clone().context("dup target fd")?, tgt.bytes, false, true)?;
     let cs = v.cs;
-    let mut nodes = scan_tree(src, &v.upc)?;
+    let mut nodes = tree(&v.upc)?;
     // Mandatory: never trust a clear bitmap bit that something still references. The walk
     // keeps the directories planning may touch (the --to path and every source directory
     // path under it), so planning uses exactly what was verified.

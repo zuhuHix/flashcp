@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use flashcp::TargetSpec;
 use flashcp::events::{Event, error_json};
-use flashcp::{add, bench, copy, dataset, exfat, pack, probe, pull, util};
+use flashcp::{add, bench, copy, dataset, exfat, mount, pack, probe, pull, util};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -102,6 +102,22 @@ enum Cmd {
         /// Print progress as JSON lines on stdout
         #[arg(long)]
         json: bool,
+    },
+    /// SPIKE: serve the exFAT volume on TARGET (block device or image) at MOUNTPOINT through
+    /// FUSE; new files are staged and committed in one sequential pass when writes go idle,
+    /// on fsync and on unmount (fusermount3 -u MOUNTPOINT)
+    Mount {
+        target: PathBuf,
+        mountpoint: PathBuf,
+        /// Commit after this many ms without writes
+        #[arg(long, default_value_t = 1500)]
+        idle_ms: u64,
+        /// Stage up to this many MB in RAM (/dev/shm), then on the local disk
+        #[arg(long, default_value_t = 512)]
+        ram_mb: u64,
+        /// Disable FUSE writeback caching
+        #[arg(long)]
+        no_writeback: bool,
     },
     /// Copy the files of an exFAT volume on TARGET (block device or image file, opened
     /// read-only; preferably unmounted) into DEST, reading the volume in large sequential chunks
@@ -338,6 +354,15 @@ fn run(cmd: Cmd) -> Result<()> {
                 );
             }
             Ok(())
+        }
+        Cmd::Mount { target, mountpoint, idle_ms, ram_mb, no_writeback } => {
+            let o = mount::MountOpts {
+                idle: std::time::Duration::from_millis(idle_ms),
+                ram_cap: ram_mb << 20,
+                writeback: !no_writeback,
+                ..Default::default()
+            };
+            mount::mount(&target, &mountpoint, &o)
         }
         Cmd::Info { target, target_fd, json } => {
             let i = add::info_of(&spec(target, target_fd))?;

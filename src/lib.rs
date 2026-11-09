@@ -9,6 +9,7 @@ pub mod dataset;
 pub(crate) mod dirfd;
 pub mod events;
 pub mod exfat;
+pub mod mount;
 pub mod pack;
 pub mod probe;
 pub mod pull;
