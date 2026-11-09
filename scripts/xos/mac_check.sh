@@ -65,6 +65,9 @@ else
   report "- \`$LABEL\` verify: **FAIL** (see verify-$LABEL.txt)"; ok=0
 fi
 
+probe=$(python3 "$HERE/nfc_probe.py" "$mp" "macos:$LABEL" 2>&1); echo "$probe" | tee "$LOGDIR/nfcprobe-$LABEL.txt"
+echo "$probe" | sed 's/^/  - /' >>"$SUMMARY"
+
 if python3 "$HERE/write_test.py" "$mp" "$MANIFEST" "$LOGDIR/after-$LABEL.json" 2>&1 | tee "$LOGDIR/writetest-$LABEL.txt"; then
   report "- \`$LABEL\` write test: OK"
 else

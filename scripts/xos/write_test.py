@@ -29,7 +29,22 @@ UNI_STEMS = [unicodedata.normalize("NFC", s) for s in ["新しい", "Νέο", "�
 
 
 def fs_path(mount, rel):
-    return os.path.join(long_path(mount), *rel.split("/"))
+    """Path of the NFC manifest key REL on disk.
+
+    macOS's exFAT driver lists names in NFD and does not find a name looked up in the NFC form
+    it was stored in (see nfc_probe.py), so each component is matched against the real listing.
+    A component that does not exist yet (a new file) is used as given.
+    """
+    path = long_path(mount)
+    for part in rel.split("/"):
+        cand = os.path.join(path, part)
+        if not os.path.lexists(cand) and os.path.isdir(path):
+            for name in os.listdir(path):
+                if unicodedata.normalize("NFC", name) == part:
+                    cand = os.path.join(path, name)
+                    break
+        path = cand
+    return path
 
 
 def main(argv):

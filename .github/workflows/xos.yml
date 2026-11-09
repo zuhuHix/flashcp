@@ -46,6 +46,8 @@ jobs:
         with: { name: xos-prefix-1g, path: out/prefix-1g, retention-days: 3, compression-level: 1 }
       - uses: actions/upload-artifact@v4
         with: { name: xos-superfloppy, path: out/superfloppy, retention-days: 3, compression-level: 1 }
+      - uses: actions/upload-artifact@v4
+        with: { name: xos-control-mkfs, path: out/control-mkfs, retention-days: 3, compression-level: 1 }
 
   windows:
     name: windows chkdsk (${{ matrix.vol }})
@@ -54,9 +56,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        vol: [prefix-auto, full-auto, prefix-4k, prefix-128k, prefix-1g, superfloppy]
-    # The superfloppy (no partition table) variant is report-only: it never fails the build.
-    continue-on-error: ${{ matrix.vol == 'superfloppy' }}
+        vol: [prefix-auto, full-auto, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs]
+    # Report-only entries, never fail the build: superfloppy (no partition table), and
+    # control-mkfs (the same tree written by mkfs.exfat + Linux, a reference for attributing failures).
+    continue-on-error: ${{ matrix.vol == 'superfloppy' || matrix.vol == 'control-mkfs' }}
     defaults:
       run:
         shell: pwsh
@@ -81,8 +84,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        vol: [prefix-auto, full-auto, prefix-4k, prefix-128k, prefix-1g, superfloppy]
-    continue-on-error: ${{ matrix.vol == 'superfloppy' }}
+        vol: [prefix-auto, full-auto, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs]
+    continue-on-error: ${{ matrix.vol == 'superfloppy' || matrix.vol == 'control-mkfs' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

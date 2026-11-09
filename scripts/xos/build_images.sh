@@ -71,5 +71,25 @@ for spec in "${VOLUMES[@]}"; do
   echo "::endgroup::"
 done
 
+# Control: the same tree written by mkfs.exfat + the Linux kernel driver (not by flashcp), so a
+# behaviour seen on another OS can be attributed to flashcp or to exFAT on that OS in general.
+if sudo -n true 2>/dev/null; then
+  echo "::group::volume control-mkfs (mkfs.exfat + Linux cp)"
+  vol="$WORK/control-mkfs.vol"
+  truncate -s 512M "$vol"
+  mkfs.exfat -L XOSTEST "$vol"
+  mp=$(mktemp -d)
+  sudo mount -o loop "$vol" "$mp"
+  sudo cp -r --preserve=timestamps "$WORK/src/." "$mp/"
+  sudo umount "$mp"
+  check_linux "$vol" || echo "control volume does not match the manifest on Linux (reported, not fatal)"
+  mkdir -p "$OUT/control-mkfs"
+  python3 "$HERE/mbr_wrap.py" "$vol" "$OUT/control-mkfs/control-mkfs.img"
+  python3 "$HERE/mkvhd.py" "$OUT/control-mkfs/control-mkfs.img" "$OUT/control-mkfs/control-mkfs.vhd"
+  cp "$WORK/manifest.json" "$OUT/control-mkfs/"
+  rm -f "$vol"
+  echo "::endgroup::"
+fi
+
 rm -rf "$WORK"
 ls -lsR "$OUT"
