@@ -75,6 +75,10 @@ struct Reader {
     upcase: Vec<u16>,
     /// Cluster -> the object that owns it. Every allocated cluster must have exactly one owner.
     claimed: BTreeMap<u32, String>,
+    /// Read what an interrupted `flashcp sync` leaves: skip orphan secondaries (in-use
+    /// secondaries after a deleted 0x85 within its SecondaryCount) and, of two live sets with
+    /// one case-folded name, see only the later (newer) one.
+    crashed: bool,
 }
 
 fn err<T>(msg: impl Into<String>) -> Result<T, String> {
@@ -380,6 +384,14 @@ impl Reader {
             }
             if t & IN_USE == 0 {
                 i += 1;
+                if self.crashed && t == ET_FILE & !IN_USE {
+                    for _ in 0..e[1] {
+                        if i >= n || bytes[i * ENTRY] & 0x40 == 0 {
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
                 continue;
             }
             match t {
@@ -459,7 +471,17 @@ impl Reader {
         }
         let owner = if is_root { "/" } else { prefix };
         let mut seen_names = std::collections::HashSet::new();
-        for child in self.parse_entries(bytes, owner, is_root)? {
+        let mut children = self.parse_entries(bytes, owner, is_root)?;
+        if self.crashed {
+            let mut last = std::collections::HashMap::new();
+            for (k, c) in children.iter().enumerate() {
+                let folded: Vec<u16> = c.name.encode_utf16().map(|u| self.upcase[u as usize]).collect();
+                last.insert(folded, k);
+            }
+            let keep: std::collections::HashSet<usize> = last.into_values().collect();
+            children = children.into_iter().enumerate().filter(|(k, _)| keep.contains(k)).map(|e| e.1).collect();
+        }
+        for child in children {
             let path = if prefix.is_empty() { child.name.clone() } else { format!("{prefix}/{}", child.name) };
             let folded: Vec<u16> = child.name.encode_utf16().map(|u| self.upcase[u as usize]).collect();
             if !seen_names.insert(folded) {
@@ -517,12 +539,23 @@ pub fn read_volume_allow_leaks(path: &Path) -> Result<Volume, String> {
     read_volume_opts(path, true)
 }
 
+/// Like [`read_volume_allow_leaks`], for the states an interrupted `flashcp sync` leaves:
+/// orphan secondaries are skipped, and of duplicate names only the later set is seen.
+#[allow(dead_code)] // used by tests/sync.rs, not by every test binary
+pub fn read_volume_crashed(path: &Path) -> Result<Volume, String> {
+    read_volume_inner(path, true, true)
+}
+
 fn read_volume_opts(path: &Path, allow_leaks: bool) -> Result<Volume, String> {
+    read_volume_inner(path, allow_leaks, false)
+}
+
+fn read_volume_inner(path: &Path, allow_leaks: bool, crashed: bool) -> Result<Volume, String> {
     let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let file_len = file.metadata().map_err(|e| e.to_string())?.len();
     let info = read_boot(&file, file_len)?;
     let fat = read_fat(&file, &info)?;
-    let mut r = Reader { file, info, fat, upcase: Vec::new(), claimed: BTreeMap::new() };
+    let mut r = Reader { file, info, fat, upcase: Vec::new(), claimed: BTreeMap::new(), crashed };
     let root_clusters = r.eoc_clusters(info.root_cluster, "root directory")?;
     r.claim(&root_clusters, "root directory")?;
     let root = r.read_clusters(&root_clusters, root_clusters.len() as u64 * info.cluster_size)?;

@@ -63,6 +63,7 @@ fn sync_ok(src: &Path, img: &Path, extra: &[&str]) {
         .arg(img)
         .args(extra)
         .env("FLASHCP_TEST_NO_ADD_BUILD", "1")
+        .env("XDG_STATE_HOME", img.parent().unwrap().join("state"))
         .output()
         .expect("run flashcp sync");
     assert_success(&out, &format!("flashcp sync {extra:?}"));
@@ -107,7 +108,7 @@ fn mount_sync_into_kernel_written_directory() {
     fs::create_dir_all(src.join("moved")).expect("create the move target");
     fs::rename(src.join("random-5mb.bin"), src.join("moved/random-5mb.bin")).expect("move a file");
 
-    sync_ok(&src, &img, &["--to", "site", "--delete"]);
+    sync_ok(&src, &img, &["--to", "site", "--delete", "--yes"]);
     fsck_strict(&img);
     let vol = read_back(&img);
     let site = subset(&vol, |k| k.starts_with("site/"));
@@ -144,7 +145,7 @@ fn mount_sync_reverts_a_kernel_edit_on_a_flashcp_built_image() {
     write_file(&src.join("café.txt"), b"changed by the source\n");
     write_file(&src.join("added/new.txt"), b"new\n");
     fs::remove_file(src.join("bulk/d1/f002.bin")).expect("delete a file");
-    sync_ok(&src, &img, &["--delete"]);
+    sync_ok(&src, &img, &["--delete", "--yes"]);
     fsck_strict(&img);
     let problems = compare_trees(&read_source_tree(&src), &read_back(&img));
     assert!(problems.is_empty(), "after the first sync:\n{}", problems.join("\n"));
@@ -158,7 +159,7 @@ fn mount_sync_reverts_a_kernel_edit_on_a_flashcp_built_image() {
     fsck_strict(&img);
 
     // The second sync reverts all of it to the source.
-    sync_ok(&src, &img, &["--delete"]);
+    sync_ok(&src, &img, &["--delete", "--yes"]);
     fsck_strict(&img);
     let problems = compare_trees(&read_source_tree(&src), &read_back(&img));
     assert!(problems.is_empty(), "after the second sync:\n{}", problems.join("\n"));
