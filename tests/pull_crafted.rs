@@ -329,3 +329,53 @@ fn plan_reports_the_read_strategy_and_overrides_apply() {
     let p = plan(&["--gap-kb", "8", "--inflight", "3", "--buffered", "true"]);
     assert!(p.contains(r#""gap_kb":8,"inflight":3,"direct":false"#), "{p}");
 }
+
+// ───────────────────────── directory stream entries ─────────────────────────
+
+/// A directory entry with ValidDataLength ≠ DataLength (the spec requires them equal): the
+/// shared parser refuses it, so pull, add and info all do.
+#[test]
+fn directory_with_valid_length_mismatch_is_refused_by_pull_and_add() {
+    let dir = test_dir("crafted_dir_vdl");
+    write_file(&dir.join("src/odd-dir/f.txt"), b"x");
+    write_file(&dir.join("more/new.txt"), b"y");
+    let img = dir.join("v.img");
+    build(&dir.join("src"), &img, 32 * MB, &["--cluster", "4096"]);
+    let mut b = fs::read(&img).unwrap();
+    patch_set(&mut b, "odd-dir", |s| {
+        let len = u64::from_le_bytes(s[56..64].try_into().unwrap());
+        s[40..48].copy_from_slice(&(len + 4096).to_le_bytes());
+    });
+    fs::write(&img, &b).unwrap();
+    let before = fs::read(&img).unwrap();
+    let dest = dir.join("out");
+    pull_fails(&img, &dest, &[], &[], "differs from DataLength");
+    pull_fails(&img, &dest, &["--skip-existing"], &[], "differs from DataLength");
+    assert!(!dest.exists(), "a refused pull created the destination");
+    let add = flashcp().arg("add").arg(dir.join("more")).arg(&img).output().unwrap();
+    let err = String::from_utf8_lossy(&add.stderr);
+    assert!(!add.status.success() && err.contains("differs from DataLength"), "add accepted it:\n{err}");
+    let info = flashcp().arg("info").arg(&img).output().unwrap();
+    assert!(!info.status.success(), "info accepted it");
+    assert!(fs::read(&img).unwrap() == before, "a refused add changed the image");
+}
+
+/// A directory whose DataLength is not a multiple of the cluster size.
+#[test]
+fn directory_length_not_a_cluster_multiple_is_refused() {
+    let dir = test_dir("crafted_dir_len");
+    write_file(&dir.join("src/odd-dir/f.txt"), b"x");
+    let img = dir.join("v.img");
+    build(&dir.join("src"), &img, 32 * MB, &["--cluster", "4096"]);
+    let mut b = fs::read(&img).unwrap();
+    patch_set(&mut b, "odd-dir", |s| {
+        s[40..48].copy_from_slice(&1000u64.to_le_bytes());
+        s[56..64].copy_from_slice(&1000u64.to_le_bytes());
+    });
+    fs::write(&img, &b).unwrap();
+    let dest = dir.join("out");
+    pull_fails(&img, &dest, &[], &[], "not a non-zero multiple of the cluster size");
+    assert!(!dest.exists());
+    let add = flashcp().arg("add").arg(dir.join("src")).arg(&img).arg("--skip-existing").output().unwrap();
+    assert!(!add.status.success(), "add accepted it");
+}
