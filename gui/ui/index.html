@@ -17,6 +17,11 @@
   </header>
 
   <main class="app-main">
+    <div class="mode-switch" role="group" aria-label="Direction">
+      <button id="mode-copy" type="button" aria-pressed="true">Copy to USB</button>
+      <button id="mode-pull" type="button" aria-pressed="false">Copy from USB</button>
+    </div>
+
     <section class="card" aria-labelledby="drives-heading">
       <h2 id="drives-heading">Drive</h2>
       <div id="drives" class="drive-list" role="radiogroup" aria-labelledby="drives-heading"></div>
@@ -45,7 +50,7 @@
       <p id="trust-error" class="trust-error" role="alert" hidden></p>
     </section>
 
-    <section class="card" aria-labelledby="files-heading">
+    <section class="card" id="copy-files" aria-labelledby="files-heading">
       <h2 id="files-heading">Files</h2>
       <div id="dropzone" class="dropzone">
         <p class="drop-title">Drop files or folders here</p>
@@ -61,7 +66,7 @@
       <ul id="sources" class="sources"></ul>
     </section>
 
-    <section class="card" aria-labelledby="dest-heading">
+    <section class="card" id="copy-dest" aria-labelledby="dest-heading">
       <h2 id="dest-heading">Destination</h2>
       <label for="dest" class="field-label">Folder on the drive</label>
       <input id="dest" type="text" value="/" autocomplete="off" spellcheck="false"
@@ -73,8 +78,61 @@
       </label>
     </section>
 
-    <section class="actions">
+    <section class="card" id="pull-source" aria-labelledby="pull-source-heading" hidden>
+      <h2 id="pull-source-heading">From the drive</h2>
+      <div id="pull-browser">
+        <nav aria-label="Folder on the drive">
+          <ol id="crumbs" class="crumbs"></ol>
+        </nav>
+        <div class="browser-row">
+          <button id="pull-up" type="button">Up</button>
+          <p id="pull-folder-status" class="hint" role="status"></p>
+        </div>
+        <ul id="pull-folders" class="folder-list" aria-label="Folders on the drive"></ul>
+      </div>
+      <div id="pull-typed" hidden>
+        <label for="pull-from" class="field-label">Folder on the drive</label>
+        <input id="pull-from" type="text" value="" placeholder="Whole drive" autocomplete="off"
+               spellcheck="false" aria-describedby="pull-typed-hint">
+        <p id="pull-typed-hint" class="hint"></p>
+      </div>
+      <p id="pull-current" class="hint"></p>
+      <div class="button-row">
+        <button id="pull-whole" type="button">Use whole drive</button>
+      </div>
+    </section>
+
+    <section class="card" id="pull-dest-card" aria-labelledby="pull-dest-heading" hidden>
+      <h2 id="pull-dest-heading">To this computer</h2>
+      <p class="field-label">Copy to</p>
+      <p id="pull-dest-path" class="code dest-path"></p>
+      <p class="hint">Files are copied into this folder. It is created if it does not exist.</p>
+      <div class="button-row">
+        <button id="pull-change" type="button">Change…</button>
+        <button id="pull-default" type="button" hidden>Use default folder</button>
+      </div>
+    </section>
+
+    <section id="collision" class="card panel warn" tabindex="-1" aria-labelledby="collision-title" hidden>
+      <p id="collision-title" class="stage">The destination is not empty</p>
+      <p id="collision-text" class="dest-path"></p>
+      <p class="hint">
+        Skip existing copies only the files that are not there yet. Overwrite replaces files that
+        have the same name. Cancel copies nothing.
+      </p>
+      <div class="button-row">
+        <button id="collision-skip" class="accent" type="button">Skip existing</button>
+        <button id="collision-overwrite" type="button">Overwrite</button>
+        <button id="collision-cancel" type="button">Cancel</button>
+      </div>
+    </section>
+
+    <section class="actions" id="copy-actions">
       <button id="copy" class="primary" type="button" disabled>Fast copy</button>
+    </section>
+
+    <section class="actions" id="pull-actions" hidden>
+      <button id="pull-start" class="primary" type="button" disabled>Copy from USB</button>
     </section>
 
     <section id="progress" class="card panel" aria-live="polite" hidden>
@@ -85,6 +143,7 @@
 
     <section id="done" class="card panel success" aria-live="polite" hidden>
       <p id="summary" class="summary"></p>
+      <p id="done-warning" class="hint" role="status" hidden></p>
       <p id="wall" class="hint"></p>
       <button id="copy-more" type="button">Copy more</button>
     </section>

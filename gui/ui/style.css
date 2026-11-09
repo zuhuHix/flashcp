@@ -628,6 +628,131 @@ progress {
   color: var(--text);
 }
 
+/* ---- mode switch ---- */
+
+.mode-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+.mode-switch button {
+  padding: 10px 14px;
+  font-weight: 600;
+  background: var(--surface);
+}
+
+.mode-switch button:first-child {
+  border-radius: 8px 0 0 8px;
+}
+
+.mode-switch button:last-child {
+  border-radius: 0 8px 8px 0;
+  margin-left: -1px;
+}
+
+.mode-switch button[aria-pressed="true"],
+.mode-switch button[aria-pressed="true"]:hover:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  position: relative;
+}
+
+/* ---- pull: folder browser and destination ---- */
+
+.dest-path {
+  overflow-wrap: anywhere;
+  margin-top: 4px;
+}
+
+.crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  font-size: 13px;
+}
+
+.crumbs li + li::before {
+  content: "/";
+  color: var(--muted);
+  margin: 0 4px;
+}
+
+button.crumb {
+  border: none;
+  background: none;
+  padding: 2px 4px;
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+button.crumb:hover:not(:disabled) {
+  background: none;
+}
+
+.crumbs [aria-current="location"] {
+  font-weight: 600;
+  padding: 2px 4px;
+}
+
+.browser-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.browser-row .hint {
+  margin-top: 0;
+}
+
+.folder-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+button.folder {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+button.folder .arrow {
+  color: var(--muted);
+}
+
+#pull-current {
+  margin-top: 10px;
+  margin-bottom: 8px;
+  color: var(--text);
+}
+
+#pull-typed .hint {
+  margin-bottom: 8px;
+}
+
+#collision {
+  scroll-margin-top: 12px;
+}
+
+#collision:focus {
+  outline-offset: 0;
+}
+
 /* ---- phone-width and narrow windows ---- */
 
 @media (max-width: 420px) {

@@ -31,6 +31,24 @@ import {
   selectDrive,
   openTrust,
   closeTrust,
+  canPull,
+  pullArgs,
+  pullDestination,
+  normalizeFrom,
+  parentFrom,
+  breadcrumbs,
+  folderRows,
+  browseKey,
+  setFolders,
+  setMode,
+  setPullFrom,
+  setPullDest,
+  resetPullDest,
+  applyPullRequest,
+  pullSummaryText,
+  showCollision,
+  clearCollision,
+  collisionText,
 } from "./logic.js";
 
 const tauri = window.__TAURI__ || null;
@@ -74,8 +92,18 @@ const DEMO_DRIVES = [
   },
 ];
 const DEMO_PATHS = ["/home/demo/Photos", "/home/demo/notes.txt"];
+// Folder tree of the demo drive, same shape as the fake tree in the backend.
+const DEMO_TREE = {
+  "": ["DCIM", "Documents", "Music"],
+  DCIM: ["100CANON", "101CANON"],
+  Documents: ["2026"],
+};
+const DEMO_DOWNLOADS = "/home/demo/Downloads";
 
 let demoSettings = { autostart: false, notifyOnPlug: true };
+// ?pull=conflict: the first demo pull ends with the "already exist" error.
+const demoParams = new URLSearchParams(window.location.search);
+let demoConflictPending = !hasTauri && demoParams.get("pull") === "conflict";
 
 let state = {
   drives: [],
@@ -90,23 +118,40 @@ let state = {
   trustOpen: false,
   trustBusy: false,
   trustError: null,
+  mode: "copy",
+  downloads: null,
+  pullFrom: "",
+  pullFolders: null,
+  pullDestOverride: null,
+  pullCollision: null,
 };
 
 const ids = [
   "banner", "drives", "drives-empty", "nonexfat", "trust", "trust-text", "trust-open-row",
   "trust-open", "trust-confirm", "trust-facts", "trust-yes", "trust-cancel", "trust-error",
-  "dropzone", "add-files", "add-folder",
-  "sources-head", "sources-count", "clear-sources", "sources", "dest", "dest-hint",
-  "skip-existing", "copy", "progress", "stage", "bar", "progress-text", "done", "summary",
-  "wall", "copy-more", "error", "error-message", "dismiss", "notice", "advanced",
-  "erase-hint", "erase-label", "erase-confirm", "erase", "settings", "set-autostart",
+  "mode-copy", "mode-pull",
+  "copy-files", "dropzone", "add-files", "add-folder",
+  "sources-head", "sources-count", "clear-sources", "sources", "copy-dest", "dest", "dest-hint",
+  "skip-existing", "copy-actions", "copy", "progress", "stage", "bar", "progress-text", "done",
+  "summary", "done-warning", "wall", "copy-more", "error", "error-message", "dismiss", "notice",
+  "advanced", "erase-hint", "erase-label", "erase-confirm", "erase", "settings", "set-autostart",
   "set-notify",
+  "pull-source", "pull-browser", "crumbs", "pull-up", "pull-folder-status", "pull-folders",
+  "pull-typed", "pull-from", "pull-typed-hint", "pull-current", "pull-whole",
+  "pull-dest-card", "pull-dest-path", "pull-change", "pull-default",
+  "collision", "collision-title", "collision-text", "collision-skip", "collision-overwrite",
+  "collision-cancel", "pull-actions", "pull-start",
 ];
 const els = Object.fromEntries(ids.map((id) => [id, document.getElementById(id)]));
 
 // Signatures of the last rendered lists, so focus survives progress updates.
 let drivesSig = null;
 let sourcesSig = null;
+let folderSig = null;
+// Folder listing currently being fetched (a folderKey), so it is requested once.
+let foldersInFlight = null;
+// Whether the collision panel was open on the last render (to move focus into it once).
+let collisionOpen = false;
 
 function messageOf(err) {
   if (typeof err === "string") return err;
@@ -136,12 +181,37 @@ async function demoInvoke(cmd, args) {
       return { ...demoSettings };
     case "take_pending_files":
       return [];
+    case "take_pending_pull":
+      return null;
+    case "pull_defaults":
+      return { downloads: DEMO_DOWNLOADS };
+    case "dest_status": {
+      // Demo rule: a destination ending in "/Existing" already has files; any other path is empty.
+      const exists = String(args.path || "").endsWith("/Existing");
+      return { exists, isDir: exists, empty: !exists };
+    }
+    case "list_drive_folders": {
+      const drive = DEMO_DRIVES.find((d) => d.id === args.driveId);
+      if (!drive || !drive.mountPoint) {
+        throw new Error("The drive is not mounted, type a folder name instead");
+      }
+      return [...(DEMO_TREE[args.rel] || [])];
+    }
     case "start_copy":
       runDemoJob(args.sources.length, "add");
       return null;
     case "start_erase":
       runDemoJob(1, "build");
       return null;
+    case "start_pull": {
+      if (demoConflictPending && args.existing === "fail") {
+        demoConflictPending = false;
+        runDemoJob(1, "pull", { dest: args.dest, conflict: true });
+      } else {
+        runDemoJob(1, "pull", { dest: args.dest });
+      }
+      return null;
+    }
     case "trust_drive": {
       // Simulated: the real helper asks for admin authentication here.
       await new Promise((resolve) => setTimeout(resolve, 400));
@@ -156,32 +226,51 @@ async function demoInvoke(cmd, args) {
 }
 
 // Simulated job for the browser preview: same stage sequence the backend emits.
-function runDemoJob(total, op) {
+// extra.conflict: stop before copying with the "already exist" error (backend behaviour).
+function runDemoJob(total, op, extra = {}) {
   const planFiles = 40;
   const planBytes = 120_000_000;
-  const base = { op, total, index: 0, filesDone: 0, bytesDone: 0, planFiles, planBytes, message: null, summary: null };
-  const steps = [
-    { stage: "unmounting" },
-    { stage: "authorizing" },
-  ];
-  for (let i = 0; i < total; i++) {
-    for (let k = 1; k <= 4; k++) {
-      const frac = (i * 4 + k) / (total * 4);
-      steps.push({
-        stage: "running",
-        index: i,
-        filesDone: Math.round(planFiles * frac),
-        bytesDone: Math.round(planBytes * frac),
-      });
+  const base = { op, total, index: 0, filesDone: 0, bytesDone: 0, planFiles, planBytes, message: null, summary: null, conflict: false };
+  let steps;
+  if (extra.conflict) {
+    steps = [
+      { stage: "unmounting" },
+      { stage: "remounting" },
+      {
+        stage: "error",
+        conflict: true,
+        message: `${planFiles} file(s) already exist in the destination ${extra.dest}, e.g. a, b; pass --skip-existing or --overwrite`,
+      },
+    ];
+  } else {
+    steps = op === "pull" ? [{ stage: "unmounting" }] : [{ stage: "unmounting" }, { stage: "authorizing" }];
+    for (let i = 0; i < total; i++) {
+      for (let k = 1; k <= 4; k++) {
+        const frac = (i * 4 + k) / (total * 4);
+        steps.push({
+          stage: "running",
+          index: i,
+          filesDone: Math.round(planFiles * frac),
+          bytesDone: Math.round(planBytes * frac),
+        });
+      }
     }
+    steps.push({ stage: "remounting", filesDone: planFiles, bytesDone: planBytes });
+    steps.push({
+      stage: "done",
+      filesDone: planFiles,
+      bytesDone: planBytes,
+      summary: {
+        files: planFiles,
+        bytes: planBytes,
+        secs: 1.8,
+        wallSecs: 4.1,
+        mountPoint: op === "pull" ? null : DEMO_DRIVES[0].mountPoint,
+        dest: op === "pull" ? extra.dest : null,
+        warning: null,
+      },
+    });
   }
-  steps.push({ stage: "remounting", filesDone: planFiles, bytesDone: planBytes });
-  steps.push({
-    stage: "done",
-    filesDone: planFiles,
-    bytesDone: planBytes,
-    summary: { files: planFiles, bytes: planBytes, secs: 1.8, wallSecs: 4.1, mountPoint: DEMO_DRIVES[0].mountPoint },
-  });
   steps.forEach((step, n) => {
     setTimeout(() => onJob({ ...base, ...step, planFiles, planBytes }), 350 * (n + 1));
   });
@@ -199,7 +288,12 @@ function setNotice(text) {
 }
 
 function onJob(update) {
-  setState(applyJobUpdate(state, update));
+  let next = applyJobUpdate(state, update);
+  // A pull stopped by the collision check: offer skip / overwrite / cancel instead of a plain error.
+  if (update && update.op === "pull" && update.stage === "error" && update.conflict === true) {
+    next = showCollision(next, pullDestination(state), "conflict");
+  }
+  setState(next);
 }
 
 function failJob(message) {
@@ -280,6 +374,107 @@ async function startErase() {
   }
 }
 
+// choice: null for a first try (the destination is checked before anything is written),
+// or "skip" / "overwrite" from the collision panel.
+async function startPull(choice) {
+  if (!canPull(state)) return;
+  const dest = pullDestination(state);
+  if (choice === null) {
+    let status;
+    try {
+      status = await call("dest_status", { path: dest });
+    } catch (err) {
+      setNotice(`Could not check ${dest}: ${messageOf(err)}`);
+      return;
+    }
+    if (status.exists && !status.isDir) {
+      setNotice(`${dest} is a file, not a folder. Choose another folder with Change…`);
+      return;
+    }
+    if (status.exists && !status.empty) {
+      setState(showCollision(state, dest, "preflight"));
+      return;
+    }
+  }
+  const args = pullArgs(state, choice || "fail");
+  if (!args) return;
+  setState(beginJob(clearCollision(state), "pull", 1));
+  try {
+    await call("start_pull", args);
+  } catch (err) {
+    failJob(messageOf(err));
+  }
+}
+
+function chooseCollision(choice) {
+  if (!state.pullCollision || jobActive(state)) return;
+  setState(clearCollision(dismissJob(state)));
+  startPull(choice);
+}
+
+function cancelCollision() {
+  setState(clearCollision(dismissJob(state)));
+}
+
+async function changePullDest() {
+  if (jobActive(state)) return;
+  const current = pullDestination(state) || "";
+  if (!hasTauri) {
+    const typed = window.prompt(
+      "Preview only: the folder to copy into, as a full path. Ending it with /Existing shows the collision panel.",
+      current,
+    );
+    if (typed) setState(setPullDest(state, typed));
+    return;
+  }
+  try {
+    const picked = await tauri.dialog.open({ directory: true, multiple: false, defaultPath: current || undefined });
+    if (typeof picked === "string" && picked) setState(setPullDest(state, picked));
+  } catch (err) {
+    setNotice(`Could not open the folder picker: ${messageOf(err)}`);
+  }
+}
+
+function navigatePull(rel) {
+  setState(setPullFrom(state, rel));
+  focusFolderBrowser();
+}
+
+// Keep keyboard focus in the browser after a navigation rebuilds the list.
+function focusFolderBrowser() {
+  const up = els["pull-up"];
+  if (!up.disabled) {
+    up.focus();
+    return;
+  }
+  const first = els["pull-folders"].querySelector("button");
+  if (first && !first.disabled) first.focus();
+}
+
+// Fetch the folder list for the current drive and folder, once per key.
+function maybeLoadFolders() {
+  if (state.mode !== "pull") return;
+  const key = browseKey(state);
+  if (key === null) return;
+  if ((state.pullFolders && state.pullFolders.key === key) || foldersInFlight === key) return;
+  const drive = selectedDrive(state);
+  const rel = normalizeFrom(state.pullFrom);
+  foldersInFlight = key;
+  const finish = () => {
+    if (foldersInFlight === key) foldersInFlight = null;
+  };
+  call("list_drive_folders", { driveId: drive.id, rel }).then(
+    (names) => {
+      finish();
+      if (browseKey(state) === key) setState(setFolders(state, key, names, null));
+    },
+    (err) => {
+      finish();
+      if (browseKey(state) === key) setState(setFolders(state, key, [], messageOf(err)));
+    },
+  );
+}
+
 function showTrustPanel() {
   const drive = selectedDrive(state);
   if (!canTrust(drive) || jobActive(state) || state.trustBusy) return;
@@ -317,12 +512,22 @@ async function changeSetting(patch) {
   }
 }
 
+function onPullRequest(req) {
+  setState(applyPullRequest(state, req));
+}
+
 // ---- rendering -------------------------------------------------------------
 
 function render() {
   const busy = jobActive(state);
   const drive = selectedDrive(state);
   const job = state.job;
+  const pull = state.mode === "pull";
+  const collisionShown = pull && !!state.pullCollision;
+
+  // Direction switch
+  els["mode-copy"].setAttribute("aria-pressed", String(!pull));
+  els["mode-pull"].setAttribute("aria-pressed", String(pull));
 
   // Drives
   renderDrives();
@@ -331,12 +536,15 @@ function render() {
   els.nonexfat.hidden = !nonExfat;
   if (nonExfat) els.nonexfat.textContent = nonExfatText(drive);
 
-  // Sources
+  // Copy to USB: sources and destination
+  els["copy-files"].hidden = pull;
+  els["copy-dest"].hidden = pull;
+  els["copy-actions"].hidden = pull;
+  els.advanced.hidden = pull;
   renderSources(busy);
   els["add-files"].disabled = busy;
   els["add-folder"].disabled = busy;
 
-  // Destination
   const normalized = normalizeDestDir(state.destDir);
   if (els.dest.value !== state.destDir) els.dest.value = state.destDir;
   els.dest.disabled = busy;
@@ -349,6 +557,13 @@ function render() {
         : `Copies into ${normalized}`;
   els["skip-existing"].checked = state.skipExisting;
   els["skip-existing"].disabled = busy;
+
+  // Copy from USB: source on the drive, destination, collision panel, start
+  els["pull-source"].hidden = !pull;
+  els["pull-dest-card"].hidden = !pull;
+  els["pull-actions"].hidden = !pull;
+  if (pull) renderPull(busy);
+  renderCollision(collisionShown);
 
   // Trust: shown while the selected drive is not trusted
   renderTrust(drive, busy);
@@ -369,14 +584,18 @@ function render() {
   const done = job && job.stage === "done" && job.summary;
   els.done.hidden = !done;
   if (done) {
-    els.summary.textContent = summaryText(job.summary);
+    const isPull = job.op === "pull";
+    els.summary.textContent = isPull ? pullSummaryText(job.summary) : summaryText(job.summary);
+    const warning = isPull && job.summary.warning ? job.summary.warning : "";
+    els["done-warning"].hidden = !warning;
+    els["done-warning"].textContent = warning;
     const mount = job.summary.mountPoint ? ` Drive is mounted at ${job.summary.mountPoint}.` : "";
     els.wall.textContent = `Whole job including unmount and remount: ${formatDuration(job.summary.wallSecs)}.${mount}`;
   }
 
-  // Error
+  // Error (a collision is shown in its own panel instead)
   const failed = job && job.stage === "error";
-  els.error.hidden = !failed;
+  els.error.hidden = !failed || collisionShown;
   if (failed) els["error-message"].textContent = stageText(job);
 
   // Notice
@@ -397,6 +616,123 @@ function render() {
 
   // Preview banner
   els.banner.hidden = hasTauri;
+
+  maybeLoadFolders();
+}
+
+function renderPull(busy) {
+  const key = browseKey(state);
+  const entry = key !== null && state.pullFolders && state.pullFolders.key === key ? state.pullFolders : null;
+  // The browser needs a mounted drive and a listing that did not fail; otherwise type the folder.
+  const browsing = key !== null && !(entry && entry.error);
+  const from = normalizeFrom(state.pullFrom);
+
+  els["pull-browser"].hidden = !browsing;
+  els["pull-typed"].hidden = browsing;
+  if (browsing) renderFolderBrowser(entry, from || "", busy);
+
+  if (els["pull-from"].value !== state.pullFrom) els["pull-from"].value = state.pullFrom;
+  els["pull-from"].disabled = busy;
+  els["pull-from"].setAttribute("aria-invalid", from === null ? "true" : "false");
+  els["pull-typed-hint"].textContent = entry && entry.error
+    ? `Folders can't be listed (${entry.error}). Type a folder name, or leave it empty for the whole drive.`
+    : "The drive is not mounted, so folders can't be listed. Type a folder name, or leave it empty for the whole drive.";
+
+  els["pull-current"].textContent =
+    from === null
+      ? "That folder name is not allowed. Use a path inside the drive, without “..”."
+      : from === ""
+        ? "Copying the whole drive."
+        : `Copying only the folder ${from}.`;
+  els["pull-whole"].hidden = from === "";
+  els["pull-whole"].disabled = busy;
+
+  const dest = pullDestination(state);
+  els["pull-dest-path"].textContent = dest || "No default folder yet.";
+  els["pull-change"].disabled = busy;
+  els["pull-default"].hidden = !state.pullDestOverride;
+  els["pull-default"].disabled = busy;
+
+  els["pull-start"].disabled = !canPull(state);
+}
+
+function renderFolderBrowser(entry, from, busy) {
+  const crumbs = breadcrumbs(from);
+  const names = entry ? entry.names : null;
+  const sig = JSON.stringify([from, names, busy]);
+  els["pull-up"].disabled = busy || from === "";
+  const status = names === null
+    ? "Loading folders…"
+    : names.length === 0
+      ? "No folders here."
+      : names.length === 1 ? "1 folder here." : `${names.length} folders here.`;
+  els["pull-folder-status"].textContent = status;
+  if (sig === folderSig) return;
+  folderSig = sig;
+
+  const crumbList = els.crumbs;
+  crumbList.replaceChildren(
+    ...crumbs.map((c, i) => {
+      const li = document.createElement("li");
+      if (i === crumbs.length - 1) {
+        const here = document.createElement("span");
+        here.textContent = c.label;
+        here.setAttribute("aria-current", "location");
+        li.append(here);
+      } else {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "crumb";
+        button.textContent = c.label;
+        button.disabled = busy;
+        button.addEventListener("click", () => navigatePull(c.from));
+        li.append(button);
+      }
+      return li;
+    }),
+  );
+
+  const list = els["pull-folders"];
+  list.replaceChildren(
+    ...folderRows(names || [], from).map((row) => {
+      const li = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "folder";
+      const label = document.createElement("span");
+      label.textContent = row.name;
+      const arrow = document.createElement("span");
+      arrow.className = "arrow";
+      arrow.setAttribute("aria-hidden", "true");
+      arrow.textContent = "›";
+      button.append(label, arrow);
+      button.setAttribute("aria-label", `Open ${row.name}`);
+      if (row.from === null) {
+        button.disabled = true;
+        button.title = "flashcp can't open this folder name";
+      } else {
+        button.disabled = busy;
+        button.addEventListener("click", () => navigatePull(row.from));
+      }
+      li.append(button);
+      return li;
+    }),
+  );
+}
+
+function renderCollision(open) {
+  els.collision.hidden = !open;
+  if (!open) {
+    collisionOpen = false;
+    return;
+  }
+  els["collision-text"].textContent = collisionText(state.pullCollision.dest);
+  els["collision-skip"].disabled = jobActive(state);
+  els["collision-overwrite"].disabled = jobActive(state);
+  if (!collisionOpen) {
+    collisionOpen = true;
+    els.collision.focus();
+  }
 }
 
 function renderTrust(drive, busy) {
@@ -542,6 +878,9 @@ function renderSources(busy) {
 // ---- wiring ------------------------------------------------------------------
 
 function wire() {
+  els["mode-copy"].addEventListener("click", () => setState(setMode(state, "copy")));
+  els["mode-pull"].addEventListener("click", () => setState(setMode(state, "pull")));
+
   els["add-files"].addEventListener("click", () => pickPaths(false));
   els["add-folder"].addEventListener("click", () => pickPaths(true));
   els["clear-sources"].addEventListener("click", () => setState({ ...state, sources: [] }));
@@ -555,7 +894,9 @@ function wire() {
   });
 
   els.copy.addEventListener("click", startCopy);
-  els["copy-more"].addEventListener("click", () => setState(resetForm(state)));
+  els["copy-more"].addEventListener("click", () =>
+    setState(state.mode === "pull" ? dismissJob(state) : resetForm(state)),
+  );
   els.dismiss.addEventListener("click", () => setState(dismissJob(state)));
 
   els["erase-confirm"].addEventListener("input", () => {
@@ -563,6 +904,19 @@ function wire() {
     render();
   });
   els.erase.addEventListener("click", startErase);
+
+  els["pull-up"].addEventListener("click", () => navigatePull(parentFrom(state.pullFrom)));
+  els["pull-whole"].addEventListener("click", () => navigatePull(""));
+  els["pull-from"].addEventListener("input", () => {
+    state = { ...state, pullFrom: els["pull-from"].value };
+    render();
+  });
+  els["pull-change"].addEventListener("click", changePullDest);
+  els["pull-default"].addEventListener("click", () => setState(resetPullDest(state)));
+  els["pull-start"].addEventListener("click", () => startPull(null));
+  els["collision-skip"].addEventListener("click", () => chooseCollision("skip"));
+  els["collision-overwrite"].addEventListener("click", () => chooseCollision("overwrite"));
+  els["collision-cancel"].addEventListener("click", cancelCollision);
 
   els["trust-open"].addEventListener("click", showTrustPanel);
   els["trust-cancel"].addEventListener("click", cancelTrust);
@@ -603,9 +957,13 @@ async function listenToBackend() {
   await tauri.event.listen("job", (e) => onJob(e.payload));
   await tauri.event.listen("drives-changed", () => refreshDrives());
   await tauri.event.listen("files-received", (e) => addSources(e.payload));
+  await tauri.event.listen("pull-requested", (e) => onPullRequest(e.payload));
 }
 
 async function init() {
+  // Preview only: ?mode=pull opens the Copy from USB view.
+  if (!hasTauri && demoParams.get("mode") === "pull") state = { ...state, mode: "pull" };
+
   wire();
   wireDragDrop();
   render();
@@ -624,6 +982,22 @@ async function init() {
     addSources(await call("take_pending_files"));
   } catch (err) {
     setNotice(`Could not read files from the command line: ${messageOf(err)}`);
+  }
+
+  try {
+    const defaults = await call("pull_defaults");
+    if (defaults && typeof defaults.downloads === "string") {
+      setState({ ...state, downloads: defaults.downloads });
+    }
+  } catch (err) {
+    setNotice(`Could not find your Downloads folder: ${messageOf(err)}`);
+  }
+
+  try {
+    const req = await call("take_pending_pull");
+    if (req) setState(applyPullRequest(state, req));
+  } catch (err) {
+    setNotice(`Could not read the folder from the file manager: ${messageOf(err)}`);
   }
 }
 
