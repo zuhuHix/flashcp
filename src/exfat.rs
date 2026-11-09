@@ -1105,10 +1105,13 @@ pub(crate) fn build_target(mut nodes: Vec<Node>, tgt: Target, o: &BuildOpts, sin
     let mut w = SeqWriter::new(dev.clone());
     w.set_device_offset(tgt.part_off * SECTOR);
     let abort_at: Option<u64> = std::env::var(ABORT_AT_ENV).ok().and_then(|v| v.parse().ok());
-    let check_abort = |w: &SeqWriter| {
+    // Writes what is queued (so the device really holds a partial volume), then dies.
+    let abort_if_due = |w: SeqWriter| -> SeqWriter {
         if abort_at.is_some_and(|a| w.written >= a) {
+            let _ = w.finish();
             std::process::abort();
         }
+        w
     };
     let serial = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u32;
     let pct = ((p.used_end - 2) * 100 / g.cluster_count).min(100) as u8;
@@ -1190,7 +1193,7 @@ pub(crate) fn build_target(mut nodes: Vec<Node>, tgt: Target, o: &BuildOpts, sin
         w.zeros_to(at + n.clusters * cs)?;
         bytes_done += n.size;
         tick.progress((empty_files + k + 1) as u64, bytes_done, false);
-        check_abort(&w);
+        w = abort_if_due(w);
     }
     let written = w.finish()?; // syncs
     // Everything is on the device: now the main boot sector may say "clean".
