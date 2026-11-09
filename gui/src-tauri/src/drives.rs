@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 pub const NOT_TRUSTED_MESSAGE: &str = "This drive isn't trusted yet. Use “Trust this drive…” first.";
-pub const NO_SERIAL_MESSAGE: &str = "This drive doesn't report a serial number, so flashcp can't trust it.";
+pub const NO_SERIAL_MESSAGE: &str = "This drive doesn't report a usable serial number or WWN, so flashcp \
+     can't remember it safely. You can still copy to it from the command line: sudo flashcp add <folder> /dev/sdX";
 
 /// A udisks Block object, reduced to the fields the filter needs.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -55,8 +56,15 @@ pub struct Drive {
     pub mount_point: Option<String>,
     pub model: String,
     pub whole_disk: bool,
-    /// Identity key: udisks Drive.Serial, or the WWN when the serial is empty, else "".
+    /// Identity key (same rule as the helper, see weak.rs): the serial unless it is a
+    /// placeholder, else the WWN unless that is one too, else "" (can't be trusted).
     pub serial: String,
+    /// udisks Drive.WWN, "-" when none. Part of the identity tuple sent to flashcp-trust.
+    pub wwn: String,
+    /// udisks Drive.Model alone (no vendor), "-" when none. Part of the identity tuple.
+    pub id_model: String,
+    /// Whole-disk size in bytes (udisks Drive.Size). Part of the identity tuple.
+    pub drive_size: u64,
     /// The trust file has this serial and this drive size. A UI hint only; the helper decides.
     pub trusted: bool,
 }
@@ -80,7 +88,9 @@ pub fn select_drives(blocks: &[RawBlock], drives: &HashMap<String, RawDrive>, tr
             }
             let fs_type = if b.has_filesystem { b.id_type.clone() } else { String::new() };
             let model = format!("{} {}", d.vendor.trim(), d.model.trim()).trim().to_string();
-            let serial = if d.serial.is_empty() { d.wwn.clone() } else { d.serial.clone() };
+            let wwn = if d.wwn.trim().is_empty() { "-".to_string() } else { d.wwn.clone() };
+            let id_model = if d.model.trim().is_empty() { "-".to_string() } else { d.model.trim().to_string() };
+            let serial = crate::weak::identity_key(&d.serial, &wwn).unwrap_or("").to_string();
             let trusted = trust::is_trusted(trust, &serial, d.drive_size);
             Some(Drive {
                 id: b.object_path.clone(),
@@ -93,6 +103,9 @@ pub fn select_drives(blocks: &[RawBlock], drives: &HashMap<String, RawDrive>, tr
                 model,
                 whole_disk: !b.is_partition,
                 serial,
+                wwn,
+                id_model,
+                drive_size: d.drive_size,
                 trusted,
             })
         })
@@ -152,6 +165,9 @@ pub fn fake_drives() -> Vec<Drive> {
             model: "Fake USB".into(),
             whole_disk: false,
             serial: "FAKE0001".into(),
+            wwn: "-".into(),
+            id_model: "Fake USB".into(),
+            drive_size: 32_015_122_432,
             trusted: trusted(FAKE_USB_ID),
         },
         Drive {
@@ -165,6 +181,9 @@ pub fn fake_drives() -> Vec<Drive> {
             model: "Fake USB".into(),
             whole_disk: false,
             serial: "OLD0002".into(),
+            wwn: "-".into(),
+            id_model: "Fake USB".into(),
+            drive_size: 8_004_829_184,
             trusted: trusted(FAKE_OLD_ID),
         },
     ]
@@ -371,6 +390,32 @@ mod tests {
         let d = &select_drives(&blocks, &m, &trust_for("0x5000cca", 32_000_000_000))[0];
         assert_eq!(d.serial, "0x5000cca");
         assert!(d.trusted);
+    }
+
+    #[test]
+    fn placeholder_serial_is_keyed_by_wwn_or_untrustable() {
+        let blocks = [part("/b/sdb1", "/dev/sdb1", "/drv/usb", "exfat", "X")];
+        let mut m = HashMap::new();
+        // Junk serial WITH a real WWN: keyed by the WWN, like the helper.
+        m.insert("/drv/usb".to_string(), RawDrive { serial: "0123456789ABCDEF".into(), ..usb() });
+        assert_eq!(select_drives(&blocks, &m, &[])[0].serial, "0x5000cca");
+        // Junk serial and no WWN: can't be trusted.
+        m.insert("/drv/usb".to_string(), RawDrive { serial: "000000000000".into(), wwn: String::new(), ..usb() });
+        let d = &select_drives(&blocks, &m, &trust_for("000000000000", 32_000_000_000))[0];
+        assert_eq!((d.serial.as_str(), d.wwn.as_str(), d.trusted), ("", "-", false));
+        assert_eq!(require_trusted(d), Err(NO_SERIAL_MESSAGE.to_string()));
+    }
+
+    #[test]
+    fn identity_tuple_fields() {
+        let mut m = HashMap::new();
+        m.insert("/drv/usb".to_string(), usb());
+        let blocks = [part("/b/sdb1", "/dev/sdb1", "/drv/usb", "exfat", "X")];
+        let d = &select_drives(&blocks, &m, &[])[0];
+        // id_model is udisks' Model alone (what the helper derives from ID_MODEL_ENC), not vendor+model.
+        assert_eq!((d.id_model.as_str(), d.model.as_str()), ("Ultra", "SanDisk Ultra"));
+        assert_eq!(d.wwn, "0x5000cca");
+        assert_eq!(d.drive_size, usb().drive_size);
     }
 
     #[test]

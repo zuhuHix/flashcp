@@ -56,7 +56,9 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustRequest {
     pub dev: DevName,
-    pub expect: String,
+    /// The full identity the user was shown and confirmed. Every field must match the drive
+    /// the helper actually opens, or nothing is written.
+    pub shown: crate::identity::Identity,
 }
 
 fn tail() -> [String; 3] {
@@ -206,8 +208,26 @@ pub fn parse(args: &[OsString]) -> Result<Request, String> {
 /// Parse flashcp-trust's argv (without argv[0]): exactly `<dev> --expect <key>`.
 pub fn parse_trust(args: &[OsString]) -> Result<TrustRequest, String> {
     match utf8(args)?.as_slice() {
-        [dev, "--expect", key] => Ok(TrustRequest { dev: parse_dev(dev)?, expect: check_key(key)? }),
-        _ => Err("usage: flashcp-trust <dev> --expect <key>".into()),
+        [dev, "--expect", key, "--wwn", wwn, "--model", model, "--size", size] => {
+            let field = |v: &str| {
+                if v.is_empty() || v.chars().count() > 256 || v.chars().any(char::is_control) {
+                    Err("--wwn/--model must be 1-256 characters without control characters (\"-\" for none)"
+                        .to_string())
+                } else {
+                    Ok(v.to_string())
+                }
+            };
+            let size: u64 = size
+                .parse()
+                .ok()
+                .filter(|&n: &u64| n > 0 && size.bytes().all(|b| b.is_ascii_digit()))
+                .ok_or("--size must be a positive number of bytes")?;
+            Ok(TrustRequest {
+                dev: parse_dev(dev)?,
+                shown: crate::identity::Identity { key: check_key(key)?, wwn: field(wwn)?, model: field(model)?, size },
+            })
+        }
+        _ => Err("usage: flashcp-trust <dev> --expect <key> --wwn <wwn|-> --model <model|-> --size <bytes>".into()),
     }
 }
 
@@ -472,27 +492,43 @@ mod tests {
         assert!(check_key("-AB 12").is_ok());
     }
 
+    fn tr(dev: &str, key: &str, wwn: &str, model: &str, size: &str) -> Vec<OsString> {
+        os(&[dev, "--expect", key, "--wwn", wwn, "--model", model, "--size", size])
+    }
+
     #[test]
     fn trust_args() {
-        let r = parse_trust(&os(&["/dev/sdb", "--expect", "4C53000"])).unwrap();
-        assert_eq!(r, TrustRequest { dev: parse_dev("/dev/sdb").unwrap(), expect: "4C53000".into() });
-        assert!(parse_trust(&os(&["/dev/sdb1", "--expect", "K"])).is_ok());
-        let cases: &[&[&str]] = &[
-            &[],
-            &["/dev/sdb"],
-            &["/dev/sdb", "--expect"],
-            &["/dev/sdb", "--expect", ""],
-            &["/dev/sdb", "--expect", "a\nb"],
-            &["/dev/sdb", "--expect", "K", "--expect", "K"],
-            &["/dev/sdb", "--expect", "K", "extra"],
-            &["--expect", "K", "/dev/sdb"],
-            &["/dev/sdb", "--expect=K"],
-            &["/dev/sdb", "--key", "K"],
+        let r = parse_trust(&tr("/dev/sdb", "4C53000", "-", "DATAMAG 20Gbps", "1000204886016")).unwrap();
+        let shown = crate::identity::Identity {
+            key: "4C53000".into(),
+            wwn: "-".into(),
+            model: "DATAMAG 20Gbps".into(),
+            size: 1_000_204_886_016,
+        };
+        assert_eq!(r, TrustRequest { dev: parse_dev("/dev/sdb").unwrap(), shown });
+        assert!(parse_trust(&tr("/dev/sdb1", "K", "0x5001", "-", "1")).is_ok());
+        let ok = ["/dev/sdb", "--expect", "K", "--wwn", "-", "--model", "M", "--size", "512"];
+        let cases: Vec<Vec<&str>> = vec![
+            vec![],
+            vec!["/dev/sdb"],
+            vec!["/dev/sdb", "--expect", "K"],
+            ok[..ok.len() - 1].to_vec(),
+            [&ok[..], &["extra"]].concat(),
+            vec!["/dev/sdb", "--expect", "", "--wwn", "-", "--model", "M", "--size", "512"],
+            vec!["/dev/sdb", "--expect", "a\nb", "--wwn", "-", "--model", "M", "--size", "512"],
+            vec!["/dev/sdb", "--expect", "K", "--wwn", "", "--model", "M", "--size", "512"],
+            vec!["/dev/sdb", "--expect", "K", "--wwn", "-", "--model", "M\tX", "--size", "512"],
+            vec!["/dev/sdb", "--expect", "K", "--wwn", "-", "--model", "M", "--size", "0"],
+            vec!["/dev/sdb", "--expect", "K", "--wwn", "-", "--model", "M", "--size", "+512"],
+            vec!["/dev/sdb", "--expect", "K", "--wwn", "-", "--model", "M", "--size", "1e9"],
+            vec!["/dev/sdb", "--model", "M", "--expect", "K", "--wwn", "-", "--size", "512"],
+            vec!["--expect", "K", "/dev/sdb", "--wwn", "-", "--model", "M", "--size", "512"],
+            vec!["/dev/sdb", "--expect=K", "--wwn", "-", "--model", "M", "--size", "512"],
         ];
-        for c in cases {
+        for c in &cases {
             assert!(parse_trust(&os(c)).is_err(), "{c:?} accepted");
         }
-        assert!(parse_trust(&os(&["/dev/sdb", "--expect", &"k".repeat(129)])).is_err());
+        assert!(parse_trust(&tr("/dev/sdb", &"k".repeat(129), "-", "M", "1")).is_err());
     }
 
     #[test]

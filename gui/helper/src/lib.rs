@@ -15,6 +15,7 @@ pub mod identity;
 pub mod json;
 pub mod mounts;
 pub mod trust;
+pub mod weak;
 
 use std::ffi::OsString;
 use std::io;
@@ -100,6 +101,22 @@ pub fn check_drive(
 }
 
 /// The drive must match a trusted entry on all four fields.
+/// Trust-time check: the drive the helper opened must be exactly the one the user was shown,
+/// field by field, so a swap or re-enumeration between the dialog and the open can't enroll a
+/// different drive that merely shares a serial.
+pub fn same_drive(shown: &Identity, actual: &Identity) -> Result<(), String> {
+    let diff = [
+        ("serial", shown.key == actual.key),
+        ("WWN", shown.wwn == actual.wwn),
+        ("model", shown.model == actual.model),
+        ("size", shown.size == actual.size),
+    ];
+    match diff.iter().find(|(_, same)| !same) {
+        None => Ok(()),
+        Some((what, _)) => Err(format!("the drive changed, please re-select it ({what} differs)")),
+    }
+}
+
 pub fn require_trusted(entries: &[Identity], id: &Identity) -> Result<(), String> {
     if trust::matches(entries, id) {
         Ok(())
@@ -181,7 +198,9 @@ fn trust(argv: &[OsString]) -> Result<i32, Fail> {
     let fd = open_device(&roots, &req.dev, false).map_err(|e| open_err(&req.dev, e))?;
     let st = fstat(fd.as_fd()).map_err(|e| Internal(format!("fstat: {e}")))?;
     // Not idle-checked: a mounted stick may be trusted. A disk carrying the system is refused.
-    let (_, id) = check_drive(&roots, st, &req.dev, false, &req.expect).map_err(Validation)?;
+    let valid = validate_device(&roots, st, &req.dev, false).map_err(Validation)?;
+    let id = read_identity(&roots, &valid).map_err(|e| Validation(format!("{}: {e}", req.dev.path())))?;
+    same_drive(&req.shown, &id).map_err(Validation)?;
     TrustStore::system().add(&id).map_err(Internal)?;
     json::print_line(&json::trusted_line(&id));
     Ok(0)
@@ -246,6 +265,24 @@ mod tests {
     }
 
     #[test]
+    fn same_drive_requires_every_field() {
+        let shown = Identity { key: "SER1".into(), wwn: "0x5001".into(), model: "Stick".into(), size: 1024 };
+        assert!(same_drive(&shown, &shown.clone()).is_ok());
+        let cases = [
+            ("serial", Identity { key: "SER2".into(), ..shown.clone() }),
+            ("WWN", Identity { wwn: "0x5002".into(), ..shown.clone() }),
+            ("WWN", Identity { wwn: "-".into(), ..shown.clone() }),
+            ("model", Identity { model: "Stick2".into(), ..shown.clone() }),
+            ("size", Identity { size: 2048, ..shown.clone() }),
+        ];
+        for (what, actual) in cases {
+            let e = same_drive(&shown, &actual).unwrap_err();
+            assert!(e.starts_with("the drive changed, please re-select it"), "{e}");
+            assert!(e.contains(what), "{e}");
+        }
+    }
+
+    #[test]
     fn check_drive_reads_identity_and_requires_expect() {
         let t = tempfile::tempdir().unwrap();
         let roots = fake_roots(t.path());
@@ -256,7 +293,7 @@ mod tests {
         assert!(check_drive(&roots, st, &dev, true, "SER2").unwrap_err().contains("not the expected drive"));
         // Untrustable (no serial, no WWN) is refused even with a matching-looking expect.
         fs::write(roots.udev_data.join("b8:16"), "E:ID_BUS=usb\n").unwrap();
-        assert!(check_drive(&roots, st, &dev, true, "-").unwrap_err().contains("cannot be trusted"));
+        assert!(check_drive(&roots, st, &dev, true, "-").unwrap_err().contains("remember it safely"));
         // Trust store round trip: trusting what check_drive saw makes require_trusted pass.
         fs::write(roots.udev_data.join("b8:16"), "E:ID_BUS=usb\nE:ID_SERIAL_SHORT=SER1\nE:ID_MODEL=Stick\n").unwrap();
         let store = TrustStore { dir: t.path().join("etc-flashcp") };
@@ -360,7 +397,10 @@ mod tests {
         }
         let a: Vec<OsString> = ["info", "/dev/sdb", "--expect", "S"].iter().map(OsString::from).collect();
         assert!(matches!(helper(&a), Err(Validation(m)) if m.contains("pkexec")));
-        let a: Vec<OsString> = ["/dev/sdb", "--expect", "S"].iter().map(OsString::from).collect();
+        let a: Vec<OsString> = ["/dev/sdb", "--expect", "S", "--wwn", "-", "--model", "M", "--size", "512"]
+            .iter()
+            .map(OsString::from)
+            .collect();
         assert!(matches!(trust(&a), Err(Validation(m)) if m.contains("pkexec")));
         // Bad argv is reported before the root check.
         assert!(matches!(trust(&[]), Err(Validation(m)) if m.contains("usage")));

@@ -7,6 +7,9 @@ mod runner;
 mod settings;
 mod trust;
 mod udisks;
+// The placeholder-identity rules are shared verbatim with the root helper.
+#[path = "../../helper/src/weak.rs"]
+mod weak;
 
 use drives::{expected_confirm, require_trusted, Drive};
 use job::{JobLock, Request};
@@ -186,8 +189,8 @@ async fn trust_drive(app: AppHandle, drive_id: String) -> Result<(), String> {
     if udisks::fake_mode() {
         drives::fake_trust(&drive.id);
     } else {
-        let (device, serial) = (drive.device.clone(), drive.serial.clone());
-        let result = tauri::async_runtime::spawn_blocking(move || runner::trust_device(&device, &serial))
+        let shown = drive.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || runner::trust_device(&shown))
             .await
             .map_err(|e| e.to_string())?;
         result?;
