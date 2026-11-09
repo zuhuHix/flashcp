@@ -4,7 +4,7 @@
 
 **Copy thousands of small files to and from a USB drive as normal loose files.
 Measured up to 10.3× faster writes and up to 26.8× faster reads than `mount` + `cp` on a USB SSD
-under Linux, and up to 5.7× on a cheap USB 2.0 stick.** Results vary by drive; see the [benchmarks](#benchmarks).
+under Linux, and 2.5–5.7× on a cheap USB 2.0 stick (writing a blank stick 2.5–5.3×; adding to an optimized stick 5.7×, single run).** Results vary by drive; see the [benchmarks](#benchmarks).
 
 [![CI](https://github.com/zuhuHix/flashcp/actions/workflows/ci.yml/badge.svg)](https://github.com/zuhuHix/flashcp/actions/workflows/ci.yml)
 [![Windows + macOS checks](https://github.com/zuhuHix/flashcp/actions/workflows/xos.yml/badge.svg)](https://github.com/zuhuHix/flashcp/actions/workflows/xos.yml)
@@ -261,11 +261,12 @@ raw bandwidth is the limit for both methods, so the gap shrinks.
 
 The small dataset (20k files / 169 MB). Kernel baselines include mount and unmount. This stick
 varies a lot from run to run (its controller does its own housekeeping): the same `mkfs` + `cp`
-took 110.4 s in one run and 179.6 s in another, so the build row shows that range.
+took 110.4 s in one run and 179.6 s in another, so the build row shows that range. An earlier session on the
+same stick measured 86.3 s (`mkfs` + `cp`) against 34.6 s for `build`, which is 2.5×, so expect 2.5–5.3× there.
 
 | operation | normal copy | **flashcp** | speed-up | runs |
 |---|---:|---:|---:|---|
-| `build` (auto → 4 KB clusters) vs `mkfs.exfat` + `cp` | 110.4–179.6 s | **33.6 s** | 3.3–5.3× | median of 3 |
+| `build` (auto → 4 KB clusters) vs `mkfs.exfat` + `cp` | 110.4–179.6 s (earlier session: 86.3 s) | **33.6 s** (earlier: 34.6 s) | 2.5–5.3× | median of 3 |
 | first copy onto an empty, freshly formatted stick (`add`, written as a build) | 104.3 s | **34.9 s** | ≈3× | median of 3 |
 | `add` 20k more files onto a stick holding 20k (`mkfs` default, 32 KB clusters) | 209.8 s | **84.1 s** | 2.5× | 1 |
 | same, onto a stick after `flashcp optimize` (4 KB clusters) | 209.8 s¹ | **36.5 s** | 5.7× | 1 |
