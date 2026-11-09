@@ -32,11 +32,10 @@ jobs:
       - name: Read crate version and check tag
         id: version
         env:
-          EVENT: ${{ github.event_name }}
         run: |
           set -eu
           VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="flashcp") | .version')
-          if [ "$EVENT" = "push" ] && [ "${GITHUB_REF_NAME#v}" != "$VERSION" ]; then
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$VERSION" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $VERSION (expected tag v$VERSION)"
             exit 1
           fi
