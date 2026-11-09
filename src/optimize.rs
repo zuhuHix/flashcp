@@ -27,15 +27,27 @@
 //!    manifest equals `<tmp>/manifest`.
 //! 5. **cleanup**: `state=done`, then the tree, the manifest, the state file, the dir.
 //!
-//! A later run finds the temp dir by the drive's identity (USB serial / WWID; for an image its
-//! inode) and resumes: no state, `pulled` or `verified` (device never written) or `done`
-//! (checked) → the dir is discarded and a fresh run starts. `building` → if the device holds a
-//! clean volume whose manifest equals the saved one and whose boot sector is not the original
-//! one, the build had finished: clean up. If it holds the original volume with the original
-//! content, or a dirty / unparsable / half-written one: re-verify the temp tree against the
-//! manifest and rebuild from it. Anything else (a clean volume with other content: someone
-//! reformatted or wrote to it) is refused, naming the temp dir; user data is never erased
-//! automatically.
+//! The new volume's serial number is chosen before the pull and saved in the state file with a
+//! fingerprint of the original boot sector, so a later run can tell the volume this optimize
+//! was writing from the original one and from anything else. Every run holds an exclusive
+//! flock on `<tmp>/lock`; a temp dir locked by another run is never touched.
+//!
+//! A later run finds the temp dir by the drive's identity (USB serial / WWID plus the
+//! partition's start sector; for an image its inode) and resumes: no state, `pulled` or
+//! `verified` (device never written) or `done` (checked) → the dir is discarded and a fresh run
+//! starts. `building` → judged by the raw boot sector:
+//! - our saved serial (main or backup boot sector): a dirty / unparsable volume is our
+//!   half-written build → re-verify the temp tree against the manifest and rebuild; a clean one
+//!   whose manifest equals the saved one is the finished build → clean up; a clean one with
+//!   other content was written since → refused.
+//! - the original boot sector (flags aside), clean, content equal to the manifest: the build
+//!   never started → re-verify and rebuild. Original but dirty, or with other content: the drive
+//!   was used since and may hold newer data → refused.
+//! - anything else (another filesystem, another exFAT volume, another card) → refused.
+//!
+//! A refusal keeps the temp dir and explains what is where; user data is never erased
+//! automatically. Image targets are re-checked for a loop device right before the build and
+//! the check (loop devices ignore our flock).
 
 use crate::events::{Event, Op, Sink, Ticker};
 use crate::exfat::{
@@ -71,7 +83,29 @@ const MARGIN: u64 = 64 << 20;
 const PER_ENTRY: u64 = 4096;
 const TMPFS_MAGIC: i64 = 0x0102_1994;
 const RAMFS_MAGIC: i64 = 0x8584_58f6;
-const STATE_MAGIC: &str = "flashcp-optimize-state 1";
+/// Test hook: pretend the image got attached to a loop device right before this phase
+/// (build | check).
+const LOOP_ENV: &str = "FLASHCP_TEST_OPTIMIZE_LOOP";
+/// statfs f_type of filesystems known to be disk-backed (the temp copy must survive a power
+/// loss): ext2/3/4, xfs, btrfs, f2fs, bcachefs, zfs, ntfs3, ntfs, exfat, vfat, nilfs, jfs,
+/// reiserfs.
+const DISK_FS: [u32; 13] = [
+    0xEF53,
+    0x5846_5342,
+    0x9123_683E,
+    0xF2F5_2010,
+    0xCA45_1A4E,
+    0x2FC1_2FC1,
+    0x7366_746E,
+    0x5346_544E,
+    0x2011_BAB0,
+    0x4D44,
+    0x3434,
+    0x3153_464A,
+    0x5265_4973,
+];
+const OVERLAYFS_MAGIC: u32 = 0x794C_7630;
+const STATE_MAGIC: &str = "flashcp-optimize-state 2";
 
 #[derive(Clone, Debug, Default)]
 pub struct OptimizeOpts {
@@ -131,6 +165,8 @@ struct State {
     label: String,
     /// Fingerprint of the original volume's boot sector (see [`fingerprint`]).
     orig: u64,
+    /// Serial number of the volume this run writes (decided before the pull).
+    serial: u32,
 }
 
 fn hex(s: &str) -> String {
@@ -152,7 +188,12 @@ impl State {
             Phase::Building => "building",
             Phase::Done => "done",
         };
-        format!("{STATE_MAGIC}\nstate={p}\nlabel={}\noriginal={:016x}\n", hex(&self.label), self.orig)
+        format!(
+            "{STATE_MAGIC}\nstate={p}\nlabel={}\noriginal={:016x}\nserial={:08x}\n",
+            hex(&self.label),
+            self.orig,
+            self.serial
+        )
     }
 
     /// The state in `dir`; Ok(None) when there is no state file, Err when it is unreadable.
@@ -164,7 +205,7 @@ impl State {
         };
         let mut lines = s.lines();
         ensure!(lines.next() == Some(STATE_MAGIC), "the state file is not a flashcp optimize state");
-        let (mut phase, mut label, mut orig) = (None, None, None);
+        let (mut phase, mut label, mut orig, mut serial) = (None, None, None, None);
         for l in lines {
             match l.split_once('=') {
                 Some(("state", v)) => {
@@ -179,11 +220,12 @@ impl State {
                 }
                 Some(("label", v)) => label = unhex(v),
                 Some(("original", v)) => orig = u64::from_str_radix(v, 16).ok(),
+                Some(("serial", v)) => serial = u32::from_str_radix(v, 16).ok(),
                 _ => {}
             }
         }
-        match (phase, label, orig) {
-            (Some(phase), Some(label), Some(orig)) => Ok(Some(State { phase, label, orig })),
+        match (phase, label, orig, serial) {
+            (Some(phase), Some(label), Some(orig), Some(serial)) => Ok(Some(State { phase, label, orig, serial })),
             _ => bail!("the state file is incomplete"),
         }
     }
@@ -213,17 +255,68 @@ fn fingerprint(sector0: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(&s)
 }
 
+fn serial_of(sector: &[u8]) -> u32 {
+    u32::from_le_bytes(sector[100..104].try_into().unwrap())
+}
+
+fn is_exfat(sector: &[u8]) -> bool {
+    sector.len() >= 512 && &sector[3..11] == b"EXFAT   " && sector[510..512] == [0x55, 0xAA]
+}
+
+/// A serial for the new volume that differs from the original's (and is not 0).
+fn new_serial(orig_sector0: &[u8]) -> u32 {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let mut s = (t ^ (t >> 32) ^ (std::process::id() as u64).rotate_left(16)) as u32;
+    while s == 0 || s == serial_of(orig_sector0) {
+        s = s.wrapping_add(0x9E37_79B9);
+    }
+    s
+}
+
+/// Takes an exclusive flock on `<dir>/lock`, held as long as the returned file lives. Fails
+/// when another run holds it.
+fn lock_dir(dir: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let p = dir.join("lock");
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&p)
+        .with_context(|| format!("open {}", p.display()))?;
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&f), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = std::io::Error::last_os_error();
+        ensure!(
+            e.raw_os_error() != Some(libc::EWOULDBLOCK),
+            "{} is in use by another `flashcp optimize` (of this drive, or of another one with the same identity, \
+             e.g. a second card in the same reader); wait for it to finish, then run again",
+            dir.display()
+        );
+        return Err(anyhow::Error::new(e).context(format!("flock {}", p.display())));
+    }
+    Ok(f)
+}
+
 // ───────────────────────── where the copy goes ─────────────────────────
 
 /// The drive's stable identity (names the temp dir) and the "maj:min" of every block device
 /// the copy must not live on (the whole disk, its partitions and holders; empty for an image).
-fn identity(md: &fs::Metadata) -> Result<(String, Vec<String>)> {
+/// For a block device the key is the disk's identity plus the partition's start sector
+/// (`part_off`), so partitions of one disk, and cards sharing one reader's USB serial at
+/// different starts, get different temp dirs (the state's fingerprint and serial catch the rest).
+fn identity(md: &fs::Metadata, part_off: u64) -> Result<(String, Vec<String>)> {
     if !md.file_type().is_block_device() {
         return Ok((format!("img-{}-{}", md.dev(), md.ino()), Vec::new()));
     }
     let rdev = md.rdev();
     let (maj, min) = (libc::major(rdev), libc::minor(rdev));
-    let key = crate::devprofile::device_key(rdev).unwrap_or_else(|| format!("dev-{maj}-{min}"));
+    let key = match crate::devprofile::device_key(rdev) {
+        Some(k) => format!("{k}-p{part_off}"),
+        None => format!("dev-{maj}-{min}"),
+    };
     // A partition's siblings are on the same stick: avoid the whole disk.
     let node = Path::new(SYS_BLOCK).join(format!("{maj}:{min}"));
     let disk = if node.join("partition").exists() {
@@ -276,9 +369,25 @@ fn free_bytes(p: &Path) -> Result<u64> {
     crate::util::statfs_free(p)
 }
 
-/// Picks the first candidate that is disk-backed (not tmpfs / ramfs: RAM is gone after a power
-/// loss while the drive is erased; allowed only when given explicitly), not on the drive
-/// being optimized, writable, and has `need` bytes free. Lists every rejection otherwise.
+/// Why a filesystem of statfs type `t` may not survive a power loss (None: a known disk
+/// filesystem, see [`DISK_FS`]).
+fn not_disk_backed(t: i64) -> Option<String> {
+    let t = t as u64 as u32;
+    if DISK_FS.contains(&t) {
+        None
+    } else if t as i64 == TMPFS_MAGIC || t as i64 == RAMFS_MAGIC {
+        Some("is in RAM (tmpfs)".into())
+    } else if t == OVERLAYFS_MAGIC {
+        Some("is on overlayfs (on live-USB systems usually backed by RAM)".into())
+    } else {
+        Some(format!("is on a filesystem flashcp does not know to be disk-backed (type {t:#x}: RAM, zram or network?)"))
+    }
+}
+
+/// Picks the first candidate that is disk-backed (one of [`DISK_FS`]; tmpfs, overlayfs, zram
+/// and the like may be gone after a power loss while the drive is erased; allowed only when
+/// given explicitly), not on the drive being optimized, writable, and has `need` bytes free.
+/// Lists every rejection otherwise.
 fn pick_base(cands: &[(PathBuf, bool)], need: u64, avoid: &[String], what: &str) -> Result<PathBuf> {
     let explicit = cands.len() == 1 && cands[0].1;
     let mut why = Vec::new();
@@ -295,9 +404,14 @@ fn pick_base(cands: &[(PathBuf, bool)], need: u64, avoid: &[String], what: &str)
             if avoid.contains(&format!("{}:{}", libc::major(md.dev()), libc::minor(md.dev()))) {
                 return Ok(Err(format!("is on {what} itself")));
             }
-            let t = fs_type(at)?;
-            if (t == TMPFS_MAGIC || t == RAMFS_MAGIC) && !explicit {
-                return Ok(Err("is in RAM (tmpfs), lost on a power loss; pass it with --temp to use it anyway".into()));
+            let ram = not_disk_backed(fs_type(at)?);
+            if let Some(why) = &ram
+                && !explicit
+            {
+                return Ok(Err(format!(
+                    "{why}: the copy could be lost on a power loss while the drive is rebuilt; pass it with --temp \
+                     to use it anyway"
+                )));
             }
             let c = CString::new(at.as_os_str().as_bytes())?;
             if unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
@@ -307,9 +421,9 @@ fn pick_base(cands: &[(PathBuf, bool)], need: u64, avoid: &[String], what: &str)
             if free < need {
                 return Ok(Err(format!("has only {} free", human_bytes(free as f64))));
             }
-            if t == TMPFS_MAGIC || t == RAMFS_MAGIC {
+            if let Some(why) = ram {
                 eprintln!(
-                    "warning: {} is in RAM (tmpfs): if the power fails while the drive is rebuilt, the copy is lost",
+                    "warning: {} {why}: if the power fails while the drive is rebuilt, the copy may be lost",
                     p.display()
                 );
             }
@@ -322,8 +436,8 @@ fn pick_base(cands: &[(PathBuf, bool)], need: u64, avoid: &[String], what: &str)
         }
     }
     bail!(
-        "no place for the temporary copy: optimize needs {} free (outside {what}, not in RAM) to hold a verified \
-         copy of your files while the drive is rebuilt. Checked:\n{}\nFree some space or pass --temp DIR on \
+        "no place for the temporary copy: optimize needs {} free (outside {what}, on a disk filesystem) to hold a \
+         verified copy of your files while the drive is rebuilt. Checked:\n{}\nFree some space or pass --temp DIR on \
          another disk",
         human_bytes(need as f64),
         why.join("\n")
@@ -440,8 +554,8 @@ fn in_layout(v: &Vol, t: &VolTree, nodes: &[Node], refs: &[Ref], p: &crate::exfa
         })
 }
 
-fn build_opts(label: &str) -> BuildOpts {
-    BuildOpts { cluster: None, label: label.to_string(), fat: FatMode::Prefix, readers: 12, dry_run: false }
+fn build_opts(label: &str, serial: Option<u32>) -> BuildOpts {
+    BuildOpts { cluster: None, label: label.to_string(), fat: FatMode::Prefix, readers: 12, dry_run: false, serial }
 }
 
 // ───────────────────────── running phases ─────────────────────────
@@ -551,10 +665,50 @@ fn recovery(what: &str, tmp: &Path, base: &Path, label: &str, fd: bool) -> Strin
     )
 }
 
+/// Fails if the image target is attached to a loop device now. open_target refused that at the
+/// start, but a loop device ignores our flock, so a `losetup` (and mount) between phases is
+/// only seen by looking again, right before the device is written and before it is checked.
+fn not_looped(ctx: &Ctx, at: &str) -> Result<()> {
+    if !ctx.image {
+        return Ok(());
+    }
+    let md = ctx.held.metadata().context("fstat target")?;
+    let dev = crate::add::loop_device_of(&md)
+        .or_else(|| (std::env::var(LOOP_ENV).as_deref() == Ok(at)).then(|| "/dev/loop-test".to_string()));
+    match dev {
+        Some(d) => bail!(
+            "{} was attached to loop device {d} while optimize ran (it may be mounted); stopped before the {at} \
+             phase. Unmount and detach it (umount, then losetup -d {d})",
+            ctx.what
+        ),
+        None => Ok(()),
+    }
+}
+
+/// Reads `len` raw bytes at `off` of the held target (what is on the medium, not the cache);
+/// shorter or empty when the device is.
+fn read_raw(held: &File, off: u64, len: u64) -> Vec<u8> {
+    use std::os::unix::fs::FileExt;
+    set_direct(held, false);
+    unsafe { libc::posix_fadvise(std::os::fd::AsRawFd::as_raw_fd(held), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    let mut b = vec![0u8; len as usize];
+    let mut n = 0;
+    while n < b.len() {
+        match held.read_at(&mut b[n..], off + n as u64) {
+            Ok(0) | Err(_) => break,
+            Ok(k) => n += k,
+        }
+    }
+    b.truncate(n);
+    b
+}
+
 /// Everything about the target the phases share.
 struct Ctx {
     what: String,
     fd: bool,
+    /// The target is an image file (loop devices ignore our flock: see [`not_looped`]).
+    image: bool,
     held: File,
     dev_len: u64,
     _flags: FlagGuard,
@@ -575,15 +729,23 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
     // Target's own guard only covers the build.
     let flags = FlagGuard::new(&held).map_err(untouched)?;
     let md = held.metadata().context("fstat target").map_err(untouched)?;
-    let (key, avoid) = identity(&md).map_err(untouched)?;
-    let ctx =
-        Ctx { what: what.clone(), fd: matches!(target, TargetSpec::Fd(_)), held, dev_len: tgt.bytes, _flags: flags };
+    let (key, avoid) = identity(&md, tgt.part_off).map_err(untouched)?;
+    let ctx = Ctx {
+        what: what.clone(),
+        fd: matches!(target, TargetSpec::Fd(_)),
+        image: md.file_type().is_file(),
+        held,
+        dev_len: tgt.bytes,
+        _flags: flags,
+    };
     let mut run = Run { tick: Ticker::new(sink), steps: 0, step: 0, phases: Vec::new(), started: None };
     let t0 = Instant::now();
     let cands = candidates(o.temp.as_deref());
 
     // ── an earlier, interrupted run? ──
     let mut building = Vec::new();
+    // Every temp dir of this identity stays locked until the run ends (or it is removed).
+    let mut locks = Vec::new();
     for (base, _) in &cands {
         let dir = base.join(temp_name(&key));
         match fs::symlink_metadata(&dir) {
@@ -591,6 +753,7 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
             _ => {}
         }
         check_ours(&dir).map_err(untouched)?;
+        locks.push(lock_dir(&dir).map_err(untouched)?);
         let st = State::load(&dir).with_context(|| {
             format!(
                 "{} holds a copy from an earlier optimize of this drive, but its state file is unreadable, so \
@@ -621,7 +784,9 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
         building.iter().map(|(_, d, _)| d.display().to_string()).collect::<Vec<_>>().join(", ")
     );
     if let Some((base, dir, st)) = building.pop() {
-        return resume(&mut run, ctx, tgt, &base, &dir, st, o, t0);
+        let r = resume(&mut run, ctx, tgt, &base, &dir, st, o, t0);
+        drop(locks);
+        return r;
     }
 
     // ── read and plan ──
@@ -632,10 +797,11 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
         )
         .map_err(untouched)?;
     let orig = fingerprint(&v.sector0);
+    let serial = new_serial(&v.sector0);
     let label = v.label.clone();
     let old_cs = v.cs;
     let (mut nodes, refs) = nodes_of(&t).map_err(untouched)?;
-    let (p, _why) = choose_cluster(&mut nodes, &tgt, &build_opts(&label))
+    let (p, _why) = choose_cluster(&mut nodes, &tgt, &build_opts(&label, None))
         .context("flashcp build cannot lay out this data on the drive")
         .map_err(untouched)?;
     let already = in_layout(&v, &t, &nodes, &refs, &p, &tgt);
@@ -716,7 +882,7 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
 
     // ── pull + verify: the device is only read; on any error the copy is deleted ──
     run.steps = 5;
-    let st = State { phase: Phase::None, label: label.clone(), orig };
+    let st = State { phase: Phase::None, label: label.clone(), orig, serial };
     // Created here, exclusively (EEXIST if anything appeared since the lookup above): only a
     // directory this run created is ever deleted on error.
     fs::DirBuilder::new()
@@ -726,6 +892,8 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
         .with_context(|| format!("create {}", tmp.display()))
         .and_then(|_| check_ours(&tmp))
         .map_err(untouched)?;
+    // Not removed on failure: another run may have taken it over in the instant since mkdir.
+    let _lock = lock_dir(&tmp).map_err(untouched)?;
     let copied = (|| -> Result<Manifest> {
         run.phase("pull");
         let tree = tmp.join("tree");
@@ -814,7 +982,7 @@ fn rebuild(
     // Re-scan the copy exactly as build will, and plan it, before the device is touched.
     let prepared = (|| -> Result<Vec<Node>> {
         let mut nodes = scan_tree(&tree, &upcase_map()).context("scan the temporary copy")?;
-        choose_cluster(&mut nodes, &tgt, &build_opts(&st.label)).context("plan the rebuild")?;
+        choose_cluster(&mut nodes, &tgt, &build_opts(&st.label, None)).context("plan the rebuild")?;
         Ok(nodes)
     })();
     let nodes = match prepared {
@@ -834,14 +1002,18 @@ fn rebuild(
     }
     // From here on the verified copy in <tmp> is never deleted until the check passes.
     hook("building").map_err(|e| e.context(hint()))?;
+    not_looped(ctx, "build").map_err(|e| e.context(hint()))?;
     set_direct(&tgt.file, tgt.direct);
-    build_target(nodes, tgt, &build_opts(&st.label), &mut forward(&mut run.tick)).map_err(|e| e.context(hint()))?;
+    build_target(nodes, tgt, &build_opts(&st.label, Some(st.serial)), &mut forward(&mut run.tick))
+        .map_err(|e| e.context(hint()))?;
     hook("build").map_err(|e| e.context(hint()))?;
 
     run.phase("check");
     let checked = (|| -> Result<()> {
+        not_looped(ctx, "check")?;
         let (v, t) = open_walk(&ctx.held, ctx.dev_len).context("the rebuilt drive does not parse as a clean volume")?;
         ensure!(v.label == st.label, "the rebuilt volume's label is {:?}, not {:?}", v.label, st.label);
+        ensure!(serial_of(&v.sector0) == st.serial, "the drive does not hold the volume this optimize wrote");
         drop(v);
         let m = hash_device(run, &ctx.held, &t).context("hash the rebuilt drive")?;
         let d = manifest.diff(&m, "the original", "the rebuilt drive");
@@ -873,7 +1045,7 @@ fn cleanup(tmp: &Path) -> Result<()> {
         fs::remove_dir_all(&tree).with_context(|| format!("remove {}", tree.display()))?;
     }
     hook("cleanup")?;
-    for f in ["manifest", "state"] {
+    for f in ["manifest", "state", "lock"] {
         match fs::remove_file(tmp.join(f)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
@@ -904,9 +1076,12 @@ fn resume(
             format!(
                 "an interrupted optimize of {what} had started rebuilding it, but its manifest {} is missing or \
                  damaged, so flashcp cannot prove the copy in {} is complete and will not continue on its own. \
-                 Check those files, then rebuild the drive with `flashcp build {} <device> --label {:?} --yes-erase`",
+                 Check the drive first: if it still opens and holds your files, keep it and delete {} (that copy may \
+                 be older). Only if it does not, rebuild it from the copy with `flashcp build {} <device> --label \
+                 {:?} --yes-erase`",
                 tmp.join("manifest").display(),
                 tree.display(),
+                tmp.display(),
                 tree.display(),
                 st.label
             )
@@ -914,7 +1089,7 @@ fn resume(
     let (files, dirs, data) = (saved.files.len() as u64, saved.dirs.len() as u64, saved.bytes());
     // What a rebuild from the copy would write (a damaged copy fails later, with the hint).
     let planned = scan_tree(&tree, &upcase_map()).and_then(|mut n| {
-        choose_cluster(&mut n, &tgt, &build_opts(&st.label)).map(|(p, _)| (p.g.cluster, p.write_bytes))
+        choose_cluster(&mut n, &tgt, &build_opts(&st.label, None)).map(|(p, _)| (p.g.cluster, p.write_bytes))
     });
     let (cluster, write_bytes) = planned.as_ref().map_or((0, 0), |x| *x);
     run.tick.emit(Event::Plan {
@@ -958,11 +1133,23 @@ fn resume(
         stats
     };
 
-    // What is on the drive now? Only a clean volume with exactly the saved content counts as
-    // ours; a clean volume with other content is someone else's and is never erased.
-    match open_walk(&ctx.held, ctx.dev_len) {
-        Ok((v, t)) => {
-            let original = fingerprint(&v.sector0) == st.orig;
+    // What is on the drive now? Judged by the raw boot sector (see the module docs): only the
+    // volume this optimize was writing (our saved serial), or the untouched original with
+    // exactly the saved content, is ever written; anything else is refused.
+    let walked = open_walk(&ctx.held, ctx.dev_len);
+    let s0 = read_raw(&ctx.held, 0, 4096.min(ctx.dev_len));
+    let bps = if is_exfat(&s0) && (9..=12).contains(&s0[108]) { 1usize << s0[108] } else { SECTOR as usize };
+    let original = is_exfat(&s0) && s0.len() >= bps && fingerprint(&s0[..bps]) == st.orig;
+    // build writes the main and the backup boot sector (12 × 512 bytes in) first; either one
+    // with our serial means our build had started.
+    let backup = read_raw(&ctx.held, 12 * SECTOR, SECTOR);
+    let ours = [&s0, &backup].iter().any(|s| is_exfat(s) && serial_of(s) == st.serial);
+    let keep = format!(
+        "The temporary copy in {} is kept; it holds the files as they were when that optimize started",
+        tmp.display()
+    );
+    match walked {
+        Ok((v, t)) if original || ours => {
             stats.old_cluster = v.cs;
             drop(v);
             // Finished: check, cleanup. Still the original volume: check, verify, build, check, cleanup.
@@ -970,19 +1157,28 @@ fn resume(
             run.phase("check");
             let m = hash_device(run, &ctx.held, &t).context("hash the drive")?;
             let d = saved.diff(&m, "the saved manifest", "the drive");
-            ensure!(
-                d.is_empty(),
-                "{what} holds a clean exFAT volume whose files differ from the interrupted optimize's copy in {} \
-                 ({} differences, e.g. {}). Someone may have reformatted or written to the drive since, so flashcp \
-                 will not erase it. To put the copy back on the drive, run `flashcp build {} <device> --label {:?} \
-                 --yes-erase`; otherwise delete {}",
-                tmp.display(),
-                d.len(),
-                first_diffs(&d[..d.len().min(3)]),
-                tree.display(),
-                st.label,
-                tmp.display()
-            );
+            if !d.is_empty() && original {
+                bail!(
+                    "{what} still holds the original volume, but its files changed after the interrupted optimize \
+                     made its copy ({} differences, e.g. {}): the drive holds newer data than the copy. flashcp will \
+                     not erase it; keep the drive as it is. The copy in {} is stale: check that it holds nothing you \
+                     still need, delete it, and run optimize again to start over",
+                    d.len(),
+                    first_diffs(&d[..d.len().min(3)]),
+                    tmp.display()
+                );
+            }
+            if !d.is_empty() {
+                bail!(
+                    "{what} holds the volume the interrupted optimize built, complete, but its files differ from \
+                     that optimize's copy ({} differences, e.g. {}): it was probably written to since, so flashcp \
+                     will not erase it. {keep}. Check the drive and the copy, and delete {} when you no longer need \
+                     it",
+                    d.len(),
+                    first_diffs(&d[..d.len().min(3)]),
+                    tmp.display()
+                );
+            }
             if !original {
                 // The rebuilt volume, complete and checked: only the cleanup was missing.
                 stats.cluster = stats.old_cluster;
@@ -996,10 +1192,24 @@ fn resume(
             }
             eprintln!("note: {what} still holds the original volume; resuming the interrupted optimize");
         }
-        Err(e) => {
+        Err(e) if ours => {
             eprintln!("note: {what} holds an unfinished rebuild ({e:#}); resuming the interrupted optimize");
             run.steps = 4;
         }
+        Err(e) if original => bail!(
+            "{what} still holds the original volume, but it is not clean now ({e:#}): it was mounted, and perhaps \
+             written to, after the interrupted optimize made its copy, so the drive may hold newer data than the \
+             copy. flashcp will not erase it. Plug it into a computer, let it check the drive (or run fsck.exfat), \
+             eject it safely, and run optimize again: if its files are unchanged it continues, otherwise keep the \
+             drive and delete the stale copy {}",
+            tmp.display()
+        ),
+        _ => bail!(
+            "{what} holds neither the original volume nor the one the interrupted optimize was writing (reformatted, \
+             written by another program, or a different card or drive?), so flashcp will not write to it. {keep}. \
+             If the drive holds what you want, check that the copy holds nothing you still need and delete {}",
+            tmp.display()
+        ),
     }
     if o.dry_run {
         return Ok(finish(run, stats));
@@ -1032,12 +1242,56 @@ mod tests {
         let d = std::env::temp_dir().join(format!("flashcp-optstate-{}", std::process::id()));
         fs::create_dir_all(&d).unwrap();
         assert!(State::load(&d).unwrap().is_none());
-        let st = State { phase: Phase::Building, label: "Mÿ\n=Stick".into(), orig: 0xDEAD_BEEF_0123 };
+        let st =
+            State { phase: Phase::Building, label: "Mÿ\n=Stick".into(), orig: 0xDEAD_BEEF_0123, serial: 0x89AB_CDEF };
         save_state(&d, &st).unwrap();
         let back = State::load(&d).unwrap().unwrap();
-        assert_eq!((back.phase, back.label, back.orig), (st.phase, st.label, st.orig));
+        assert_eq!(
+            (back.phase, back.label, back.orig, back.serial),
+            (st.phase.clone(), st.label.clone(), st.orig, st.serial)
+        );
+        // A state without the serial (an older format) is not trusted.
+        fs::write(d.join("state"), st.encode().replace("serial=89abcdef\n", "")).unwrap();
+        assert!(State::load(&d).is_err());
         fs::write(d.join("state"), "garbage").unwrap();
         assert!(State::load(&d).is_err());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn only_known_disk_filesystems_hold_the_copy() {
+        for t in [0xEF53i64, 0x5846_5342, 0x9123_683E, 0xF2F5_2010, 0x2FC1_2FC1, 0x2011_BAB0] {
+            assert_eq!(not_disk_backed(t), None, "{t:#x}");
+        }
+        assert!(not_disk_backed(TMPFS_MAGIC).unwrap().contains("tmpfs"));
+        assert!(not_disk_backed(RAMFS_MAGIC).is_some());
+        assert!(not_disk_backed(OVERLAYFS_MAGIC as i64).unwrap().contains("overlayfs"));
+        assert!(not_disk_backed(0x6969).is_some(), "nfs"); // network / unknown: needs --temp
+        assert!(not_disk_backed(0x9fa0).is_some(), "proc");
+        // f_type as a sign-extended 32-bit word (32-bit platforms) is still recognized.
+        assert_eq!(not_disk_backed(0xF2F5_2010u32 as i32 as i64), None);
+    }
+
+    #[test]
+    fn new_serial_differs_from_the_original() {
+        let mut s0 = vec![0u8; 512];
+        for _ in 0..100 {
+            let s = new_serial(&s0);
+            assert!(s != 0 && s != serial_of(&s0));
+            s0[100..104].copy_from_slice(&s.to_le_bytes());
+            assert_ne!(new_serial(&s0), s);
+        }
+    }
+
+    #[test]
+    fn a_locked_temp_dir_is_refused() {
+        let d = std::env::temp_dir().join(format!("flashcp-optlock-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let held = lock_dir(&d).unwrap();
+        let e = lock_dir(&d).unwrap_err().to_string();
+        assert!(e.contains("in use by another"), "{e}");
+        drop(held);
+        lock_dir(&d).unwrap();
         fs::remove_dir_all(&d).unwrap();
     }
 

@@ -404,9 +404,142 @@ fn resume_refuses_a_drive_written_since() {
     let before = digest(&s.img);
     let e = optimize_fails(&s, &["--yes"], &[]);
     assert!(e.contains("will not erase it") && e.contains(&t.display().to_string()), "{e}");
+    // The drive holds the newer data: keep it; never suggest writing the stale copy over it.
+    assert!(e.contains("newer data") && e.contains("keep the drive") && e.contains("stale"), "{e}");
+    assert!(!e.contains("flashcp build") && !e.contains("otherwise delete"), "{e}");
     assert_eq!(digest(&s.img), before, "a foreign volume was written");
     assert_eq!(the_temp_dir(&s), t, "temp copy removed");
     fs::remove_dir_all(&s.dir).unwrap();
+}
+
+/// Sets VolumeDirty in the main boot sector (as a camera or Windows does while mounted, and
+/// leaves when the stick is pulled out).
+fn set_dirty(img: &Path) {
+    let mut b = fs::read(img).unwrap();
+    b[106] |= 2;
+    fs::write(img, b).unwrap();
+}
+
+fn serial_in(img: &Path) -> u32 {
+    let b = fs::read(img).unwrap();
+    le32(&b, 100)
+}
+
+fn saved_serial(tmp: &Path) -> u32 {
+    let s = fs::read_to_string(tmp.join("state")).unwrap();
+    u32::from_str_radix(s.lines().find_map(|l| l.strip_prefix("serial=")).expect("serial line"), 16).unwrap()
+}
+
+/// The build never started (state=building), then the original volume was mounted, written
+/// and pulled out (dirty): the drive may hold newer files than the copy, so it is not rebuilt.
+#[test]
+fn resume_refuses_the_original_volume_left_dirty() {
+    let s = stick("opt_resume_orig_dirty");
+    optimize_fails(&s, &["--yes"], &[("FLASHCP_TEST_OPTIMIZE_STOP", "building")]);
+    let t = the_temp_dir(&s);
+    set_dirty(&s.img);
+    let before = digest(&s.img);
+    let e = optimize_fails(&s, &["--yes"], &[]);
+    assert!(e.contains("original volume") && e.contains("not clean") && e.contains("newer data"), "{e}");
+    assert!(!e.contains("flashcp build"), "{e}");
+    assert_eq!(digest(&s.img), before, "a dirty original volume was overwritten");
+    assert_eq!(the_temp_dir(&s), t, "temp copy removed");
+    fs::remove_dir_all(&s.dir).unwrap();
+}
+
+/// state=building, then the drive was reformatted (another exFAT serial) or overwritten with
+/// something else (no exFAT at all): neither is ours, neither is erased.
+#[test]
+fn resume_refuses_a_reformatted_or_foreign_drive() {
+    let s = stick("opt_resume_reformatted");
+    optimize_fails(&s, &["--yes"], &[("FLASHCP_TEST_OPTIMIZE_STOP", "building"), ("FLASHCP_TEST_OPTIMIZE_ABORT", "1")]);
+    let t = the_temp_dir(&s);
+    run_ok(Command::new("mkfs.exfat").args(["-L", "OTHER"]).arg(&s.img), "mkfs.exfat");
+    let before = digest(&s.img);
+    let e = optimize_fails(&s, &["--yes"], &[]);
+    assert!(e.contains("neither the original volume") && e.contains(&t.display().to_string()), "{e}");
+    assert_eq!(digest(&s.img), before, "a reformatted drive was written");
+    // Not a filesystem flashcp knows (e.g. reformatted as FAT32 / NTFS, here: zeros).
+    let mut b = fs::read(&s.img).unwrap();
+    b[..MB as usize].fill(0);
+    b[3..11].copy_from_slice(b"NTFS    ");
+    fs::write(&s.img, &b).unwrap();
+    let before = digest(&s.img);
+    let e = optimize_fails(&s, &["--yes"], &[]);
+    assert!(e.contains("neither the original volume"), "{e}");
+    assert_eq!(digest(&s.img), before, "a foreign drive was written");
+    assert_eq!(the_temp_dir(&s), t, "temp copy removed");
+    assert_eq!(state_of(&t), "building");
+    fs::remove_dir_all(&s.dir).unwrap();
+}
+
+/// The build finished (clean, our serial) but the check never ran; then files were added. Our
+/// volume, but with other content: refused, not rebuilt.
+#[test]
+fn resume_refuses_our_finished_volume_written_since() {
+    let s = stick("opt_resume_ours_written");
+    optimize_fails(&s, &["--yes"], &[("FLASHCP_TEST_OPTIMIZE_STOP", "build"), ("FLASHCP_TEST_OPTIMIZE_ABORT", "1")]);
+    let t = the_temp_dir(&s);
+    assert_eq!(serial_in(&s.img), saved_serial(&t), "the build did not write the serial saved in the state");
+    let extra = s.dir.join("extra");
+    write_file(&extra.join("new.txt"), b"added after the crash\n");
+    run_ok(flashcp().arg("add").arg(&extra).arg(&s.img), "flashcp add");
+    let before = digest(&s.img);
+    let e = optimize_fails(&s, &["--yes"], &[]);
+    assert!(e.contains("the interrupted optimize built") && e.contains("will not erase it"), "{e}");
+    assert_eq!(digest(&s.img), before, "a volume written since was overwritten");
+    assert_eq!(the_temp_dir(&s), t);
+    fs::remove_dir_all(&s.dir).unwrap();
+}
+
+/// Our serial and dirty (a half-written build, or ours left dirty): rebuilt from the copy.
+#[test]
+fn resume_rebuilds_our_dirty_volume() {
+    let s = stick("opt_resume_ours_dirty");
+    optimize_fails(&s, &["--yes"], &[("FLASHCP_TEST_OPTIMIZE_STOP", "build")]);
+    let t = the_temp_dir(&s);
+    assert_eq!(serial_in(&s.img), saved_serial(&t));
+    set_dirty(&s.img);
+    let out = optimize_ok(&s, &["--yes"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unfinished rebuild"), "not rebuilt");
+    assert_optimized(&s);
+    fs::remove_dir_all(&s.dir).unwrap();
+}
+
+/// A temp dir locked by another run is neither resumed nor removed.
+#[test]
+fn resume_refuses_a_temp_dir_locked_by_another_run() {
+    let s = stick("opt_resume_locked");
+    optimize_fails(&s, &["--yes"], &[("FLASHCP_TEST_OPTIMIZE_STOP", "building")]);
+    let t = the_temp_dir(&s);
+    let lock = fs::File::open(t.join("lock")).expect("lock file");
+    lock.try_lock().expect("take the lock");
+    let before = digest(&s.img);
+    let e = optimize_fails(&s, &["--yes"], &[]);
+    assert!(e.contains("in use by another") && e.contains("nothing was changed"), "{e}");
+    assert_eq!(digest(&s.img), before);
+    assert_eq!(state_of(&t), "building");
+    drop(lock);
+    optimize_ok(&s, &["--yes"]);
+    assert_optimized(&s);
+    fs::remove_dir_all(&s.dir).unwrap();
+}
+
+/// An image attached to a loop device between phases (losetup ignores our flock): stopped
+/// before the build and before the check, with the copy kept and named.
+#[test]
+fn loop_device_attached_between_phases_stops_the_run() {
+    for at in ["build", "check"] {
+        let s = stick(&format!("opt_loop_{at}"));
+        let before = digest(&s.img);
+        let e = optimize_fails(&s, &["--yes"], &[("FLASHCP_TEST_OPTIMIZE_LOOP", at)]);
+        assert!(e.contains("loop device") && e.contains("all your files are safe in"), "{at}: {e}");
+        assert_eq!(digest(&s.img) == before, at == "build", "{at}: wrong write state");
+        assert_eq!(state_of(&the_temp_dir(&s)), "building");
+        optimize_ok(&s, &["--yes"]);
+        assert_optimized(&s);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
 }
 
 #[test]

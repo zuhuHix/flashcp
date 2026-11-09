@@ -49,6 +49,8 @@ pub struct BuildOpts {
     pub fat: FatMode,
     pub readers: usize,
     pub dry_run: bool,
+    /// Volume serial number to write (default: derived from the current time).
+    pub serial: Option<u32>,
 }
 
 // ───────────────────────── up-case table & checksums ─────────────────────────
@@ -1286,7 +1288,10 @@ pub(crate) fn build_target(mut nodes: Vec<Node>, tgt: Target, o: &BuildOpts, sin
         }
         w
     };
-    let serial = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u32;
+    let serial = match o.serial {
+        Some(s) => s,
+        None => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u32,
+    };
     let pct = ((p.used_end - 2) * 100 / g.cluster_count).min(100) as u8;
 
     // 1. Boot region + backup. The main boot sector says VolumeDirty until the very end, so a
@@ -1691,7 +1696,14 @@ mod tests {
         };
         let dir = std::env::temp_dir().join(format!("flashcp-choose-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let o = BuildOpts { cluster: None, label: String::new(), fat: FatMode::Prefix, readers: 1, dry_run: true };
+        let o = BuildOpts {
+            cluster: None,
+            label: String::new(),
+            fat: FatMode::Prefix,
+            readers: 1,
+            dry_run: true,
+            serial: None,
+        };
         let pick = |bytes: u64, n: usize| {
             let p = dir.join("i.img");
             let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&p).unwrap();
