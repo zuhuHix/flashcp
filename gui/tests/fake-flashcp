@@ -1,12 +1,15 @@
 #!/bin/sh
 # Fake flashcp for tests and dry runs. Speaks the JSON-lines contract and writes nothing.
-# Accepts the shapes the GUI passes: add|build <src> --target-fd N [...], and info --target-fd N.
+# Accepts the shapes the GUI passes: add|build <src> --target-fd N [...], pull --target-fd N <dest>
+# [--from REL] [--skip-existing|--overwrite] [--json], and info --target-fd N.
 # FAKE_FLASHCP_MODE selects the stdout stream:
 #   normal   (default) plan, progress, done; exit 0
 #   garbage  plan, progress, a non-JSON line mid-stream, progress, done; exit 0
 #   nodone   plan and progress only; exit 0
 #   twodone  two complete items (plan, progress, done each); exit 0
 #   error    plan, then an error event "fake failure: device busy"; exit 2
+#   conflict (pull, and any op) without --skip-existing or --overwrite: an error event with flashcp's
+#            collision message, exit 1, before any plan. With either flag: the normal stream.
 # FAKE_FLASHCP_FAIL=1 is an alias for FAKE_FLASHCP_MODE=error.
 # FAKE_FLASHCP_LOG=<file> appends the received argv (one arg per line, then "--").
 # FAKE_FLASHCP_DELAY=<seconds> between progress lines (default 0.05).
@@ -21,7 +24,7 @@ case "$op" in
   info)
     echo '{"label":"FAKEUSB","cluster":32768,"size":32010928128,"free":30000000000,"files":12,"dirs":3,"dirty":false}'
     exit 0 ;;
-  add|build) ;;
+  add|build|pull) ;;
   *) echo "{\"event\":\"error\",\"message\":\"unknown op $op\"}"; exit 2 ;;
 esac
 
@@ -29,7 +32,11 @@ mode="${FAKE_FLASHCP_MODE:-normal}"
 if [ "$FAKE_FLASHCP_FAIL" = "1" ]; then mode=error; fi
 
 plan() {
-  echo '{"event":"plan","op":"'"$op"'","files":100,"dirs":5,"bytes":50000000,"write_bytes":52000000}'
+  if [ "$op" = pull ]; then
+    echo '{"event":"plan","op":"pull","files":100,"dirs":5,"bytes":50000000,"strategy":{"transport":"uas","gap_kb":32,"inflight":32,"buffered":false}}'
+  else
+    echo '{"event":"plan","op":"'"$op"'","files":100,"dirs":5,"bytes":50000000,"write_bytes":52000000}'
+  fi
 }
 
 # progress N: N progress lines, paced by FAKE_FLASHCP_DELAY
@@ -46,8 +53,22 @@ done_line() {
   echo '{"event":"done","files":100,"bytes":50000000,"secs":0.5}'
 }
 
+# Collision check for conflict mode. The destination of pull is the argument after --target-fd N.
+collide() {
+  for a in "$@"; do
+    case "$a" in --skip-existing|--overwrite) return 1 ;; esac
+  done
+  return 0
+}
+
 case "$mode" in
   normal) plan; progress 10; done_line ;;
+  conflict)
+    if collide "$@"; then
+      echo '{"event":"error","message":"2 file(s) already exist in the destination /home/u/out, e.g. a.txt, b.txt; pass --skip-existing or --overwrite"}'
+      exit 1
+    fi
+    plan; progress 10; done_line ;;
   garbage) plan; progress 5; echo 'this is not json'; progress 5; done_line ;;
   nodone) plan; progress 10 ;;
   twodone) plan; progress 10; done_line; plan; progress 10; done_line ;;

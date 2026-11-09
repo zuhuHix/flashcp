@@ -1,5 +1,6 @@
 //! flashcp's JSON-lines events: a strict per-process validator, and the aggregated job state the GUI shows.
 
+use crate::pull::is_collision;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -150,6 +151,7 @@ pub enum Stage {
 pub enum Op {
     Add,
     Build,
+    Pull,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -160,6 +162,10 @@ pub struct JobSummary {
     pub secs: f64,
     pub wall_secs: f64,
     pub mount_point: Option<String>,
+    /// Pull: the local destination folder. None for add and build.
+    pub dest: Option<String>,
+    /// Pull: set when the copy succeeded but the drive could not be remounted.
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -174,6 +180,8 @@ pub struct JobUpdate {
     pub plan_files: u64,
     pub plan_bytes: u64,
     pub message: Option<String>,
+    /// True only on an error caused by flashcp's collision message (see `pull::is_collision`).
+    pub conflict: bool,
     pub summary: Option<JobSummary>,
 }
 
@@ -248,6 +256,7 @@ impl JobAggregate {
             bytes_done: self.bytes_done(),
             plan_files: self.plan_files,
             plan_bytes: self.plan_bytes,
+            conflict: stage == Stage::Error && message.as_deref().is_some_and(is_collision),
             message,
             summary: None,
         }
@@ -494,5 +503,41 @@ mod tests {
         assert_eq!(u.plan_bytes, 30);
         assert_eq!(u.total, 2);
         assert!(u.summary.is_none());
+    }
+
+    #[test]
+    fn pull_plan_with_nested_strategy_is_accepted() {
+        let mut v = RunValidator::new(1);
+        let plan = r#"{"event":"plan","op":"pull","files":3,"dirs":1,"bytes":30,"strategy":{"transport":"uas","gap_kb":32,"inflight":32,"buffered":false}}"#;
+        assert_eq!(v.feed(plan), Ok(Some(FlashcpEvent::Plan { files: 3, bytes: 30 })));
+        assert_eq!(v.feed(done()), Ok(Some(FlashcpEvent::Done { files: 100, bytes: 50_000_000, secs: 0.5 })));
+        assert_eq!(v.finish(ok()), Ok(()));
+    }
+
+    #[test]
+    fn pull_with_two_dones_fails() {
+        let mut v = RunValidator::new(1);
+        let plan = r#"{"event":"plan","op":"pull","files":3,"dirs":1,"bytes":30,"strategy":{"transport":"uas"}}"#;
+        assert!(matches!(v.feed(plan), Ok(Some(_))));
+        assert!(matches!(v.feed(done()), Ok(Some(_))));
+        assert!(matches!(v.feed(plan), Ok(Some(_))));
+        assert_eq!(err(&mut v, done()), "flashcp finished more items than expected (1)");
+    }
+
+    #[test]
+    fn only_collision_errors_set_the_conflict_flag() {
+        let agg = JobAggregate::default();
+        let collision = "2 file(s) already exist in the destination /d, e.g. a, b; pass --skip-existing or --overwrite";
+        let u = agg.update(Stage::Error, Op::Pull, 0, 1, Some(collision.to_string()));
+        assert!(u.conflict);
+        assert_eq!(u.op, Op::Pull);
+        assert!(!agg.update(Stage::Error, Op::Pull, 0, 1, Some("Unmount failed".into())).conflict);
+        assert!(!agg.update(Stage::Running, Op::Pull, 0, 1, Some(collision.into())).conflict);
+        assert!(!agg.update(Stage::Error, Op::Add, 0, 1, None).conflict);
+    }
+
+    #[test]
+    fn pull_op_serializes_as_pull() {
+        assert_eq!(serde_json::to_string(&Op::Pull).unwrap(), "\"pull\"");
     }
 }

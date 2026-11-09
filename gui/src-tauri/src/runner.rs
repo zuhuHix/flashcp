@@ -4,6 +4,7 @@
 use crate::drives::Drive;
 use crate::drives::NOT_TRUSTED_MESSAGE;
 use crate::events::{FlashcpEvent, JobAggregate, JobUpdate, Op, RunValidator, Stage};
+use crate::pull::Existing;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -186,6 +187,12 @@ pub enum Action {
         confirm: String,
         label: String,
     },
+    /// Copy files off the drive into the local folder `dest`. Empty `from` means the whole drive.
+    Pull {
+        from: String,
+        existing: Existing,
+        dest: String,
+    },
 }
 
 /// One process to run. `covers` has one entry per `done` the process must emit: the number of
@@ -252,6 +259,17 @@ impl Invocation {
                 args.push(src.clone());
                 vec![Run { args, covers: vec![1] }]
             }
+            (Invocation::Helper, Action::Pull { from, existing, dest }) => {
+                let mut args = strings(&[HELPER_PATH, "pull", device, "--expect", expect]);
+                if !from.is_empty() {
+                    args.extend(strings(&["--from", from]));
+                }
+                if let Some(flag) = existing.flag() {
+                    args.push(flag.to_string());
+                }
+                args.push(dest.clone());
+                vec![Run { args, covers: vec![1] }]
+            }
             (Invocation::Direct(_), Action::Add { items, skip_existing }) => items
                 .iter()
                 .map(|item| {
@@ -268,6 +286,17 @@ impl Invocation {
                 if !label.is_empty() {
                     args.push("--label".to_string());
                     args.push(label.clone());
+                }
+                args.push("--json".to_string());
+                vec![Run { args, covers: vec![1] }]
+            }
+            (Invocation::Direct(_), Action::Pull { from, existing, dest }) => {
+                let mut args = strings(&["pull", "--target-fd", TARGET_FD, dest]);
+                if !from.is_empty() {
+                    args.extend(strings(&["--from", from]));
+                }
+                if let Some(flag) = existing.flag() {
+                    args.push(flag.to_string());
                 }
                 args.push("--json".to_string());
                 vec![Run { args, covers: vec![1] }]
@@ -713,6 +742,80 @@ mod tests {
         );
     }
 
+    fn pull(from: &str, existing: Existing) -> Action {
+        Action::Pull { from: from.into(), existing, dest: "/home/u/Downloads/USB".into() }
+    }
+
+    #[test]
+    fn helper_pull_argv_with_and_without_from_and_each_existing_mode() {
+        let dev = "/dev/sdz1";
+        let whole = Invocation::Helper.runs(dev, "FAKE0001", &pull("", Existing::Fail));
+        assert_eq!(whole.len(), 1, "one helper run per job");
+        assert_eq!(whole[0].args, s(&[HELPER_PATH, "pull", dev, "--expect", "FAKE0001", "/home/u/Downloads/USB"]));
+        assert_eq!(whole[0].covers, vec![1]);
+
+        let folder = Invocation::Helper.runs(dev, "FAKE0001", &pull("Photos/2026", Existing::Skip));
+        assert_eq!(
+            folder[0].args,
+            s(&[
+                HELPER_PATH,
+                "pull",
+                dev,
+                "--expect",
+                "FAKE0001",
+                "--from",
+                "Photos/2026",
+                "--skip-existing",
+                "/home/u/Downloads/USB",
+            ])
+        );
+
+        let over = Invocation::Helper.runs(dev, "FAKE0001", &pull("Photos", Existing::Overwrite));
+        assert_eq!(
+            over[0].args,
+            s(&[
+                HELPER_PATH,
+                "pull",
+                dev,
+                "--expect",
+                "FAKE0001",
+                "--from",
+                "Photos",
+                "--overwrite",
+                "/home/u/Downloads/USB"
+            ])
+        );
+    }
+
+    #[test]
+    fn direct_pull_argv_with_and_without_from_and_each_existing_mode() {
+        let direct = Invocation::Direct("/fake".into());
+        let whole = direct.runs("/dev/sdz1", "FAKE0001", &pull("", Existing::Fail));
+        assert_eq!(whole[0].args, s(&["pull", "--target-fd", "3", "/home/u/Downloads/USB", "--json"]));
+        assert_eq!(whole[0].covers, vec![1]);
+
+        let skip = direct.runs("/dev/sdz1", "FAKE0001", &pull("Photos/2026", Existing::Skip));
+        assert_eq!(
+            skip[0].args,
+            s(&[
+                "pull",
+                "--target-fd",
+                "3",
+                "/home/u/Downloads/USB",
+                "--from",
+                "Photos/2026",
+                "--skip-existing",
+                "--json",
+            ])
+        );
+
+        let over = direct.runs("/dev/sdz1", "FAKE0001", &pull("Photos", Existing::Overwrite));
+        assert_eq!(
+            over[0].args,
+            s(&["pull", "--target-fd", "3", "/home/u/Downloads/USB", "--from", "Photos", "--overwrite", "--json"])
+        );
+    }
+
     #[test]
     fn invocation_selects_helper_unless_direct_is_set() {
         assert_eq!(Invocation::from_direct(None), Invocation::Helper);
@@ -849,6 +952,72 @@ mod tests {
             fs::read_to_string(&log).unwrap(),
             "add\n/h/Photos\n--target-fd\n3\n--to\n/Photos\n--skip-existing\n--json\n--\n\
              add\n/c/stage\n--target-fd\n3\n--to\n/\n--skip-existing\n--json\n--\n"
+        );
+    }
+
+    fn pull_run(args: &[&str]) -> Vec<Run> {
+        let mut argv = vec!["pull", "--target-fd", "3", "/home/u/out"];
+        argv.extend_from_slice(args);
+        argv.push("--json");
+        vec![run(&argv, &[1])]
+    }
+
+    fn pull_job(runs: &[Run], env: &[(&str, &str)]) -> Result<JobAggregate, String> {
+        run_job(FAKE, runs, Op::Pull, env, |_| {})
+    }
+
+    #[test]
+    fn pull_normal_stream_succeeds() {
+        let mut updates = Vec::new();
+        let runs = pull_run(&[]);
+        let agg = run_job(FAKE, &runs, Op::Pull, &[FAST], |u| updates.push(u)).expect("fake pull succeeds");
+        assert_eq!(agg.finished_files(), 100);
+        assert_eq!(updates.first().map(|u| u.stage), Some(Stage::Authorizing));
+        assert!(updates.iter().all(|u| u.op == Op::Pull && u.total == 1 && !u.conflict));
+    }
+
+    #[test]
+    fn pull_collision_without_flags_fails_with_the_collision_message() {
+        let runs = pull_run(&[]);
+        let msg = pull_job(&runs, &[("FAKE_FLASHCP_MODE", "conflict"), FAST]).expect_err("must refuse");
+        assert!(msg.contains("already exist"), "{msg}");
+        assert!(crate::pull::is_collision(&msg));
+    }
+
+    #[test]
+    fn pull_collision_with_skip_or_overwrite_succeeds() {
+        for flag in ["--skip-existing", "--overwrite"] {
+            let runs = pull_run(&[flag]);
+            let agg = pull_job(&runs, &[("FAKE_FLASHCP_MODE", "conflict"), FAST]).expect("retry with a flag succeeds");
+            assert_eq!(agg.finished_files(), 100, "{flag}");
+        }
+    }
+
+    #[test]
+    fn pull_nodone_and_twodone_fail() {
+        let runs = pull_run(&[]);
+        assert_eq!(
+            pull_job(&runs, &[("FAKE_FLASHCP_MODE", "nodone"), FAST]).unwrap_err(),
+            "flashcp stopped before finishing (0 of 1 items done)"
+        );
+        assert_eq!(
+            pull_job(&runs, &[("FAKE_FLASHCP_MODE", "twodone"), FAST]).unwrap_err(),
+            "flashcp finished more items than expected (1)"
+        );
+    }
+
+    #[test]
+    fn pull_direct_argv_reaches_flashcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let log_s = log.to_string_lossy().into_owned();
+        let action = pull("Photos/2026", Existing::Skip);
+        let runs = Invocation::Direct(FAKE.into()).runs("/dev/sdz1", "FAKE0001", &action);
+        let env = [("FAKE_FLASHCP_LOG", log_s.as_str()), FAST];
+        pull_job(&runs, &env).expect("fake pull succeeds");
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            "pull\n--target-fd\n3\n/home/u/Downloads/USB\n--from\nPhotos/2026\n--skip-existing\n--json\n--\n"
         );
     }
 
