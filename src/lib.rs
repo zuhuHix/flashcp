@@ -6,6 +6,7 @@ pub mod add;
 pub mod bench;
 pub mod copy;
 pub mod dataset;
+pub(crate) mod dirfd;
 pub mod events;
 pub mod exfat;
 pub mod pack;

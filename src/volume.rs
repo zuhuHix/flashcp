@@ -73,6 +73,8 @@ pub(crate) struct Vol {
     pub(crate) cc: u64,
     pub(crate) flags: u16,
     pub(crate) sector0: Vec<u8>,
+    /// VolumeLength in bytes (validated ≤ the device length): nothing past it is read.
+    pub(crate) vol_bytes: u64,
     /// Bounded FAT page cache (FIFO eviction): at most FAT_CACHE_PAGES × FAT_PAGE bytes.
     pub(crate) fat_cache: HashMap<u64, Vec<u8>>,
     pub(crate) fat_order: std::collections::VecDeque<u64>,
@@ -108,7 +110,9 @@ impl Vol {
     }
 
     /// Parses and validates the boot region, bitmap, up-case table and root directory.
-    pub(crate) fn open(dev: File, dev_len: u64, allow_dirty: bool) -> Result<Vol> {
+    /// `read_bitmap: false` validates the bitmap's entry and chain but does not load it (for
+    /// read-only walks that never consult it; `bitmap` stays empty).
+    pub(crate) fn open(dev: File, dev_len: u64, allow_dirty: bool, read_bitmap: bool) -> Result<Vol> {
         ensure!(dev_len >= 24 * 512, "target is too small to hold an exFAT volume");
         let mut s0 = vec![0u8; 512];
         dev.read_exact_at(&mut s0, 0).context("read boot sector")?;
@@ -162,6 +166,7 @@ impl Vol {
             cc,
             flags,
             sector0: region[..bps as usize].to_vec(),
+            vol_bytes: vol_sectors * bps,
             fat_cache: HashMap::new(),
             fat_order: Default::default(),
             kept: HashMap::new(),
@@ -172,7 +177,7 @@ impl Vol {
             label: String::new(),
             dirs: Vec::new(),
         };
-        let root_clusters = v.chain(root, "root directory")?;
+        let root_clusters = v.chain(root, "root directory", MAX_DIR_BYTES / cs)?;
         ensure!(root_clusters.len() as u64 * cs <= MAX_DIR_BYTES, "root directory is larger than 256 MB");
         let data = v.read_clusters(&root_clusters, root_clusters.len() as u64 * cs)?;
         let mut extras = RootExtras::default();
@@ -187,7 +192,9 @@ impl Vol {
         let bm_len = le64(&bm, 24);
         ensure!(bm_len == cc.div_ceil(8), "allocation bitmap length {bm_len} does not match the cluster count");
         v.bitmap_clusters = v.object_clusters(le32(&bm, 20), false, bm_len, "allocation bitmap")?;
-        v.bitmap = v.read_clusters(&v.bitmap_clusters, bm_len)?;
+        if read_bitmap {
+            v.bitmap = v.read_clusters(&v.bitmap_clusters, bm_len)?;
+        }
 
         ensure!(extras.upcase.len() == 1, "root directory must have exactly one up-case table entry");
         let uc = extras.upcase[0];
@@ -237,13 +244,15 @@ impl Vol {
         Ok(le32(p, (off - page * FAT_PAGE) as usize))
     }
 
-    pub(crate) fn chain(&mut self, first: u32, what: &str) -> Result<Vec<u32>> {
+    /// A FAT chain up to EOC, refused once it exceeds `max` clusters (a loop, or simply too
+    /// long), so a crafted chain can never make this walk or allocate more than `max`.
+    pub(crate) fn chain(&mut self, first: u32, what: &str, max: u64) -> Result<Vec<u32>> {
         let mut v = Vec::new();
         let mut c = first;
         loop {
             ensure!(self.valid(c), "{what}: FAT chain points at invalid cluster {c:#x}");
             v.push(c);
-            ensure!(v.len() as u64 <= self.cc, "{what}: FAT chain has a loop");
+            ensure!(v.len() as u64 <= max.min(self.cc), "{what}: FAT chain is too long (or has a loop)");
             let n = self.fat(c)?;
             if n == EOC {
                 return Ok(v);
@@ -263,28 +272,50 @@ impl Vol {
                 .with_context(|| format!("{what}: contiguous extent runs past the end of the volume"))?;
             return Ok(run.map(|c| c as u32).collect());
         }
-        let c = self.chain(first, what)?;
-        ensure!(c.len() as u64 == n, "{what}: FAT chain has {} clusters, its length needs {n}", c.len());
-        Ok(c)
+        // Walk exactly n clusters, then demand EOC: bounded by the length, whatever the FAT says.
+        let mut v = Vec::with_capacity(n.min(self.cc) as usize);
+        let mut c = first;
+        for k in 0..n {
+            ensure!(self.valid(c), "{what}: FAT chain points at invalid cluster {c:#x}");
+            v.push(c);
+            let next = self.fat(c)?;
+            if k + 1 == n {
+                ensure!(next == EOC, "{what}: FAT chain is longer than its length needs ({n} clusters)");
+            } else {
+                ensure!(next != EOC, "{what}: FAT chain has {} clusters, its length needs {n}", k + 1);
+                c = next;
+            }
+        }
+        Ok(v)
     }
 
     pub(crate) fn cluster_off(&self, c: u32) -> u64 {
         self.heap_off + (c as u64 - 2) * self.cs
     }
 
+    /// Reads an object straight into one buffer of `len` bytes (no per-run copies, so the
+    /// peak is `len`, which matters for a bitmap of up to 512 MB).
     pub(crate) fn read_clusters(&self, clusters: &[u32], len: u64) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(len as usize);
-        let mut i = 0;
-        while i < clusters.len() && (out.len() as u64) < len {
+        ensure!(len <= clusters.len() as u64 * self.cs, "object is shorter than its length");
+        let mut out = vec![0u8; len as usize];
+        let (mut i, mut done) = (0, 0usize);
+        while i < clusters.len() && done < out.len() {
             let mut j = i + 1;
             while j < clusters.len() && clusters[j] == clusters[j - 1] + 1 {
                 j += 1;
             }
-            let want = ((j - i) as u64 * self.cs).min(len - out.len() as u64);
-            out.extend_from_slice(&self.read_at(self.cluster_off(clusters[i]), want)?);
+            let want = ((j - i) as u64 * self.cs).min((out.len() - done) as u64);
+            let off = self.cluster_off(clusters[i]);
+            ensure!(
+                off.checked_add(want).is_some_and(|e| e <= self.dev_len),
+                "volume structure at byte {off} lies outside the device"
+            );
+            self.dev
+                .read_exact_at(&mut out[done..done + want as usize], off)
+                .with_context(|| format!("read {want} bytes at {off}"))?;
+            done += want as usize;
             i = j;
         }
-        ensure!(out.len() as u64 == len, "object is shorter than its length");
         Ok(out)
     }
 
@@ -335,7 +366,7 @@ impl Vol {
     /// Directories whose up-cased path is in `wanted` are kept in `dirs` (indexed by `kept`) for
     /// planning; the rest are dropped as soon as they are walked, so memory stays bounded.
     pub(crate) fn verify_allocation(&mut self, wanted: &HashSet<Vec<Vec<u16>>>) -> Result<u64> {
-        let mut refd = vec![0u8; self.bitmap.len()];
+        let mut refd = cluster_set(self.cc);
         let mut objects = 0u64;
         let sys = [
             (self.dirs[0].clusters.clone(), "the root directory"),
@@ -432,16 +463,51 @@ pub(crate) fn contiguous_run(first: u32, n: u64, cc: u64) -> Result<std::ops::Ra
     Ok(first..first + n)
 }
 
+/// A visited-cluster bitset (one bit per heap cluster), as used by the reachability walks.
+pub(crate) fn cluster_set(cc: u64) -> Vec<u8> {
+    vec![0u8; cc.div_ceil(8) as usize]
+}
+
+/// Sets cluster `c` (≥ 2, inside the heap) in a [`cluster_set`]; false if it was already set.
+pub(crate) fn mark(set: &mut [u8], c: u32) -> bool {
+    let i = (c - 2) as usize;
+    let (byte, bit) = (i / 8, 1u8 << (i % 8));
+    let fresh = set[byte] & bit == 0;
+    set[byte] |= bit;
+    fresh
+}
+
+/// Sets clusters [first, first + n) (inside the heap); on a cluster that was already set,
+/// returns it (the bits before it stay set). Whole bytes go eight at a time.
+pub(crate) fn mark_range(set: &mut [u8], first: u32, n: u64) -> std::result::Result<(), u32> {
+    let (mut i, end) = (first as u64 - 2, first as u64 - 2 + n);
+    while i < end {
+        if i.is_multiple_of(8) && end - i >= 8 {
+            let b = &mut set[(i / 8) as usize];
+            if *b != 0 {
+                return Err((i + 2 + b.trailing_zeros() as u64) as u32);
+            }
+            *b = 0xFF;
+            i += 8;
+        } else {
+            if !mark(set, (i + 2) as u32) {
+                return Err((i + 2) as u32);
+            }
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Marks cluster `c` referenced; refuses cross-links and clusters the bitmap calls free.
 pub(crate) fn claim(refd: &mut [u8], bitmap: &[u8], c: u32, what: &dyn Fn() -> String) -> Result<()> {
     let i = (c - 2) as usize;
     let (byte, bit) = (i / 8, 1u8 << (i % 8));
     ensure!(
-        refd[byte] & bit == 0,
+        mark(refd, c),
         "cluster {c} is used twice (cross-linked), again by {}; refusing to modify this volume (run fsck.exfat)",
         what()
     );
-    refd[byte] |= bit;
     ensure!(
         bitmap[byte] & bit != 0,
         "cluster {c} used by {} is marked free in the allocation bitmap; refusing to modify this volume (run fsck.exfat)",
@@ -579,6 +645,19 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn mark_range_finds_the_first_overlap() {
+        let mut set = cluster_set(64);
+        assert_eq!(mark_range(&mut set, 5, 20), Ok(()));
+        assert!(!mark(&mut set, 5) && !mark(&mut set, 24) && mark(&mut set, 25));
+        assert_eq!(mark_range(&mut set, 30, 30), Ok(()));
+        assert_eq!(mark_range(&mut set, 2, 64), Err(5));
+        let mut set = cluster_set(64);
+        assert!(mark(&mut set, 40));
+        assert_eq!(mark_range(&mut set, 10, 50), Err(40));
+        assert_eq!(mark_range(&mut set, 2, 0), Ok(()));
+    }
+
+    #[test]
     fn decode_ts_inverts_ts() {
         for (secs, ns) in
             [(315_532_800i64, 0u32), (1_709_164_799, 990_000_000), (1_700_000_001, 123_456_789), (4_354_819_199, 0)]
@@ -641,7 +720,7 @@ mod tests {
     fn cluster_count_over_spec_limit_is_refused() {
         for (tag, cc, refused) in [("max", 0xFFFF_FFF5u32, false), ("over", 0xFFFF_FFF6, true), ("zero", 0, true)] {
             let (p, f) = boot_image(tag, cc);
-            let e = format!("{:#}", Vol::open(f, 32 << 20, false).err().expect("geometry should not fit 32 MB"));
+            let e = format!("{:#}", Vol::open(f, 32 << 20, false, true).err().expect("geometry should not fit 32 MB"));
             assert_eq!(e.contains("ClusterCount"), refused, "cc {cc:#x}: {e}");
             fs::remove_file(p).unwrap();
         }
@@ -671,6 +750,7 @@ mod tests {
             cc: cc - 2,
             flags: 0,
             sector0: vec![],
+            vol_bytes: cc * 4,
             fat_cache: HashMap::new(),
             fat_order: Default::default(),
             kept: HashMap::new(),
