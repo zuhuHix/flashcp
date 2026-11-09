@@ -112,6 +112,9 @@ pub struct CalibrateArgs {
     /// honest) or `profile` (the built-in profile as shipped)
     #[arg(long, default_value = "probe", value_parser = ["probe", "profile"])]
     pub prior: String,
+    /// Quick look: a quarter of the optimizer evaluations and 5 point-wise folds
+    #[arg(long)]
+    pub fast: bool,
 }
 
 /// Runs one `flashcp sim` subcommand.
@@ -441,6 +444,17 @@ pub fn sweep_scenarios(
 /// has no per-transport helper, so the ftl.* keys are left out unless the model has an FTL.
 /// Parameters whose base value is not positive are left out too (calibration fits in log
 /// space and needs a positive start); each one left out is reported on stderr.
+/// The workload family of a scenario for grouped cross-validation: drive × op × dataset ×
+/// layout (micro-probe points: drive × kind). Scenarios that differ only in flashcp settings
+/// (args/env) share a family and are held out together.
+fn family_of(sc: &Scenario) -> String {
+    if sc.op == "micro" {
+        format!("{}/micro/{}", sc.drive, sc.kind.as_deref().unwrap_or("?"))
+    } else {
+        format!("{}/{}/{}/{}", sc.drive, sc.op, sc.data, sc.layout)
+    }
+}
+
 const STRUCTURAL: &[&str] = &["lanes", "max_req", "rd.streams", "ftl.au", "ftl.open", "ftl.gc_mean", "ftl.gc_sigma"];
 
 fn default_free(base: &Model) -> Vec<String> {
@@ -735,9 +749,15 @@ fn calibrate_cmd(a: &CalibrateArgs) -> Result<()> {
             }
         };
         match built {
-            Ok(trace) => {
-                points.push(CalPoint { id: sc.id.clone(), drive: sc.drive.clone(), real, lo: sc.lo, hi: sc.hi, trace })
-            }
+            Ok(trace) => points.push(CalPoint {
+                id: sc.id.clone(),
+                drive: sc.drive.clone(),
+                real,
+                lo: sc.lo,
+                hi: sc.hi,
+                family: family_of(sc),
+                trace,
+            }),
             Err(e) => {
                 eprintln!("[sim] skip {}: {e:#}", sc.id);
                 skipped.push(sc.id.clone());
@@ -767,13 +787,20 @@ fn calibrate_cmd(a: &CalibrateArgs) -> Result<()> {
             .collect();
         let free = if a.free.is_empty() { default_free(&base) } else { check_free(&a.free)? };
         let free_refs: Vec<&str> = free.iter().map(String::as_str).collect();
-        let rep = calib::calibrate(&pts, &dpairs, &base, &free_refs)?;
+        let t0 = std::time::Instant::now();
+        let rep = calib::calibrate_opts(&pts, &dpairs, &base, &free_refs, calib::CalOpts { fast: a.fast })?;
         let table = rep.table();
         let (ok, total) = rep.ranking();
+        let (lok, _) = rep.ranking_lofo();
         let summary = format!(
-            "{d}: {} points, median |CV error| {:.1}%, ranking {ok}/{total} correct",
+            "{d}: {} points in {} families, median |held-out error| {:.1}% point-wise, {:.1}% \
+             family-wise; ranking {ok}/{total} point-wise, {lok}/{total} family-wise ({:.0} s fit{})",
             pts.len(),
-            100.0 * rep.median_abs_err_cv()
+            rep.families,
+            100.0 * rep.median_abs_err_cv(),
+            100.0 * rep.median_abs_err_lofo(),
+            t0.elapsed().as_secs_f64(),
+            if a.fast { ", --fast" } else { "" }
         );
         println!("{}", table.trim_end());
         let _ = writeln!(md, "## {d}\n\n```text\n{}\n```\n\n{summary}\n", table.trim_end());

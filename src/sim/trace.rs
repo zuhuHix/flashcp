@@ -4,17 +4,21 @@
 //! Enabled by `FLASHCP_TRACE=<file>` (or `--trace <file>`, which sets it). When off, every hook
 //! is one relaxed atomic load before the syscall it wraps, so behaviour and speed are unchanged.
 //!
-//! # Format (version 1)
+//! # Format (version 2)
 //! One JSON object per line. The first line is the header, the last one the end record:
 //! ```text
-//! {"v":1,"ev":"start","cmd":"pull","device":"sandisk-cruzer-usb2"}
-//! {"ev":"note","key":"strategy","val":{...}}                 any JSON value
-//! {"ev":"phase","name":"data","t":1234}
-//! {"ev":"io","op":"w","off":1048576,"len":122880,"qd":1,"grp":0,"seq":0,"q":1,"t":1250,"d":1262}
-//! {"ev":"sync","t":1300,"d":1310}
-//! {"ev":"direct","on":true,"t":1311}
+//! {"v":2,"ev":"start","cmd":"pull","device":"sandisk-cruzer-usb2"}
+//! {"i":0,"ev":"note","key":"strategy","val":{...}}                 any JSON value
+//! {"i":1,"ev":"phase","name":"data","t":1234}
+//! {"i":2,"ev":"io","op":"w","off":1048576,"len":122880,"qd":1,"grp":0,"seq":0,"q":1,"t":1250,"d":1262}
+//! {"i":3,"ev":"sync","t":1300,"d":1310}
+//! {"i":4,"ev":"direct","on":true,"t":1311}
 //! {"ev":"end","t":5000}
 //! ```
+//! - `i`: global issue order (an atomic counter taken when the op is issued). Each thread
+//!   buffers its own records and writes them in batches, so lines of different threads are
+//!   interleaved in chunks: a reader sorts by `i` (version 1 traces had no `i` and were in
+//!   file order).
 //! - `t` / `d`: microseconds since the trace started, at issue and at completion (on the
 //!   recording machine, i.e. usually an image on NVMe: only host time is meaningful there).
 //! - `op`: `w` (write) or `r` (read); `off` is the byte offset in the target (partition), `len`
@@ -27,12 +31,28 @@
 //!   one group may be written out of order by racing threads, sort by it.
 //! - `q`: device ops actually in flight at issue time, including this one (informational).
 //! - `sync`: fsync/fdatasync of the target: a barrier and a cache flush.
+//!
+//! # What a trace contains
+//! Byte offsets and lengths of device ops, timestamps, queue depths, phase names, and the
+//! strategy notes (pull's strategy object, add's gap-policy text). No file names, paths or
+//! contents. Offsets and sizes still reveal the shape of the data (how many files, their sizes
+//! and layout), so treat a trace of a private drive as potentially sensitive.
+//!
+//! # Cost
+//! Off: one relaxed atomic load per op. On: two clock reads, one atomic increment and a
+//! formatted line appended to a thread-local buffer, which is written to the file (under a
+//! mutex) every [`BATCH`] bytes and when the thread ends, so threads issuing I/O in parallel
+//! never wait for each other per op.
 
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
+
+/// A thread's buffered records are written to the file when they exceed this many bytes.
+pub const BATCH: usize = 64 << 10;
 
 /// The environment variable that turns tracing on (the value is the output file).
 pub const TRACE_ENV: &str = "FLASHCP_TRACE";
@@ -41,7 +61,62 @@ static ON: AtomicBool = AtomicBool::new(false);
 static SINK: OnceLock<Sink> = OnceLock::new();
 static GROUPS: AtomicU32 = AtomicU32::new(1);
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static ORDER: AtomicU64 = AtomicU64::new(0);
 
+/// One thread's unwritten records. Kept in [`BUFS`] too, so [`finish`] can drain every
+/// thread's buffer whether or not the thread still runs (thread-local destructors may run
+/// after a scoped thread already counts as joined, so they cannot be relied on).
+type Buf = std::sync::Arc<Mutex<Vec<u8>>>;
+static BUFS: Mutex<Vec<Buf>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static LOCAL: RefCell<Option<Buf>> = const { RefCell::new(None) };
+}
+
+fn write_out(buf: &mut Vec<u8>) {
+    if buf.is_empty() {
+        return;
+    }
+    if let Some(sk) = SINK.get() {
+        let mut o = sk.out.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = o.write_all(buf);
+    }
+    buf.clear();
+}
+
+/// Appends one record (with its issue order `i`) to this thread's buffer: its own mutex,
+/// uncontended except when [`finish`] drains it.
+fn record(i: u64, body: std::fmt::Arguments<'_>) {
+    let put = |b: &mut Vec<u8>| {
+        let _ = write!(b, r#"{{"i":{i},"#);
+        let _ = b.write_fmt(body);
+        b.push(b'\n');
+        if b.len() >= BATCH {
+            write_out(b);
+        }
+    };
+    let done = LOCAL.try_with(|l| {
+        let buf = l
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                let b: Buf = Default::default();
+                BUFS.lock().unwrap_or_else(|e| e.into_inner()).push(b.clone());
+                b
+            })
+            .clone();
+        put(&mut buf.lock().unwrap_or_else(|e| e.into_inner()));
+    });
+    if done.is_err() {
+        // Thread teardown: no thread-local any more, write directly.
+        let mut b = Vec::new();
+        put(&mut b);
+        write_out(&mut b);
+    }
+}
+
+fn next_i() -> u64 {
+    ORDER.fetch_add(1, Relaxed)
+}
 struct Sink {
     out: Mutex<BufWriter<File>>,
     t0: Instant,
@@ -90,7 +165,7 @@ pub fn init(path: &std::path::Path, cmd: &str) -> anyhow::Result<()> {
     let _ = SINK.set(Sink { out: Mutex::new(BufWriter::with_capacity(1 << 20, f)), t0: Instant::now() });
     let dev = crate::sim::device::sim_device().map(|d| d.name.clone());
     line(&format!(
-        r#"{{"v":1,"ev":"start","cmd":{},"device":{}}}"#,
+        r#"{{"v":2,"ev":"start","cmd":{},"device":{}}}"#,
         crate::events::json_str(cmd),
         dev.map_or("null".into(), |d| crate::events::json_str(&d))
     ));
@@ -105,6 +180,9 @@ pub fn finish() {
         return;
     }
     ON.store(false, Relaxed);
+    for b in BUFS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        write_out(&mut b.lock().unwrap_or_else(|e| e.into_inner()));
+    }
     line(&format!(r#"{{"ev":"end","t":{}}}"#, now()));
     if let Some(sk) = SINK.get() {
         let _ = sk.out.lock().unwrap_or_else(|e| e.into_inner()).flush();
@@ -123,14 +201,18 @@ pub fn io<T>(op: Op, off: u64, len: u64, qd: usize, grp: u32, seq: u64, f: impl 
         return f();
     }
     let q = INFLIGHT.fetch_add(1, Relaxed) + 1;
+    let i = next_i();
     let t = now();
     let r = f();
     let d = now();
     INFLIGHT.fetch_sub(1, Relaxed);
     let o = if op == Op::Read { "r" } else { "w" };
-    line(&format!(
-        r#"{{"ev":"io","op":"{o}","off":{off},"len":{len},"qd":{qd},"grp":{grp},"seq":{seq},"q":{q},"t":{t},"d":{d}}}"#
-    ));
+    record(
+        i,
+        format_args!(
+            r#""ev":"io","op":"{o}","off":{off},"len":{len},"qd":{qd},"grp":{grp},"seq":{seq},"q":{q},"t":{t},"d":{d}}}"#
+        ),
+    );
     r
 }
 
@@ -146,9 +228,10 @@ pub fn sync<T>(f: impl FnOnce() -> T) -> T {
     if !on() {
         return f();
     }
+    let i = next_i();
     let t = now();
     let r = f();
-    line(&format!(r#"{{"ev":"sync","t":{t},"d":{}}}"#, now()));
+    record(i, format_args!(r#""ev":"sync","t":{t},"d":{}}}"#, now()));
     r
 }
 
@@ -156,7 +239,7 @@ pub fn sync<T>(f: impl FnOnce() -> T) -> T {
 #[inline(always)]
 pub fn direct(on_: bool) {
     if on() {
-        line(&format!(r#"{{"ev":"direct","on":{on_},"t":{}}}"#, now()));
+        record(next_i(), format_args!(r#""ev":"direct","on":{on_},"t":{}}}"#, now()));
     }
 }
 
@@ -164,7 +247,7 @@ pub fn direct(on_: bool) {
 #[inline(always)]
 pub fn phase(name: &str) {
     if on() {
-        line(&format!(r#"{{"ev":"phase","name":{},"t":{}}}"#, crate::events::json_str(name), now()));
+        record(next_i(), format_args!(r#""ev":"phase","name":{},"t":{}}}"#, crate::events::json_str(name), now()));
     }
 }
 
@@ -172,6 +255,6 @@ pub fn phase(name: &str) {
 #[inline(always)]
 pub fn note(key: &str, json: impl FnOnce() -> String) {
     if on() {
-        line(&format!(r#"{{"ev":"note","key":{},"val":{}}}"#, crate::events::json_str(key), json()));
+        record(next_i(), format_args!(r#""ev":"note","key":{},"val":{}}}"#, crate::events::json_str(key), json()));
     }
 }

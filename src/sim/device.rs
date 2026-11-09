@@ -49,25 +49,81 @@ pub struct SimDevice {
 }
 
 impl SimDevice {
-    /// Parses the file format above. None when it is not a devprofile file.
-    pub fn parse(text: &str) -> Option<SimDevice> {
-        let profile = DevProfile::parse(text)?;
+    /// Parses the file format above. Strict about the `sim.*` keys: an unknown `sim.*` key, a
+    /// malformed or out-of-range value, or a key given twice is an error naming the line (a
+    /// silently ignored override would record the wrong strategy). The profile part keeps
+    /// [`DevProfile::parse`]'s rules.
+    pub fn parse(text: &str) -> Result<SimDevice, String> {
+        let profile = DevProfile::parse(text).ok_or("not a flashcp-devprofile file")?;
         let mut d = SimDevice { profile, name: "sim".into(), ..Default::default() };
-        for l in text.lines() {
+        let mut seen = std::collections::HashSet::new();
+        for (n, l) in text.lines().enumerate() {
             let Some((k, v)) = l.split_once('=') else { continue };
-            let v = v.trim();
-            match k.trim() {
-                "sim.name" => d.name = v.to_string(),
-                "sim.max_sectors_kb" => d.max_sectors_kb = v.parse().ok(),
-                "sim.logical_block" => d.logical_block = v.parse().ok(),
-                "sim.removable" => d.removable = v == "1" || v == "true",
-                "sim.probe_choice" => d.probe_choice = parse_choice(v),
-                "sim.part_start_sectors" => d.part_start_sectors = v.parse().unwrap_or(0),
-                "sim.size_bytes" => d.size_bytes = v.parse().ok(),
-                _ => {}
+            let (k, v) = (k.trim(), v.trim());
+            if !k.starts_with("sim.") {
+                continue;
+            }
+            let bad = |what: &str| format!("line {}: {k}={v}: {what}", n + 1);
+            if !seen.insert(k.to_string()) {
+                return Err(bad("given twice"));
+            }
+            fn num<T: std::str::FromStr>(v: &str) -> Option<T> {
+                v.parse().ok()
+            }
+            match k {
+                "sim.name" => {
+                    let ok = !v.is_empty()
+                        && v.len() <= 64
+                        && v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+                    if !ok {
+                        return Err(bad("expected 1-64 characters of [A-Za-z0-9._-]"));
+                    }
+                    d.name = v.to_string();
+                }
+                "sim.max_sectors_kb" => {
+                    d.max_sectors_kb = Some(
+                        num(v).filter(|k| (1..=1 << 20).contains(k)).ok_or_else(|| bad("expected 1..1048576 (KB)"))?,
+                    )
+                }
+                "sim.logical_block" => {
+                    d.logical_block = Some(
+                        num::<u64>(v)
+                            .filter(|b| b.is_power_of_two() && (512..=4096).contains(b))
+                            .ok_or_else(|| bad("expected 512, 1024, 2048 or 4096"))?,
+                    )
+                }
+                "sim.removable" => {
+                    d.removable = match v {
+                        "1" | "true" => true,
+                        "0" | "false" => false,
+                        _ => return Err(bad("expected 0, 1, true or false")),
+                    }
+                }
+                "sim.probe_choice" => {
+                    d.probe_choice = Some(
+                        parse_choice(v)
+                            .ok_or_else(|| bad("expected skip|fill|pad<bytes, multiple of 4096>:<qd 1..64>"))?,
+                    )
+                }
+                "sim.part_start_sectors" => {
+                    d.part_start_sectors = num(v).ok_or_else(|| bad("expected a sector number"))?;
+                }
+                "sim.size_bytes" => {
+                    d.size_bytes = Some(
+                        num::<u64>(v)
+                            .filter(|s| *s >= 1 << 20 && s.is_multiple_of(512))
+                            .ok_or_else(|| bad("expected bytes, ≥ 1 MiB and a multiple of 512"))?,
+                    )
+                }
+                _ => {
+                    return Err(bad(
+                        "unknown sim.* key (known: name, max_sectors_kb, logical_block, removable, probe_choice, \
+                         part_start_sectors, size_bytes)",
+                    ));
+                }
             }
         }
-        Some(d)
+        Ok(d)
     }
 }
 
@@ -91,8 +147,8 @@ pub fn sim_device() -> Option<&'static SimDevice> {
             eprintln!("flashcp: {SIM_DEVICE_ENV}={}: {e}", p.to_string_lossy());
             std::process::exit(2)
         });
-        Some(SimDevice::parse(&text).unwrap_or_else(|| {
-            eprintln!("flashcp: {SIM_DEVICE_ENV}={}: not a flashcp-devprofile file", p.to_string_lossy());
+        Some(SimDevice::parse(&text).unwrap_or_else(|e| {
+            eprintln!("flashcp: {SIM_DEVICE_ENV}={}: {e}", p.to_string_lossy());
             std::process::exit(2)
         }))
     })
@@ -116,6 +172,32 @@ mod tests {
         assert_eq!(d.profile.patterns.len(), 1);
         assert_eq!((d.max_sectors_kb, d.logical_block, d.removable), (Some(120), Some(512), true));
         assert_eq!(d.probe_choice, Some(PatternChoice { mode: GapMode::Fill, qd: 2 }));
-        assert!(SimDevice::parse("nope").is_none());
+        assert!(SimDevice::parse("nope").is_err());
+    }
+
+    #[test]
+    fn malformed_or_unknown_sim_keys_are_errors() {
+        let base = "flashcp-devprofile 1\ntransport=usb-storage\n";
+        for (line, needle) in [
+            ("sim.max_sectors_kb=12O", "sim.max_sectors_kb"),
+            ("sim.max_sectors_kb=0", "1..1048576"),
+            ("sim.logical_block=513", "512, 1024"),
+            ("sim.removable=yes", "0, 1, true"),
+            ("sim.probe_choice=skip", "skip|fill"),
+            ("sim.probe_choice=pad100:1", "skip|fill"),
+            ("sim.part_start_sectors=-1", "sector number"),
+            ("sim.size_bytes=1000", "1 MiB"),
+            ("sim.name=a b", "[A-Za-z0-9._-]"),
+            ("sim.max_sector_kb=120", "unknown sim.* key"),
+        ] {
+            let e = SimDevice::parse(&format!("{base}{line}\n")).unwrap_err();
+            assert!(e.contains(needle) && e.contains("line 3"), "{line}: {e}");
+        }
+        let twice = SimDevice::parse(&format!("{base}sim.removable=1\nsim.removable=0\n")).unwrap_err();
+        assert!(twice.contains("given twice"), "{twice}");
+        // Both shipped device files are valid.
+        for f in [include_str!("devices/sandisk.dev"), include_str!("devices/msi.dev")] {
+            SimDevice::parse(f).unwrap();
+        }
     }
 }
