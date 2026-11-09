@@ -897,9 +897,30 @@ const optPlan = (over = {}) => ({
   needBytes: 1_200_000_000,
   tempFree: 48_000_000_000,
   enoughSpace: true,
+  tempVolatile: false,
+  token: "0123456789abcdef0123456789abcdef",
   ...over,
 });
 const near = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-6, `${actual} != ${expected}`);
+
+describe("optimize plan confirmation token", () => {
+  test("a plan without a token cannot be confirmed", () => {
+    for (const token of [undefined, "", null]) {
+      const view = optimizePlanView(optPlan({ token }));
+      assert.equal(view.canConfirm, false);
+      assert.equal(view.mode, "refused");
+      assert.match(view.error, /cannot be started/);
+    }
+    assert.equal(optimizePlanView(optPlan()).canConfirm, true);
+    assert.equal(optimizePlanView(optPlan({ resume: true })).confirmLabel, "Resume optimize");
+  });
+  test("a temp folder in RAM is refused", () => {
+    const view = optimizePlanView(optPlan({ tempVolatile: true }));
+    assert.equal(view.mode, "volatile");
+    assert.equal(view.canConfirm, false);
+    assert.match(view.error, /tmpfs/);
+  });
+});
 
 describe("optimizeEstimate", () => {
   test("fresh plan: two reads, one write, per-file cost, fast and slow ends", () => {
