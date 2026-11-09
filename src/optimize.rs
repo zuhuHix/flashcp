@@ -286,14 +286,12 @@ impl Geom {
 }
 
 /// 16 random bytes from the kernel (getrandom, else /dev/urandom).
-fn random_id() -> Result<[u8; 16]> {
+pub(crate) fn random_id() -> Result<[u8; 16]> {
     let mut b = [0u8; 16];
     let n = unsafe { libc::getrandom(b.as_mut_ptr().cast(), b.len(), 0) };
     if n != b.len() as isize {
         use std::io::Read;
-        File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut b))
-            .context("read random bytes for the optimize job id")?;
+        File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).context("read random bytes for a job id")?;
     }
     Ok(b)
 }
