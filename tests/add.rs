@@ -886,3 +886,86 @@ fn image_locked_by_another_process_is_refused() {
     fsck_clean(&img);
     fs::remove_dir_all(&dir).expect("remove scratch dir");
 }
+
+// ───────────────────────── gap policy ─────────────────────────
+
+#[test]
+fn image_add_uses_the_default_gap_policy() {
+    let dir = test_dir("add_gap_policy_image");
+    let img = dir.join("disk.img");
+    make_image(&img, 64 * MB);
+    mkfs(&img, None);
+    let src = dir.join("src");
+    small_src(&src, "a.txt");
+    let out = add_ok(&src, &img, &["--dry-run"]);
+    let plan = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(plan.contains("gaps: fill own slack ≤ 32.8 KB, skip otherwise; 8 in flight (image default)"), "{plan}");
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+/// The hard safety rule of the gap policy: free space interleaved with live files, a policy
+/// that would zero-fill gaps of any size (FLASHCP_TEST_GAP_FILL), and still not one byte of an
+/// existing file may change, because every gap between the new runs is a used cluster.
+#[test]
+fn gap_fill_never_writes_over_existing_files() {
+    let dir = test_dir("add_gap_fill_safety");
+    let base = dir.join("base");
+    for k in 0..40u64 {
+        write_random(&base.join(format!("d/f{k:02}.bin")), 4096, 500 + k);
+    }
+    let img = dir.join("disk.img");
+    // First with a one-cluster filler to learn the free space, then with a filler that leaves
+    // a single free cluster at the end, so the add has to use the holes made below.
+    write_file(&base.join("z/fill.bin"), b"x");
+    make_image(&img, 32 * MB);
+    assert_success(&run_build(&base, &img, &["--cluster", "4096"]), "flashcp build");
+    let free = json_u64(&info_json(&img), "free");
+    write_random(&base.join("z/fill.bin"), free, 99);
+    assert_success(&run_build(&base, &img, &["--cluster", "4096"]), "flashcp build");
+    assert_eq!(json_u64(&info_json(&img), "free"), 4096);
+    let heap = read_ok(&img).info.heap_offset;
+    // flashcp's layout: bitmap 2, up-case 3..=4, root 5, d/ 6, z/ 7; d/'s entry sets are 96
+    // bytes each (file, stream, one name). Delete every other file: clear InUse on its three
+    // entries and its bitmap bit.
+    let mut kept = read_source_tree(&base);
+    let d = cluster_off(heap, 6);
+    for k in (0..40u64).step_by(2) {
+        let set = d + 96 * k;
+        let mut stream = [0u8; 32];
+        let f = fs::File::open(&img).expect("open image");
+        std::os::unix::fs::FileExt::read_exact_at(&f, &mut stream, set + 32).expect("read stream entry");
+        assert_eq!(stream[0], 0xC0, "unexpected layout");
+        let first = u32::from_le_bytes(stream[20..24].try_into().unwrap()) as u64;
+        for e in 0..3 {
+            patch_byte(&img, set + 32 * e, |b| b & 0x7F);
+        }
+        let bit = first - 2;
+        patch_byte(&img, cluster_off(heap, 2) + bit / 8, |b| {
+            assert_ne!(b & (1 << (bit % 8)), 0, "cluster {first} should be allocated");
+            b & !(1 << (bit % 8))
+        });
+        kept.remove(&format!("d/f{k:02}.bin"));
+    }
+    fsck_clean(&img);
+    let new = dir.join("new");
+    for k in 0..15u64 {
+        write_random(&new.join(format!("n/n{k:02}.bin")), 4000, 900 + k);
+    }
+    let out = flashcp()
+        .arg("add")
+        .arg(&new)
+        .arg(&img)
+        .env("FLASHCP_TEST_GAP_FILL", "1000000000")
+        .env("FLASHCP_TEST_GAPS", "1")
+        .output()
+        .expect("run flashcp add");
+    assert_success(&out, "flashcp add");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("(test override)"), "{stdout}");
+    // 16 one-cluster objects in 16 holes: the first skip, then 15 gaps, each a live file.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("gaps: 0 bytes zero-filled, 16 skipped"), "a gap over live files was filled: {stderr}");
+    fsck_clean(&img);
+    expect_tree(&read_ok(&img), kept, read_source_tree(&new), &[]);
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
