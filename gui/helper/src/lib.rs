@@ -174,7 +174,7 @@ fn helper(argv: &[OsString]) -> Result<i32, Fail> {
 
     // Open once; everything below is about this fd, and flashcp gets this fd.
     let roots = Roots::system();
-    let fd = open_device(&roots, req.dev(), req.writes()).map_err(|e| open_err(req.dev(), e))?;
+    let fd = open_device(&roots, req.dev(), req.access()).map_err(|e| open_err(req.dev(), e))?;
     let st = fstat(fd.as_fd()).map_err(|e| Internal(format!("fstat: {e}")))?;
     let (_, id) = check_drive(&roots, st, req.dev(), true, req.expect()).map_err(Validation)?;
     let entries = TrustStore::system().load().map_err(Validation)?;
@@ -195,7 +195,7 @@ fn trust(argv: &[OsString]) -> Result<i32, Fail> {
     let req = args::parse_trust(argv).map_err(Validation)?;
     require_root()?;
     let roots = Roots::system();
-    let fd = open_device(&roots, &req.dev, false).map_err(|e| open_err(&req.dev, e))?;
+    let fd = open_device(&roots, &req.dev, args::Access::Read).map_err(|e| open_err(&req.dev, e))?;
     let st = fstat(fd.as_fd()).map_err(|e| Internal(format!("fstat: {e}")))?;
     // Not idle-checked: a mounted stick may be trusted. A disk carrying the system is refused.
     let valid = validate_device(&roots, st, &req.dev, false).map_err(Validation)?;
@@ -381,6 +381,17 @@ mod tests {
         assert_eq!(log_lines(&log).len(), 2);
         assert_eq!(job(t.path(), &prog, &["info", "/dev/sdb1", "--expect", "SER1"]), Ok(0));
         assert_eq!(log_lines(&log)[2], "info --target-fd 3 --json");
+    }
+
+    #[test]
+    fn pull_runs_flashcp_once_with_the_fixed_argv() {
+        let t = tempfile::tempdir().unwrap();
+        let (prog, log) = fake_flashcp(t.path(), "{}", 0);
+        let a = ["pull", "/dev/sdb1", "--expect", "SER1", "--from", "DCIM", "--overwrite", "/home/u/Downloads/S"];
+        assert_eq!(job(t.path(), &prog, &a), Ok(0));
+        assert_eq!(log_lines(&log), ["pull --target-fd 3 /home/u/Downloads/S --from DCIM --overwrite --json"]);
+        // The helper itself never creates or inspects the destination.
+        assert!(!Path::new("/home/u/Downloads/S").exists());
     }
 
     #[test]

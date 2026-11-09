@@ -11,7 +11,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-use crate::args::DevName;
+use crate::args::{Access, DevName};
 use crate::mounts;
 
 /// Mount points that mark a disk as the running system's disk.
@@ -74,16 +74,26 @@ pub fn fstat(fd: BorrowedFd) -> io::Result<NodeStat> {
     Ok(NodeStat::from_libc(&st))
 }
 
-/// Open `/dev/<name>` (under `roots.dev`) the way the helper hands it to flashcp:
-/// `O_RDWR|O_EXCL` for writing ops (the kernel refuses `O_EXCL` on a block device that is mounted
-/// or otherwise claimed, and keeps others from claiming it while we hold it), `O_RDONLY` for
-/// reading ones. Always `O_NOFOLLOW|O_CLOEXEC`. Validation happens afterwards, on this fd.
-pub fn open_device(roots: &Roots, dev: &DevName, write: bool) -> io::Result<OwnedFd> {
+/// The `open(2)` flags for an access mode. `O_EXCL` on a block device (without `O_CREAT`) is an
+/// exclusive claim, independent of the access mode: the kernel refuses it on a device that is
+/// mounted or otherwise claimed, and keeps others from mounting or claiming it while we hold it.
+pub fn open_flags(access: Access) -> libc::c_int {
+    let mode = match access {
+        Access::Read => libc::O_RDONLY,
+        Access::ReadExclusive => libc::O_RDONLY | libc::O_EXCL,
+        Access::WriteExclusive => libc::O_RDWR | libc::O_EXCL,
+    };
+    mode | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY
+}
+
+/// Open `/dev/<name>` (under `roots.dev`) the way the helper hands it to flashcp, with
+/// [`open_flags`]: `O_RDWR|O_EXCL` for `add`/`build`, `O_RDONLY|O_EXCL` for `pull`, `O_RDONLY`
+/// for `info` and `flashcp-trust`. Validation happens afterwards, on this fd.
+pub fn open_device(roots: &Roots, dev: &DevName, access: Access) -> io::Result<OwnedFd> {
     let path = roots.dev.join(&dev.name);
     let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let mode = if write { libc::O_RDWR | libc::O_EXCL } else { libc::O_RDONLY };
     // SAFETY: valid C string; the returned fd is owned below.
-    let raw = unsafe { libc::open(c.as_ptr(), mode | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY) };
+    let raw = unsafe { libc::open(c.as_ptr(), open_flags(access)) };
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -507,6 +517,34 @@ mod tests {
     }
 
     #[test]
+    fn open_flags_per_access() {
+        let acc = |a| open_flags(a) & libc::O_ACCMODE;
+        let excl = |a| open_flags(a) & libc::O_EXCL != 0;
+        assert_eq!((acc(Access::Read), excl(Access::Read)), (libc::O_RDONLY, false));
+        // pull reads, but claims the device exclusively so it cannot be mounted mid-copy.
+        assert_eq!((acc(Access::ReadExclusive), excl(Access::ReadExclusive)), (libc::O_RDONLY, true));
+        assert_eq!((acc(Access::WriteExclusive), excl(Access::WriteExclusive)), (libc::O_RDWR, true));
+        for a in [Access::Read, Access::ReadExclusive, Access::WriteExclusive] {
+            let f = open_flags(a);
+            assert_eq!(
+                f & (libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY),
+                libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY
+            );
+            assert_eq!(f & (libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND), 0);
+        }
+        // The pull fd really is read-only: flashcp gets no write access to the drive.
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir(t.path().join("dev")).unwrap();
+        fs::write(t.path().join("dev/sdb"), "x").unwrap();
+        let mut roots = Roots::system();
+        roots.dev = t.path().join("dev");
+        let fd = open_device(&roots, &parse_dev("/dev/sdb").unwrap(), Access::ReadExclusive).unwrap();
+        let fl = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(fl & libc::O_ACCMODE, libc::O_RDONLY);
+        assert_eq!(unsafe { libc::write(fd.as_raw_fd(), b"y".as_ptr().cast(), 1) }, -1);
+    }
+
+    #[test]
     fn real_fstat_and_open_nofollow() {
         let n = std::fs::File::open("/dev/null").unwrap();
         let s = fstat(n.as_fd()).unwrap();
@@ -518,12 +556,12 @@ mod tests {
         let mut roots = Roots::system();
         roots.dev = t.path().join("dev");
         let dev = parse_dev("/dev/sdb").unwrap();
-        let e = open_device(&roots, &dev, false).unwrap_err();
+        let e = open_device(&roots, &dev, Access::Read).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::ELOOP));
         // A regular file opens fine and fstat says "not a block device", which validation rejects.
         fs::remove_file(t.path().join("dev/sdb")).unwrap();
         fs::write(t.path().join("dev/sdb"), "x").unwrap();
-        let fd = open_device(&roots, &dev, true).unwrap();
+        let fd = open_device(&roots, &dev, Access::WriteExclusive).unwrap();
         let st = fstat(fd.as_fd()).unwrap();
         assert!(!st.is_block);
         assert!(validate_device(&roots, st, &dev, true).unwrap_err().contains("not a block device"));
