@@ -1,4 +1,4 @@
-//! Strict argv parsing for both programs. The helper accepts exactly three command shapes and
+//! Strict argv parsing for both programs. The helper accepts exactly four command shapes and
 //! builds every flashcp argv itself from the validated values, so nothing the caller sends is
 //! forwarded verbatim.
 
@@ -6,7 +6,8 @@ use std::ffi::OsString;
 
 /// Longest source path we accept (PATH_MAX).
 const MAX_SRC: usize = 4096;
-/// Longest destination directory inside the volume.
+/// Longest destination directory inside the volume (`add --item .. <to>`), and longest
+/// `pull --from` folder inside the volume.
 const MAX_TO: usize = 1024;
 /// exFAT volume labels hold at most 15 UTF-16 units; we count chars, which is never more lenient
 /// for the BMP and keeps the rule simple.
@@ -45,11 +46,55 @@ pub struct Item {
     pub to: String,
 }
 
+/// What `pull` does with files that already exist in the destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Existing {
+    /// Neither flag: flashcp refuses to start if anything would collide.
+    Fail,
+    Skip,
+    Overwrite,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    Add { dev: DevName, expect: String, skip_existing: bool, items: Vec<Item> },
-    Build { dev: DevName, expect: String, confirm: String, label: Option<String>, src: String },
-    Info { dev: DevName, expect: String },
+    Add {
+        dev: DevName,
+        expect: String,
+        skip_existing: bool,
+        items: Vec<Item>,
+    },
+    Build {
+        dev: DevName,
+        expect: String,
+        confirm: String,
+        label: Option<String>,
+        src: String,
+    },
+    Info {
+        dev: DevName,
+        expect: String,
+    },
+    /// Copy files OFF the volume into `dest`, a local directory. `dest` is never touched by the
+    /// helper (it runs as root); flashcp opens or creates it after the privilege drop.
+    Pull {
+        dev: DevName,
+        expect: String,
+        from: Option<String>,
+        existing: Existing,
+        dest: String,
+    },
+}
+
+/// How the helper opens the device for a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// `O_RDONLY`: `info` only reads the boot region, briefly.
+    Read,
+    /// `O_RDONLY|O_EXCL`: `pull` reads the whole volume and must see it stay unmounted and
+    /// unclaimed for the whole run (see SECURITY-NOTES.md).
+    ReadExclusive,
+    /// `O_RDWR|O_EXCL`: `add` and `build`.
+    WriteExclusive,
 }
 
 /// `flashcp-trust <dev> --expect <key>`.
@@ -75,19 +120,30 @@ pub fn info_args() -> Vec<String> {
 impl Request {
     pub fn dev(&self) -> &DevName {
         match self {
-            Request::Add { dev, .. } | Request::Build { dev, .. } | Request::Info { dev, .. } => dev,
+            Request::Add { dev, .. }
+            | Request::Build { dev, .. }
+            | Request::Info { dev, .. }
+            | Request::Pull { dev, .. } => dev,
         }
     }
 
     pub fn expect(&self) -> &str {
         match self {
-            Request::Add { expect, .. } | Request::Build { expect, .. } | Request::Info { expect, .. } => expect,
+            Request::Add { expect, .. }
+            | Request::Build { expect, .. }
+            | Request::Info { expect, .. }
+            | Request::Pull { expect, .. } => expect,
         }
     }
 
-    /// `info` only reads; everything else needs a writable, exclusive open.
-    pub fn writes(&self) -> bool {
-        !matches!(self, Request::Info { .. })
+    /// `info` reads briefly, `pull` reads but holds the device exclusively, `add` and `build`
+    /// write and hold it exclusively.
+    pub fn access(&self) -> Access {
+        match self {
+            Request::Info { .. } => Access::Read,
+            Request::Pull { .. } => Access::ReadExclusive,
+            Request::Add { .. } | Request::Build { .. } => Access::WriteExclusive,
+        }
     }
 
     /// The exact argvs (without argv[0]) of the flashcp runs, in order: one per item for `add`,
@@ -116,6 +172,19 @@ impl Request {
                 vec![v]
             }
             Request::Info { .. } => vec![info_args()],
+            Request::Pull { from, existing, dest, .. } => {
+                let mut v = vec!["pull".to_string(), "--target-fd".into(), TARGET_FD.to_string(), dest.clone()];
+                if let Some(f) = from {
+                    v.extend(["--from".into(), f.clone()]);
+                }
+                match existing {
+                    Existing::Fail => {}
+                    Existing::Skip => v.push("--skip-existing".into()),
+                    Existing::Overwrite => v.push("--overwrite".into()),
+                }
+                v.push("--json".into());
+                vec![v]
+            }
         }
     }
 }
@@ -201,6 +270,25 @@ pub fn parse(args: &[OsString]) -> Result<Request, String> {
             }
             Ok(Request::Info { dev, expect: expect.ok_or("info requires --expect")? })
         }
+        "pull" => {
+            let (mut from, mut existing, mut dest) = (None, None, None);
+            while let Some(f) = it.next() {
+                match f {
+                    "--expect" => once(&mut expect, f, val(&mut it, f).and_then(check_key))?,
+                    "--from" => once(&mut from, f, val(&mut it, f).and_then(check_from))?,
+                    "--skip-existing" | "--overwrite" if existing.is_some() => {
+                        return Err("give at most one of --skip-existing and --overwrite".into())
+                    }
+                    "--skip-existing" => existing = Some(Existing::Skip),
+                    "--overwrite" => existing = Some(Existing::Overwrite),
+                    s if s.starts_with('/') && dest.is_none() => dest = Some(check_dest(s)?),
+                    _ => return Err("unexpected argument for pull".into()),
+                }
+            }
+            let expect = expect.ok_or("pull requires --expect")?;
+            let dest = dest.ok_or("pull requires a destination directory")?;
+            Ok(Request::Pull { dev, expect, from, existing: existing.unwrap_or(Existing::Fail), dest })
+        }
         _ => Err("unknown operation".into()),
     }
 }
@@ -279,6 +367,36 @@ fn check_to(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
+/// `pull`'s local destination directory. The helper runs as root, so it deliberately does NOT
+/// look at this path (no stat, no ownership or permission check, no canonicalisation): any such
+/// check would be a root-side check of a user-controlled path, racy and confusable through
+/// symlinks. It only makes sure the value is an unambiguous path argument (absolute, so it can
+/// never parse as a flag, and resolves the same with flashcp's cwd `/`). flashcp opens or creates
+/// it after the privilege drop, so the kernel applies the invoking user's own rights.
+fn check_dest(s: &str) -> Result<String, String> {
+    if !s.starts_with('/') {
+        return Err("destination must be an absolute path".into());
+    }
+    if s.contains('\0') || s.len() > MAX_SRC {
+        return Err("destination path is invalid or too long".into());
+    }
+    Ok(s.to_string())
+}
+
+/// `pull --from`: a folder inside the volume, relative to its root, in canonical form:
+/// non-empty components separated by single `/`, none `.` or `..`, no leading `/` or `-` (so it
+/// can never be read as a flag), no control characters, at most 1024 bytes.
+pub fn check_from(s: &str) -> Result<String, String> {
+    let bad = || "--from must be a relative folder on the drive, like \"Photos/2026\"".to_string();
+    if s.is_empty() || s.len() > MAX_TO || s.starts_with('-') || s.chars().any(char::is_control) {
+        return Err(bad());
+    }
+    if s.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
+        return Err(bad());
+    }
+    Ok(s.to_string())
+}
+
 /// Volume label. A leading `-` is refused so flashcp's argument parser can never read it as
 /// a flag.
 fn check_label(s: &str) -> Result<String, String> {
@@ -318,7 +436,7 @@ mod tests {
         let r = p(&["add", "/dev/sdb1", "--expect", "SER1", "--item", "/home/u/a", "/Photos", "--item", "/b c", "/"])
             .unwrap();
         assert_eq!(r.expect(), "SER1");
-        assert!(r.writes());
+        assert_eq!(r.access(), Access::WriteExclusive);
         assert_eq!(
             r.flashcp_runs(),
             [
@@ -364,9 +482,119 @@ mod tests {
         );
         assert_eq!(r.flashcp_runs(), [vec!["build", "/d", "--target-fd", "3", "--yes-erase", "--json"]]);
         let r = p(&["info", "/dev/sdz9", "--expect", "S"]).unwrap();
-        assert!(!r.writes());
+        assert_eq!(r.access(), Access::Read);
         assert_eq!(r.flashcp_runs(), [vec!["info", "--target-fd", "3", "--json"]]);
         assert_eq!(info_args(), ["info", "--target-fd", "3", "--json"]);
+    }
+
+    #[test]
+    fn pull_shapes() {
+        let r = p(&["pull", "/dev/sdb1", "--expect", "S", "/home/u/Downloads/STICK-2026-11-09"]).unwrap();
+        assert_eq!(r.access(), Access::ReadExclusive);
+        assert_eq!(
+            r,
+            Request::Pull {
+                dev: parse_dev("/dev/sdb1").unwrap(),
+                expect: "S".into(),
+                from: None,
+                existing: Existing::Fail,
+                dest: "/home/u/Downloads/STICK-2026-11-09".into()
+            }
+        );
+        assert_eq!(
+            r.flashcp_runs(),
+            [vec!["pull", "--target-fd", "3", "/home/u/Downloads/STICK-2026-11-09", "--json"]]
+        );
+        // Flag order does not matter; the flashcp argv is always built in one fixed order.
+        assert_eq!(
+            runs(&["pull", "/dev/sdc", "/d e", "--skip-existing", "--from", "DCIM/100 CANON", "--expect", "K"]),
+            [vec!["pull", "--target-fd", "3", "/d e", "--from", "DCIM/100 CANON", "--skip-existing", "--json"]]
+        );
+        assert_eq!(
+            runs(&["pull", "/dev/sdc", "--expect", "K", "--overwrite", "/d", "--from", "ä"]),
+            [vec!["pull", "--target-fd", "3", "/d", "--from", "ä", "--overwrite", "--json"]]
+        );
+        // The destination is passed through as given: the helper never resolves it as root.
+        assert_eq!(runs(&["pull", "/dev/sdc", "--expect", "K", "/a/../b"])[0][3], "/a/../b");
+        let long = format!("/{}", "a".repeat(MAX_SRC - 1));
+        assert!(p(&["pull", "/dev/sdc", "--expect", "K", &long]).is_ok());
+        let f = "a".repeat(MAX_TO);
+        assert!(p(&["pull", "/dev/sdc", "--expect", "K", "--from", &f, "/d"]).is_ok());
+    }
+
+    #[test]
+    fn pull_bad_args_rejected() {
+        let cases: &[&[&str]] = &[
+            &["pull", "/dev/sdb1"],
+            &["pull", "/dev/sdb1", "/d"],
+            &["pull", "/dev/sdb1", "--expect", "S"],
+            &["pull", "/dev/sdb1", "--expect", "S", "d"],
+            &["pull", "/dev/sdb1", "--expect", "S", "./d"],
+            &["pull", "/dev/sdb1", "--expect", "S", "-d"],
+            &["pull", "/dev/sdb1", "--expect", "S", "~/d"],
+            &["pull", "/dev/sdb1", "--expect", "S", ""],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d\0x"],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d", "/e"],
+            &["pull", "/dev/sdb1", "--expect", "S", "--expect", "S", "/d"],
+            &["pull", "/dev/sdb1", "--expect=S", "/d"],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d", "--skip-existing", "--overwrite"],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d", "--overwrite", "--skip-existing"],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d", "--skip-existing", "--skip-existing"],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d", "--overwrite", "--overwrite"],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d", "--from"],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d", "--from", "A", "--from", "B"],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d", "--from=A"],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d", "--target-fd", "5"],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d", "--json"],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d", "--chunk-kb", "1"],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d", "--item", "/x", "/"],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d", "--to", "/"],
+            &["pull", "/dev/sdb1", "--expect", "S", "/d", "--yes-erase"],
+            &["PULL", "/dev/sdb1", "--expect", "S", "/d"],
+            &["pull", "/dev/nvme0n1", "--expect", "S", "/d"],
+        ];
+        for c in cases {
+            assert!(p(c).is_err(), "{c:?} accepted");
+        }
+        let long = format!("/{}", "a".repeat(MAX_SRC));
+        assert!(p(&["pull", "/dev/sdc", "--expect", "K", &long]).is_err());
+        let e = p(&["pull", "/dev/sdb1", "--expect", "S"]).unwrap_err();
+        assert!(e.contains("destination"), "{e}");
+        let e = p(&["pull", "/dev/sdb1", "/d"]).unwrap_err();
+        assert!(e.contains("--expect"), "{e}");
+    }
+
+    #[test]
+    fn pull_from_must_be_relative_and_canonical() {
+        for ok in ["DCIM", "DCIM/100CANON", "a b/c", "ä/ö", "a-b", "a/-b", ".hidden", "a/..b", "..."] {
+            assert_eq!(check_from(ok).unwrap(), ok, "{ok:?}");
+        }
+        let long = "a".repeat(MAX_TO + 1);
+        for bad in [
+            "",
+            "/",
+            "/DCIM",
+            "DCIM/",
+            "a//b",
+            ".",
+            "./a",
+            "a/.",
+            "..",
+            "../a",
+            "a/..",
+            "a/../b",
+            "-a",
+            "--x",
+            "a\nb",
+            "a\tb",
+            "a\0b",
+            "a\u{7f}",
+            "\u{1b}[31m",
+            &long,
+        ] {
+            assert!(check_from(bad).is_err(), "{bad:?} accepted");
+            assert!(p(&["pull", "/dev/sdb", "--expect", "S", "--from", bad, "/d"]).is_err(), "{bad:?} accepted");
+        }
     }
 
     #[test]
