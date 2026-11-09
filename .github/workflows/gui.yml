@@ -62,12 +62,31 @@ jobs:
           # that are not ours to fix, so this one is informational only.
           desktop-file-validate packaging/desktop/flashcp-dolphin.desktop || \
             echo "::warning::flashcp-dolphin.desktop does not pass desktop-file-validate (expected for KDE service menus)"
+          desktop-file-validate packaging/desktop/flashcp-dolphin-pull.desktop || \
+            echo "::warning::flashcp-dolphin-pull.desktop does not pass desktop-file-validate (expected for KDE service menus)"
       - name: Validate Nautilus extension and polkit policy
         run: |
           set -eux
           python3 -m py_compile packaging/desktop/flashcp_nautilus.py
+          python3 -m py_compile packaging/desktop/test_flashcp_nautilus.py
           xmllint --noout packaging/desktop/io.github.zuhuhix.flashcp.helper.policy
           xmllint --noout packaging/desktop/io.github.zuhuhix.flashcp.trust.policy
+      - name: Nautilus extension unit tests
+        run: python3 -m unittest discover -s packaging/desktop -p 'test_*.py' -v
+      - name: Validate Nemo and Dolphin actions
+        run: |
+          set -eux
+          shopt -s nullglob
+          for action in packaging/desktop/*.nemo_action; do
+            grep -qE '^Name=.+' "$action" || { echo "::error::$action has no Name"; exit 1; }
+            grep -qE '^Selection=.+' "$action" || { echo "::error::$action has no Selection"; exit 1; }
+            grep -qE '^Exec=.+' "$action" || { echo "::error::$action has no Exec"; exit 1; }
+          done
+          for action in packaging/desktop/flashcp-pull*.nemo_action; do
+            grep -qE '^Exec=flashcp-gui --pull %[FP]$' "$action" || { echo "::error::$action Exec must run flashcp-gui --pull"; exit 1; }
+          done
+          grep -qE '^Exec=flashcp-gui --pull %f$' packaging/desktop/flashcp-dolphin-pull.desktop
+          grep -qE '^X-KDE-RequiredNumberOfUrls=1$' packaging/desktop/flashcp-dolphin-pull.desktop
 
   deb:
     name: build .deb
@@ -107,7 +126,9 @@ jobs:
             ./usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.helper.policy \
             ./etc/xdg/autostart/flashcp-gui.desktop \
             ./usr/share/nemo/actions/flashcp.nemo_action \
+            ./usr/share/nemo/actions/flashcp-pull.nemo_action \
             ./usr/share/kio/servicemenus/flashcp.desktop \
+            ./usr/share/kio/servicemenus/flashcp-pull.desktop \
             ./usr/share/nautilus-python/extensions/flashcp_nautilus.py \
             ./usr/bin/flashcp-gui; do
             # Tauri's tar lists paths without a leading "./"; accept both spellings.
