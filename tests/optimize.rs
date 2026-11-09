@@ -67,6 +67,38 @@ fn digest(path: &Path) -> (u64, u64) {
     (len, h.finish())
 }
 
+/// Gives the owner write permission on everything under `p` (optimize leaves its temp copy
+/// read-only), then removes it.
+fn remove_all(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fn walk(p: &Path) {
+        let Ok(md) = fs::symlink_metadata(p) else { return };
+        if md.is_dir() {
+            let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o700));
+            for e in fs::read_dir(p).unwrap() {
+                walk(&e.unwrap().path());
+            }
+        }
+    }
+    walk(p);
+    fs::remove_dir_all(p).unwrap_or_else(|e| panic!("remove {}: {e}", p.display()));
+}
+
+/// Flips (xor 0x5A) the first byte of a file of the read-only temp copy, keeping its mode and
+/// mtime: what the FLASHCP_TEST_OPTIMIZE_TAMPER hook does, so calling it again restores it.
+fn flip_first_byte(p: &Path) {
+    use std::os::unix::fs::{FileExt, PermissionsExt};
+    let md = fs::metadata(p).unwrap();
+    fs::set_permissions(p, fs::Permissions::from_mode(0o600)).unwrap();
+    let f = fs::OpenOptions::new().read(true).write(true).open(p).unwrap();
+    let mut b = [0u8];
+    f.read_exact_at(&mut b, 0).unwrap();
+    f.write_all_at(&[b[0] ^ 0x5A], 0).unwrap();
+    f.set_modified(md.modified().unwrap()).unwrap();
+    drop(f);
+    fs::set_permissions(p, md.permissions()).unwrap();
+}
+
 fn run_ok(cmd: &mut Command, what: &str) {
     assert_success(&cmd.output().unwrap_or_else(|e| panic!("run {what}: {e}")), what);
 }
@@ -207,7 +239,7 @@ fn round_trip_keeps_everything_and_changes_the_layout() {
     // --force rebuilds anyway, and the result is still right.
     optimize_ok(&s, &["--yes", "--force"]);
     assert_optimized(&s);
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 #[test]
@@ -237,7 +269,7 @@ fn json_event_sequence() {
     assert!(done.starts_with(&format!(r#"{{"event":"done","files":{files},"bytes":{bytes},"#)), "{done}");
     assert_eq!(lines.iter().filter(|l| l.contains(r#""event":"plan""#)).count(), 1);
     assert_optimized(&s);
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 // ───────────────────────── refusals: nothing written ─────────────────────────
@@ -254,7 +286,7 @@ fn dry_run_and_missing_yes_write_nothing() {
     let e = optimize_fails(&s, &[], &[]);
     assert!(e.contains("--yes") && e.contains("nothing was changed"), "{e}");
     assert_eq!(digest(&s.img), before);
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 #[test]
@@ -266,7 +298,7 @@ fn refuses_without_temp_space() {
     assert!(e.contains("nothing was changed"), "{e}");
     assert_eq!(digest(&s.img), before, "image changed");
     assert!(temp_dirs(&s).is_empty());
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 #[test]
@@ -291,13 +323,32 @@ fn refuses_tmpfs_unless_given_with_temp() {
     assert!(!out.status.success(), "accepted tmpfs");
     assert!(e.contains(&format!("{} is in RAM (tmpfs)", ram.display())), "{e}");
     assert_eq!(digest(&s.img), before);
-    // Explicitly given, it is used (with a warning).
-    let out = optimize(&s, &["--dry-run", "--temp", ram.to_str().unwrap()], &[]);
+    assert!(e.contains("--temp-volatile-i-accept-data-loss"), "{e}");
+    // Explicitly given, a dry run shows the plan (with a warning that a real run refuses it).
+    let r = ram.to_str().unwrap();
+    let out = optimize(&s, &["--dry-run", "--temp", r], &[]);
     assert_success(&out, "optimize --temp tmpfs --dry-run");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("warning"), "no tmpfs warning");
+    let warn = String::from_utf8_lossy(&out.stderr);
+    assert!(warn.contains("warning") && warn.contains("refuses it without"), "no tmpfs warning: {warn}");
     assert!(String::from_utf8_lossy(&out.stdout).contains(&ram.display().to_string()));
+    // A real run with an explicit tmpfs --temp is refused: a crash would lose the data.
+    let e = optimize_fails(&s, &["--yes", "--temp", r], &[]);
+    assert!(e.contains("is in RAM (tmpfs)") && e.contains("lose this copy"), "{e}");
+    assert!(e.contains("--temp-volatile-i-accept-data-loss") && e.contains("nothing was changed"), "{e}");
+    assert_eq!(digest(&s.img), before);
+    // The flag needs --temp.
+    let e = optimize_fails(&s, &["--yes", "--temp-volatile-i-accept-data-loss"], &[]);
+    assert!(e.contains("--temp"), "{e}");
+    assert_eq!(digest(&s.img), before);
+    // With the flag it is used, with the warning.
+    let out = optimize(&s, &["--yes", "--temp", r, "--temp-volatile-i-accept-data-loss"], &[]);
+    assert_success(&out, "optimize --temp tmpfs --temp-volatile-i-accept-data-loss");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("are lost"), "no tmpfs warning");
+    assert!(fs::read_dir(&ram).unwrap().next().is_none(), "temp copy left in {}", ram.display());
+    fsck_clean(&s.img);
+    same_tree(&s, &read_ok(&s.img), "after optimize via tmpfs");
     fs::remove_dir_all(&ram).unwrap();
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 #[test]
@@ -309,7 +360,7 @@ fn corrupted_temp_copy_is_caught_by_verify() {
     assert!(e.contains("untouched"), "{e}");
     assert_eq!(digest(&s.img), before, "image changed");
     assert!(temp_dirs(&s).is_empty(), "temp copy kept");
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 // ───────────────────────── crashes at every phase ─────────────────────────
@@ -359,7 +410,7 @@ fn crash_then_resume(name: &str, env: &[(&str, &str)], point: &str, aborted: boo
         assert!(text.contains("interrupted optimize"), "resume not reported:\n{text}");
     }
     assert_optimized(&s);
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 macro_rules! crash_tests {
@@ -413,7 +464,7 @@ fn resume_refuses_a_drive_written_since() {
     assert!(!e.contains("flashcp build") && !e.contains("otherwise delete"), "{e}");
     assert_eq!(digest(&s.img), before, "a foreign volume was written");
     assert_eq!(the_temp_dir(&s), t, "temp copy removed");
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 /// Sets VolumeDirty in the main boot sector (as a camera or Windows does while mounted, and
@@ -448,7 +499,7 @@ fn resume_refuses_the_original_volume_left_dirty() {
     assert!(!e.contains("flashcp build"), "{e}");
     assert_eq!(digest(&s.img), before, "a dirty original volume was overwritten");
     assert_eq!(the_temp_dir(&s), t, "temp copy removed");
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 /// state=building, then the drive was reformatted (another exFAT serial) or overwritten with
@@ -474,7 +525,7 @@ fn resume_refuses_a_reformatted_or_foreign_drive() {
     assert_eq!(digest(&s.img), before, "a foreign drive was written");
     assert_eq!(the_temp_dir(&s), t, "temp copy removed");
     assert_eq!(state_of(&t), "building");
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 /// The build finished (clean, our serial) but the check never ran; then files were added. Our
@@ -493,7 +544,7 @@ fn resume_refuses_our_finished_volume_written_since() {
     assert!(e.contains("the interrupted optimize built") && e.contains("will not erase it"), "{e}");
     assert_eq!(digest(&s.img), before, "a volume written since was overwritten");
     assert_eq!(the_temp_dir(&s), t);
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 /// Our serial and dirty (a half-written build, or ours left dirty): rebuilt from the copy.
@@ -507,7 +558,7 @@ fn resume_rebuilds_our_dirty_volume() {
     let out = optimize_ok(&s, &["--yes"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("unfinished rebuild"), "not rebuilt");
     assert_optimized(&s);
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 /// A temp dir locked by another run is neither resumed nor removed.
@@ -526,7 +577,7 @@ fn resume_refuses_a_temp_dir_locked_by_another_run() {
     drop(lock);
     optimize_ok(&s, &["--yes"]);
     assert_optimized(&s);
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 /// An image attached to a loop device between phases (losetup ignores our flock): stopped
@@ -542,7 +593,7 @@ fn loop_device_attached_between_phases_stops_the_run() {
         assert_eq!(state_of(&the_temp_dir(&s)), "building");
         optimize_ok(&s, &["--yes"]);
         assert_optimized(&s);
-        fs::remove_dir_all(&s.dir).unwrap();
+        remove_all(&s.dir);
     }
 }
 
@@ -557,7 +608,7 @@ fn resume_refuses_a_missing_manifest() {
     assert!(e.contains("manifest") && e.contains("missing or damaged") && e.contains("flashcp build"), "{e}");
     assert_eq!(digest(&s.img), before);
     assert!(t.join("tree").is_dir(), "copy removed");
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 #[test]
@@ -565,16 +616,13 @@ fn resume_refuses_a_temp_copy_damaged_after_the_crash() {
     let s = stick("opt_resume_damaged");
     optimize_fails(&s, &["--yes"], &[("FLASHCP_TEST_BUILD_ABORT_AT", "3000000")]);
     let t = the_temp_dir(&s);
-    let f = t.join("tree/docs/café.txt");
-    let mut b = fs::read(&f).unwrap();
-    b[0] ^= 1;
-    fs::write(&f, b).unwrap();
+    flip_first_byte(&t.join("tree/docs/café.txt"));
     let before = digest(&s.img);
     let e = optimize_fails(&s, &["--yes"], &[]);
     assert!(e.contains("no longer matches its manifest") && e.contains("docs/café.txt"), "{e}");
     assert_eq!(digest(&s.img), before, "a damaged copy was written");
     assert!(t.join("tree").is_dir());
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 // ───────────────────────── chains out of physical order, ValidDataLength ─────────────────────────
@@ -648,7 +696,7 @@ fn chained_out_of_order_and_valid_data_length_survive() {
     let s = crafted_stick("opt_crafted");
     optimize_ok(&s, &["--yes"]);
     assert_optimized(&s);
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 // ───────────────────────── the device is read once ─────────────────────────
@@ -695,17 +743,17 @@ fn pull_stream_manifest_equals_device_manifest_on_a_built_image() {
     }
     let s = Stick { orig: snapshot(&read_ok(&img)), base: dir.join("tmpbase"), dir, img };
     pull_hash_equals_device_hash(&s, &[]);
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 #[test]
 fn pull_stream_manifest_equals_device_manifest_on_a_fragmented_image() {
     let s = crafted_stick("opt_hash_crafted");
     pull_hash_equals_device_hash(&s, &[]);
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
     let s = stick("opt_hash_stick");
     pull_hash_equals_device_hash(&s, &[]);
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
 }
 
 #[test]
@@ -719,5 +767,138 @@ fn verify_does_not_read_the_drive_again() {
     assert!(r["pull"] > 0 && r["check"] > 0, "{r:?}");
     assert_eq!(r["verify"], 0, "verify read the drive again: {r:?}");
     assert_optimized(&s);
-    fs::remove_dir_all(&s.dir).unwrap();
+    remove_all(&s.dir);
+}
+
+// ───────────────────────── the copy changes after verify ─────────────────────────
+
+fn mode(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+}
+
+/// After verify the copy is read-only (files 0400, dirs 0500, the temp dir 0700), it is on disk
+/// (syncfs) before the device is first written, and the cleanup still removes it.
+#[test]
+fn verified_copy_is_read_only_and_synced_before_the_device_is_written() {
+    let s = stick("opt_sealed");
+    optimize_fails(&s, &["--yes"], &[("FLASHCP_TEST_OPTIMIZE_STOP", "verify")]);
+    assert!(temp_dirs(&s).is_empty(), "temp copy kept after a failure before the build");
+    optimize_fails(&s, &["--yes"], &[("FLASHCP_TEST_OPTIMIZE_STOP", "building")]);
+    let t = the_temp_dir(&s);
+    assert_eq!(mode(&t), 0o700, "temp dir");
+    let (mut files, mut dirs) = (0, 0);
+    let mut stack = vec![t.join("tree")];
+    while let Some(d) = stack.pop() {
+        assert_eq!(mode(&d), 0o500, "{}", d.display());
+        dirs += 1;
+        for e in fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if fs::symlink_metadata(&p).unwrap().is_dir() {
+                stack.push(p);
+            } else {
+                assert_eq!(mode(&p), 0o400, "{}", p.display());
+                files += 1;
+            }
+        }
+    }
+    assert!(files > 100 && dirs > 5, "{files} files, {dirs} dirs");
+    // Resume: the temp filesystem is synced before the first device write; cleanup removes the
+    // read-only copy.
+    let out = optimize(&s, &["--yes"], &[("FLASHCP_TEST_TRACE_READS", "1")]);
+    assert_success(&out, "flashcp optimize (resume)");
+    let err = String::from_utf8_lossy(&out.stderr);
+    let synced = err.find("flashcp-temp-synced").expect("temp fs not synced");
+    let written = err.find("flashcp-device-write").expect("no device write traced");
+    assert!(synced < written, "device written before the temp copy was synced");
+    assert_optimized(&s);
+    remove_all(&s.dir);
+}
+
+/// The image's main boot region is zeros (an unmountable volume) and the backup carries the
+/// serial the interrupted optimize saved, so a re-run knows the drive as its own.
+fn assert_unfinished_rebuild(s: &Stick, t: &Path) {
+    let b = fs::read(&s.img).unwrap();
+    assert!(b[..12 * 512].iter().all(|&x| x == 0), "main boot region written before the end");
+    assert_eq!(&b[12 * 512 + 3..12 * 512 + 11], b"EXFAT   ", "no backup boot sector");
+    assert_eq!(le32(&b, 12 * 512 + 100), saved_serial(t), "backup boot sector without our serial");
+    assert!(exfat_reader::read_volume(&s.img).is_err(), "an aborted build reads as a volume");
+    if let Ok(o) = Command::new("fsck.exfat").arg("-n").arg(&s.img).output() {
+        assert!(!o.status.success(), "fsck.exfat accepts an aborted build");
+    }
+}
+
+/// `tamper` changes a file of the verified copy after verify (contents only: same size, mode
+/// and mtime). The build must notice, stop, keep the copy and say how to recover; the drive is
+/// left unmountable; a re-run refuses the changed copy; once the file is restored, it finishes.
+fn changed_copy_is_caught(name: &str, s: &Stick, tamper: &str, rel: &str) {
+    let before = digest(&s.img);
+    let e = optimize_fails(s, &["--yes"], &[("FLASHCP_TEST_OPTIMIZE_TAMPER", tamper)]);
+    assert!(e.contains("changed after it was verified") && e.contains(rel), "{name}: {e}");
+    assert!(e.contains("restore it") && e.contains("re-run `flashcp optimize`"), "{name}: {e}");
+    assert!(e.contains("flashcp add") && e.contains("/tree") && e.contains("after formatting"), "{name}: {e}");
+    assert_ne!(digest(&s.img), before, "{name}: the build never started");
+    let t = the_temp_dir(s);
+    assert_eq!(state_of(&t), "building");
+    assert!(t.join("manifest").is_file(), "{name}: manifest removed");
+    assert_unfinished_rebuild(s, &t);
+    // Not restored: refused, nothing written.
+    let now = digest(&s.img);
+    let e = optimize_fails(s, &["--yes"], &[]);
+    assert!(e.contains("no longer matches its manifest") && e.contains(rel), "{name}: {e}");
+    assert_eq!(digest(&s.img), now, "{name}: a changed copy was written");
+    // Restored: the re-run recognizes its unfinished rebuild and completes it.
+    flip_first_byte(&t.join("tree").join(rel));
+    let out = optimize_ok(s, &["--yes"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unfinished rebuild"), "{name}: not resumed");
+    assert_optimized(s);
+}
+
+/// Changed between verify and the build: a small file, read into memory for the build.
+#[test]
+fn copy_changed_between_verify_and_build_stops_the_build() {
+    let s = stick("opt_changed_before_build");
+    changed_copy_is_caught("before the build", &s, "docs/café.txt", "docs/café.txt");
+    remove_all(&s.dir);
+}
+
+/// Changed while the build runs (after the first file went to the device): a file big enough
+/// to be streamed from the copy straight into the device buffers.
+#[test]
+fn copy_changed_during_the_build_stops_the_build() {
+    let mut s = stick("opt_changed_mid_build");
+    let big = s.dir.join("big");
+    write_random(&big.join("zz/zz/streamed.bin"), 20 * MB, 77);
+    run_ok(flashcp().arg("add").arg(&big).arg(&s.img), "flashcp add (big)");
+    s.orig = snapshot(&read_ok(&s.img));
+    changed_copy_is_caught("mid-build", &s, "1:zz/zz/streamed.bin", "zz/zz/streamed.bin");
+    remove_all(&s.dir);
+}
+
+/// Plain `flashcp build` keeps its behaviour: an interrupted build leaves the main boot sector
+/// written, saying VolumeDirty (not zeros), and a finished one is clean.
+#[test]
+fn plain_build_still_marks_dirty_until_done() {
+    let dir = test_dir("opt_plain_build");
+    let src = dir.join("src");
+    make_tricky_tree(&src);
+    let img = dir.join("disk.img");
+    make_image(&img, 64 * MB);
+    let out = flashcp()
+        .arg("build")
+        .arg(&src)
+        .arg(&img)
+        .arg("--yes-erase")
+        .env("FLASHCP_TEST_BUILD_ABORT_AT", "3000000")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the abort hook did not fire");
+    let b = fs::read(&img).unwrap();
+    assert_eq!(&b[3..11], b"EXFAT   ", "main boot sector not written first");
+    assert_eq!(b[106] & 2, 2, "an interrupted build is not marked dirty");
+    assert_success(&common::run_build(&src, &img, &[]), "flashcp build");
+    let b = fs::read(&img).unwrap();
+    assert_eq!(b[106] & 2, 0, "a finished build is dirty");
+    fsck_clean(&img);
+    remove_all(&dir);
 }
