@@ -1,10 +1,13 @@
 name: Release
 
 # Tag pushes (v*) build, smoke-test and publish a GitHub release.
-# Dispatch runs build and smoke-test everything but never publish.
+# Dispatch runs, and PRs that touch this file, build and smoke-test
+# everything but never publish.
 on:
   push:
     tags: ['v*']
+  pull_request:
+    paths: ['.github/workflows/release.yml']
   workflow_dispatch:
     inputs:
       dry_run:
@@ -165,7 +168,7 @@ jobs:
           if-no-files-found: error
 
       - name: Dry run summary
-        if: github.event_name == 'workflow_dispatch'
+        if: ${{ !(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
         run: |
           {
             echo "Dry run: no release published"
