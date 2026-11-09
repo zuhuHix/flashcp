@@ -193,6 +193,36 @@ pub enum Action {
         existing: Existing,
         dest: String,
     },
+    /// Rewrite the exFAT volume in place (flashcp optimize). `dry_run` only plans it.
+    Optimize {
+        dry_run: bool,
+    },
+}
+
+/// A failed job: the message for the user, and the recovery text flashcp gives when the stick may
+/// be half-written (the data is then somewhere else on this computer, and the job must not remount).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobFailure {
+    pub message: String,
+    pub recovery: Option<String>,
+}
+
+impl From<String> for JobFailure {
+    fn from(message: String) -> Self {
+        JobFailure { message, recovery: None }
+    }
+}
+
+/// The local folder optimize keeps its temporary copy in: `$HOME/.cache/flashcp/optimize`.
+pub fn optimize_temp_dir() -> Result<PathBuf, String> {
+    optimize_dir_under(std::env::var_os("HOME"))
+}
+
+fn optimize_dir_under(home: Option<OsString>) -> Result<PathBuf, String> {
+    home.map(PathBuf::from)
+        .filter(|h| h.is_absolute())
+        .map(|h| h.join(".cache").join("flashcp").join("optimize"))
+        .ok_or_else(|| "HOME is not set to a folder, so optimize has nowhere to keep its temporary copy".to_string())
 }
 
 /// One process to run. `covers` has one entry per `done` the process must emit: the number of
@@ -301,6 +331,25 @@ impl Invocation {
                 args.push("--json".to_string());
                 vec![Run { args, covers: vec![1] }]
             }
+            (Invocation::Helper, Action::Optimize { dry_run }) => {
+                let mut args = strings(&[HELPER_PATH, "optimize", device, "--expect", expect]);
+                if *dry_run {
+                    args.push("--dry-run".to_string());
+                }
+                vec![Run { args, covers: vec![1] }]
+            }
+            (Invocation::Direct(_), Action::Optimize { dry_run }) => {
+                // Callers check HOME first (lib.rs), so the empty fallback never reaches flashcp.
+                let temp = optimize_temp_dir().unwrap_or_default();
+                let mut args = strings(&["optimize", "--target-fd", TARGET_FD, "--temp"]);
+                args.push(temp.to_string_lossy().into_owned());
+                args.push("--yes".to_string());
+                if *dry_run {
+                    args.push("--dry-run".to_string());
+                }
+                args.push("--json".to_string());
+                vec![Run { args, covers: vec![1] }]
+            }
         }
     }
 }
@@ -361,7 +410,7 @@ pub fn run_job<F>(
     op: Op,
     env: &[(&str, &str)],
     mut on_update: F,
-) -> Result<JobAggregate, String>
+) -> Result<JobAggregate, JobFailure>
 where
     F: FnMut(JobUpdate),
 {
@@ -391,7 +440,7 @@ where
             })
         });
 
-        let mut failure: Option<String> = None;
+        let mut failure: Option<JobFailure> = None;
         let mut last_emit: Option<Instant> = None;
         if let Some(stdout) = child.stdout.take() {
             for line in BufReader::new(stdout).lines() {
@@ -405,7 +454,7 @@ where
                     Ok(Some(event)) => event,
                     Ok(None) => continue,
                     Err(message) => {
-                        failure = Some(message);
+                        failure = Some(JobFailure { message, recovery: validator.recovery().map(str::to_string) });
                         continue;
                     }
                 };
@@ -416,7 +465,7 @@ where
                         covered += run.covers.get(item).copied().unwrap_or(0);
                         true
                     }
-                    FlashcpEvent::Plan { .. } => true,
+                    FlashcpEvent::Plan { .. } | FlashcpEvent::Phase { .. } => true,
                     FlashcpEvent::Progress { .. } => last_emit.is_none_or(|t| t.elapsed() >= PROGRESS_INTERVAL),
                 };
                 if emit {
@@ -429,18 +478,18 @@ where
             }
         }
 
-        if let Some(message) = failure {
+        if let Some(failure) = failure {
             let _ = child.wait();
-            return Err(user_message(message));
+            return Err(JobFailure { message: user_message(failure.message), recovery: failure.recovery });
         }
         let status: ExitStatus = child.wait().map_err(|e| format!("Waiting for {program} failed: {e}"))?;
         let stderr_text = stderr_reader.and_then(|h| h.join().ok()).unwrap_or_default();
         match validator.finish(status) {
             Ok(()) => {}
             Err(_) if !status.success() => {
-                return Err(user_message(failure_message(program, status.code(), &stderr_text)));
+                return Err(user_message(failure_message(program, status.code(), &stderr_text)).into());
             }
-            Err(message) => return Err(user_message(message)),
+            Err(message) => return Err(user_message(message).into()),
         }
     }
     Ok(agg)
@@ -561,7 +610,7 @@ mod tests {
     }
 
     fn fail(runs: &[Run], env: &[(&str, &str)]) -> String {
-        run_job(FAKE, runs, Op::Add, env, |_| {}).expect_err("the job must fail")
+        run_job(FAKE, runs, Op::Add, env, |_| {}).expect_err("the job must fail").message
     }
 
     // ---- planning ----
@@ -924,7 +973,10 @@ mod tests {
     #[test]
     fn exit_code_without_error_event_fails_the_job() {
         let runs = [run(&["-c", "exit 3"], &[1])];
-        assert_eq!(run_job("/bin/sh", &runs, Op::Add, &[], |_| {}).unwrap_err(), "flashcp exited with status 3");
+        assert_eq!(
+            run_job("/bin/sh", &runs, Op::Add, &[], |_| {}).unwrap_err().message,
+            "flashcp exited with status 3"
+        );
     }
 
     #[test]
@@ -932,7 +984,7 @@ mod tests {
         let script = r#"echo '{"event":"error","message":"flashcp-helper: drive not trusted: FAKE0001"}'; exit 3"#;
         let runs = [run(&["-c", script], &[1])];
         assert_eq!(
-            run_job("/bin/sh", &runs, Op::Add, &[], |_| {}).unwrap_err(),
+            run_job("/bin/sh", &runs, Op::Add, &[], |_| {}).unwrap_err().message,
             "This drive isn't trusted yet. Use “Trust this drive…” first."
         );
     }
@@ -963,7 +1015,7 @@ mod tests {
     }
 
     fn pull_job(runs: &[Run], env: &[(&str, &str)]) -> Result<JobAggregate, String> {
-        run_job(FAKE, runs, Op::Pull, env, |_| {})
+        run_job(FAKE, runs, Op::Pull, env, |_| {}).map_err(|f| f.message)
     }
 
     #[test]
@@ -1024,7 +1076,160 @@ mod tests {
     #[test]
     fn missing_program_is_an_error() {
         let err = run_job("/nonexistent/flashcp-binary", &[run(&["info"], &[1])], Op::Add, &[], |_| {})
-            .expect_err("cannot start");
+            .expect_err("cannot start")
+            .message;
         assert!(err.starts_with("Cannot start /nonexistent/flashcp-binary"));
+    }
+
+    // ---- optimize ----
+
+    fn optimize_action(dry_run: bool) -> Action {
+        Action::Optimize { dry_run }
+    }
+
+    fn optimize_runs(dry_run: bool) -> Vec<Run> {
+        Invocation::Direct(FAKE.into()).runs("/dev/sdz1", "FAKE0001", &optimize_action(dry_run))
+    }
+
+    fn optimize_job(mode: &str, dry_run: bool, updates: &mut Vec<JobUpdate>) -> Result<JobAggregate, JobFailure> {
+        let runs = optimize_runs(dry_run);
+        run_job(FAKE, &runs, Op::Optimize, &[("FAKE_FLASHCP_MODE", mode), FAST], |u| updates.push(u))
+    }
+
+    /// The phases in the order they started: (name, step, steps). Asserts each starts from zero.
+    fn phase_starts(updates: &[JobUpdate]) -> Vec<(String, u32, u32)> {
+        let mut out = Vec::new();
+        let mut last: Option<String> = None;
+        for u in updates {
+            if u.phase != last {
+                if let Some(p) = &u.phase {
+                    assert_eq!(u.files_done, 0, "a new phase starts from zero");
+                    out.push((p.clone(), u.step, u.steps));
+                }
+                last = u.phase.clone();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn helper_optimize_argv_dry_and_real() {
+        let dev = "/dev/sdz1";
+        let real = Invocation::Helper.runs(dev, "FAKE0001", &optimize_action(false));
+        assert_eq!(real.len(), 1, "one helper run per job");
+        assert_eq!(real[0].args, s(&[HELPER_PATH, "optimize", dev, "--expect", "FAKE0001"]));
+        assert_eq!(real[0].covers, vec![1]);
+        let dry = Invocation::Helper.runs(dev, "FAKE0001", &optimize_action(true));
+        assert_eq!(dry[0].args, s(&[HELPER_PATH, "optimize", dev, "--expect", "FAKE0001", "--dry-run"]));
+    }
+
+    #[test]
+    fn direct_optimize_argv_dry_and_real() {
+        let temp = optimize_temp_dir().unwrap().to_string_lossy().into_owned();
+        let direct = Invocation::Direct("/fake".into());
+        let real = direct.runs("/dev/sdz1", "FAKE0001", &optimize_action(false));
+        assert_eq!(real[0].args, s(&["optimize", "--target-fd", "3", "--temp", temp.as_str(), "--yes", "--json"]));
+        assert_eq!(real[0].covers, vec![1]);
+        let dry = direct.runs("/dev/sdz1", "FAKE0001", &optimize_action(true));
+        assert_eq!(
+            dry[0].args,
+            s(&["optimize", "--target-fd", "3", "--temp", temp.as_str(), "--yes", "--dry-run", "--json"])
+        );
+    }
+
+    #[test]
+    fn optimize_temp_dir_is_under_home_and_needs_an_absolute_home() {
+        assert_eq!(optimize_dir_under(Some("/h".into())).unwrap(), PathBuf::from("/h/.cache/flashcp/optimize"));
+        assert!(optimize_dir_under(None).is_err());
+        assert!(optimize_dir_under(Some("rel".into())).is_err());
+    }
+
+    #[test]
+    fn optimize_direct_argv_reaches_flashcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let log_s = log.to_string_lossy().into_owned();
+        let temp = optimize_temp_dir().unwrap().to_string_lossy().into_owned();
+        let runs = optimize_runs(true);
+        let env = [("FAKE_FLASHCP_LOG", log_s.as_str()), FAST];
+        run_job(FAKE, &runs, Op::Optimize, &env, |_| {}).expect("dry run succeeds");
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            format!("optimize\n--target-fd\n3\n--temp\n{temp}\n--yes\n--dry-run\n--json\n--\n")
+        );
+    }
+
+    #[test]
+    fn optimize_phases_reset_progress_and_reach_the_updates() {
+        let mut updates = Vec::new();
+        let agg = optimize_job("normal", false, &mut updates).expect("fake optimize succeeds");
+        assert_eq!(agg.finished_files(), 100);
+        let plan = agg.plan().expect("the plan is remembered");
+        assert_eq!((plan.files, plan.dirs, plan.write_bytes), (100, 5, 52_000_000));
+        assert_eq!(plan.strategy.as_ref().unwrap()["new_cluster"], 4096);
+        let phases = phase_starts(&updates);
+        let names: Vec<(&str, u32, u32)> = phases.iter().map(|(n, a, b)| (n.as_str(), *a, *b)).collect();
+        assert_eq!(names, [("pull", 1, 5), ("verify", 2, 5), ("build", 3, 5), ("check", 4, 5), ("cleanup", 5, 5)]);
+    }
+
+    #[test]
+    fn optimize_resume_stream_with_three_steps_is_accepted() {
+        let mut updates = Vec::new();
+        let agg = optimize_job("optimize-resume", false, &mut updates).expect("resume finishes the job");
+        assert_eq!(agg.finished_files(), 100);
+        assert_eq!(agg.plan().unwrap().strategy.as_ref().unwrap()["resume"], true);
+        let names: Vec<(String, u32, u32)> = phase_starts(&updates);
+        assert_eq!(names, [("build".to_string(), 1, 3), ("check".to_string(), 2, 3), ("cleanup".to_string(), 3, 3)]);
+    }
+
+    #[test]
+    fn optimize_dry_run_is_a_plan_and_done_without_phases() {
+        for mode in ["normal", "optimize-resume", "optimize-interrupt"] {
+            let mut updates = Vec::new();
+            let agg = optimize_job(mode, true, &mut updates).expect("dry run succeeds");
+            assert!(phase_starts(&updates).is_empty(), "{mode}");
+            assert_eq!(agg.finished_files(), 100, "{mode}");
+        }
+    }
+
+    #[test]
+    fn optimize_already_done_writes_nothing() {
+        let mut updates = Vec::new();
+        let agg = optimize_job("optimize-already", false, &mut updates).expect("nothing to do is success");
+        let plan = agg.plan().expect("plan");
+        assert_eq!(plan.write_bytes, 0);
+        assert_eq!(plan.strategy.as_ref().unwrap()["already_optimized"], true);
+        assert!(plan.strategy.as_ref().unwrap()["temp"].is_null());
+        assert!(phase_starts(&updates).is_empty());
+    }
+
+    #[test]
+    fn optimize_interrupt_fails_with_its_recovery_text() {
+        let mut updates = Vec::new();
+        let failure = optimize_job("optimize-interrupt", false, &mut updates).expect_err("must fail");
+        assert_eq!(failure.message, "optimize: the drive stopped responding");
+        let recovery = failure.recovery.expect("a half-written stick carries recovery");
+        assert!(recovery.contains("re-run optimize"), "{recovery}");
+        let names: Vec<String> = phase_starts(&updates).into_iter().map(|p| p.0).collect();
+        assert_eq!(names, ["pull", "verify", "build"]);
+    }
+
+    #[test]
+    fn optimize_nospace_fails_before_any_plan_without_recovery() {
+        let mut updates = Vec::new();
+        for dry in [true, false] {
+            let failure = optimize_job("optimize-nospace", dry, &mut updates).expect_err("no room");
+            assert!(failure.message.starts_with("no place for the temporary copy"), "{}", failure.message);
+            assert_eq!(failure.recovery, None);
+        }
+        assert!(updates.iter().all(|u| u.phase.is_none() && u.plan_files == 0));
+    }
+
+    #[test]
+    fn non_optimize_streams_carry_no_phase_or_recovery() {
+        let mut updates = Vec::new();
+        let runs = [run(&["add", "--json"], &[1])];
+        run_job(FAKE, &runs, Op::Add, &[FAST], |u| updates.push(u)).expect("fake add succeeds");
+        assert!(updates.iter().all(|u| u.phase.is_none() && u.recovery.is_none() && u.step == 0));
     }
 }

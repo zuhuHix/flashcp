@@ -3,6 +3,7 @@
 mod drives;
 mod events;
 mod job;
+mod optimize;
 mod pull;
 mod runner;
 mod settings;
@@ -14,8 +15,9 @@ mod weak;
 
 use drives::{expected_confirm, require_trusted, Drive};
 use job::{JobLock, Request};
+use optimize::OptimizePlan;
 use pull::{DestStatus, PullDefaults, PullRequest};
-use runner::{Action, Source};
+use runner::{Action, Invocation, Source};
 use settings::{Paths, Settings};
 use std::collections::HashSet;
 use std::error::Error;
@@ -235,6 +237,92 @@ async fn start_pull(
         staged: Vec::new(),
     };
     job::spawn(app, request, lock)
+}
+
+/// Optimize works on exFAT sticks and on blank ones: a half-built stick from an interrupted optimize
+/// has no filesystem, and flashcp decides whether it can resume.
+fn require_optimizable(drive: &Drive) -> Result<(), String> {
+    if drive.is_exfat || drive.fs_type.is_empty() {
+        return Ok(());
+    }
+    Err(format!("{} is not exFAT ({}). Optimize only works on exFAT sticks.", drive.device, drive.fs_type))
+}
+
+/// flashcp optimize --dry-run: plans the rewrite without touching the stick, then remounts the
+/// stick if it was mounted. Blocks until flashcp exits.
+fn optimize_dry_run(drive: Drive) -> Result<OptimizePlan, String> {
+    let fake = udisks::fake_mode();
+    let was_mounted = !fake && drive.mount_point.is_some();
+    if was_mounted {
+        udisks::unmount(&drive.id).map_err(|e| format!("Could not unmount {}: {e}", drive.device))?;
+    }
+    let inv = Invocation::from_env();
+    let runs = inv.runs(&drive.device, &drive.serial, &Action::Optimize { dry_run: true });
+    let result = runner::run_job(inv.program(), &runs, events::Op::Optimize, &[], |_| {});
+    let remount_error = if was_mounted { job::remount(&drive, fake).err() } else { None };
+    let agg = result.map_err(|failure| {
+        let mut message = failure.message;
+        if let Some(e) = &remount_error {
+            message = format!("{message} (remounting also failed: {e})");
+        }
+        match failure.recovery {
+            Some(recovery) => format!("{message}\n\n{recovery}"),
+            None => message,
+        }
+    })?;
+    if let Some(e) = remount_error {
+        return Err(format!("The check finished, but the drive could not be remounted: {e}"));
+    }
+    let plan = agg.plan().ok_or_else(|| "flashcp did not report a plan".to_string())?;
+    Ok(optimize::plan_from(
+        plan.files,
+        plan.dirs,
+        plan.bytes,
+        plan.write_bytes,
+        plan.strategy.as_ref(),
+        optimize::free_bytes,
+    ))
+}
+
+/// What "Optimize this stick" would do to this drive, for the confirmation dialog.
+#[tauri::command]
+async fn optimize_plan(state: State<'_, AppState>, drive_id: String) -> Result<OptimizePlan, String> {
+    let lock = JobLock::acquire(&state.job_running)?;
+    let drive = find_drive(drives_now().await?, &drive_id)?;
+    require_optimizable(&drive)?;
+    require_trusted(&drive)?;
+    runner::optimize_temp_dir()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lock = lock;
+        optimize_dry_run(drive)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Rewrites the drive with flashcp optimize (through the helper or directly). Runs as a job.
+#[tauri::command]
+async fn start_optimize(app: AppHandle, state: State<'_, AppState>, drive_id: String) -> Result<(), String> {
+    let lock = JobLock::acquire(&state.job_running)?;
+    let drive = find_drive(drives_now().await?, &drive_id)?;
+    require_optimizable(&drive)?;
+    require_trusted(&drive)?;
+    runner::optimize_temp_dir()?;
+    let request = Request {
+        op: events::Op::Optimize,
+        drive,
+        action: Action::Optimize { dry_run: false },
+        total: 1,
+        stage_dir: PathBuf::new(),
+        staged: Vec::new(),
+    };
+    job::spawn(app, request, lock)
+}
+
+/// True when an optimize run left its working folder behind (an interrupted run to finish).
+#[tauri::command]
+fn optimize_pending() -> bool {
+    runner::optimize_temp_dir().is_ok_and(|dir| optimize::pending_job(&dir))
 }
 
 /// Sub-folders of `rel` on a mounted drive, for the folder browser.
@@ -459,7 +547,10 @@ pub fn run() {
             list_drive_folders,
             pull_defaults,
             dest_status,
-            take_pending_pull
+            take_pending_pull,
+            optimize_plan,
+            start_optimize,
+            optimize_pending
         ])
         .setup(setup_app)
         .run(tauri::generate_context!())
