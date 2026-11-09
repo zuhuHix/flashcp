@@ -969,3 +969,63 @@ fn gap_fill_never_writes_over_existing_files() {
     expect_tree(&read_ok(&img), kept, read_source_tree(&new), &[]);
     fs::remove_dir_all(&dir).expect("remove scratch dir");
 }
+
+// ───────────────────────── empty volume: add = build ─────────────────────────
+
+fn mkfs_32k_labelled(img: &Path) {
+    let out = Command::new("mkfs.exfat").args(["-c", "32768", "-L", "MYSTICK"]).arg(img).output().unwrap();
+    assert_success(&out, "mkfs.exfat");
+}
+
+/// A fresh 32 KB-cluster volume is written as one build: smaller clusters, label kept,
+/// every file there, fsck clean, and the JSON still says op "add".
+#[test]
+fn add_onto_empty_coarse_volume_is_a_build() {
+    let dir = test_dir("add_empty_build");
+    let src = dir.join("src");
+    make_tricky_tree(&src);
+    let img = dir.join("v.img");
+    make_image(&img, IMG);
+    mkfs_32k_labelled(&img);
+    let out = add_ok(&src, &img, &["--json"]);
+    let plan = String::from_utf8_lossy(&out.stdout).lines().next().unwrap().to_string();
+    assert!(plan.contains(r#""op":"add""#), "{plan}");
+    fsck_clean(&img);
+    let v = read_ok(&img);
+    assert!(v.info.cluster_size < 32768, "cluster {}", v.info.cluster_size);
+    assert_eq!(v.label, "MYSTICK");
+    let problems = compare_trees(&read_source_tree(&src), &v);
+    assert!(problems.is_empty(), "{problems:?}");
+    // --to puts the tree under the path, still as a build.
+    make_image(&img, IMG);
+    mkfs_32k_labelled(&img);
+    add_ok(&src, &img, &["--to", "Backups/2026"]);
+    fsck_clean(&img);
+    let v = read_ok(&img);
+    assert!(v.info.cluster_size < 32768);
+    expect_tree(&v, BTreeMap::new(), under("Backups/2026", read_source_tree(&src)), &["Backups", "Backups/2026"]);
+}
+
+/// Anything on the volume (one file) means a normal, non-destructive add: cluster unchanged,
+/// the old file still there. A dry run writes nothing either way.
+#[test]
+fn add_onto_volume_with_data_stays_an_add() {
+    let dir = test_dir("add_nonempty_stays");
+    let a = dir.join("a");
+    write_file(&a.join("old.txt"), b"keep me");
+    let src = dir.join("src");
+    make_tricky_tree(&src);
+    let img = dir.join("v.img");
+    make_image(&img, IMG);
+    mkfs_32k_labelled(&img);
+    let before = digest(&img);
+    add_ok(&src, &img, &["--dry-run"]);
+    assert_eq!(digest(&img), before, "dry run wrote");
+    let out = flashcp().arg("add").arg(&a).arg(&img).env("FLASHCP_TEST_NO_ADD_BUILD", "1").output().unwrap();
+    assert_success(&out, "add a");
+    add_ok(&src, &img, &[]);
+    fsck_clean(&img);
+    let v = read_ok(&img);
+    assert_eq!(v.info.cluster_size, 32768);
+    expect_tree(&v, read_source_tree(&a), read_source_tree(&src), &[]);
+}

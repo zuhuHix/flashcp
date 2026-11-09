@@ -79,7 +79,11 @@ fn stick(name: &str) -> Stick {
     run_ok(Command::new("mkfs.exfat").args(["-c", "32768", "-L", LABEL]).arg(&img), "mkfs.exfat");
     let a = dir.join("batch-a");
     make_tricky_tree(&a);
-    run_ok(flashcp().arg("add").arg(&a).arg(&img).args(["--to", "docs"]), "flashcp add (batch a)");
+    // A kernel-style 32 KB volume filled file by file: add must not turn into a build here.
+    run_ok(
+        flashcp().arg("add").arg(&a).arg(&img).args(["--to", "docs"]).env("FLASHCP_TEST_NO_ADD_BUILD", "1"),
+        "flashcp add (batch a)",
+    );
     let b = dir.join("batch-b");
     for i in 0..40u64 {
         write_random(&b.join(format!("bulk/d{}/late-{i:02}.bin", i % 4)), 3000 + i * 517, i + 7);
