@@ -7,12 +7,14 @@ on:
       - "gui/**"
       - "packaging/desktop/**"
       - ".github/workflows/gui.yml"
+      - ".github/actions/gui-deb/**"
   pull_request:
     branches: [main]
     paths:
       - "gui/**"
       - "packaging/desktop/**"
       - ".github/workflows/gui.yml"
+      - ".github/actions/gui-deb/**"
 
 permissions:
   contents: read
@@ -133,64 +135,14 @@ jobs:
     needs: test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Same build and content checks as the release (release.yml).
+      - uses: ./.github/actions/gui-deb
+        id: gui
         with:
-          workspaces: gui
-      - name: Install system libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
-            librsvg2-dev libssl-dev libxdo-dev pkg-config
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Build deb
-        working-directory: gui/src-tauri
-        run: npx --yes @tauri-apps/cli@2.12.4 build --bundles deb
-      - name: Check package contents
-        run: |
-          set -eux
-          shopt -s nullglob
-          debs=(gui/target/release/bundle/deb/*.deb)
-          test "${#debs[@]}" -eq 1
-          deb="${debs[0]}"
-          dpkg -I "$deb"
-          dpkg -c "$deb" > contents.txt
-          cat contents.txt
-          for path in \
-            ./usr/libexec/flashcp-helper \
-            ./usr/libexec/flashcp-trust \
-            ./usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.trust.policy \
-            ./usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.helper.policy \
-            ./etc/xdg/autostart/flashcp-gui.desktop \
-            ./usr/share/nemo/actions/flashcp.nemo_action \
-            ./usr/share/nemo/actions/flashcp-pull.nemo_action \
-            ./usr/share/kio/servicemenus/flashcp.desktop \
-            ./usr/share/kio/servicemenus/flashcp-pull.desktop \
-            ./usr/share/nautilus-python/extensions/flashcp_nautilus.py \
-            ./usr/bin/flashcp-gui; do
-            # Tauri's tar lists paths without a leading "./"; accept both spellings.
-            awk '{print $NF}' contents.txt | sed 's#^\./##' | grep -qxF "${path#./}" || { echo "::error::missing $path"; exit 1; }
-          done
-          # The helper runs as root through pkexec, so it must be root-owned and not writable by others.
-          for bin in flashcp-helper flashcp-trust; do
-            grep -qE "^-rwxr-xr-x (root/root|0/0) .* (\./)?usr/libexec/$bin\$" contents.txt
-          done
-          # The packaged helper knows optimize and refuses a caller-chosen temp dir.
-          mkdir pkg && dpkg-deb -x "$deb" pkg
-          set +e
-          ok="$(pkg/usr/libexec/flashcp-helper optimize /dev/sdb1 --expect S --dry-run)"; ok_code=$?
-          bad="$(pkg/usr/libexec/flashcp-helper optimize /dev/sdb1 --expect S --temp /tmp)"; bad_code=$?
-          set -e
-          test "$ok_code" -eq 3
-          echo "$ok" | grep -q "must be started via pkexec"
-          test "$bad_code" -eq 3
-          echo "$bad" | grep -q "unexpected argument for optimize"
-          # The package must pull in the CLI.
-          dpkg-deb -f "$deb" Depends | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -qx 'flashcp'
-      - uses: actions/upload-artifact@v4
+          toolchain: 1.99.1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: flashcp-gui-deb
-          path: gui/target/release/bundle/deb/*.deb
+          path: ${{ steps.gui.outputs.deb }}
+          if-no-files-found: error
