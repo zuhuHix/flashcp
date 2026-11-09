@@ -190,9 +190,11 @@ fn micro_probe(file: &File, v: &Vol) -> Option<(f64, f64)> {
     Some(((many - one).max(0.0) / 255.0, bw))
 }
 
-/// Picks gap, depth and I/O mode from the source's transport (sysfs), and on BOT from a
-/// micro-probe: a gap is read through only when reading it costs less than the request it
-/// saves (gap / bandwidth < per-request overhead). Explicit options override every choice.
+/// Picks gap, depth and I/O mode from the source's transport (sysfs), and on BOT from the
+/// device's cached read profile or, without one, a micro-probe (whose result is cached): a gap
+/// is read through only when reading it costs less than the request it saves (gap / bandwidth
+/// < per-request overhead). Explicit options override every choice. Image files are never
+/// cached (only block devices have a profile).
 fn choose_strategy(file: &File, v: &Vol, o: &PullOpts) -> Strategy {
     let dev = file.metadata().map(|m| if m.file_type().is_block_device() { m.rdev() } else { m.dev() }).unwrap_or(0);
     let transport = crate::probe::device_info_of(dev).transport.unwrap_or_else(|| "other".into());
@@ -201,8 +203,23 @@ fn choose_strategy(file: &File, v: &Vol, o: &PullOpts) -> Strategy {
     if s.transport == "usb-storage" {
         s.inflight = BOT_INFLIGHT;
         s.gap = 0;
+        let bdev = crate::devprofile::block_dev_of(file);
+        let cached = || bdev.and_then(crate::devprofile::load).and_then(|p| Some((p.read_cmd_s?, p.seq_read_bps?)));
+        let measure = || {
+            let m = micro_probe(file, v)?;
+            if let Some(d) = bdev {
+                let p = crate::devprofile::DevProfile {
+                    seq_read_bps: Some(m.1),
+                    read_cmd_s: Some(m.0),
+                    transport: Some(s.transport.clone()),
+                    ..Default::default()
+                };
+                crate::devprofile::save(d, &p);
+            }
+            Some(m)
+        };
         if o.gap.is_none()
-            && let Some((lat, bw)) = micro_probe(file, v)
+            && let Some((lat, bw)) = cached().or_else(measure)
         {
             s.overhead_ms = Some(lat * 1e3);
             s.mbps = Some(bw / 1e6);
