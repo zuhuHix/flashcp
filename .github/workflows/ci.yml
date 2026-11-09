@@ -106,4 +106,5 @@ jobs:
           cargo test --locked --test build mount -- --nocapture 2>&1 | tee mount-tests.log
           cargo test --locked --test add_kernel mount -- --nocapture --test-threads=1 2>&1 | tee -a mount-tests.log
           cargo test --locked --test pull_kernel mount -- --nocapture --test-threads=1 2>&1 | tee -a mount-tests.log
+          cargo test --locked --test sync_kernel mount -- --nocapture --test-threads=1 2>&1 | tee -a mount-tests.log
           if grep -q SKIP mount-tests.log; then echo "::error::a gated mount test was skipped"; exit 1; fi
