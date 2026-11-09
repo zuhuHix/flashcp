@@ -1841,4 +1841,141 @@ mod tests {
         f.node("8:32");
         assert_eq!(f.related("8:32").unwrap(), sorted(&["8:32"]));
     }
+
+    // ───── device offsets, flush boundaries, usable size ─────
+
+    const LAYOUT_VOLS: [u64; 4] = [32 << 20, 64 << 20, 1 << 30, 3 << 30];
+    const LAYOUT_CLUSTERS: [u64; 4] = [512, 4096, 32 << 10, 128 << 10];
+
+    #[test]
+    fn geometry_heap_is_4mib_aligned_on_the_device() {
+        // The partition starts at 1 MiB: the heap must sit on a 4 MiB boundary of the device.
+        let dev_off = 1 << 20;
+        let mut checked = 0;
+        for &vol in &LAYOUT_VOLS {
+            for &c in &LAYOUT_CLUSTERS {
+                let Some(g) = geometry(vol, c, dev_off) else { continue };
+                checked += 1;
+                assert_eq!((g.heap_off * SECTOR + dev_off) % ALIGN, 0, "vol {vol} cluster {c}");
+            }
+        }
+        assert!(checked >= 8, "only {checked} geometries were checked");
+    }
+
+    #[test]
+    fn geometry_heap_is_4mib_aligned_for_whole_device_images() {
+        let mut checked = 0;
+        for &vol in &LAYOUT_VOLS {
+            for &c in &LAYOUT_CLUSTERS {
+                let Some(g) = geometry(vol, c, 0) else { continue };
+                checked += 1;
+                assert_eq!((g.heap_off * SECTOR) % ALIGN, 0, "vol {vol} cluster {c}");
+            }
+        }
+        assert!(checked >= 8, "only {checked} geometries were checked");
+    }
+
+    #[test]
+    fn geometry_ignores_device_offsets_that_are_not_4k_multiples() {
+        let mut checked = 0;
+        for &vol in &LAYOUT_VOLS {
+            for &c in &LAYOUT_CLUSTERS {
+                let Some(base) = geometry(vol, c, 0) else { continue };
+                let Some(odd) = geometry(vol, c, (1 << 20) + 512) else { continue };
+                checked += 1;
+                assert_eq!(
+                    (odd.fat_off, odd.fat_len, odd.heap_off, odd.cluster_count),
+                    (base.fat_off, base.fat_len, base.heap_off, base.cluster_count),
+                    "vol {vol} cluster {c}"
+                );
+            }
+        }
+        assert!(checked >= 8, "only {checked} geometries were checked");
+    }
+
+    #[test]
+    fn usable_bytes_rounds_down_to_4k() {
+        assert_eq!(usable_bytes(0), 0);
+        assert_eq!(usable_bytes(4095), 0);
+        assert_eq!(usable_bytes(4096), 4096);
+        assert_eq!(usable_bytes(64 << 20), 64 << 20);
+        assert_eq!(usable_bytes((64 << 20) + 512), 64 << 20);
+        assert_eq!(usable_bytes((64 << 20) + 1000), 64 << 20);
+        assert_eq!(usable_bytes((64 << 20) + 4095), 64 << 20);
+        for b in [1u64, 511, 512, 4097, 12_345_678] {
+            let u = usable_bytes(b);
+            assert_eq!(u % 4096, 0, "{b}");
+            assert!(u <= b && b - u < 4096, "{b}");
+        }
+    }
+
+    /// Deterministic byte source for the SeqWriter tests (xorshift64).
+    fn next_rand(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    fn seqw_temp(tag: &str) -> (PathBuf, File) {
+        let p = std::env::temp_dir().join(format!("flashcp-seqw-{tag}-{}", std::process::id()));
+        let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&p).unwrap();
+        (p, f)
+    }
+
+    #[test]
+    fn seq_writer_device_offset_keeps_stream_intact() {
+        let (p, f) = seqw_temp("devoff");
+        let mut w = SeqWriter::new(Arc::new(f));
+        w.set_device_offset(1 << 20);
+        let mut rng = 0x2545_F491_4F6C_DD1D_u64;
+        let mut expect: Vec<u8> = Vec::new();
+        // Mixed write() sizes from 1 byte to 300 KB, so flushes land on every kind of boundary.
+        while expect.len() < 20 << 20 {
+            let n = 1 + (next_rand(&mut rng) % 300_000) as usize;
+            let chunk: Vec<u8> = (0..n).map(|_| next_rand(&mut rng) as u8).collect();
+            w.write(&chunk).unwrap();
+            expect.extend_from_slice(&chunk);
+        }
+        // Then a stream piece read straight from a file (write_from), across boundaries too.
+        let (src_p, mut src_w) = seqw_temp("devoff-src");
+        let piece: Vec<u8> = (0..(9 << 20) + 777).map(|_| next_rand(&mut rng) as u8).collect();
+        std::io::Write::write_all(&mut src_w, &piece).unwrap();
+        drop(src_w);
+        let mut src = File::open(&src_p).unwrap();
+        w.write_from(&mut src, piece.len() as u64).unwrap();
+        expect.extend_from_slice(&piece);
+        assert_eq!(w.cur(), expect.len() as u64);
+        w.finish().unwrap();
+
+        let got = fs::read(&p).unwrap();
+        assert!(got.len() >= expect.len(), "file is shorter than the stream");
+        assert!(got[..expect.len()] == expect[..], "stream content differs");
+        assert!(got[expect.len()..].iter().all(|&b| b == 0), "padding after the stream is not zero");
+        fs::remove_file(&p).unwrap();
+        fs::remove_file(&src_p).unwrap();
+    }
+
+    #[test]
+    fn seq_writer_flushes_on_absolute_device_multiples() {
+        // Stream offset 0 is device byte 1 MiB, so the first flush boundary is at stream 7 MiB.
+        let (p, f) = seqw_temp("bounds");
+        let mut w = SeqWriter::new(Arc::new(f));
+        w.set_device_offset(1 << 20);
+        w.write(&vec![1u8; 7 << 20]).unwrap();
+        assert_eq!(w.written, 7 << 20, "flush at device 8 MiB");
+        w.write(&vec![2u8; (8 << 20) - 1]).unwrap();
+        assert_eq!(w.written, 7 << 20, "no flush before device 16 MiB");
+        w.write(&[3u8]).unwrap();
+        assert_eq!(w.written, 15 << 20, "flush at device 16 MiB");
+        w.finish().unwrap();
+        let got = fs::read(&p).unwrap();
+        assert_eq!(got.len() as u64, 15 << 20);
+        assert!(got[..7 << 20].iter().all(|&b| b == 1));
+        assert!(got[7 << 20..(15 << 20) - 1].iter().all(|&b| b == 2));
+        assert_eq!(got[(15 << 20) - 1], 3);
+        fs::remove_file(&p).unwrap();
+    }
 }
