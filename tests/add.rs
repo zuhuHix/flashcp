@@ -553,27 +553,31 @@ fn crash_then_recover(phase: &str) {
             assert!(problems.is_empty(), "tree changed after stop at {phase}:\n{}", problems.join("\n"));
         }
         _ => {
-            // Clusters are allocated but unreferenced: the reader must refuse, and say why.
+            // Clusters are allocated but unreferenced: the strict reader must refuse, and say why.
             let e = exfat_reader::read_volume(&c.img).expect_err("reader accepted a volume with leaked clusters");
             assert!(
                 e.contains("marked allocated but no file or directory uses it"),
                 "unexpected reader error after stop at {phase}: {e}"
             );
+            // Leaks are the ONLY problem: everything reachable is the old tree, byte for byte.
+            let vol = exfat_reader::read_volume_allow_leaks(&c.img)
+                .unwrap_or_else(|e| panic!("leak-tolerant read after stop at {phase}: {e}"));
+            let problems = compare_trees(&c.before, &vol);
+            assert!(problems.is_empty(), "tree changed after stop at {phase}:\n{}", problems.join("\n"));
         }
     }
     recover_and_add(&c);
     let after_info = info_json(&c.img);
     assert_eq!(json_u64(&after_info, "files"), json_u64(&c.before_info, "files") + 301, "file count after recovery");
-    match phase {
-        "dirty" | "data" => {
-            let CrashCase { dir, img, src, before, .. } = c;
-            expect_tree(&read_ok(&img), before, under("existing", read_source_tree(&src)), &["existing"]);
-            fs::remove_dir_all(&dir).expect("remove scratch dir");
-        }
-        // Leaked clusters survive fsck -y and the later add, so the strict reader still refuses
-        // the volume (see the ignored test at the end). fsck and info are what can be checked.
-        _ => fs::remove_dir_all(&c.dir).expect("remove scratch dir"),
-    }
+    // Leaked clusters survive fsck -y and the later add, so after alloc/fat crashes the
+    // recovered volume is read leak-tolerantly; the full old + new tree must match either way.
+    let CrashCase { dir, img, src, before, .. } = c;
+    let vol = match phase {
+        "dirty" | "data" => read_ok(&img),
+        _ => exfat_reader::read_volume_allow_leaks(&img).unwrap_or_else(|e| panic!("read after recovery: {e}")),
+    };
+    expect_tree(&vol, before, under("existing", read_source_tree(&src)), &["existing"]);
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
 }
 
 #[test]
@@ -786,5 +790,81 @@ fn boot_sector_flags_clean_and_percent_updated_after_add() {
         }
     }
     read_ok(&img);
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+// ───────────────────────── inconsistent allocation is refused ─────────────────────────
+
+/// A flashcp-built 64 MB volume, 4 KB clusters, root holding a.bin and b.bin (one cluster each).
+/// flashcp's layout: bitmap at cluster 2, up-case table 3..=4, root dir 5, a.bin 6, b.bin 7.
+fn two_file_volume(name: &str) -> (std::path::PathBuf, std::path::PathBuf, u64) {
+    let dir = test_dir(name);
+    let base = dir.join("base");
+    write_file(&base.join("a.bin"), &[0xAA; 4096]);
+    write_file(&base.join("b.bin"), &[0xBB; 4096]);
+    let img = dir.join("disk.img");
+    make_image(&img, 64 * MB);
+    assert_success(&run_build(&base, &img, &["--cluster", "4096"]), "flashcp build");
+    let vol = read_ok(&img);
+    assert_eq!(vol.info.cluster_size, 4096);
+    (dir, img, vol.info.heap_offset)
+}
+
+fn cluster_off(heap: u64, c: u64) -> u64 {
+    heap + (c - 2) * 4096
+}
+
+fn assert_refused_unchanged(dir: &Path, img: &Path, needle: &str) {
+    let src = dir.join("src");
+    small_src(&src, "new.txt");
+    let before = digest(img);
+    let out = add_cmd(&src, img, &[]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "add onto an inconsistent volume succeeded");
+    assert!(err.contains(needle), "stderr does not mention {needle:?}:\n{err}");
+    assert_eq!(digest(img), before, "a refused add changed the image");
+}
+
+#[test]
+fn bitmap_bit_clear_for_live_file_is_refused() {
+    let (dir, img, heap) = two_file_volume("refuse_free_live_cluster");
+    // a.bin's cluster 6 is bit 4 of the bitmap's first byte.
+    let bm = cluster_off(heap, 2);
+    patch_byte(&img, bm, |b| {
+        assert_ne!(b & 0x10, 0, "cluster 6 should be allocated");
+        b & !0x10
+    });
+    assert_refused_unchanged(&dir, &img, "marked free in the allocation bitmap");
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+#[test]
+fn cross_linked_clusters_are_refused() {
+    let (dir, img, heap) = two_file_volume("refuse_cross_link");
+    // Root dir (cluster 5): label, bitmap, up-case entries, then a.bin's set (3 entries) and
+    // b.bin's set at byte 192. Point b.bin's FirstCluster at a.bin's cluster 6.
+    let set_off = cluster_off(heap, 5) + 192;
+    let mut set = vec![0u8; 96];
+    {
+        let mut f = fs::File::open(&img).expect("open image");
+        f.seek(SeekFrom::Start(set_off)).expect("seek");
+        f.read_exact(&mut set).expect("read set");
+    }
+    assert_eq!(set[0], 0x85, "expected b.bin's file entry");
+    assert_eq!(u32::from_le_bytes(set[52..56].try_into().unwrap()), 7, "b.bin should start at cluster 7");
+    set[52..56].copy_from_slice(&6u32.to_le_bytes());
+    let mut sum: u16 = 0;
+    for (i, &b) in set.iter().enumerate() {
+        if i != 2 && i != 3 {
+            sum = sum.rotate_right(1).wrapping_add(b as u16);
+        }
+    }
+    set[2..4].copy_from_slice(&sum.to_le_bytes());
+    {
+        let mut f = fs::OpenOptions::new().write(true).open(&img).expect("open image");
+        f.seek(SeekFrom::Start(set_off)).expect("seek");
+        f.write_all(&set).expect("write set");
+    }
+    assert_refused_unchanged(&dir, &img, "cross-linked");
     fs::remove_dir_all(&dir).expect("remove scratch dir");
 }

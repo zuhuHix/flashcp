@@ -506,6 +506,18 @@ fn read_fat(file: &File, info: &BootInfo) -> Result<Vec<u32>, String> {
 /// checksum, and that every allocated cluster is owned by exactly one object and marked in the
 /// allocation bitmap, and the reverse.
 pub fn read_volume(path: &Path) -> Result<Volume, String> {
+    read_volume_opts(path, false)
+}
+
+/// Like [`read_volume`], but tolerates clusters that are marked allocated and referenced by
+/// nothing (what an interrupted writer leaks). Everything reachable is still fully validated,
+/// including that every used cluster is marked allocated and owned exactly once.
+#[allow(dead_code)] // used by tests/add.rs, not by every test binary
+pub fn read_volume_allow_leaks(path: &Path) -> Result<Volume, String> {
+    read_volume_opts(path, true)
+}
+
+fn read_volume_opts(path: &Path, allow_leaks: bool) -> Result<Volume, String> {
     let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let file_len = file.metadata().map_err(|e| e.to_string())?.len();
     let info = read_boot(&file, file_len)?;
@@ -578,7 +590,7 @@ pub fn read_volume(path: &Path) -> Result<Volume, String> {
         }
     }
     for c in 2..(info.cluster_count as u32 + 2) {
-        if bit(c) && !r.claimed.contains_key(&c) {
+        if !allow_leaks && bit(c) && !r.claimed.contains_key(&c) {
             return err(format!("cluster {c} is marked allocated but no file or directory uses it"));
         }
     }

@@ -44,6 +44,8 @@ const MAX_DIR_BYTES: u64 = 256 << 20;
 const FLAG_ACTIVE_FAT: u16 = 1;
 const FLAG_DIRTY: u16 = 2;
 const FLAG_MEDIA_FAILURE: u16 = 4;
+/// ClearToZero: the spec says to clear it before modifying the file system.
+const FLAG_CLEAR_TO_ZERO: u16 = 8;
 /// Test hook: stop after the named phase (dirty | data | alloc | fat) to simulate a crash.
 const STOP_ENV: &str = "FLASHCP_TEST_STOP_AFTER";
 /// Gaps up to this size between written spans are zero-filled rather than skipped.
@@ -146,6 +148,7 @@ struct Vol {
     fat_cache: HashMap<u64, Vec<u8>>,
     bitmap: Vec<u8>,
     bitmap_clusters: Vec<u32>,
+    upcase_clusters: Vec<u32>,
     upc: Vec<u16>,
     label: String,
     dirs: Vec<Dir>,
@@ -225,6 +228,7 @@ impl Vol {
             fat_cache: HashMap::new(),
             bitmap: Vec::new(),
             bitmap_clusters: Vec::new(),
+            upcase_clusters: Vec::new(),
             upc: Vec::new(),
             label: String::new(),
             dirs: Vec::new(),
@@ -252,6 +256,7 @@ impl Vol {
         ensure!((2..=2 * 65536).contains(&uc_len), "implausible up-case table length {uc_len}");
         let uc_clusters = v.object_clusters(le32(&uc, 20), false, uc_len, "up-case table")?;
         let raw = v.read_clusters(&uc_clusters, uc_len)?;
+        v.upcase_clusters = uc_clusters;
         ensure!(checksum32(&raw, &[], 0) == le32(&uc, 4), "up-case table checksum mismatch");
         v.upc = upcase_from(&raw);
         v.label = extras.label;
@@ -368,6 +373,79 @@ impl Vol {
         })
     }
 
+    /// Walks everything the volume references (root, bitmap, up-case table, every directory
+    /// and every file stream, NoFatChain runs and FAT chains alike, bounded by DataLength) and
+    /// checks it against the allocation bitmap. Refuses a referenced cluster that the bitmap
+    /// calls free, a cluster referenced twice (cross-link), and chains that loop, leave the
+    /// heap, or do not match DataLength. Allocated-but-unreferenced (leaked) clusters are fine:
+    /// allocation only ever uses clusters the bitmap calls free. Returns objects checked.
+    fn verify_allocation(&mut self) -> Result<u64> {
+        let mut refd = vec![0u8; self.bitmap.len()];
+        let mut objects = 0u64;
+        let sys = [
+            (self.dirs[0].clusters.clone(), "the root directory"),
+            (self.bitmap_clusters.clone(), "the allocation bitmap"),
+            (self.upcase_clusters.clone(), "the up-case table"),
+        ];
+        for (clusters, what) in &sys {
+            for &c in clusters {
+                claim(&mut refd, &self.bitmap, c, &|| what.to_string())?;
+            }
+            objects += 1;
+        }
+        let root_path = String::new();
+        let mut stack: Vec<(String, Vec<Child>)> = vec![(root_path, self.dirs[0].children.values().cloned().collect())];
+        while let Some((path, kids)) = stack.pop() {
+            for ch in kids {
+                objects += 1;
+                let what = || format!("{path}/{}", String::from_utf16_lossy(&ch.name));
+                if ch.is_dir {
+                    let d = self.read_child(0, &path, &ch)?;
+                    for &c in &d.clusters {
+                        claim(&mut refd, &self.bitmap, c, &what)?;
+                    }
+                    stack.push((d.path, d.children.into_values().collect()));
+                } else {
+                    self.claim_stream(&mut refd, &ch, &what)?;
+                }
+            }
+        }
+        Ok(objects)
+    }
+
+    /// Claims a file's clusters without materializing them (files can be huge).
+    fn claim_stream(&mut self, refd: &mut [u8], ch: &Child, what: &dyn Fn() -> String) -> Result<()> {
+        let n = ch.len.div_ceil(self.cs);
+        if n == 0 {
+            return Ok(());
+        }
+        if ch.no_fat_chain {
+            ensure!(
+                self.valid(ch.first) && ch.first as u64 + n <= self.cc + 2,
+                "{}: contiguous extent runs past the end of the volume",
+                what()
+            );
+            for c in ch.first..ch.first + n as u32 {
+                claim(refd, &self.bitmap, c, what)?;
+            }
+            return Ok(());
+        }
+        let mut c = ch.first;
+        for k in 0..n {
+            ensure!(self.valid(c), "{}: FAT chain points at invalid cluster {c:#x}", what());
+            // A loop revisits a cluster, which claim() reports as a cross-link.
+            claim(refd, &self.bitmap, c, what)?;
+            let next = self.fat(c)?;
+            if k + 1 == n {
+                ensure!(next == EOC, "{}: FAT chain is longer than its DataLength", what());
+            } else {
+                ensure!(next != EOC, "{}: FAT chain is shorter than its DataLength", what());
+                c = next;
+            }
+        }
+        Ok(())
+    }
+
     fn free_clusters(&self) -> u64 {
         let used: u64 = self.bitmap.iter().map(|b| b.count_ones() as u64).sum();
         // Bits past ClusterCount in the last byte are not clusters.
@@ -376,6 +454,24 @@ impl Vol {
         let pad_used = if pad > 0 { (last >> (8 - pad)).count_ones() as u64 } else { 0 };
         self.cc - (used - pad_used)
     }
+}
+
+/// Marks cluster `c` referenced; refuses cross-links and clusters the bitmap calls free.
+fn claim(refd: &mut [u8], bitmap: &[u8], c: u32, what: &dyn Fn() -> String) -> Result<()> {
+    let i = (c - 2) as usize;
+    let (byte, bit) = (i / 8, 1u8 << (i % 8));
+    ensure!(
+        refd[byte] & bit == 0,
+        "cluster {c} is used twice (cross-linked), again by {}; refusing to modify this volume (run fsck.exfat)",
+        what()
+    );
+    refd[byte] |= bit;
+    ensure!(
+        bitmap[byte] & bit != 0,
+        "cluster {c} used by {} is marked free in the allocation bitmap; refusing to modify this volume (run fsck.exfat)",
+        what()
+    );
+    Ok(())
 }
 
 fn rekey(children: Vec<Child>, upc: &[u16]) -> Result<HashMap<Vec<u16>, Child>> {
@@ -636,6 +732,16 @@ fn stop_after(phase: &str) -> Result<()> {
     Ok(())
 }
 
+/// VolumeFlags while modifying: dirty set, ClearToZero cleared (spec 3.1.13.4).
+fn working_flags(flags: u16) -> u16 {
+    (flags | FLAG_DIRTY) & !FLAG_CLEAR_TO_ZERO
+}
+
+/// VolumeFlags when done: dirty cleared, ClearToZero stays cleared.
+fn clean_flags(flags: u16) -> u16 {
+    flags & !(FLAG_DIRTY | FLAG_CLEAR_TO_ZERO)
+}
+
 fn write_flags(v: &mut Vol, flags: u16, pct: Option<u8>) -> Result<()> {
     v.sector0[106..108].copy_from_slice(&flags.to_le_bytes());
     if let Some(p) = pct {
@@ -687,6 +793,10 @@ pub fn add(src: &Path, target: &Path, o: &AddOpts, sink: Sink<'_>) -> Result<Add
         .open(format!("/proc/self/fd/{}", excl.as_raw_fd()))
         .context("reopen target for metadata I/O")?;
     let mut v = Vol::open(meta, tgt.bytes, false)?;
+    // Mandatory: never trust a clear bitmap bit that something still references.
+    let tv = Instant::now();
+    let verified = v.verify_allocation()?;
+    let verify_secs = tv.elapsed().as_secs_f64();
     let cs = v.cs;
     let mut nodes = scan_tree(src, &v.upc)?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
@@ -982,13 +1092,14 @@ pub fn add(src: &Path, target: &Path, o: &AddOpts, sink: Sink<'_>) -> Result<Add
     let fragmented = runs.iter().filter(|(o, r)| !matches!(o, Obj::Ext(_)) && r.len() > 1).count() as u64;
     let (files, dirs) = (new_files.len() as u64, new_dirs.len() as u64);
     let detail = format!(
-        "plan: add {files} files, {dirs} dirs, {} data │ cluster {} │ {} free │ {} new objects fragmented │ will write {}{}",
+        "plan: add {files} files, {dirs} dirs, {} data │ cluster {} │ {} free │ {} new objects fragmented │ will write {}{} │ verified {verified} objects in {:.0} ms",
         human_bytes(data_bytes as f64),
         human_bytes(cs as f64),
         human_bytes((free_total * cs) as f64),
         fragmented,
         human_bytes(write_bytes as f64),
-        if skipped > 0 { format!(" │ skipping {skipped} existing") } else { String::new() }
+        if skipped > 0 { format!(" │ skipping {skipped} existing") } else { String::new() },
+        verify_secs * 1e3
     );
     tick.emit(Event::Plan { op: Op::Add, files, dirs, bytes: data_bytes, write_bytes, detail });
     let stats = |written: u64| AddStats {
@@ -1008,7 +1119,7 @@ pub fn add(src: &Path, target: &Path, o: &AddOpts, sink: Sink<'_>) -> Result<Add
 
     // ── phase 0: mark dirty ──
     let flags = v.flags;
-    write_flags(&mut v, flags | FLAG_DIRTY, None)?;
+    write_flags(&mut v, working_flags(flags), None)?;
     stop_after("dirty")?;
 
     // ── phase 1: data, one ascending stream ──
@@ -1106,7 +1217,7 @@ pub fn add(src: &Path, target: &Path, o: &AddOpts, sink: Sink<'_>) -> Result<Add
     // ── phase 4: clean ──
     let used = v.cc - v.free_clusters();
     let pct = (used * 100 / v.cc).min(100) as u8;
-    write_flags(&mut v, flags & !FLAG_DIRTY, Some(pct))?;
+    write_flags(&mut v, clean_flags(flags), Some(pct))?;
     tick.progress(files, data_bytes, true);
     if !tgt.direct {
         eprintln!("note: target does not support O_DIRECT, used buffered writes");
@@ -1227,6 +1338,26 @@ mod tests {
         assert!(!take_exact(&mut f, 18, 4));
         assert!(take_exact(&mut f, 30, 5));
         assert_eq!(f, vec![(10, 2), (15, 5)]);
+    }
+
+    #[test]
+    fn volume_flags_clear_to_zero_is_cleared() {
+        for f in [0u16, FLAG_CLEAR_TO_ZERO, FLAG_CLEAR_TO_ZERO | 0x10] {
+            assert_eq!(working_flags(f) & FLAG_CLEAR_TO_ZERO, 0, "working {f:#x}");
+            assert_ne!(working_flags(f) & FLAG_DIRTY, 0, "working {f:#x}");
+            assert_eq!(clean_flags(working_flags(f)) & (FLAG_CLEAR_TO_ZERO | FLAG_DIRTY), 0, "clean {f:#x}");
+        }
+        assert_eq!(clean_flags(working_flags(0x10)), 0x10, "other bits are preserved");
+    }
+
+    #[test]
+    fn claim_refuses_free_and_cross_linked() {
+        let bitmap = [0b0000_0011u8]; // clusters 2 and 3 allocated
+        let mut refd = [0u8];
+        let w = || "f".to_string();
+        claim(&mut refd, &bitmap, 2, &w).unwrap();
+        assert!(format!("{:#}", claim(&mut refd, &bitmap, 2, &w).unwrap_err()).contains("cross-linked"));
+        assert!(format!("{:#}", claim(&mut refd, &bitmap, 4, &w).unwrap_err()).contains("marked free"));
     }
 
     #[test]
