@@ -477,3 +477,92 @@ fn mount_add_into_single_cluster_holes_keeps_neighbours() {
     }
     fs::remove_dir_all(&dir).expect("remove scratch dir");
 }
+
+// ───────────────────────── 7. inherited --target-fd (privileged helper) ─────────────────────────
+
+/// Detaches the loop device even when an assertion fails.
+struct LoopGuard(String);
+
+impl Drop for LoopGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(kernel::tool("losetup")).args(["-d", &self.0]).output();
+    }
+}
+
+/// A "privileged helper" (this test, as root) opens a loop device O_RDWR|O_EXCL and hands the fd
+/// to flashcp, which must use it without reopening anything: build, add and info all work,
+/// fsck is clean, and nobody else can claim the device while flashcp runs.
+#[test]
+fn mount_target_fd_inherited_from_helper() {
+    if !kernel::gated() {
+        return;
+    }
+    if !kernel::is_root() {
+        eprintln!("SKIP --target-fd test: needs root to open a loop device read-write");
+        return;
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let dir = test_dir("mount_target_fd");
+    let img = dir.join("fd.img");
+    common::make_image(&img, 64 * MB);
+    let out = std::process::Command::new(kernel::tool("losetup"))
+        .args(["--find", "--show"])
+        .arg(&img)
+        .output()
+        .expect("run losetup");
+    assert_success(&out, "losetup");
+    let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let _guard = LoopGuard(dev.clone());
+    let excl = || OpenOptions::new().read(true).write(true).custom_flags(libc::O_EXCL).open(&dev);
+    let held = excl().expect("helper: open loop device O_RDWR|O_EXCL");
+    let fd = held.as_raw_fd();
+    // Let the child inherit it (Rust opens with O_CLOEXEC).
+    assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0, "clear FD_CLOEXEC");
+    let fd_s = fd.to_string();
+
+    let src = dir.join("src");
+    make_tricky_tree(&src);
+    let mut child = flashcp()
+        .args(["build"])
+        .arg(&src)
+        .args(["--target-fd", &fd_s, "--yes-erase", "--cluster", "4096"])
+        .spawn()
+        .expect("spawn flashcp build --target-fd");
+    // While it runs (and after), the exclusive claim held by the helper's fd keeps others out.
+    let e = excl().expect_err("a second O_EXCL open succeeded while flashcp was running");
+    assert_eq!(e.raw_os_error(), Some(libc::EBUSY), "second O_EXCL open: {e}");
+    assert!(child.wait().expect("wait for flashcp").success(), "flashcp build --target-fd failed");
+
+    let more = dir.join("more");
+    gen_dataset("tiny")(&more);
+    let out = flashcp().arg("add").arg(&more).args(["--target-fd", &fd_s, "--to", "more"]).output().expect("add");
+    assert_success(&out, "flashcp add --target-fd");
+    let out = flashcp().args(["info", "--target-fd", &fd_s, "--json"]).output().expect("info");
+    assert_success(&out, "flashcp info --target-fd");
+    let info = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(info.contains("\"dirty\":false"), "info: {info}");
+    // A regular file is refused via --target-fd even when opened read-write.
+    let reg = OpenOptions::new().read(true).write(true).open(&img).expect("open image");
+    assert_eq!(unsafe { libc::fcntl(reg.as_raw_fd(), libc::F_SETFD, 0) }, 0);
+    let out = flashcp()
+        .arg("add")
+        .arg(&more)
+        .args(["--target-fd", &reg.as_raw_fd().to_string()])
+        .output()
+        .expect("add onto a regular-file fd");
+    assert!(!out.status.success(), "--target-fd accepted a regular file");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a block device"));
+    drop(reg);
+    drop(held);
+
+    fsck_strict(Path::new(&dev));
+    let vol = read_back(Path::new(&dev));
+    let mut want = read_source_tree(&src);
+    want.extend(rebase(&read_source_tree(&more), "more/"));
+    let more_dir = vol.tree.get("more").expect("more/ missing");
+    assert!(more_dir.is_dir);
+    want.insert("more".into(), SrcNode { is_dir: true, bytes: vec![], mtime: more_dir.mtime });
+    check_no_problems("--target-fd volume", compare_trees(&want, &vol));
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}

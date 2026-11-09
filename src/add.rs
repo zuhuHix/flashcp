@@ -25,15 +25,14 @@
 
 use crate::events::{Event, Op, Sink, Ticker};
 use crate::exfat::{
-    Item, Node, SeqWriter, checksum16, checksum32, entry_set, finish_set, open_target, ordered_reader, release,
-    scan_tree, set_bytes, upcase_from, validate_name,
+    Item, Node, SeqWriter, TargetSpec, checksum16, checksum32, entry_set, finish_set, open_target_fd, ordered_reader,
+    release, scan_tree, set_bytes, set_direct, upcase_from, validate_name,
 };
 use crate::util::human_bytes;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -41,6 +40,11 @@ use std::time::Instant;
 const EOC: u32 = 0xFFFF_FFFF;
 /// The spec caps a directory at 256 MB.
 const MAX_DIR_BYTES: u64 = 256 << 20;
+/// Largest ClusterCount the spec allows.
+const MAX_CLUSTER_COUNT: u64 = 0xFFFF_FFF5;
+/// FAT cache: FAT_CACHE_PAGES pages of FAT_PAGE bytes (4 MB), whatever the volume size.
+const FAT_PAGE: u64 = 64 << 10;
+const FAT_CACHE_PAGES: usize = 64;
 const FLAG_ACTIVE_FAT: u16 = 1;
 const FLAG_DIRTY: u16 = 2;
 const FLAG_MEDIA_FAILURE: u16 = 4;
@@ -126,6 +130,8 @@ struct Dir {
     /// (parent dir index, set offset, set length) of this directory's own entry set.
     entry: Option<(usize, usize, usize)>,
     path: String,
+    /// Up-cased path components from the root (the key into `Vol::kept`).
+    key: Vec<Vec<u16>>,
 }
 
 #[derive(Default)]
@@ -145,7 +151,11 @@ struct Vol {
     cc: u64,
     flags: u16,
     sector0: Vec<u8>,
+    /// Bounded FAT page cache (FIFO eviction): at most FAT_CACHE_PAGES × FAT_PAGE bytes.
     fat_cache: HashMap<u64, Vec<u8>>,
+    fat_order: std::collections::VecDeque<u64>,
+    /// Directories parsed by the verification walk that planning needs, by `Dir::key`.
+    kept: HashMap<Vec<Vec<u16>>, usize>,
     bitmap: Vec<u8>,
     bitmap_clusters: Vec<u32>,
     upcase_clusters: Vec<u32>,
@@ -205,10 +215,15 @@ impl Vol {
         let cc = le32(&region, 92) as u64;
         let root = le32(&region, 96);
         let flags = le16(&region, 106);
+        // Spec limits, checked before any arithmetic uses them.
+        ensure!((1..=MAX_CLUSTER_COUNT).contains(&cc), "ClusterCount {cc} is outside the exFAT limit");
         ensure!(vol_sectors.checked_mul(bps).is_some_and(|b| b <= dev_len), "VolumeLength is larger than the target");
-        ensure!(fat_off >= 24 * bps && fat_len >= (cc + 2) * 4, "inconsistent FAT geometry");
-        ensure!(heap_off >= fat_off + fat_len && heap_off + cc * cs <= vol_sectors * bps, "inconsistent heap geometry");
-        ensure!(cc >= 1 && (2..cc + 2).contains(&(root as u64)), "root directory cluster {root} out of range");
+        ensure!(fat_off >= 24 * bps && fat_len >= (cc + 2) * 4, "inconsistent FAT geometry (FatLength too small)");
+        ensure!(
+            heap_off >= fat_off + fat_len && heap_off + cc * cs <= vol_sectors * bps,
+            "inconsistent heap geometry (ClusterHeapOffset + ClusterCount × cluster > VolumeLength)"
+        );
+        ensure!((2..cc + 2).contains(&(root as u64)), "root directory cluster {root} out of range");
         ensure!(flags & FLAG_ACTIVE_FAT == 0, "volume uses the second FAT (TexFAT); not supported");
         ensure!(flags & FLAG_MEDIA_FAILURE == 0, "volume is flagged with a media failure; refusing to write");
         ensure!(
@@ -226,6 +241,8 @@ impl Vol {
             flags,
             sector0: region[..bps as usize].to_vec(),
             fat_cache: HashMap::new(),
+            fat_order: Default::default(),
+            kept: HashMap::new(),
             bitmap: Vec::new(),
             bitmap_clusters: Vec::new(),
             upcase_clusters: Vec::new(),
@@ -269,7 +286,9 @@ impl Vol {
             children,
             entry: None,
             path: String::new(),
+            key: Vec::new(),
         });
+        v.kept.insert(Vec::new(), 0);
         Ok(v)
     }
 
@@ -279,15 +298,21 @@ impl Vol {
 
     fn fat(&mut self, c: u32) -> Result<u32> {
         let off = self.fat_off + c as u64 * 4;
-        let page = off / 4096;
+        let page = off / FAT_PAGE;
         if !self.fat_cache.contains_key(&page) {
-            let start = page * 4096;
-            let len = 4096.min(self.dev_len - start);
+            let start = page * FAT_PAGE;
+            let len = FAT_PAGE.min(self.dev_len - start);
             let p = self.read_at(start, len)?;
+            if self.fat_order.len() >= FAT_CACHE_PAGES {
+                let old = self.fat_order.pop_front().unwrap();
+                self.fat_cache.remove(&old);
+            }
             self.fat_cache.insert(page, p);
+            self.fat_order.push_back(page);
         }
+        debug_assert!(self.fat_cache.len() <= FAT_CACHE_PAGES);
         let p = &self.fat_cache[&page];
-        Ok(le32(p, (off - page * 4096) as usize))
+        Ok(le32(p, (off - page * FAT_PAGE) as usize))
     }
 
     fn chain(&mut self, first: u32, what: &str) -> Result<Vec<u32>> {
@@ -312,11 +337,9 @@ impl Vol {
             return Ok(Vec::new());
         }
         if no_fat_chain {
-            ensure!(
-                self.valid(first) && first as u64 + n <= self.cc + 2,
-                "{what}: contiguous extent runs past the end of the volume"
-            );
-            return Ok((first..first + n as u32).collect());
+            let run = contiguous_run(first, n, self.cc)
+                .with_context(|| format!("{what}: contiguous extent runs past the end of the volume"))?;
+            return Ok(run.map(|c| c as u32).collect());
         }
         let c = self.chain(first, what)?;
         ensure!(c.len() as u64 == n, "{what}: FAT chain has {} clusters, its length needs {n}", c.len());
@@ -343,12 +366,18 @@ impl Vol {
         Ok(out)
     }
 
-    /// Loads (and validates) a child directory of `parent`; returns its index in `dirs`.
-    fn load_child(&mut self, parent: usize, ch: &Child) -> Result<usize> {
-        let path = self.dirs[parent].path.clone();
-        let d = self.read_child(parent, &path, ch)?;
-        self.dirs.push(d);
-        Ok(self.dirs.len() - 1)
+    /// A child directory of `parent`, as parsed and verified by the walk (never re-read, so
+    /// planning sees exactly what was verified); its index in `dirs`.
+    fn load_child(&self, parent: usize, ch: &Child) -> Result<usize> {
+        let mut key = self.dirs[parent].key.clone();
+        key.push(upcase(&ch.name, &self.upc));
+        self.kept.get(&key).copied().ok_or_else(|| {
+            anyhow!(
+                "internal error: {}/{} was not kept by the verification walk",
+                self.dirs[parent].path,
+                String::from_utf16_lossy(&ch.name)
+            )
+        })
     }
 
     fn read_child(&mut self, parent: usize, parent_path: &str, ch: &Child) -> Result<Dir> {
@@ -370,6 +399,7 @@ impl Vol {
             children,
             entry: Some((parent, ch.set_off, ch.set_len)),
             path,
+            key: Vec::new(),
         })
     }
 
@@ -379,7 +409,10 @@ impl Vol {
     /// calls free, a cluster referenced twice (cross-link), and chains that loop, leave the
     /// heap, or do not match DataLength. Allocated-but-unreferenced (leaked) clusters are fine:
     /// allocation only ever uses clusters the bitmap calls free. Returns objects checked.
-    fn verify_allocation(&mut self) -> Result<u64> {
+    ///
+    /// Directories whose up-cased path is in `wanted` are kept in `dirs` (indexed by `kept`) for
+    /// planning; the rest are dropped as soon as they are walked, so memory stays bounded.
+    fn verify_allocation(&mut self, wanted: &HashSet<Vec<Vec<u16>>>) -> Result<u64> {
         let mut refd = vec![0u8; self.bitmap.len()];
         let mut objects = 0u64;
         let sys = [
@@ -393,18 +426,34 @@ impl Vol {
             }
             objects += 1;
         }
-        let root_path = String::new();
-        let mut stack: Vec<(String, Vec<Child>)> = vec![(root_path, self.dirs[0].children.values().cloned().collect())];
-        while let Some((path, kids)) = stack.pop() {
+        // (key, path, children, index in dirs if kept)
+        type Work = (Vec<Vec<u16>>, String, Vec<Child>, Option<usize>);
+        let mut stack: Vec<Work> =
+            vec![(Vec::new(), String::new(), self.dirs[0].children.values().cloned().collect(), Some(0))];
+        while let Some((key, path, kids, kept_at)) = stack.pop() {
             for ch in kids {
                 objects += 1;
                 let what = || format!("{path}/{}", String::from_utf16_lossy(&ch.name));
                 if ch.is_dir {
-                    let d = self.read_child(0, &path, &ch)?;
+                    let mut d = self.read_child(kept_at.unwrap_or(0), &path, &ch)?;
                     for &c in &d.clusters {
                         claim(&mut refd, &self.bitmap, c, &what)?;
                     }
-                    stack.push((d.path, d.children.into_values().collect()));
+                    let mut ckey = key.clone();
+                    ckey.push(upcase(&ch.name, &self.upc));
+                    let grand: Vec<Child> = d.children.values().cloned().collect();
+                    let dpath = d.path.clone();
+                    // A wanted directory's parent is wanted too (prefixes), so kept_at is Some.
+                    let at = if kept_at.is_some() && wanted.contains(&ckey) {
+                        d.key = ckey.clone();
+                        self.dirs.push(d);
+                        let i = self.dirs.len() - 1;
+                        self.kept.insert(ckey.clone(), i);
+                        Some(i)
+                    } else {
+                        None
+                    };
+                    stack.push((ckey, dpath, grand, at));
                 } else {
                     self.claim_stream(&mut refd, &ch, &what)?;
                 }
@@ -420,13 +469,10 @@ impl Vol {
             return Ok(());
         }
         if ch.no_fat_chain {
-            ensure!(
-                self.valid(ch.first) && ch.first as u64 + n <= self.cc + 2,
-                "{}: contiguous extent runs past the end of the volume",
-                what()
-            );
-            for c in ch.first..ch.first + n as u32 {
-                claim(refd, &self.bitmap, c, what)?;
+            let run = contiguous_run(ch.first, n, self.cc)
+                .with_context(|| format!("{}: contiguous extent runs past the end of the volume", what()))?;
+            for c in run {
+                claim(refd, &self.bitmap, c as u32, what)?; // c < cc + 2 ≤ 0xFFFF_FFF7
             }
             return Ok(());
         }
@@ -454,6 +500,14 @@ impl Vol {
         let pad_used = if pad > 0 { (last >> (8 - pad)).count_ones() as u64 } else { 0 };
         self.cc - (used - pad_used)
     }
+}
+
+/// Clusters [first, first + n) of a contiguous (NoFatChain) object, in u64 so nothing can
+/// overflow; None unless the whole run lies inside the heap (2 ..= cc + 1).
+fn contiguous_run(first: u32, n: u64, cc: u64) -> Result<std::ops::Range<u64>> {
+    let first = first as u64;
+    ensure!(first >= 2 && n >= 1 && first.checked_add(n).is_some_and(|e| e <= cc + 2), "out of range");
+    Ok(first..first + n)
 }
 
 /// Marks cluster `c` referenced; refuses cross-links and clusters the bitmap calls free.
@@ -776,29 +830,51 @@ struct Seg {
 }
 
 pub fn add(src: &Path, target: &Path, o: &AddOpts, sink: Sink<'_>) -> Result<AddStats> {
+    add_to(src, &TargetSpec::from(target), o, sink)
+}
+
+/// [`add`] onto a [`TargetSpec`] (a path, or an inherited block-device fd).
+pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> Result<AddStats> {
     let t0 = Instant::now();
     let mut tick = Ticker::new(sink);
     ensure!(
         fs::metadata(src).with_context(|| format!("source {}", src.display()))?.is_dir(),
         "source must be a directory"
     );
-    let tgt = open_target(target)?;
-    // The exclusive (O_EXCL) handle stays open until we return, so nobody can mount the
-    // device mid-way; data goes through it (O_DIRECT when possible).
+    let tgt = target.open_rw()?;
+    // The one open file description (exclusively claimed: O_EXCL / flock) is used for
+    // everything and stays open until we return, so nobody can mount the device mid-way.
+    // Nothing is reopened by path. Metadata I/O is buffered; O_DIRECT is switched on (F_SETFL)
+    // only for the data phase. Duplicated fds share the description, hence the flags.
     let excl = Arc::new(tgt.file);
-    // A second, buffered handle on the SAME open file (not the path), for metadata I/O.
-    let meta = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(format!("/proc/self/fd/{}", excl.as_raw_fd()))
-        .context("reopen target for metadata I/O")?;
-    let mut v = Vol::open(meta, tgt.bytes, false)?;
-    // Mandatory: never trust a clear bitmap bit that something still references.
-    let tv = Instant::now();
-    let verified = v.verify_allocation()?;
-    let verify_secs = tv.elapsed().as_secs_f64();
+    set_direct(&excl, false);
+    let mut v = Vol::open(excl.try_clone().context("dup target fd")?, tgt.bytes, false)?;
     let cs = v.cs;
     let mut nodes = scan_tree(src, &v.upc)?;
+    // Mandatory: never trust a clear bitmap bit that something still references. The walk
+    // keeps the directories planning may touch (the --to path and every source directory
+    // path under it), so planning uses exactly what was verified.
+    let mut wanted: HashSet<Vec<Vec<u16>>> = HashSet::new();
+    let mut dest: Vec<Vec<u16>> = Vec::new();
+    wanted.insert(dest.clone());
+    for comp in o.to.as_deref().unwrap_or("").split('/').filter(|c| !c.is_empty() && *c != ".") {
+        dest.push(upcase(&comp.encode_utf16().collect::<Vec<_>>(), &v.upc));
+        wanted.insert(dest.clone());
+    }
+    let mut q = vec![(0usize, dest)];
+    while let Some((n, key)) = q.pop() {
+        for &c in &nodes[n].children {
+            if nodes[c].is_dir {
+                let mut k = key.clone();
+                k.push(upcase(&nodes[c].name, &v.upc));
+                wanted.insert(k.clone());
+                q.push((c, k));
+            }
+        }
+    }
+    let tv = Instant::now();
+    let verified = v.verify_allocation(&wanted)?;
+    let verify_secs = tv.elapsed().as_secs_f64();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
     let now = (now.as_secs() as i64, now.subsec_nanos());
 
@@ -1126,9 +1202,9 @@ pub fn add(src: &Path, target: &Path, o: &AddOpts, sink: Sink<'_>) -> Result<Add
     let empty_files = (files as usize - file_order.len()) as u64;
     tick.progress(empty_files, 0, true);
     if !segs.is_empty() {
-        let direct = tgt.direct && cs.is_multiple_of(4096) && v.heap_off.is_multiple_of(4096);
-        let mut w =
-            if direct { SeqWriter::new(excl.clone()) } else { SeqWriter::with_align(Arc::new(v.dev.try_clone()?), 1) };
+        let direct =
+            tgt.direct && cs.is_multiple_of(4096) && v.heap_off.is_multiple_of(4096) && set_direct(&excl, true);
+        let mut w = if direct { SeqWriter::new(excl.clone()) } else { SeqWriter::with_align(excl.clone(), 1) };
         let reads: Vec<(PathBuf, u64)> = file_order.iter().map(|&i| (nodes[i].src.clone(), nodes[i].size)).collect();
         let (rx, budget) = ordered_reader(reads, o.readers.max(1), 256 << 20, 16 << 20);
         let mut pending: BTreeMap<usize, Item> = BTreeMap::new();
@@ -1201,6 +1277,7 @@ pub fn add(src: &Path, target: &Path, o: &AddOpts, sink: Sink<'_>) -> Result<Add
         }
         ensure!(cur.is_none(), "internal layout error: a file was not fully written");
         w.finish()?; // syncs
+        set_direct(&excl, false); // metadata phases are small buffered writes
     }
     stop_after("data")?;
 
@@ -1232,18 +1309,28 @@ pub fn add(src: &Path, target: &Path, o: &AddOpts, sink: Sink<'_>) -> Result<Add
 
 /// Read-only summary of an exFAT volume (needs only read access; no exclusive open).
 pub fn info(target: &Path) -> Result<VolumeInfo> {
-    let f = File::open(target).with_context(|| format!("open {}", target.display()))?;
-    let md = f.metadata()?;
-    let len = if md.file_type().is_block_device() {
-        let mut size: u64 = 0;
-        // BLKGETSIZE64 = _IOR(0x12, 114, size_t)
-        let r = unsafe { libc::ioctl(f.as_raw_fd(), crate::exfat::BLKGETSIZE64 as _, &mut size) };
-        ensure!(r == 0, "BLKGETSIZE64 failed on {}", target.display());
-        size
-    } else if md.is_file() {
-        md.len()
-    } else {
-        bail!("{} is neither a block device nor a regular image file", target.display());
+    info_of(&TargetSpec::from(target))
+}
+
+/// [`info`] of a [`TargetSpec`]; an inherited fd may be O_RDONLY and must be a block device.
+pub fn info_of(target: &TargetSpec) -> Result<VolumeInfo> {
+    let (f, len) = match target {
+        TargetSpec::Fd(fd) => {
+            let t = open_target_fd(*fd, false)?;
+            (t.file, t.bytes)
+        }
+        TargetSpec::Path(target) => {
+            let f = File::open(target).with_context(|| format!("open {}", target.display()))?;
+            let md = f.metadata()?;
+            let len = if md.file_type().is_block_device() {
+                crate::exfat::blk_size(&f)?
+            } else if md.is_file() {
+                md.len()
+            } else {
+                bail!("{} is neither a block device nor a regular image file", target.display());
+            };
+            (f, len)
+        }
     };
     let mut v = Vol::open(f, len, true)?;
     let (mut files, mut dirs) = (0u64, 0u64);
@@ -1358,6 +1445,95 @@ mod tests {
         claim(&mut refd, &bitmap, 2, &w).unwrap();
         assert!(format!("{:#}", claim(&mut refd, &bitmap, 2, &w).unwrap_err()).contains("cross-linked"));
         assert!(format!("{:#}", claim(&mut refd, &bitmap, 4, &w).unwrap_err()).contains("marked free"));
+    }
+
+    #[test]
+    fn contiguous_run_boundaries() {
+        let cc = MAX_CLUSTER_COUNT;
+        assert_eq!(contiguous_run(2, 1, 16).unwrap(), 2..3);
+        assert_eq!(contiguous_run(2, 16, 16).unwrap(), 2..18);
+        assert!(contiguous_run(2, 17, 16).is_err());
+        assert!(contiguous_run(1, 1, 16).is_err());
+        assert!(contiguous_run(0, 1, 16).is_err());
+        assert!(contiguous_run(2, 0, 16).is_err());
+        // Last legal cluster of the largest volume, and runs that would overflow u32.
+        let last = (cc + 1) as u32;
+        assert_eq!(contiguous_run(last, 1, cc).unwrap(), cc + 1..cc + 2);
+        assert!(contiguous_run(last, 2, cc).is_err());
+        assert!(contiguous_run(u32::MAX, 1, cc).is_err());
+        assert!(contiguous_run(u32::MAX - 1, u32::MAX as u64, cc).is_err());
+        assert!(contiguous_run(2, u64::MAX, cc).is_err());
+    }
+
+    /// A 32 MB image holding the mkfs.exfat reference boot region with ClusterCount patched.
+    fn boot_image(tag: &str, cluster_count: u32) -> (PathBuf, File) {
+        let mut b = include_bytes!("testdata/mkfs_boot.bin").to_vec();
+        b[92..96].copy_from_slice(&cluster_count.to_le_bytes());
+        let c = checksum32(&b[..11 * 512], &[106, 107, 112], 0);
+        for i in 0..128 {
+            b[11 * 512 + i * 4..11 * 512 + i * 4 + 4].copy_from_slice(&c.to_le_bytes());
+        }
+        let p = std::env::temp_dir().join(format!("flashcp-boot-{tag}-{}.img", std::process::id()));
+        let f = File::options().read(true).write(true).create(true).truncate(true).open(&p).unwrap();
+        f.set_len(32 << 20).unwrap();
+        f.write_all_at(&b, 0).unwrap();
+        (p, f)
+    }
+
+    #[test]
+    fn cluster_count_over_spec_limit_is_refused() {
+        for (tag, cc, refused) in [("max", 0xFFFF_FFF5u32, false), ("over", 0xFFFF_FFF6, true), ("zero", 0, true)] {
+            let (p, f) = boot_image(tag, cc);
+            let e = format!("{:#}", Vol::open(f, 32 << 20, false).err().expect("geometry should not fit 32 MB"));
+            assert_eq!(e.contains("ClusterCount"), refused, "cc {cc:#x}: {e}");
+            fs::remove_file(p).unwrap();
+        }
+    }
+
+    #[test]
+    fn fat_cache_stays_bounded() {
+        // A fake 256 MB "FAT" at offset 0 whose entry i holds i ^ 0x5A5A5A5A.
+        let p = std::env::temp_dir().join(format!("flashcp-fat-{}.img", std::process::id()));
+        let f = File::options().read(true).write(true).create(true).truncate(true).open(&p).unwrap();
+        let cc: u64 = 64 << 20;
+        let mut chunk = Vec::with_capacity(4 << 20);
+        for base in (0..cc).step_by(1 << 20) {
+            chunk.clear();
+            for i in base..base + (1 << 20) {
+                chunk.extend_from_slice(&((i as u32) ^ 0x5A5A_5A5A).to_le_bytes());
+            }
+            f.write_all_at(&chunk, base * 4).unwrap();
+        }
+        let mut v = Vol {
+            dev: f,
+            dev_len: cc * 4,
+            bps: 512,
+            cs: 4096,
+            fat_off: 0,
+            heap_off: cc * 4,
+            cc: cc - 2,
+            flags: 0,
+            sector0: vec![],
+            fat_cache: HashMap::new(),
+            fat_order: Default::default(),
+            kept: HashMap::new(),
+            bitmap: vec![],
+            bitmap_clusters: vec![],
+            upcase_clusters: vec![],
+            upc: vec![],
+            label: String::new(),
+            dirs: vec![],
+        };
+        // Stride through the whole 256 MB FAT (4096 distinct pages), then revisit.
+        for round in 0..2 {
+            for c in (2..cc - 2).step_by(16 << 10) {
+                assert_eq!(v.fat(c as u32).unwrap(), (c as u32) ^ 0x5A5A_5A5A, "round {round} entry {c}");
+                assert!(v.fat_cache.len() <= FAT_CACHE_PAGES);
+            }
+        }
+        let bytes: usize = v.fat_cache.values().map(|p| p.len()).sum();
+        assert!(bytes <= FAT_CACHE_PAGES * FAT_PAGE as usize, "cache holds {bytes} bytes");
+        fs::remove_file(p).unwrap();
     }
 
     #[test]

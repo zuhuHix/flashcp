@@ -868,3 +868,21 @@ fn cross_linked_clusters_are_refused() {
     assert_refused_unchanged(&dir, &img, "cross-linked");
     fs::remove_dir_all(&dir).expect("remove scratch dir");
 }
+
+/// Image targets are flock'd exclusively for the whole run: a concurrent holder makes add and
+/// build refuse, and nothing is written.
+#[test]
+fn image_locked_by_another_process_is_refused() {
+    use std::os::unix::io::AsRawFd;
+    let (dir, img, _) = two_file_volume("refuse_locked_image");
+    let holder = fs::File::open(&img).expect("open image");
+    assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0, "take the lock");
+    assert_refused_unchanged(&dir, &img, "locked by another process");
+    let out = run_build(&dir.join("src"), &img, &[]);
+    assert!(!out.status.success(), "build onto a locked image succeeded");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("locked by another process"));
+    drop(holder);
+    add_ok(&dir.join("src"), &img, &[]);
+    fsck_clean(&img);
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
