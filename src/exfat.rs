@@ -509,9 +509,14 @@ impl SeqWriter {
             }
         }
         let end_pos = self.spans.last().map(|&(bo, off)| off + (len - bo) as u64).unwrap();
-        let fresh = self.back.recv().map_err(|_| anyhow::anyhow!("I/O thread died"))?;
+        // The I/O thread drops its ends of both channels when it stops (error or panic), so
+        // neither call can block forever; either failure surfaces the thread's own error.
+        let Ok(fresh) = self.back.recv() else { return Err(self.io_error()) };
         let full = std::mem::replace(&mut self.buf, fresh);
-        self.tx.as_ref().unwrap().send((full, spans)).map_err(|_| anyhow::anyhow!("I/O thread died"))?;
+        let Some(tx) = self.tx.as_ref() else { return Err(self.io_error()) };
+        if tx.send((full, spans)).is_err() {
+            return Err(self.io_error());
+        }
         self.written += len as u64;
         self.fill = 0;
         self.spans.clear();
@@ -570,10 +575,23 @@ impl SeqWriter {
         }
         Ok(())
     }
+    /// Joins the stopped I/O thread and returns its original error.
+    fn io_error(&mut self) -> anyhow::Error {
+        drop(self.tx.take());
+        match self.io.take().map(|h| h.join()) {
+            Some(Ok(Err(e))) => e,
+            Some(Err(_)) => anyhow::anyhow!("I/O thread panicked"),
+            Some(Ok(Ok(()))) | None => anyhow::anyhow!("I/O thread stopped"),
+        }
+    }
     pub(crate) fn finish(mut self) -> Result<u64> {
         self.flush()?;
         drop(self.tx.take());
-        self.io.take().unwrap().join().unwrap()?;
+        match self.io.take().map(|h| h.join()) {
+            Some(Ok(r)) => r?,
+            Some(Err(_)) => bail!("I/O thread panicked"),
+            None => bail!("I/O thread stopped"),
+        }
         Ok(self.written)
     }
 }
@@ -1066,6 +1084,37 @@ mod tests {
         let err = validate(name, &mut HashSet::new(), &upc).expect_err("name should be rejected");
         let msg = format!("{err:#}");
         assert!(msg.contains(needle), "message was: {msg}");
+    }
+
+    // ───── sequential writer ─────
+
+    /// A target that rejects every write (opened read-only): the error must come back from
+    /// write()/finish() promptly, with the I/O thread's own message, never a hang.
+    #[test]
+    fn seq_writer_propagates_write_failure_without_hanging() {
+        let dir = std::env::temp_dir().join(format!("flashcp-seqw-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("ro.img");
+        File::create(&p).unwrap().set_len(64 << 20).unwrap();
+        let ro = Arc::new(File::open(&p).unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut w = SeqWriter::with_align(ro, 1);
+            let chunk = vec![0xA5u8; 1 << 20];
+            let mut res = Ok(());
+            for _ in 0..48 {
+                res = w.write(&chunk);
+                if res.is_err() {
+                    break;
+                }
+            }
+            let res = res.and_then(|_| w.finish().map(|_| ()));
+            let _ = tx.send(res.map_err(|e| format!("{e:#}")));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("SeqWriter hung on a failing target");
+        let msg = got.expect_err("writes to a read-only target succeeded");
+        assert!(msg.contains("write at"), "lost the original I/O error: {msg}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     // ───── checksums and up-case table ─────
