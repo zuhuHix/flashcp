@@ -700,7 +700,7 @@ pub(crate) fn open_target(path: &Path) -> Result<Target> {
         }
         let mut size: u64 = 0;
         // BLKGETSIZE64 = _IOR(0x12, 114, size_t)
-        let r = unsafe { libc::ioctl(std::os::unix::io::AsRawFd::as_raw_fd(&file), 0x80081272, &mut size) };
+        let r = unsafe { libc::ioctl(std::os::unix::io::AsRawFd::as_raw_fd(&file), BLKGETSIZE64 as _, &mut size) };
         ensure!(r == 0, "BLKGETSIZE64 failed");
         let start = fs::read_to_string(format!("{SYS_BLOCK}/{maj}:{min}/start"))
             .ok()
@@ -729,6 +729,10 @@ fn mount_of(path: &Path) -> Option<(String, String)> {
         related_devs(Path::new(SYS_BLOCK), &format!("{}:{}", libc::major(md.rdev()), libc::minor(md.rdev()))).ok()?;
     mounted_dev(&fs::read_to_string("/proc/self/mountinfo").ok()?, &devs)
 }
+
+/// BLKGETSIZE64 = _IOR(0x12, 114, size_t). The ioctl request type is c_ulong on glibc but
+/// c_int on musl, so the literal is cast at the call site (`as _`) instead of typed.
+pub(crate) const BLKGETSIZE64: u32 = 0x8008_1272;
 
 const SYS_BLOCK: &str = "/sys/dev/block";
 
