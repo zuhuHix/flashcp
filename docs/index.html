@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>flashcp: fast small-file copies to USB drives</title>
-  <meta name="description" content="flashcp builds a normal exFAT volume in one sequential pass, so thousands of small files copy up to 10x faster to USB sticks and external drives.">
+  <meta name="description" content="flashcp builds a normal exFAT volume in one sequential pass, so thousands of small files copy as normal loose files. Measured up to 10.3x faster than mkfs + cp on a USB SSD under Linux; results vary by drive.">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
   <script>
@@ -43,7 +43,7 @@
       <div class="hero-text">
         <p class="eyebrow">Rust CLI &middot; exFAT &middot; GPL-3.0-or-later</p>
         <h1>flashcp</h1>
-        <p class="pitch">Copy thousands of small files to a USB drive as normal loose files, measured up to 10.3&times; faster on a USB SSD under Linux. Results vary by drive.</p>
+        <p class="pitch">Copy thousands of small files to a USB drive as normal loose files, measured up to 10.3&times; faster than <code>mkfs</code> + <code>cp</code> on a USB SSD under Linux. Results vary by drive; <a href="#benchmarks">see the benchmarks</a>.</p>
 
         <div class="cta-row">
           <a class="btn btn-primary" href="https://github.com/zuhuHix/flashcp">GitHub repo</a>

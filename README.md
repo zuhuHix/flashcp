@@ -134,7 +134,8 @@ It may understate how much the device gains from parallel writes.
 
 `--fat prefix` (the default) writes only the FAT entries that are in use. exFAT treats the
 allocation bitmap as the authority on which clusters are free, so free FAT entries don't matter.
-On large drives with small clusters that saves up to a gigabyte of writes.
+On large drives with small clusters that saves a lot: a 1 TB volume with 4 KB clusters has
+a FAT of about 976 MB (244 million clusters × 4 bytes), and prefix mode writes only the used part.
 
 Tested: building over a junk-filled image, then writing 300 MB plus 300 new files with the Linux
 kernel driver: `fsck.exfat` clean.
