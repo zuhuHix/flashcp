@@ -64,7 +64,7 @@ mod tests {
 
     #[test]
     fn parses_v1_lines() {
-        let text = "# trusted by flashcp-trust\n\nv1\tSN123\t0x5000cca\tSanDisk Ultra\t32000000000\n";
+        let text = "# trusted by flashcp-trust\n\nv1\tSN123\t0x50014ee2b5a1c3d7\tSanDisk Ultra\t32000000000\n";
         assert_eq!(parse(text), vec![TrustEntry { key: "SN123".into(), size: 32_000_000_000 }]);
     }
 

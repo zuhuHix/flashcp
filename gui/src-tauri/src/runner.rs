@@ -429,17 +429,18 @@ fn error_message(line: &str) -> Option<String> {
 /// The exact argv for flashcp-trust: the full identity the user was shown, so the helper can
 /// refuse if the device it opens differs in any field.
 pub fn trust_args(drive: &Drive) -> Vec<String> {
+    let id = &drive.identity;
     vec![
         TRUST_HELPER_PATH.to_string(),
         drive.device.clone(),
         "--expect".into(),
-        drive.serial.clone(),
+        id.key.clone(),
         "--wwn".into(),
-        drive.wwn.clone(),
+        id.wwn.clone(),
         "--model".into(),
-        drive.id_model.clone(),
+        id.model.clone(),
         "--size".into(),
-        drive.drive_size.to_string(),
+        id.disk_size.to_string(),
     ]
 }
 
@@ -475,25 +476,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trust_args_carry_the_full_identity_tuple() {
+    fn trust_args_equal_the_identity_the_dialog_shows() {
         let mut d = crate::drives::fake_drives().remove(0);
-        d.wwn = "0x500014a000000001".into();
-        d.id_model = "DATAMAG 20Gbps".into();
-        d.drive_size = 1_000_204_886_016;
+        d.identity = crate::drives::TrustIdentity::from_udisks(
+            "500014a000000001",
+            "0x500014a000000001",
+            "DATAMAG 20Gbps",
+            1_000_204_886_016,
+        );
+        // The dialog renders the serialized `identity` object (ui/logic.js trustDetails); the
+        // argv must carry exactly those values.
+        let json = serde_json::to_value(&d).unwrap();
+        let shown = &json["identity"];
+        assert_eq!(shown["keyKind"], "serial");
+        let expected: Vec<String> = vec![
+            TRUST_HELPER_PATH.into(),
+            "/dev/sdz1".into(),
+            "--expect".into(),
+            shown["key"].as_str().unwrap().into(),
+            "--wwn".into(),
+            shown["wwn"].as_str().unwrap().into(),
+            "--model".into(),
+            shown["model"].as_str().unwrap().into(),
+            "--size".into(),
+            shown["diskSize"].as_u64().unwrap().to_string(),
+        ];
+        assert_eq!(trust_args(&d), expected);
         assert_eq!(
-            trust_args(&d),
-            [
-                TRUST_HELPER_PATH,
-                "/dev/sdz1",
-                "--expect",
-                "FAKE0001",
-                "--wwn",
-                "0x500014a000000001",
-                "--model",
-                "DATAMAG 20Gbps",
-                "--size",
-                "1000204886016"
-            ]
+            &expected[3..],
+            ["500014a000000001", "--wwn", "0x500014a000000001", "--model", "DATAMAG 20Gbps", "--size", "1000204886016"]
         );
     }
 
