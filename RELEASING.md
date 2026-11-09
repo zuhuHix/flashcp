@@ -16,6 +16,8 @@
    gh run watch
    ```
 
+   A PR that changes `.github/workflows/release.yml` gets the same dry run automatically. (`workflow_dispatch` only works once the workflow is on `main`.)
+
 4. Tag the merged commit on `main` and push the tag:
 
    ```sh
