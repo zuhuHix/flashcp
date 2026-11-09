@@ -1,6 +1,7 @@
 //! flashcp as a library: build a whole exFAT volume in one sequential pass ([`build`]), add a
-//! tree to an existing exFAT volume ([`add`]), make a directory of one match a tree ([`sync`]), copy files off one ([`pull`]), or summarize one
-//! ([`info`]). Long operations report through a callback of [`events::Event`]s.
+//! tree to an existing exFAT volume ([`add`]), make a directory of one match a tree ([`sync`]),
+//! copy files off one ([`pull`]), or summarize one ([`info`]). Long operations report through a
+//! callback of [`events::Event`]s.
 
 pub mod add;
 pub(crate) mod add_build;
