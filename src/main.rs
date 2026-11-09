@@ -179,12 +179,26 @@ enum Cmd {
         /// Replace files that already exist in DEST
         #[arg(long, conflicts_with = "update")]
         overwrite: bool,
-        /// Copy only files that are new or whose size or modification time differ; replace changed ones safely
+        /// Copy only files that are new or whose size or modification time differ; replace changed ones safely.
+        ///
+        /// Quick check: a file in DEST is up to date when its size and modification time match the
+        /// volume's (mtime at exFAT's 10 ms precision). A same-size change whose mtime was preserved
+        /// (for example by `cp -p` or `rsync -t`) is therefore skipped, not copied.
         #[arg(long, conflicts_with_all = ["skip_existing", "overwrite"])]
         update: bool,
-        /// With --update: delete files and directories in DEST that are not on the volume
+        /// With --update: delete files and directories in DEST that are not on the volume.
+        ///
+        /// The deletions are listed before anything is written. Nothing is deleted without --yes, and
+        /// DEST is never pruned when it is `/`, a direct child of `/`, your home directory, an ancestor
+        /// of it, or another user's home (a direct child of /home).
         #[arg(long, requires = "update")]
         delete_extraneous: bool,
+        /// Confirm the deletions of --delete-extraneous
+        #[arg(long, requires = "delete_extraneous")]
+        yes: bool,
+        /// Also confirm more than 1000 deletions (with --yes)
+        #[arg(long, requires = "yes")]
+        yes_many: bool,
         /// Largest device read in KB (default: chosen per device)
         #[arg(long, hide = true)]
         chunk_kb: Option<usize>,
@@ -485,6 +499,8 @@ fn run(cmd: Cmd) -> Result<()> {
             overwrite,
             update,
             delete_extraneous,
+            yes,
+            yes_many,
             chunk_kb,
             gap_kb,
             inflight,
@@ -507,6 +523,8 @@ fn run(cmd: Cmd) -> Result<()> {
                 overwrite,
                 update,
                 delete_extraneous,
+                yes,
+                yes_many,
                 chunk: chunk_kb.map(|c| c << 10),
                 gap: gap_kb.map(|g| g << 10),
                 buffered,

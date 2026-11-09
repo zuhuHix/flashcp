@@ -14,7 +14,7 @@ use common::{
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 // ───────────────────────── helpers ─────────────────────────
@@ -240,7 +240,7 @@ fn delete_extraneous_removes_strays_and_leaves_outside_alone() {
     symlink(&outside, dest.join("stray-dir/into")).expect("symlink into outside");
     symlink(&outside, dest.join("link-out")).expect("symlink to outside");
 
-    let text = pull_ok(&img, &dest, &["--update", "--delete-extraneous"]);
+    let text = pull_ok(&img, &dest, &["--update", "--delete-extraneous", "--yes"]);
     // stray.txt, sub/extra.txt, link-out, and stray-dir with a, a/b, a/b/c.bin, x.txt and into.
     assert!(text.contains(", deleted 9 extraneous"), "expected 9 deletions:\n{text}");
 
@@ -298,10 +298,12 @@ fn cli_refuses_delete_extraneous_without_update_and_update_with_overwrite() {
     let img = dir.join("disk.img");
     build_image(&src, &img);
 
-    let cases: [(&[&str], &[&str]); 3] = [
+    let cases: [(&[&str], &[&str]); 5] = [
         (&["--delete-extraneous"], &["--delete-extraneous", "--update"]),
         (&["--update", "--overwrite"], &["--update", "--overwrite"]),
         (&["--update", "--skip-existing"], &["--update", "--skip-existing"]),
+        (&["--update", "--delete-extraneous", "--yes-many"], &["--yes-many", "--yes"]),
+        (&["--update", "--yes"], &["--yes", "--delete-extraneous"]),
     ];
     for (args, needles) in cases {
         let dest = dir.join("out-refused");
@@ -313,5 +315,176 @@ fn cli_refuses_delete_extraneous_without_update_and_update_with_overwrite() {
         }
         assert!(!dest.exists(), "pull {args:?} created the destination");
     }
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+// ───────────────────────── g. deletion needs --yes, and is listed first ─────────────────────────
+
+/// Every entry under `dir` with its type, inode, mtime and content (or link target): equal
+/// snapshots mean not one byte, name, inode or directory mtime changed.
+fn tree_snapshot(dir: &Path) -> BTreeMap<String, String> {
+    fn walk(dir: &Path, prefix: &str, out: &mut BTreeMap<String, String>) {
+        for e in fs::read_dir(dir).expect("read dir") {
+            let e = e.expect("dir entry");
+            let md = fs::symlink_metadata(e.path()).expect("stat");
+            let name = e.file_name().into_string().expect("UTF-8 name");
+            let key = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            let head = format!("ino={} mtime={}.{}", md.ino(), md.mtime(), md.mtime_nsec());
+            let desc = if md.is_dir() {
+                format!("dir {head}")
+            } else if md.file_type().is_symlink() {
+                format!("link {head} -> {:?}", fs::read_link(e.path()).expect("read link"))
+            } else {
+                format!("file {head} {:?}", fs::read(e.path()).expect("read file"))
+            };
+            out.insert(key.clone(), desc);
+            if md.is_dir() {
+                walk(&e.path(), &key, out);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, "", &mut out);
+    out
+}
+
+/// Builds the source and a DEST with strays, then changes the source (a.txt rewritten, sub/new.txt
+/// added): what a deletion-enabled --update would copy and remove. Returns (image, DEST).
+/// The strays are 9 entries: stray.txt, sub/extra.txt, link-out, and stray-dir with itself, a,
+/// a/b, a/b/c.bin, x.txt and the link `into`.
+fn stray_setup(dir: &Path) -> (PathBuf, PathBuf) {
+    let src = dir.join("src");
+    make_source(&src);
+    let img = dir.join("disk.img");
+    build_image(&src, &img);
+    let dest = dir.join("out");
+    pull_ok(&img, &dest, &[]);
+    write_file(&dest.join("stray.txt"), b"stray\n");
+    write_file(&dest.join("sub/extra.txt"), b"extra\n");
+    write_file(&dest.join("stray-dir/a/b/c.bin"), &pattern(9, 5_000));
+    write_file(&dest.join("stray-dir/x.txt"), b"x\n");
+    symlink(dir.join("outside"), dest.join("stray-dir/into")).expect("symlink");
+    symlink(dir.join("outside"), dest.join("link-out")).expect("symlink");
+    write_file(&src.join("a.txt"), b"alpha, version two, and longer now\n");
+    set_mtime(&src.join("a.txt"), unix_secs(2025, 1, 1, 0, 0, 0), 42_000_000);
+    write_file(&src.join("sub/new.txt"), b"brand new\n");
+    build_image(&src, &img);
+    (img, dest)
+}
+
+#[test]
+fn delete_without_yes_fails_before_anything_is_written() {
+    let dir = test_dir("pull_update_no_yes");
+    let (img, dest) = stray_setup(&dir);
+    let before = tree_snapshot(&dest);
+
+    let out = pull_cmd(&img, &dest, &["--update", "--delete-extraneous"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success(), "deletion went ahead without --yes:\n{stdout}");
+    assert!(
+        stderr.contains("pass --yes to delete them, or drop --delete-extraneous"),
+        "wrong refusal message:\n{stderr}"
+    );
+    assert!(stderr.contains("9 entries would be deleted"), "wrong count:\n{stderr}");
+    assert!(stdout.contains("delete: stray.txt"), "the plan did not list the deletions:\n{stdout}");
+    assert_eq!(tree_snapshot(&dest), before, "DEST changed although the deletion was refused");
+    assert!(!dest.join("sub/new.txt").exists(), "a file was copied before the deletion was confirmed");
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+#[test]
+fn delete_list_is_itemized_in_human_and_json_output() {
+    let dir = test_dir("pull_update_list");
+    let (img, dest) = stray_setup(&dir);
+
+    // Human output, confirmed: the plan line, then one line per top-level entry.
+    let text = pull_ok(&img, &dest, &["--update", "--delete-extraneous", "--yes"]);
+    let plan_at = text.find("pull: ").expect("plan line");
+    for line in
+        ["delete: stray.txt\n", "delete: sub/extra.txt\n", "delete: stray-dir/ (6 entries)\n", "delete: link-out\n"]
+    {
+        let at = text.find(line).unwrap_or_else(|| panic!("missing {line:?} in:\n{text}"));
+        assert!(at > plan_at, "{line:?} printed before the plan:\n{text}");
+    }
+    assert!(!text.contains("delete: stray-dir/a"), "entries inside a deleted directory itemized:\n{text}");
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+
+    // JSON, refused: the plan event is followed by the extraneous event, then the error event.
+    let dir = test_dir("pull_update_list_json");
+    let (img, dest) = stray_setup(&dir);
+    let before = tree_snapshot(&dest);
+    let out = pull_cmd(&img, &dest, &["--update", "--delete-extraneous", "--json"]);
+    assert!(!out.status.success());
+    let json = String::from_utf8_lossy(&out.stdout).into_owned();
+    let plan_at = json.find(r#"{"event":"plan""#).expect("plan event");
+    let extra_at = json.find(r#"{"event":"extraneous","entries":["#).expect("extraneous event");
+    assert!(extra_at > plan_at, "extraneous event before the plan:\n{json}");
+    for item in [
+        r#"{"path":"stray.txt","dir":false,"entries":1}"#,
+        r#"{"path":"sub/extra.txt","dir":false,"entries":1}"#,
+        r#"{"path":"stray-dir","dir":true,"entries":6}"#,
+        r#"{"path":"link-out","dir":false,"entries":1}"#,
+    ] {
+        assert!(json.contains(item), "missing {item} in:\n{json}");
+    }
+    assert!(json.contains(r#"{"event":"error""#), "no error event:\n{json}");
+    assert_eq!(tree_snapshot(&dest), before, "DEST changed although the deletion was refused");
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+// ───────────────────────── h. more than 1000 entries needs --yes-many ─────────────────────────
+
+#[test]
+fn many_deletions_need_yes_many() {
+    let dir = test_dir("pull_update_many");
+    let (img, dest) = stray_setup(&dir);
+    // A stray directory with 1001 files: 1002 entries with the directory itself, 1011 in all.
+    for i in 0..1001 {
+        write_file(&dest.join(format!("many/f{i:04}.txt")), b"x");
+    }
+    let before = tree_snapshot(&dest);
+
+    let out = pull_cmd(&img, &dest, &["--update", "--delete-extraneous", "--yes"]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success(), "1011 deletions went ahead with --yes alone");
+    assert!(stderr.contains("1011 entries would be deleted"), "{stderr}");
+    assert!(stderr.contains("--yes-many"), "the refusal does not name --yes-many:\n{stderr}");
+    assert_eq!(tree_snapshot(&dest), before, "DEST changed although the deletion was refused");
+
+    let text = pull_ok(&img, &dest, &["--update", "--delete-extraneous", "--yes", "--yes-many"]);
+    assert!(text.contains("delete: many/ (1002 entries)"), "{text}");
+    assert!(text.contains(", deleted 1011 extraneous"), "expected 1002 + 9 deletions:\n{text}");
+    assert!(!dest.join("many").exists(), "many/ survived --yes-many");
+    assert_same_tree(&dir.join("src"), &dest, false);
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
+
+// ───────────────────────── i. broad destinations are never pruned ─────────────────────────
+
+#[test]
+fn delete_into_home_or_its_ancestor_is_refused_even_with_yes() {
+    let dir = test_dir("pull_update_protected");
+    let (img, _dest) = stray_setup(&dir);
+    let home = dir.join("home");
+    write_file(&home.join("stray.txt"), b"my file\n");
+    write_file(&home.join("Documents/notes.txt"), b"notes\n");
+    let before = tree_snapshot(&home);
+
+    for (dest, reason) in [(home.clone(), "your home directory"), (dir.clone(), "an ancestor of your home directory")] {
+        let out = flashcp()
+            .arg("pull")
+            .arg(&img)
+            .arg(&dest)
+            .args(["--update", "--delete-extraneous", "--yes"])
+            .env("HOME", &home)
+            .output()
+            .expect("run flashcp pull");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(!out.status.success(), "pull into {} was accepted", dest.display());
+        assert!(stderr.contains("refusing --delete-extraneous"), "{stderr}");
+        assert!(stderr.contains(reason), "{stderr}");
+    }
+    assert_eq!(tree_snapshot(&home), before, "$HOME changed");
     fs::remove_dir_all(&dir).expect("remove scratch dir");
 }

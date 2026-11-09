@@ -70,8 +70,13 @@ pub struct PullOpts {
     /// check, see [`up_to_date`]); a changed file is replaced as --overwrite replaces it.
     pub update: bool,
     /// With `update`: remove every entry of a planned destination directory whose name the
-    /// volume does not have there, after the transfer succeeded.
+    /// volume does not have there, after the transfer succeeded. What would go is computed at
+    /// plan time and listed; nothing is deleted unless `yes` is set (see [`protected_dest`]).
     pub delete_extraneous: bool,
+    /// With `delete_extraneous`: confirms the deletion (needed whenever anything would go).
+    pub yes: bool,
+    /// With `delete_extraneous` and `yes`: also confirms more than [`MANY_DELETE`] entries.
+    pub yes_many: bool,
     /// Largest single device read, in bytes (None: chosen per device, see [`Strategy`]).
     pub chunk: Option<usize>,
     /// Gaps between extents up to this many bytes are read through rather than skipped
@@ -93,6 +98,8 @@ impl Default for PullOpts {
             overwrite: false,
             update: false,
             delete_extraneous: false,
+            yes: false,
+            yes_many: false,
             chunk: None,
             gap: None,
             inflight: None,
@@ -127,6 +134,8 @@ pub const MAX_EXTENTS: usize = 16 << 20;
 pub const MAX_DEPTH: usize = 256;
 /// Longest relative path created under the destination (PATH_MAX).
 pub const MAX_PATH: usize = 4096;
+/// --delete-extraneous with more entries than this (recursively) also needs `yes_many`.
+pub const MANY_DELETE: u64 = 1000;
 /// Test hook: a shell command run after planning, before anything is written.
 const AFTER_PLAN_ENV: &str = "FLASHCP_TEST_AFTER_PLAN";
 /// Test hook: print every data read ("flashcp-read OFFSET LEN") to stderr.
@@ -673,8 +682,23 @@ struct Plan {
     exts: Vec<Ext>,
     skipped: u64,
     collisions: Vec<String>,
-    /// (parent directory index, name) of every volume entry, for --delete-extraneous.
-    keep: HashSet<(u32, Vec<u8>)>,
+    /// --delete-extraneous: the top-level entries of existing destination directories that the
+    /// volume does not have, sorted by path.
+    extraneous: Vec<Extraneous>,
+    /// Entries (recursively) in `extraneous`.
+    extra_total: u64,
+}
+
+/// One top-level entry of an existing destination directory that --delete-extraneous removes.
+struct Extraneous {
+    /// Index of the directory that holds it (into [`Plan::dirs`]).
+    dir: u32,
+    name: CString,
+    /// Path relative to the destination.
+    rel: String,
+    is_dir: bool,
+    /// The entry and everything inside it (symlinks count once, never followed).
+    entries: u64,
 }
 
 /// The --update quick check for an existing destination entry: a regular file of the same size
@@ -702,13 +726,16 @@ fn plan(v: &mut Vol, start: Vec<Child>, seen: &mut [u8], root: Option<&OwnedFd>,
         exts: Vec::new(),
         skipped: 0,
         collisions: Vec::new(),
-        keep: HashSet::new(),
+        extraneous: Vec::new(),
+        extra_total: 0,
     };
     // (children, dir index, volume path, depth, relative path length, exists in the destination)
     let mut stack: Vec<(Vec<Child>, u32, String, usize, usize, bool)> =
         vec![(start, 0, String::new(), 0, 0, root.is_some())];
     let mut entries = 0u64;
     while let Some((kids, di, vpath, depth, plen, exists)) = stack.pop() {
+        // The names the volume has in this directory (for --delete-extraneous).
+        let mut here: HashSet<Vec<u8>> = HashSet::new();
         let shown_dir = if vpath.is_empty() { "/".to_string() } else { vpath.clone() };
         // The existing destination directory, to look for collisions in.
         let dfd = match (exists, root) {
@@ -726,7 +753,7 @@ fn plan(v: &mut Vol, start: Vec<Child>, seen: &mut [u8], root: Option<&OwnedFd>,
             let name = component(&ch.name, &shown_dir)?;
             let cname = CString::new(name.clone()).expect("component() refuses NUL");
             if o.delete_extraneous {
-                p.keep.insert((di, cname.as_bytes().to_vec()));
+                here.insert(cname.as_bytes().to_vec());
             }
             let clen = plen + usize::from(plen > 0) + name.len();
             let what = format!("{vpath}/{name}");
@@ -838,8 +865,54 @@ fn plan(v: &mut Vol, start: Vec<Child>, seen: &mut [u8], root: Option<&OwnedFd>,
                 st: Mutex::new(JobState { file: None, left: ch.valid_len, tmp: None, hash: 0 }),
             });
         }
+        // Every volume entry of this directory is known now: what else the destination holds
+        // here is extraneous. Only an existing directory can hold anything.
+        if let (Some(fd), true) = (&dfd, o.delete_extraneous) {
+            let names =
+                dirfd::list_at(fd.as_fd()).with_context(|| format!("list {}", dest_rel(&p.dirs, di).display()))?;
+            for name in names {
+                if here.contains(name.as_bytes()) {
+                    continue;
+                }
+                let st = dirfd::stat_at(fd.as_fd(), &name)?;
+                let entries = dirfd::count_tree_at(fd.as_fd(), &name)?;
+                let rel = dest_rel(&p.dirs, di).join(std::ffi::OsStr::from_bytes(name.as_bytes()));
+                p.extra_total += entries;
+                p.extraneous.push(Extraneous {
+                    dir: di,
+                    name,
+                    rel: rel.display().to_string(),
+                    is_dir: st.is_some_and(|st| dirfd::is_dir(&st)),
+                    entries,
+                });
+            }
+        }
     }
+    p.extraneous.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(p)
+}
+
+/// Why --delete-extraneous must never run into `dest` (canonical, or None when it is not a
+/// protected place): the filesystem root, a direct child of `/` (/home, /usr, /etc, …), the
+/// home directory `home`, an ancestor of it, or a direct child of /home (another user's home).
+/// A destination that does not exist yet is never protected: nothing in it can be extraneous.
+pub fn protected_dest(dest: &Path, home: Option<&Path>) -> Option<&'static str> {
+    if dest == Path::new("/") {
+        return Some("the filesystem root");
+    }
+    if dest.parent() == Some(Path::new("/")) {
+        return Some("a top-level system directory");
+    }
+    if home == Some(dest) {
+        return Some("your home directory");
+    }
+    if home.is_some_and(|h| h.starts_with(dest)) {
+        return Some("an ancestor of your home directory");
+    }
+    if dest.parent() == Some(Path::new("/home")) {
+        return Some("another user's home directory");
+    }
+    None
 }
 
 fn dest_rel(dirs: &[DirNode], mut i: u32) -> PathBuf {
@@ -851,23 +924,42 @@ fn dest_rel(dirs: &[DirNode], mut i: u32) -> PathBuf {
     parts.iter().rev().collect()
 }
 
-/// --delete-extraneous: in every planned directory, removes each entry whose name the volume
-/// does not have there (`keep`). Returns the entries removed (see [`PullStats::deleted`]).
-fn delete_extraneous(d: &Dest, keep: &HashSet<(u32, Vec<u8>)>) -> Result<u64> {
+/// --delete-extraneous: removes the entries planned by [`plan`] (and only those). Returns the
+/// entries removed (see [`PullStats::deleted`]).
+fn delete_extraneous(d: &Dest, extra: &[Extraneous]) -> Result<u64> {
     let mut cache = DirCache::default();
     let mut deleted = 0;
-    for i in 0..d.dirs.len() as u32 {
-        let dir = cache.get(d, i)?;
-        let names = dirfd::list_at(dir).with_context(|| format!("list {}", d.path.join(d.rel(i)).display()))?;
-        for name in names {
-            if keep.contains(&(i, name.as_bytes().to_vec())) {
-                continue;
-            }
-            deleted += dirfd::remove_tree_at(dir, &name)
-                .with_context(|| format!("delete {} (not on the volume)", d.shown(i, &name)))?;
-        }
+    for e in extra {
+        let dir = cache.get(d, e.dir)?;
+        deleted +=
+            dirfd::remove_tree_at(dir, &e.name).with_context(|| format!("delete {} (not on the volume)", e.rel))?;
     }
     Ok(deleted)
+}
+
+/// The itemized deletion list: one line per top-level entry (directories with their entry count).
+fn extraneous_lines(extra: &[Extraneous]) -> String {
+    extra
+        .iter()
+        .map(|e| {
+            if e.is_dir {
+                format!("\ndelete: {}/ ({} entries)", e.rel, e.entries)
+            } else {
+                format!("\ndelete: {}", e.rel)
+            }
+        })
+        .collect()
+}
+
+/// The JSON array of the `extraneous` event.
+fn extraneous_json(extra: &[Extraneous]) -> String {
+    let items: Vec<String> = extra
+        .iter()
+        .map(|e| {
+            format!(r#"{{"path":{},"dir":{},"entries":{}}}"#, crate::events::json_str(&e.rel), e.is_dir, e.entries)
+        })
+        .collect();
+    format!("[{}]", items.join(","))
 }
 
 /// Removes the temp files of replacements that never completed.
@@ -945,6 +1037,17 @@ fn pull_inner(
     ensure!(!(o.update && o.overwrite), "--update and --overwrite are mutually exclusive");
     ensure!(!(o.update && o.skip_existing), "--update and --skip-existing are mutually exclusive");
     ensure!(o.update || !o.delete_extraneous, "--delete-extraneous requires --update");
+    ensure!(o.delete_extraneous || !o.yes, "--yes only confirms --delete-extraneous");
+    ensure!(o.yes || !o.yes_many, "--yes-many requires --yes");
+    // Refused before anything else, even with --yes: a broad destination must never be pruned.
+    if o.delete_extraneous
+        && let Ok(canon) = fs::canonicalize(dest)
+    {
+        let home = std::env::var_os("HOME").and_then(|h| fs::canonicalize(h).ok());
+        if let Some(why) = protected_dest(&canon, home.as_deref()) {
+            bail!("refusing --delete-extraneous into {}: it is {why}; nothing was changed", canon.display());
+        }
+    }
     let mut tick = Ticker::new(sink);
     match &mounted {
         Some((dev, at, true)) => eprintln!(
@@ -1009,6 +1112,8 @@ fn pull_inner(
     let o = &PullOpts { chunk: Some(strat.chunk), ..o.clone() };
     let mut p = plan(&mut v, start, &mut seen, root.as_ref(), o)?;
     drop(seen);
+    let extra = std::mem::take(&mut p.extraneous);
+    let extra_total = p.extra_total;
     if !p.collisions.is_empty() {
         p.collisions.sort();
         let n = p.collisions.len();
@@ -1052,9 +1157,13 @@ fn pull_inner(
     } else {
         String::new()
     };
-    let delete_note = if o.delete_extraneous { ", will delete extraneous entries" } else { "" };
+    let delete_note = match (o.delete_extraneous, extra_total) {
+        (false, _) => String::new(),
+        (true, 0) => ", no extraneous entries".to_string(),
+        (true, n) => format!(", {n} extraneous entries to delete"),
+    };
     let detail = format!(
-        "pull: {files} files, {dirs} dirs, {} of data → {}{skip_note}{delete_note}; reading {} in {} requests of up to {} (cluster {}; {}: gap {}, {} in flight{})",
+        "pull: {files} files, {dirs} dirs, {} of data → {}{skip_note}{delete_note}; reading {} in {} requests of up to {} (cluster {}; {}: gap {}, {} in flight{}){}",
         human_bytes(data_bytes as f64),
         dest.display(),
         human_bytes(read_bytes as f64),
@@ -1065,6 +1174,7 @@ fn pull_inner(
         human_bytes(strat.gap as f64),
         strat.inflight,
         if strat.direct { "" } else { ", buffered" },
+        extraneous_lines(&extra),
     );
     tick.emit(Event::Plan {
         op: Op::Pull,
@@ -1076,6 +1186,20 @@ fn pull_inner(
         strategy: Some(strat.to_json()),
         sync: None,
     });
+    if o.delete_extraneous {
+        tick.emit(Event::Extraneous { entries: extraneous_json(&extra) });
+    }
+    // Nothing is written before the deletion is confirmed: the plan is printed, then refused.
+    if extra_total > 0 {
+        ensure!(
+            o.yes,
+            "{extra_total} entries would be deleted (listed above); pass --yes to delete them, or drop --delete-extraneous"
+        );
+        ensure!(
+            extra_total <= MANY_DELETE || o.yes_many,
+            "{extra_total} entries would be deleted (listed above), more than {MANY_DELETE}; pass --yes-many as well"
+        );
+    }
     if let Ok(cmd) = std::env::var(AFTER_PLAN_ENV) {
         let ok = std::process::Command::new("sh").arg("-c").arg(&cmd).status().is_ok_and(|s| s.success());
         ensure!(ok, "{AFTER_PLAN_ENV} command failed");
@@ -1084,7 +1208,6 @@ fn pull_inner(
     let d = Dest { root, path: dest.to_path_buf(), dirs: p.dirs };
     let jobs = p.jobs;
     let exts = p.exts;
-    let keep = p.keep;
 
     let res = transfer(&file, &d, &jobs, &exts, &chunks, tail_at, cut, &strat, o, hash, trace, &mut tick);
     let retries = match res {
@@ -1096,7 +1219,7 @@ fn pull_inner(
     };
     // Only now that every file is in place: whatever the volume does not have goes.
     let deleted = if o.delete_extraneous {
-        delete_extraneous(&d, &keep).context("--delete-extraneous failed; the destination is partly cleaned")?
+        delete_extraneous(&d, &extra).context("--delete-extraneous failed; the destination is partly cleaned")?
     } else {
         0
     };
@@ -1463,5 +1586,39 @@ mod tests {
             assert!(component(&u(bad), "/").is_err(), "{bad:?} accepted");
         }
         assert!(component(&[0xD800], "/").is_err(), "lone surrogate accepted");
+    }
+
+    #[test]
+    fn protected_dest_refuses_broad_destinations() {
+        let home = Path::new("/home/zuhu");
+        let refused = |d: &str, h: Option<&Path>| protected_dest(Path::new(d), h).is_some();
+        // The root, every direct child of /, $HOME, its ancestors, and other users' homes.
+        for d in ["/", "/home", "/usr", "/etc", "/var", "/tmp", "/opt", "/root", "/media", "/mnt"] {
+            assert!(refused(d, Some(home)), "{d} accepted");
+            assert!(refused(d, None), "{d} accepted without HOME");
+        }
+        assert!(refused("/home/zuhu", Some(home)), "$HOME accepted");
+        assert!(refused("/home/bob", Some(home)), "another user's home accepted");
+        assert!(refused("/home/bob", None), "another user's home accepted without HOME");
+        assert!(refused("/home/zuhu/a", Some(Path::new("/home/zuhu/a"))), "$HOME below /home accepted");
+        // $HOME in a deeper place: its ancestors are refused, its children are not.
+        let deep = Path::new("/srv/data/zuhu");
+        assert!(refused("/srv", Some(deep)), "ancestor of $HOME accepted");
+        assert!(refused("/srv/data", Some(deep)), "ancestor of $HOME accepted");
+        assert!(refused("/srv/data/zuhu", Some(deep)), "$HOME accepted");
+        assert!(!refused("/srv/data/zuhu/backup", Some(deep)), "a folder inside $HOME refused");
+        // Ordinary destinations are fine, with or without HOME.
+        for d in ["/home/zuhu/photos", "/home/zuhu/Documents/usb", "/srv/data/usb", "/mnt/usb/copy"] {
+            assert!(!refused(d, Some(home)), "{d} refused");
+        }
+        assert!(!refused("/srv/usb", None), "a child of /srv refused");
+        assert!(!refused("/mnt/usb/copy", None), "a deep folder refused");
+        // The reasons name the place.
+        assert_eq!(protected_dest(Path::new("/"), None), Some("the filesystem root"));
+        assert_eq!(protected_dest(Path::new("/usr"), None), Some("a top-level system directory"));
+        assert_eq!(protected_dest(home, Some(home)), Some("your home directory"));
+        assert_eq!(protected_dest(Path::new("/home"), Some(home)), Some("a top-level system directory"));
+        assert_eq!(protected_dest(Path::new("/srv/data"), Some(deep)), Some("an ancestor of your home directory"));
+        assert_eq!(protected_dest(Path::new("/home/bob"), Some(home)), Some("another user's home directory"));
     }
 }

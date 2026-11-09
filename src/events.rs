@@ -80,6 +80,12 @@ pub enum Event {
         bytes: u64,
         secs: f64,
     },
+    /// `pull --delete-extraneous` only, emitted right after its `Plan`: the top-level entries of
+    /// DEST that would be deleted, as a pre-encoded JSON array of
+    /// `{"path","dir","entries"}` objects (`entries` counts an entry's whole subtree).
+    Extraneous {
+        entries: String,
+    },
 }
 
 /// JSON string literal (with quotes) for `s`.
@@ -125,6 +131,7 @@ impl Event {
             Event::Done { files, bytes, secs } => {
                 format!(r#"{{"event":"done","files":{files},"bytes":{bytes},"secs":{}}}"#, json_f64(*secs))
             }
+            Event::Extraneous { entries } => format!(r#"{{"event":"extraneous","entries":{entries}}}"#),
         }
     }
 }
