@@ -1,8 +1,11 @@
 import React from 'react';
 import {Composition} from 'remotion';
+import {AddNoErase} from './AddNoErase';
 import {BenchmarkChart} from './BenchmarkChart';
 import {CopyVsBuild} from './CopyVsBuild';
+import {PullSweep} from './PullSweep';
 import {Showreel} from './Showreel';
+import {TwoDrives} from './TwoDrives';
 import {VolumeLayout} from './VolumeLayout';
 
 export const RemotionRoot: React.FC = () => (
@@ -28,7 +31,7 @@ export const RemotionRoot: React.FC = () => (
     <Composition
       id="BenchmarkChart-light"
       component={BenchmarkChart}
-      durationInFrames={270}
+      durationInFrames={390}
       fps={30}
       width={1200}
       height={640}
@@ -37,7 +40,7 @@ export const RemotionRoot: React.FC = () => (
     <Composition
       id="BenchmarkChart-dark"
       component={BenchmarkChart}
-      durationInFrames={270}
+      durationInFrames={390}
       fps={30}
       width={1200}
       height={640}
@@ -62,9 +65,63 @@ export const RemotionRoot: React.FC = () => (
       defaultProps={{theme: 'dark' as const}}
     />
     <Composition
+      id="AddNoErase-light"
+      component={AddNoErase}
+      durationInFrames={270}
+      fps={30}
+      width={1200}
+      height={600}
+      defaultProps={{theme: 'light' as const}}
+    />
+    <Composition
+      id="AddNoErase-dark"
+      component={AddNoErase}
+      durationInFrames={270}
+      fps={30}
+      width={1200}
+      height={600}
+      defaultProps={{theme: 'dark' as const}}
+    />
+    <Composition
+      id="PullSweep-light"
+      component={PullSweep}
+      durationInFrames={330}
+      fps={30}
+      width={1200}
+      height={600}
+      defaultProps={{theme: 'light' as const}}
+    />
+    <Composition
+      id="PullSweep-dark"
+      component={PullSweep}
+      durationInFrames={330}
+      fps={30}
+      width={1200}
+      height={600}
+      defaultProps={{theme: 'dark' as const}}
+    />
+    <Composition
+      id="TwoDrives-light"
+      component={TwoDrives}
+      durationInFrames={300}
+      fps={30}
+      width={1200}
+      height={600}
+      defaultProps={{theme: 'light' as const}}
+    />
+    <Composition
+      id="TwoDrives-dark"
+      component={TwoDrives}
+      durationInFrames={300}
+      fps={30}
+      width={1200}
+      height={600}
+      defaultProps={{theme: 'dark' as const}}
+    />
+    <Composition
       id="Showreel-dark"
       component={Showreel}
-      durationInFrames={840}
+      durationInFrames={1620}
       fps={30}
       width={1200}
       height={640}

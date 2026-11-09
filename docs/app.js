@@ -1,6 +1,9 @@
 /* flashcp site. Plain browser JS, no libraries.
-   Every benchmark number below is copied from the measured tables in README.md
-   (2026-11-09, MSI DATAMAG 20Gbps, exFAT, Linux 7.0). Speedups are computed here. */
+   Benchmark numbers are the measured tables from README.md (merged work only), taken on
+   2026-11-09, Linux 7.0, on two drives: an MSI DATAMAG 20Gbps USB SSD and a SanDisk Cruzer
+   Blade 8 GB USB 2.0 stick. Times are seconds, medians of 3. In-review work (PR #9) is
+   deliberately not included here. Every speedup shown is computed below from these times, except where a case
+   carries `x`: the published figure from the unrounded medians (5.58 / 0.38 s rounds to 14.7x; measured 14.6x). */
 (function () {
   'use strict';
 
@@ -61,22 +64,57 @@
   }
 
   // ---------------------------------------------------------------
-  // Benchmark data (from README.md tables)
+  // Benchmark data (measured; seconds). Each case lists the normal-copy
+  // baseline as `base`; speedup = base / method time.
+  //   build: copy = mkfs + smart copy, full = flashcp build --fat full
+  //   pull:  each drive layout has its own baseline (kernel-filled, flashcp-built)
   // ---------------------------------------------------------------
+  var DATASET_LABEL = {
+    small: '20k files / 169 MB',
+    many: '100k files / 413 MB',
+    mixed: '8.4k mixed / 1.4 GB'
+  };
+  var DRIVE_DATASETS = {
+    ssd: ['small', 'many', 'mixed'],
+    stick: ['small'] // the stick was measured on the 20k-file dataset only
+  };
 
-  // Table A: fresh volume. Times in seconds.
-  // Method order matches METHODS_A; index 0 is the baseline (mkfs + cp).
-  var METHODS_A = [
-    { label: 'mkfs + cp (baseline)', fill: 'fill-normal' },
-    { label: 'mkfs + smart copy', fill: 'fill-copy' },
-    { label: 'build, prefix FAT (default)', fill: 'fill-flash' },
-    { label: 'build, full FAT', fill: 'fill-flash2' }
-  ];
-  var DATA_A = [
-    { id: '20k', label: '20k files / 169 MB', times: [2.80, 2.85, 0.42, 0.73] },
-    { id: '100k', label: '100k files / 413 MB', times: [8.90, 8.80, 0.86, 1.83] },
-    { id: '8k', label: '8.4k mixed / 1.4 GB', times: [3.71, 3.50, 1.72, 2.21] }
-  ];
+  var BENCH = {
+    ssd: {
+      build: {
+        small: { base: 2.80, copy: 2.85, flash: 0.42, full: 0.73 },
+        many:  { base: 8.90, copy: 8.80, flash: 0.86, full: 1.83 },
+        mixed: { base: 3.71, copy: 3.50, flash: 1.72, full: 2.21 }
+      },
+      add: {
+        small: { base: 1.72, flash: 0.48 },
+        many:  { base: 9.01, flash: 1.75 },
+        mixed: { base: 3.16, flash: 1.57 }
+      },
+      pull: {
+        small: { kernel: { base: 6.01, flash: 0.66 }, built: { base: 5.58, flash: 0.38, x: 14.6 } }, // x: published speedup, computed from unrounded medians
+        many:  { kernel: { base: 27.02, flash: 2.27 }, built: { base: 31.39, flash: 1.17 } },
+        mixed: { kernel: { base: 5.39, flash: 1.82 }, built: { base: 5.44, flash: 1.68 } }
+      }
+    },
+    stick: {
+      build: {
+        small: { base: 86.3, flash: 34.6 }
+      },
+      // add is not shown on the stick: measurements in review
+      pull: {
+        small: { kernel: { base: 30.86, flash: 29.52 }, built: { base: 32.78, flash: 16.38 } }
+      }
+    }
+  };
+
+  var NORMAL_LABEL = {
+    build: 'Normal copy: mkfs + cp',
+    add: 'Normal copy: mount + cp',
+    pull: 'Normal copy: mount + cp'
+  };
+  var FLASH_LABEL = { build: 'flashcp build', add: 'flashcp add', pull: 'flashcp pull' };
+  var KERNEL_STICK_NOTE = 'on par: the stick’s ~11–14 MB/s read limit';
 
   // Table B: copies onto an existing mounted volume. Speedup vs naive cp.
   var DATA_B = [
@@ -106,94 +144,209 @@
   var EARLY_SCALE_MAX = 5;
 
   // ---------------------------------------------------------------
-  // Benchmark explorer (Table A)
+  // Benchmark explorer
   // ---------------------------------------------------------------
-  var explorer = { dataset: 'all', methods: [true, true, true, true] };
+  var explorer = {
+    drive: 'ssd',
+    op: 'build',
+    dataset: 'all',
+    extras: { copy: true, full: true }
+  };
 
   function formatSeconds(s) { return s.toFixed(2) + ' s'; }
-  function formatX(x) { return x.toFixed(1) + '×'; }
+  // Two decimals below 1.5x so a 1.05x result reads as 1.05x; one decimal otherwise.
+  function formatX(x) { return x < 1.5 ? x.toFixed(2) + '×' : x.toFixed(1) + '×'; }
+  function formatXOne(x) { return x.toFixed(1) + '×'; }
+
+  // Rows for one case: normal-copy baseline first, then the flashcp variants.
+  function rowsFor(c, op) {
+    var rows = [{ label: NORMAL_LABEL[op], t: c.base, fill: 'fill-normal' }];
+    if (op === 'build' && c.copy !== undefined && explorer.extras.copy) {
+      rows.push({ label: 'mkfs + smart copy', t: c.copy, fill: 'fill-copy' });
+    }
+    rows.push({ label: FLASH_LABEL[op], t: c.flash, x: c.x, fill: 'fill-flash' });
+    if (op === 'build' && c.full !== undefined && explorer.extras.full) {
+      rows.push({ label: 'flashcp build, full FAT', t: c.full, fill: 'fill-flash2' });
+    }
+    return rows;
+  }
+
+  // One block of bars. The first row is the baseline; every other row is scored against it.
+  function renderBars(box, rows, sub, note) {
+    if (sub) box.appendChild(el('h4', 'bar-sub-title', sub));
+
+    var maxTime = 0;
+    rows.forEach(function (r) { if (r.t > maxTime) maxTime = r.t; });
+    var baseline = rows[0].t;
+
+    rows.forEach(function (r, i) {
+      var speedup = r.x !== undefined ? r.x : baseline / r.t;
+      var isBase = i === 0;
+
+      var row = el('div', 'bar-row');
+      row.appendChild(el('div', 'bar-label', r.label));
+
+      var main = el('div', 'bar-main');
+      var track = el('div', 'bar-track');
+      track.setAttribute('role', 'img');
+      track.setAttribute('aria-label', r.label + ': ' + formatSeconds(r.t) +
+        (isBase ? ', baseline' : ', ' + formatX(speedup) + ' vs baseline'));
+      var fill = el('div', 'bar-fill ' + r.fill);
+      track.appendChild(fill);
+      main.appendChild(track);
+      row.appendChild(main);
+
+      var value = el('div', 'bar-value');
+      value.appendChild(document.createTextNode(formatSeconds(r.t) + '  '));
+      value.appendChild(el('span', 'sp', isBase ? 'baseline' : formatX(speedup)));
+      row.appendChild(value);
+
+      box.appendChild(row);
+
+      // Set the width after insertion so the CSS transition can run.
+      var pct = (r.t / maxTime) * 100;
+      requestAnimationFrame(function () { fill.style.width = pct.toFixed(2) + '%'; });
+    });
+
+    if (note) box.appendChild(el('p', 'note', note));
+  }
 
   function renderMain() {
     var box = $('bars-main');
     if (!box) return;
     box.innerHTML = '';
 
-    var sets = DATA_A.filter(function (ds) {
-      return explorer.dataset === 'all' || ds.id === explorer.dataset;
-    });
-    var active = [];
-    METHODS_A.forEach(function (m, i) { if (explorer.methods[i]) active.push(i); });
+    var drive = explorer.drive;
+    var op = explorer.op;
 
-    if (!active.length) {
-      box.appendChild(el('p', 'empty-msg', 'Select at least one method to show bars.'));
+    if (drive === 'stick' && op === 'add') {
+      box.appendChild(el('p', 'empty-msg', 'Add on the stick: measurements in review. The stick was measured for build and pull only.'));
       return;
     }
 
-    sets.forEach(function (ds) {
-      if (explorer.dataset === 'all') box.appendChild(el('h3', 'bar-group-title', ds.label));
-
-      // Scale bars within this dataset so the slowest visible method fills the track.
-      var maxTime = 0;
-      active.forEach(function (i) { if (ds.times[i] > maxTime) maxTime = ds.times[i]; });
-      var baseline = ds.times[0];
-
-      active.forEach(function (i) {
-        var t = ds.times[i];
-        var speedup = baseline / t;
-
-        var row = el('div', 'bar-row');
-        row.appendChild(el('div', 'bar-label', METHODS_A[i].label));
-
-        var main = el('div', 'bar-main');
-        var track = el('div', 'bar-track');
-        track.setAttribute('role', 'img');
-        track.setAttribute('aria-label', METHODS_A[i].label + ': ' + formatSeconds(t) + ', ' + formatX(speedup) + ' vs baseline');
-        var fill = el('div', 'bar-fill ' + METHODS_A[i].fill);
-        track.appendChild(fill);
-        main.appendChild(track);
-        row.appendChild(main);
-
-        var value = el('div', 'bar-value');
-        value.appendChild(document.createTextNode(formatSeconds(t) + '  '));
-        value.appendChild(el('span', 'sp', formatX(speedup)));
-        row.appendChild(value);
-
-        box.appendChild(row);
-
-        // Set the width after insertion so the CSS transition can run.
-        var pct = (t / maxTime) * 100;
-        requestAnimationFrame(function () { fill.style.width = pct.toFixed(2) + '%'; });
-      });
+    var sets = DRIVE_DATASETS[drive].filter(function (ds) {
+      return explorer.dataset === 'all' || ds === explorer.dataset;
     });
 
-    box.appendChild(el('p', 'note', 'Shorter bar = faster. Speedup is relative to mkfs + cp for the same dataset.'));
+    sets.forEach(function (ds) {
+      var ops = BENCH[drive][op];
+      var c = ops && ops[ds];
+      if (!c) return;
+
+      box.appendChild(el('h3', 'bar-group-title', DATASET_LABEL[ds]));
+
+      if (op === 'pull') {
+        renderBars(box, rowsFor(c.kernel, op), 'Kernel-filled drive',
+          drive === 'stick' ? KERNEL_STICK_NOTE : '');
+        renderBars(box, rowsFor(c.built, op), 'flashcp-built drive', '');
+      } else {
+        renderBars(box, rowsFor(c, op), '', '');
+      }
+    });
+
+    box.appendChild(el('p', 'note', 'Shorter bar = faster. Speedup is baseline time ÷ method time, for the same dataset and drive layout.'));
+  }
+
+  // Keep the controls consistent with the explorer state (drive limits dataset choice).
+  function syncControls() {
+    var drive = explorer.drive;
+    var op = explorer.op;
+    var allowed = DRIVE_DATASETS[drive];
+
+    var datasetOk = explorer.dataset === 'all' ? allowed.length > 1 : allowed.indexOf(explorer.dataset) !== -1;
+    if (!datasetOk) {
+      explorer.dataset = allowed[0];
+    }
+
+    markPressed($('drive-buttons'), 'data-drive', drive);
+    markPressed($('op-buttons'), 'data-op', op);
+
+    var datasetBox = $('dataset-buttons');
+    if (datasetBox) {
+      Array.prototype.forEach.call(datasetBox.querySelectorAll('button[data-dataset]'), function (b) {
+        var id = b.getAttribute('data-dataset');
+        var available = id === 'all' ? allowed.length > 1 : allowed.indexOf(id) !== -1;
+        b.disabled = !available;
+        b.setAttribute('aria-pressed', id === explorer.dataset ? 'true' : 'false');
+      });
+    }
+
+    var note = $('explorer-note');
+    if (note) {
+      if (drive === 'stick') {
+        note.textContent = 'The stick was measured only on the 20k-file dataset, so the other sizes are not offered.';
+        note.hidden = false;
+      } else {
+        note.textContent = '';
+        note.hidden = true;
+      }
+    }
+
+    // Extra build variants exist for the SSD only.
+    var variants = $('variant-group');
+    if (variants) variants.hidden = !(drive === 'ssd' && op === 'build');
+    var variantBox = $('variant-checks');
+    if (variantBox) {
+      Array.prototype.forEach.call(variantBox.querySelectorAll('input[type="checkbox"]'), function (input) {
+        input.checked = !!explorer.extras[input.value];
+      });
+    }
+  }
+
+  function markPressed(container, attr, value) {
+    if (!container) return;
+    Array.prototype.forEach.call(container.querySelectorAll('button[' + attr + ']'), function (b) {
+      b.setAttribute('aria-pressed', b.getAttribute(attr) === value ? 'true' : 'false');
+    });
+  }
+
+  function refreshExplorer() {
+    syncControls();
+    renderMain();
   }
 
   function initExplorer() {
+    var driveBox = $('drive-buttons');
+    if (driveBox) {
+      driveBox.addEventListener('click', function (ev) {
+        var btn = ev.target.closest('button[data-drive]');
+        if (!btn) return;
+        explorer.drive = btn.getAttribute('data-drive');
+        refreshExplorer();
+      });
+    }
+
+    var opBox = $('op-buttons');
+    if (opBox) {
+      opBox.addEventListener('click', function (ev) {
+        var btn = ev.target.closest('button[data-op]');
+        if (!btn) return;
+        explorer.op = btn.getAttribute('data-op');
+        refreshExplorer();
+      });
+    }
+
     var datasetBox = $('dataset-buttons');
     if (datasetBox) {
       datasetBox.addEventListener('click', function (ev) {
         var btn = ev.target.closest('button[data-dataset]');
-        if (!btn) return;
+        if (!btn || btn.disabled) return;
         explorer.dataset = btn.getAttribute('data-dataset');
-        Array.prototype.forEach.call(datasetBox.querySelectorAll('button[data-dataset]'), function (b) {
-          b.setAttribute('aria-pressed', b === btn ? 'true' : 'false');
-        });
-        renderMain();
+        refreshExplorer();
       });
     }
 
-    var checks = $('method-checks');
+    var checks = $('variant-checks');
     if (checks) {
       checks.addEventListener('change', function (ev) {
         var input = ev.target;
         if (!input || input.type !== 'checkbox') return;
-        explorer.methods[Number(input.value)] = input.checked;
+        explorer.extras[input.value] = input.checked;
         renderMain();
       });
     }
 
-    renderMain();
+    refreshExplorer();
   }
 
   // ---------------------------------------------------------------
@@ -214,7 +367,7 @@
         var main = el('div', 'bar-main');
         var track = el('div', 'bar-track');
         track.setAttribute('role', 'img');
-        track.setAttribute('aria-label', m.label + ': ' + formatX(m.x) + ' vs naive copy');
+        track.setAttribute('aria-label', m.label + ': ' + formatXOne(m.x) + ' vs naive copy');
         var fill = el('div', 'bar-fill ' + m.fill);
         track.appendChild(fill);
         var ref = el('span', 'ref-line');
@@ -223,7 +376,7 @@
         main.appendChild(track);
         row.appendChild(main);
 
-        row.appendChild(el('div', 'bar-value', formatX(m.x)));
+        row.appendChild(el('div', 'bar-value', formatXOne(m.x)));
         box.appendChild(row);
 
         var pct = Math.min(m.x / EARLY_SCALE_MAX, 1) * 100;
