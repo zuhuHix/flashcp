@@ -1,0 +1,10 @@
+[Nemo Action]
+Active=true
+Name=Fast copy to USB (flashcp)
+Comment=Copy the selected files and folders to a USB exFAT drive with flashcp
+Exec=flashcp-gui %F
+Icon-Name=flashcp-gui
+Selection=notnone
+Extensions=any;
+Quote=double
+Dependencies=flashcp-gui;

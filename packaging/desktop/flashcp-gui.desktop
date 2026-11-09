@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=flashcp
+GenericName=Fast USB copy
+Comment=Fast copy to USB drives
+Exec=flashcp-gui %F
+Icon=flashcp-gui
+Terminal=false
+Type=Application
+Categories=Utility;System;
+Keywords=usb;exfat;copy;flash;
+StartupWMClass=flashcp-gui
+StartupNotify=true

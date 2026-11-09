@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>flashcp</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="banner" class="banner" role="status" hidden>
+    Not running inside the flashcp app. Showing demo drives; actions are simulated.
+  </div>
+
+  <header class="app-header">
+    <h1>flashcp</h1>
+    <p class="tagline">Fast copy to USB drives</p>
+  </header>
+
+  <main class="app-main">
+    <section class="card" aria-labelledby="drives-heading">
+      <h2 id="drives-heading">Drive</h2>
+      <div id="drives" class="drive-list" role="radiogroup" aria-labelledby="drives-heading"></div>
+      <p id="drives-empty" class="empty" hidden>
+        Plug in a USB drive. Only USB drives are shown; internal disks never appear.
+      </p>
+      <div id="nonexfat" class="notice warn" hidden></div>
+    </section>
+
+    <section class="card" aria-labelledby="files-heading">
+      <h2 id="files-heading">Files</h2>
+      <div id="dropzone" class="dropzone">
+        <p class="drop-title">Drop files or folders here</p>
+        <div class="row">
+          <button id="add-files" type="button">Add files…</button>
+          <button id="add-folder" type="button">Add folder…</button>
+        </div>
+      </div>
+      <div id="sources-head" class="sources-head" hidden>
+        <span id="sources-count" class="hint"></span>
+        <button id="clear-sources" class="link" type="button">Clear</button>
+      </div>
+      <ul id="sources" class="sources"></ul>
+    </section>
+
+    <section class="card" aria-labelledby="dest-heading">
+      <h2 id="dest-heading">Destination</h2>
+      <label for="dest" class="field-label">Folder on the drive</label>
+      <input id="dest" type="text" value="/" autocomplete="off" spellcheck="false"
+             aria-describedby="dest-hint">
+      <p id="dest-hint" class="hint"></p>
+      <label class="check">
+        <input id="skip-existing" type="checkbox">
+        Skip files that already exist
+      </label>
+    </section>
+
+    <section class="actions">
+      <button id="copy" class="primary" type="button" disabled>Fast copy</button>
+    </section>
+
+    <section id="progress" class="card panel" aria-live="polite" hidden>
+      <p id="stage" class="stage"></p>
+      <progress id="bar" max="1" value="0"></progress>
+      <p id="progress-text" class="hint"></p>
+    </section>
+
+    <section id="done" class="card panel success" aria-live="polite" hidden>
+      <p id="summary" class="summary"></p>
+      <p id="wall" class="hint"></p>
+      <button id="copy-more" type="button">Copy more</button>
+    </section>
+
+    <section id="error" class="card panel error" role="alert" hidden>
+      <p id="error-message"></p>
+      <button id="dismiss" type="button">Dismiss</button>
+    </section>
+
+    <div id="notice" class="notice" role="status" hidden></div>
+
+    <details id="advanced" class="card collapsible">
+      <summary>Advanced</summary>
+      <h3>Erase and rebuild drive</h3>
+      <p class="hint">
+        This erases <strong>everything</strong> on the selected drive and replaces it with a new
+        exFAT volume that contains exactly the selected folder. There is no undo.
+      </p>
+      <p id="erase-hint" class="hint"></p>
+      <label for="erase-confirm" class="field-label">
+        Type <span id="erase-expected" class="code">drive name</span> to confirm
+      </label>
+      <input id="erase-confirm" type="text" autocomplete="off" spellcheck="false" disabled>
+      <button id="erase" class="danger" type="button" disabled>Erase and copy</button>
+    </details>
+
+    <details id="settings" class="card collapsible">
+      <summary>Settings</summary>
+      <label class="check">
+        <input id="set-autostart" type="checkbox">
+        Start at login (tray icon)
+      </label>
+      <label class="check">
+        <input id="set-notify" type="checkbox">
+        Notify when a USB drive is plugged in
+      </label>
+    </details>
+  </main>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>

@@ -1,0 +1,120 @@
+name: GUI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "gui/**"
+      - "packaging/desktop/**"
+      - ".github/workflows/gui.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "gui/**"
+      - "packaging/desktop/**"
+      - ".github/workflows/gui.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  test:
+    name: fmt, clippy, tests, packaging checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gui
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev libxdo-dev pkg-config desktop-file-utils libxml2-utils
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: cargo fmt
+        working-directory: gui
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        working-directory: gui
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: cargo test
+        working-directory: gui
+        run: cargo test --locked
+      - name: UI tests
+        working-directory: gui
+        run: node --test "ui/tests/*.test.mjs"
+      - name: Validate desktop entries
+        run: |
+          set -eux
+          desktop-file-validate packaging/desktop/flashcp-gui.desktop
+          desktop-file-validate packaging/desktop/flashcp-gui-autostart.desktop
+          # KDE service menus are not full desktop entries and trigger warnings
+          # that are not ours to fix, so this one is informational only.
+          desktop-file-validate packaging/desktop/flashcp-dolphin.desktop || \
+            echo "::warning::flashcp-dolphin.desktop does not pass desktop-file-validate (expected for KDE service menus)"
+      - name: Validate Nautilus extension and polkit policy
+        run: |
+          set -eux
+          python3 -m py_compile packaging/desktop/flashcp_nautilus.py
+          xmllint --noout packaging/desktop/io.github.zuhuhix.flashcp.helper.policy
+
+  deb:
+    name: build .deb
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gui
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev libxdo-dev pkg-config
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build deb
+        working-directory: gui/src-tauri
+        run: npx --yes @tauri-apps/cli@2.12.4 build --bundles deb
+      - name: Check package contents
+        run: |
+          set -eux
+          shopt -s nullglob
+          debs=(gui/target/release/bundle/deb/*.deb)
+          test "${#debs[@]}" -eq 1
+          deb="${debs[0]}"
+          dpkg -I "$deb"
+          dpkg -c "$deb" > contents.txt
+          cat contents.txt
+          for path in \
+            ./usr/libexec/flashcp-helper \
+            ./usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.helper.policy \
+            ./etc/xdg/autostart/flashcp-gui.desktop \
+            ./usr/share/nemo/actions/flashcp.nemo_action \
+            ./usr/share/kio/servicemenus/flashcp.desktop \
+            ./usr/share/nautilus-python/extensions/flashcp_nautilus.py \
+            ./usr/bin/flashcp-gui; do
+            # Tauri's tar lists paths without a leading "./"; accept both spellings.
+            awk '{print $NF}' contents.txt | sed 's#^\./##' | grep -qxF "${path#./}" || { echo "::error::missing $path"; exit 1; }
+          done
+          # The helper runs as root through pkexec, so it must be root-owned and not writable by others.
+          grep -qE '^-rwxr-xr-x (root/root|0/0) .* (\./)?usr/libexec/flashcp-helper$' contents.txt
+          # The package must pull in the CLI.
+          dpkg-deb -f "$deb" Depends | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -qx 'flashcp'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flashcp-gui-deb
+          path: gui/target/release/bundle/deb/*.deb

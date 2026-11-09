@@ -1,0 +1,63 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "flashcp-gui",
+  "mainBinaryName": "flashcp-gui",
+  "version": "0.1.0",
+  "identifier": "io.github.zuhuhix.flashcp.gui",
+  "build": {
+    "frontendDist": "../ui",
+    "beforeBuildCommand": { "script": "cargo build --release --locked -p flashcp-helper", "cwd": ".." }
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "flashcp — fast copy to USB",
+        "width": 520,
+        "height": 680,
+        "minWidth": 420,
+        "minHeight": 520,
+        "visible": false,
+        "dragDropEnabled": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb"],
+    "category": "Utility",
+    "shortDescription": "Fast copy to USB drives with flashcp",
+    "longDescription": "Tray app for flashcp: notices USB exFAT drives, offers a fast one-pass copy, and adds \"Fast copy to USB (flashcp)\" to the Nemo, Nautilus and Dolphin context menus.",
+    "license": "GPL-3.0-or-later",
+    "homepage": "https://github.com/zuhuHix/flashcp",
+    "publisher": "zuhu",
+    "copyright": "GPL-3.0-or-later",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.png"
+    ],
+    "linux": {
+      "deb": {
+        "depends": ["flashcp", "pkexec | policykit-1", "udisks2", "xdg-utils"],
+        "recommends": ["libnotify-bin", "python3-nautilus"],
+        "section": "utils",
+        "desktopTemplate": "../../packaging/desktop/flashcp-gui.desktop",
+        "files": {
+          "/usr/libexec/flashcp-helper": "../target/release/flashcp-helper",
+          "/usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.helper.policy": "../../packaging/desktop/io.github.zuhuhix.flashcp.helper.policy",
+          "/etc/xdg/autostart/flashcp-gui.desktop": "../../packaging/desktop/flashcp-gui-autostart.desktop",
+          "/usr/share/nemo/actions/flashcp.nemo_action": "../../packaging/desktop/flashcp.nemo_action",
+          "/usr/share/nautilus-python/extensions/flashcp_nautilus.py": "../../packaging/desktop/flashcp_nautilus.py",
+          "/usr/share/kio/servicemenus/flashcp.desktop": "../../packaging/desktop/flashcp-dolphin.desktop",
+          "/usr/share/icons/hicolor/scalable/apps/flashcp-gui.svg": "../../packaging/desktop/flashcp-gui.svg",
+          "/usr/share/doc/flashcp-gui/SECURITY-NOTES.md": "../../packaging/desktop/SECURITY-NOTES.md"
+        }
+      }
+    }
+  }
+}

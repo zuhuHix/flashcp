@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>flashcp</vendor>
+  <vendor_url>https://github.com/zuhuHix/flashcp</vendor_url>
+  <icon_name>flashcp-gui</icon_name>
+
+  <!-- Install to /usr/share/polkit-1/actions/. pkexec only runs /usr/libexec/flashcp-helper
+       under this action; the helper validates every argument itself (see SECURITY-NOTES.md). -->
+  <action id="io.github.zuhuhix.flashcp.helper">
+    <description>Write files to a USB drive with flashcp</description>
+    <message>Authentication is required to let flashcp write to the USB drive</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/flashcp-helper</annotate>
+  </action>
+</policyconfig>

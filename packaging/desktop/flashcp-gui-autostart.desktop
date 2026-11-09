@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=flashcp tray
+Comment=Notice USB drives and offer fast copies
+Exec=flashcp-gui --tray
+Icon=flashcp-gui
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

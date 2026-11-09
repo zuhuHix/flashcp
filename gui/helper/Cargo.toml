@@ -1,0 +1,13 @@
+[package]
+name = "flashcp-helper"
+version = "0.1.0"
+edition = "2021"
+description = "pkexec-launched helper that lends one validated USB block device to flashcp, run as the invoking user"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+libc = "0.2.191"
+
+[dev-dependencies]
+tempfile = "3.27.0"
