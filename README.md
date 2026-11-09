@@ -241,14 +241,15 @@ plus optimize rows if wanted: pull after optimize 28.9 → 16.0 s (1.8×); optim
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/two-drives-dark.gif">
-  <img alt="Schematic of a cheap USB 2.0 stick and a fast USB SSD. On the stick, the flash chip is a narrow neck of about 6.9 MB/s; flashcp removes most of the per-file overhead but the chip time stays, so it is 2.5 times faster (86.3 s to 34.6 s). On the SSD, the overhead is most of the time, so flashcp is 6.7 times faster (2.80 s to 0.42 s)." src="assets/two-drives-light.gif" width="800">
+  <img alt="Schematic of a cheap USB 2.0 stick and a fast USB SSD. On the stick, the flash chip is a narrow neck (measured 6.5 MB/s sequential write); flashcp removes most of the per-file overhead but the chip time stays, so it is 2.5 times faster (86.3 s to 34.6 s). On the SSD, the overhead is most of the time, so flashcp is 6.7 times faster (2.80 s to 0.42 s)." src="assets/two-drives-light.gif" width="800">
 </picture>
 
-The gains differ because the bottleneck differs. A cheap stick's flash chip writes at about
-6.9 MB/s and reads at about 11–14 MB/s, and no software gets past that. flashcp removes the per-file
+The gains differ because the bottleneck differs. The stick measured 6.5 MB/s for sequential 8 MB
+writes (6.2 MB/s at 64 KB, 2.5 MB/s at 4 KB, 48 random 4 KB IOPS) and about 11 MB/s for sequential
+reads; a model fit puts its write ceiling at an estimated ≈6.9 MB/s. No software gets past that. flashcp removes the per-file
 overhead, so copies get up to 2.5× faster, but the chip is the ceiling. On a fast SSD the per-file
 overhead is most of the time, so removing it gives up to 10.3× on writes and 26.8× on reads with
-many small files (about 2–3× with big files, where bandwidth is the limit again).
+many small files (2.0–3.2× on the mixed 1.4 GB dataset, where bandwidth is the limit again).
 
 Pulling from a stick that the kernel filled is on par with `cp`: both are bound by the stick's read
 speed, and every scattered file needs its own read either way. A stick written by `flashcp build`

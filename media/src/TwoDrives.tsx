@@ -34,7 +34,7 @@ const LANES: Lane[] = [
     link: 'USB 2.0 · BOT',
     neckH: 8,
     body: 'stick',
-    chipLabel: 'chip: ~6.9 MB/s write',
+    chipLabel: 'measured: 6.5 MB/s sequential write',
     mult: '2.5×',
     times: '86.3 → 34.6 s',
     oy: 10,
