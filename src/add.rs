@@ -102,7 +102,7 @@ impl VolumeInfo {
 }
 
 /// Free extents (start cluster, length) from the bitmap, ascending.
-fn free_extents(bitmap: &[u8], cc: u64) -> Vec<(u64, u64)> {
+pub(crate) fn free_extents(bitmap: &[u8], cc: u64) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     let mut run: Option<u64> = None;
     let mut i = 0u64;
@@ -138,7 +138,7 @@ fn free_extents(bitmap: &[u8], cc: u64) -> Vec<(u64, u64)> {
 }
 
 /// Removes [start, start+n) from the free list if it lies inside one extent.
-fn take_exact(free: &mut Vec<(u64, u64)>, start: u64, n: u64) -> bool {
+pub(crate) fn take_exact(free: &mut Vec<(u64, u64)>, start: u64, n: u64) -> bool {
     let Some(k) = free.iter().position(|&(s, l)| s <= start && start + n <= s + l) else { return false };
     let (s, l) = free.remove(k);
     if start + n < s + l {
@@ -152,7 +152,7 @@ fn take_exact(free: &mut Vec<(u64, u64)>, start: u64, n: u64) -> bool {
 
 /// Picks extents holding `total` clusters: the smallest single extent that fits, otherwise the
 /// biggest ones. Returned ascending by address.
-fn choose_extents(free: &[(u64, u64)], total: u64) -> Option<Vec<(u64, u64)>> {
+pub(crate) fn choose_extents(free: &[(u64, u64)], total: u64) -> Option<Vec<(u64, u64)>> {
     if total == 0 {
         return Some(Vec::new());
     }
@@ -179,7 +179,7 @@ fn choose_extents(free: &[(u64, u64)], total: u64) -> Option<Vec<(u64, u64)>> {
 }
 
 /// Splits `n` clusters off the front of `extents` (consumed in order) as runs.
-fn carve(extents: &mut std::collections::VecDeque<(u64, u64)>, mut n: u64) -> Vec<(u64, u64)> {
+pub(crate) fn carve(extents: &mut std::collections::VecDeque<(u64, u64)>, mut n: u64) -> Vec<(u64, u64)> {
     let mut runs = Vec::new();
     while n > 0 {
         let (s, l) = extents.pop_front().expect("allocation exceeded the chosen extents");
@@ -193,12 +193,12 @@ fn carve(extents: &mut std::collections::VecDeque<(u64, u64)>, mut n: u64) -> Ve
     runs
 }
 
-fn run_clusters(runs: &[(u64, u64)]) -> Vec<u32> {
+pub(crate) fn run_clusters(runs: &[(u64, u64)]) -> Vec<u32> {
     runs.iter().flat_map(|&(s, n)| (s..s + n).map(|c| c as u32)).collect()
 }
 
 /// FAT entries chaining `clusters` in order, ending with EOC.
-fn chain_entries(clusters: &[u32], out: &mut Vec<(u32, u32)>) {
+pub(crate) fn chain_entries(clusters: &[u32], out: &mut Vec<(u32, u32)>) {
     for (k, &c) in clusters.iter().enumerate() {
         out.push((c, clusters.get(k + 1).copied().unwrap_or(EOC)));
     }
@@ -316,7 +316,7 @@ pub(crate) fn fill_gap(gap: u64, foreign: std::ops::Range<u64>, pre_bitmap: &[u8
 
 /// One data-phase segment as the probe sees it.
 #[derive(Clone, Copy, Debug)]
-struct ProbeSeg {
+pub(crate) struct ProbeSeg {
     /// Partition offset and length (whole clusters).
     dev: u64,
     len: u64,
@@ -563,7 +563,7 @@ fn forced_policy(v: &str, qd: usize) -> Option<GapPolicy> {
 /// never in a dry run), else a cached write model, else the fallback. Writes in flight never
 /// come from a random-write benchmark: USB BOT gets 1 (strictly ascending), the rest 8.
 /// Image files always use the fallback (their cost is the page cache's).
-fn choose_gap_policy(dev: &File, direct: bool, v: &Vol, dev_off: u64, dry_run: bool, segs: &[ProbeSeg]) -> GapPolicy {
+pub(crate) fn choose_gap_policy(dev: &File, direct: bool, v: &Vol, dev_off: u64, dry_run: bool, segs: &[ProbeSeg]) -> GapPolicy {
     use crate::devprofile as dp;
     let rdev = dp::block_dev_of(dev);
     let transport = rdev.and_then(|r| crate::probe::device_info_of(r).transport);
@@ -625,21 +625,21 @@ fn choose_gap_policy(dev: &File, direct: bool, v: &Vol, dev_off: u64, dry_run: b
 
 /// Small writes for one metadata phase; committed ascending and coalesced, then synced.
 #[derive(Default)]
-struct Patches(Vec<(u64, Vec<u8>)>);
+pub(crate) struct Patches(Vec<(u64, Vec<u8>)>);
 
 impl Patches {
-    fn add(&mut self, off: u64, bytes: Vec<u8>) {
+    pub(crate) fn add(&mut self, off: u64, bytes: Vec<u8>) {
         if !bytes.is_empty() {
             self.0.push((off, bytes));
         }
     }
-    fn fat(&mut self, v: &Vol, entries: &[(u32, u32)]) {
+    pub(crate) fn fat(&mut self, v: &Vol, entries: &[(u32, u32)]) {
         for &(c, n) in entries {
             self.add(v.fat_off + c as u64 * 4, n.to_le_bytes().to_vec());
         }
     }
     /// Writes `bytes` at byte `off` of an object stored in `clusters`.
-    fn object(&mut self, v: &Vol, clusters: &[u32], mut off: usize, mut bytes: &[u8]) {
+    pub(crate) fn object(&mut self, v: &Vol, clusters: &[u32], mut off: usize, mut bytes: &[u8]) {
         let cs = v.cs as usize;
         while !bytes.is_empty() {
             let n = (cs - off % cs).min(bytes.len());
@@ -648,10 +648,10 @@ impl Patches {
             bytes = &bytes[n..];
         }
     }
-    fn bytes(&self) -> u64 {
+    pub(crate) fn bytes(&self) -> u64 {
         self.0.iter().map(|p| p.1.len() as u64).sum()
     }
-    fn commit(mut self, dev: &File) -> Result<()> {
+    pub(crate) fn commit(mut self, dev: &File) -> Result<()> {
         self.0.sort_by_key(|p| p.0);
         let mut i = 0;
         while i < self.0.len() {
@@ -671,7 +671,7 @@ impl Patches {
     }
 }
 
-fn stop_after(phase: &str) -> Result<()> {
+pub(crate) fn stop_after(phase: &str) -> Result<()> {
     if std::env::var(STOP_ENV).as_deref() == Ok(phase) {
         bail!("stopped after the {phase} phase ({STOP_ENV})");
     }
@@ -679,16 +679,16 @@ fn stop_after(phase: &str) -> Result<()> {
 }
 
 /// VolumeFlags while modifying: dirty set, ClearToZero cleared (spec 3.1.13.4).
-fn working_flags(flags: u16) -> u16 {
+pub(crate) fn working_flags(flags: u16) -> u16 {
     (flags | FLAG_DIRTY) & !FLAG_CLEAR_TO_ZERO
 }
 
 /// VolumeFlags when done: dirty cleared, ClearToZero stays cleared.
-fn clean_flags(flags: u16) -> u16 {
+pub(crate) fn clean_flags(flags: u16) -> u16 {
     flags & !(FLAG_DIRTY | FLAG_CLEAR_TO_ZERO)
 }
 
-fn write_flags(v: &mut Vol, flags: u16, pct: Option<u8>) -> Result<()> {
+pub(crate) fn write_flags(v: &mut Vol, flags: u16, pct: Option<u8>) -> Result<()> {
     v.sector0[106..108].copy_from_slice(&flags.to_le_bytes());
     if let Some(p) = pct {
         v.sector0[112] = p;
@@ -697,6 +697,157 @@ fn write_flags(v: &mut Vol, flags: u16, pct: Option<u8>) -> Result<()> {
         .context("write boot sector")?;
     trace::sync(|| v.dev.sync_all()).context("sync")?;
     v.flags = flags;
+    Ok(())
+}
+
+// ───────────────────────── the data phase (shared with sync) ─────────────────────────
+
+/// Bytes the data phase writes for `segs` (a file's last write padded to 4 KB within its run).
+/// `sizes[k]` is the size of the file `SegKind::File(k, _)` belongs to.
+pub(crate) fn data_write_bytes(segs: &[Seg], sizes: &[u64]) -> u64 {
+    segs.iter()
+        .map(|s| match s.kind {
+            SegKind::File(k, off) => {
+                let left = sizes[k] - off;
+                if left <= s.len { left.div_ceil(4096) * 4096 } else { s.len }.min(s.len)
+            }
+            SegKind::Mem(..) => s.len,
+        })
+        .sum()
+}
+
+/// The gap policy for the data phase over `segs` (see [`choose_gap_policy`]); `direct` is
+/// whether O_DIRECT may be used at all (target support and 4 KB alignment).
+pub(crate) fn data_gap_policy(
+    dev: &File,
+    direct: bool,
+    v: &Vol,
+    dev_off: u64,
+    dry_run: bool,
+    segs: &[Seg],
+    sizes: &[u64],
+) -> GapPolicy {
+    if segs.is_empty() {
+        return GapPolicy::fallback("nothing to write");
+    }
+    let probe_segs: Vec<ProbeSeg> = segs
+        .iter()
+        .map(|s| match s.kind {
+            SegKind::File(k, off) => {
+                let payload = (sizes[k] - off).min(s.len);
+                ProbeSeg { dev: s.dev, len: s.len, payload, file_end: off + payload == sizes[k] }
+            }
+            SegKind::Mem(..) => ProbeSeg { dev: s.dev, len: s.len, payload: s.len, file_end: false },
+        })
+        .collect();
+    choose_gap_policy(dev, direct, v, dev_off, dry_run, &probe_segs)
+}
+
+/// Phase 1: writes `segs` (sorted by address, all in clusters the pre-write bitmap `v.bitmap`
+/// calls free) as one ascending stream through the sequential writer, then syncs. `reads[k]`
+/// is the source file and size of `SegKind::File(k, _)`; `mems[m]` the bytes of
+/// `SegKind::Mem(m, _)`. `direct`: O_DIRECT may be used (switched on for the stream only).
+/// Progress counts files from `files_done` on.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_data(
+    excl: &Arc<File>,
+    direct: bool,
+    v: &Vol,
+    segs: &[Seg],
+    mems: &[Vec<u8>],
+    reads: Vec<(PathBuf, u64)>,
+    pol: &GapPolicy,
+    readers: usize,
+    tick: &mut Ticker<'_>,
+    files_done: u64,
+) -> Result<()> {
+    if segs.is_empty() {
+        return Ok(());
+    }
+    let cs = v.cs;
+    let direct = direct && set_direct(excl, true);
+    let mut w = if direct { SeqWriter::new(excl.clone()) } else { SeqWriter::with_align(excl.clone(), 1) };
+    w.set_inflight(pol.qd);
+    let files = reads.clone();
+    let (rx, budget) = ordered_reader(reads, readers.max(1), 256 << 20, 16 << 20);
+    let mut pending: BTreeMap<usize, Item> = BTreeMap::new();
+    enum Cur {
+        Data(Vec<u8>),
+        Stream(File),
+    }
+    let mut cur: Option<(usize, Cur)> = None;
+    let mut last_k = 0usize;
+    let (mut files_done, mut bytes_done) = (files_done, 0u64);
+    let mut prev_end: Option<u64> = None;
+    let (pre_bitmap, heap) = (&v.bitmap, v.heap_off);
+    let (mut filled, mut skipped_gaps) = (0u64, 0u64);
+    for s in segs {
+        // Unwritten cluster slack after a file's data is not part of the file (beyond
+        // ValidDataLength), so a gap may be skipped or zero-filled, whichever the device
+        // does faster (fill_gap). Clusters between our runs are only ever filled when the
+        // pre-add bitmap calls them free; segments are whole clusters, so prev_end and
+        // s.dev are cluster boundaries.
+        if s.dev > w.cur() {
+            if pol.fills(w.cur(), s.dev, prev_end, pre_bitmap, heap, cs) {
+                filled += s.dev - w.cur();
+                w.zeros_to(s.dev)?;
+            } else {
+                skipped_gaps += 1;
+                w.skip_to(s.dev)?;
+            }
+        }
+        ensure!(w.cur() == s.dev, "internal layout error: overlapping data segments");
+        prev_end = Some(s.dev + s.len);
+        match s.kind {
+            SegKind::Mem(m, off) => w.write(&mems[m][off..off + s.len as usize])?,
+            SegKind::File(k, off) => {
+                let (src, size) = (&files[k].0, files[k].1);
+                if cur.as_ref().map(|c| c.0) != Some(k) {
+                    ensure!(cur.is_none() && k >= last_k, "internal layout error: interleaved files");
+                    while !pending.contains_key(&k) {
+                        let (idx, item) = rx.recv().context("reader stopped")?;
+                        pending.insert(idx, item);
+                    }
+                    let c = match pending.remove(&k).unwrap() {
+                        Item::Data(d) => {
+                            ensure!(d.len() as u64 == size, "{} changed size while copying", src.display());
+                            Cur::Data(d)
+                        }
+                        Item::Stream => {
+                            let f = File::open(src).with_context(|| format!("open {}", src.display()))?;
+                            crate::util::fadvise_sequential(&f);
+                            Cur::Stream(f)
+                        }
+                    };
+                    cur = Some((k, c));
+                    last_k = k;
+                }
+                let take = (size - off).min(s.len);
+                match &mut cur.as_mut().unwrap().1 {
+                    Cur::Data(d) => w.write(&d[off as usize..(off + take) as usize])?,
+                    Cur::Stream(f) => w.write_from(f, take, None)?,
+                }
+                if off + take == size {
+                    // Pad to the I/O alignment (or the policy's unit); the rest of the
+                    // cluster is slack. Never past the run's end: with clusters under 4 KB
+                    // the next cluster may belong to someone else.
+                    w.zeros_to(pol.pad_end(w.cur(), s.dev + s.len))?;
+                    if matches!(cur.take(), Some((_, Cur::Data(_)))) {
+                        release(&budget, size.min(256 << 20));
+                    }
+                    files_done += 1;
+                    bytes_done += size;
+                    tick.progress(files_done, bytes_done, false);
+                }
+            }
+        }
+    }
+    ensure!(cur.is_none(), "internal layout error: a file was not fully written");
+    if std::env::var_os(GAPS_ENV).is_some() {
+        eprintln!("gaps: {filled} bytes zero-filled, {skipped_gaps} skipped");
+    }
+    w.finish()?; // syncs
+    set_direct(excl, false); // metadata phases are small buffered writes
     Ok(())
 }
 
@@ -710,16 +861,16 @@ enum Obj {
     File(usize),
 }
 
-enum SegKind {
+pub(crate) enum SegKind {
     Mem(usize, usize),
     /// (index into file_order, byte offset in the file)
     File(usize, u64),
 }
 
-struct Seg {
-    dev: u64,
-    len: u64,
-    kind: SegKind,
+pub(crate) struct Seg {
+    pub(crate) dev: u64,
+    pub(crate) len: u64,
+    pub(crate) kind: SegKind,
 }
 
 pub fn add(src: &Path, target: &Path, o: &AddOpts, sink: Sink<'_>) -> Result<AddStats> {
@@ -1052,37 +1203,15 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
         }
     }
     segs.sort_by_key(|s| s.dev);
-    let data_write: u64 = segs
-        .iter()
-        .map(|s| match s.kind {
-            SegKind::File(k, off) => {
-                let left = nodes[file_order[k]].size - off;
-                if left <= s.len { left.div_ceil(4096) * 4096 } else { s.len }.min(s.len)
-            }
-            SegKind::Mem(..) => s.len,
-        })
-        .sum();
+    let sizes: Vec<u64> = file_order.iter().map(|&f| nodes[f].size).collect();
+    let data_write = data_write_bytes(&segs, &sizes);
     let write_bytes = data_write + p2.bytes() + p3_fat.bytes() + p3_dir.bytes() + 2 * v.bps;
     let fragmented = runs.iter().filter(|(o, r)| !matches!(o, Obj::Ext(_)) && r.len() > 1).count() as u64;
     let (files, dirs) = (new_files.len() as u64, new_dirs.len() as u64);
     // Measuring writes into the free clusters this add is about to write, so it happens
     // before anything else is written.
-    let pol = if segs.is_empty() {
-        GapPolicy::fallback("nothing to write")
-    } else {
-        let probe_segs: Vec<ProbeSeg> = segs
-            .iter()
-            .map(|s| match s.kind {
-                SegKind::File(k, off) => {
-                    let payload = (nodes[file_order[k]].size - off).min(s.len);
-                    ProbeSeg { dev: s.dev, len: s.len, payload, file_end: off + payload == nodes[file_order[k]].size }
-                }
-                SegKind::Mem(..) => ProbeSeg { dev: s.dev, len: s.len, payload: s.len, file_end: false },
-            })
-            .collect();
-        let direct = tgt.direct && cs.is_multiple_of(4096) && v.heap_off.is_multiple_of(4096);
-        choose_gap_policy(&excl, direct, &v, tgt.part_off * 512, o.dry_run, &probe_segs)
-    };
+    let direct = tgt.direct && cs.is_multiple_of(4096) && v.heap_off.is_multiple_of(4096);
+    let pol = data_gap_policy(&excl, direct, &v, tgt.part_off * 512, o.dry_run, &segs, &sizes);
     let detail = format!(
         "plan: add {files} files, {dirs} dirs, {} data │ cluster {} │ {} free │ {} new objects fragmented │ will write {}{} │ {} │ verified {verified} objects in {:.0} ms",
         human_bytes(data_bytes as f64),
@@ -1121,92 +1250,8 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
     trace::phase("data");
     let empty_files = (files as usize - file_order.len()) as u64;
     tick.progress(empty_files, 0, true);
-    if !segs.is_empty() {
-        let direct =
-            tgt.direct && cs.is_multiple_of(4096) && v.heap_off.is_multiple_of(4096) && set_direct(&excl, true);
-        let mut w = if direct { SeqWriter::new(excl.clone()) } else { SeqWriter::with_align(excl.clone(), 1) };
-        w.set_inflight(pol.qd);
-        let reads: Vec<(PathBuf, u64)> = file_order.iter().map(|&i| (nodes[i].src.clone(), nodes[i].size)).collect();
-        let (rx, budget) = ordered_reader(reads, o.readers.max(1), 256 << 20, 16 << 20);
-        let mut pending: BTreeMap<usize, Item> = BTreeMap::new();
-        enum Cur {
-            Data(Vec<u8>),
-            Stream(File),
-        }
-        let mut cur: Option<(usize, Cur)> = None;
-        let mut last_k = 0usize;
-        let (mut files_done, mut bytes_done) = (empty_files, 0u64);
-        let mut prev_end: Option<u64> = None;
-        let (pre_bitmap, heap) = (&v.bitmap, v.heap_off);
-        let (mut filled, mut skipped_gaps) = (0u64, 0u64);
-        for s in &segs {
-            // Unwritten cluster slack after a file's data is not part of the file (beyond
-            // ValidDataLength), so a gap may be skipped or zero-filled, whichever the device
-            // does faster (fill_gap). Clusters between our runs are only ever filled when the
-            // pre-add bitmap calls them free; segments are whole clusters, so prev_end and
-            // s.dev are cluster boundaries.
-            if s.dev > w.cur() {
-                if pol.fills(w.cur(), s.dev, prev_end, pre_bitmap, heap, cs) {
-                    filled += s.dev - w.cur();
-                    w.zeros_to(s.dev)?;
-                } else {
-                    skipped_gaps += 1;
-                    w.skip_to(s.dev)?;
-                }
-            }
-            ensure!(w.cur() == s.dev, "internal layout error: overlapping data segments");
-            prev_end = Some(s.dev + s.len);
-            match s.kind {
-                SegKind::Mem(m, off) => w.write(&mems[m][off..off + s.len as usize])?,
-                SegKind::File(k, off) => {
-                    let n = &nodes[file_order[k]];
-                    if cur.as_ref().map(|c| c.0) != Some(k) {
-                        ensure!(cur.is_none() && k >= last_k, "internal layout error: interleaved files");
-                        while !pending.contains_key(&k) {
-                            let (idx, item) = rx.recv().context("reader stopped")?;
-                            pending.insert(idx, item);
-                        }
-                        let c = match pending.remove(&k).unwrap() {
-                            Item::Data(d) => {
-                                ensure!(d.len() as u64 == n.size, "{} changed size while copying", n.src.display());
-                                Cur::Data(d)
-                            }
-                            Item::Stream => {
-                                let f = File::open(&n.src).with_context(|| format!("open {}", n.src.display()))?;
-                                crate::util::fadvise_sequential(&f);
-                                Cur::Stream(f)
-                            }
-                        };
-                        cur = Some((k, c));
-                        last_k = k;
-                    }
-                    let take = (n.size - off).min(s.len);
-                    match &mut cur.as_mut().unwrap().1 {
-                        Cur::Data(d) => w.write(&d[off as usize..(off + take) as usize])?,
-                        Cur::Stream(f) => w.write_from(f, take, None)?,
-                    }
-                    if off + take == n.size {
-                        // Pad to the I/O alignment (or the policy's unit); the rest of the
-                        // cluster is slack. Never past the run's end: with clusters under 4 KB
-                        // the next cluster may belong to someone else.
-                        w.zeros_to(pol.pad_end(w.cur(), s.dev + s.len))?;
-                        if matches!(cur.take(), Some((_, Cur::Data(_)))) {
-                            release(&budget, n.size.min(256 << 20));
-                        }
-                        files_done += 1;
-                        bytes_done += n.size;
-                        tick.progress(files_done, bytes_done, false);
-                    }
-                }
-            }
-        }
-        ensure!(cur.is_none(), "internal layout error: a file was not fully written");
-        if std::env::var_os(GAPS_ENV).is_some() {
-            eprintln!("gaps: {filled} bytes zero-filled, {skipped_gaps} skipped");
-        }
-        w.finish()?; // syncs
-        set_direct(&excl, false); // metadata phases are small buffered writes
-    }
+    let reads: Vec<(PathBuf, u64)> = file_order.iter().map(|&i| (nodes[i].src.clone(), nodes[i].size)).collect();
+    write_data(&excl, direct, &v, &segs, &mems, reads, &pol, o.readers, &mut tick, empty_files)?;
     stop_after("data")?;
 
     // ── phase 2: bitmap + new chains ──
