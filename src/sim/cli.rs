@@ -48,6 +48,9 @@ pub struct RunArgs {
     /// Print JSON instead of a table
     #[arg(long)]
     pub json: bool,
+    /// Replay a trace whose run did not finish cleanly (no end record, or it panicked)
+    #[arg(long)]
+    pub allow_truncated: bool,
 }
 
 #[derive(Args, Debug)]
@@ -490,7 +493,7 @@ fn check_free(names: &[String]) -> Result<Vec<String>> {
 
 fn replay(a: &RunArgs) -> Result<()> {
     require_seeds(a.seeds)?;
-    let t = Trace::load(&a.trace)?;
+    let t = Trace::load_opts(&a.trace, a.allow_truncated)?;
     let st = t.stats();
     let mut results: Vec<(&str, SimResult, Spread)> = Vec::new();
     for p in &a.profile {

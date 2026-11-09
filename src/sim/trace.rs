@@ -15,6 +15,9 @@
 //! {"i":4,"ev":"direct","on":true,"t":1311}
 //! {"ev":"end","t":5000}
 //! ```
+//! A run that panics writes `{"ev":"aborted","t":…}` instead of `end` (a panic hook drains
+//! every thread's buffer first). Readers reject a trace without a clean `end` (or with an
+//! `aborted` record) unless told to accept truncated traces.
 //! - `i`: global issue order (an atomic counter taken when the op is issued). Each thread
 //!   buffers its own records and writes them in batches, so lines of different threads are
 //!   interleaved in chunks: a reader sorts by `i` (version 1 traces had no `i` and were in
@@ -169,8 +172,47 @@ pub fn init(path: &std::path::Path, cmd: &str) -> anyhow::Result<()> {
         crate::events::json_str(cmd),
         dev.map_or("null".into(), |d| crate::events::json_str(&d))
     ));
+    PANIC_AFTER.store(std::env::var(PANIC_ENV).ok().and_then(|v| v.parse().ok()).unwrap_or(0), Relaxed);
+    // A panic anywhere still leaves every buffered record in the file, marked aborted.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        abort_flush();
+        prev(info);
+    }));
     ON.store(true, Relaxed);
     Ok(())
+}
+
+/// Test hook: panic after this many traced I/O ops (0 = never).
+const PANIC_ENV: &str = "FLASHCP_TEST_TRACE_PANIC_AFTER";
+static PANIC_AFTER: AtomicU64 = AtomicU64::new(0);
+
+/// Writes every thread's buffered records to the file. `wait`: block on locks (normal end);
+/// otherwise skip whatever is locked (a panic hook must never deadlock).
+fn drain_all(wait: bool) {
+    let bufs = if wait { Some(BUFS.lock().unwrap_or_else(|e| e.into_inner())) } else { BUFS.try_lock().ok() };
+    for b in bufs.iter().flat_map(|v| v.iter()) {
+        let g = if wait { Some(b.lock().unwrap_or_else(|e| e.into_inner())) } else { b.try_lock().ok() };
+        if let Some(mut g) = g {
+            write_out(&mut g);
+        }
+    }
+}
+
+/// The panic path of [`finish`]: drains the buffers and writes an `aborted` record instead of
+/// `end`, so the truncated trace cannot pass for a complete one.
+fn abort_flush() {
+    if !on() {
+        return;
+    }
+    ON.store(false, Relaxed);
+    drain_all(false);
+    if let Some(sk) = SINK.get()
+        && let Ok(mut o) = sk.out.try_lock()
+    {
+        let _ = writeln!(o, r#"{{"ev":"aborted","t":{}}}"#, now());
+        let _ = o.flush();
+    }
 }
 
 /// Writes the end record and flushes. Safe to call when tracing is off, and more than once
@@ -180,9 +222,7 @@ pub fn finish() {
         return;
     }
     ON.store(false, Relaxed);
-    for b in BUFS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-        write_out(&mut b.lock().unwrap_or_else(|e| e.into_inner()));
-    }
+    drain_all(true);
     line(&format!(r#"{{"ev":"end","t":{}}}"#, now()));
     if let Some(sk) = SINK.get() {
         let _ = sk.out.lock().unwrap_or_else(|e| e.into_inner()).flush();
@@ -207,6 +247,10 @@ pub fn io<T>(op: Op, off: u64, len: u64, qd: usize, grp: u32, seq: u64, f: impl 
     let d = now();
     INFLIGHT.fetch_sub(1, Relaxed);
     let o = if op == Op::Read { "r" } else { "w" };
+    let limit = PANIC_AFTER.load(Relaxed);
+    if limit > 0 && i + 1 >= limit {
+        panic!("{PANIC_ENV}: forced panic after {limit} traced ops");
+    }
     record(
         i,
         format_args!(

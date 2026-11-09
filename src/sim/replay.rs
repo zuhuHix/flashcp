@@ -277,6 +277,9 @@ pub const MAX_LINE: usize = 64 << 10;
 pub const MAX_EVENTS: usize = 20_000_000;
 /// Largest accepted trace file.
 pub const MAX_FILE: u64 = 4 << 30;
+/// Most bytes of note keys and values retained from one trace (notes are a few hundred bytes
+/// each; they also count toward [`MAX_EVENTS`]).
+pub const MAX_NOTE_BYTES: usize = 16 << 20;
 
 /// Line-by-line trace parser (shared by [`Trace::parse`] and the streaming [`Trace::load`]).
 #[derive(Default)]
@@ -289,6 +292,10 @@ struct Parser {
     /// Issue order of each event (version 2), parallel to `tr.evs`.
     order: Vec<u64>,
     note_order: Vec<u64>,
+    note_bytes: usize,
+    aborted: bool,
+    /// Accept a trace without a clean end record (see [`Trace::load_opts`]).
+    allow_truncated: bool,
 }
 
 impl Parser {
@@ -314,7 +321,11 @@ impl Parser {
             self.header = true;
             return Ok(());
         }
-        let i = if self.version >= 2 && ev != "end" { o.u64("i").with_context(ctx)? } else { self.order.len() as u64 };
+        let i = if self.version >= 2 && ev != "end" && ev != "aborted" {
+            o.u64("i").with_context(ctx)?
+        } else {
+            self.order.len() as u64
+        };
         let e = match ev.as_str() {
             "io" => {
                 let op = o.str("op").with_context(ctx)?;
@@ -346,7 +357,15 @@ impl Parser {
                 Ev::Direct { on, t: o.u64("t").with_context(ctx)? }
             }
             "note" => {
-                self.tr.notes.push((o.str("key").with_context(ctx)?, o.raw("val").with_context(ctx)?));
+                let (k, v) = (o.str("key").with_context(ctx)?, o.raw("val").with_context(ctx)?);
+                self.note_bytes += k.len() + v.len();
+                if self.note_bytes > MAX_NOTE_BYTES {
+                    bail!("trace line {n}: notes exceed {MAX_NOTE_BYTES} bytes (the limit)");
+                }
+                if self.tr.evs.len() + self.tr.notes.len() >= MAX_EVENTS {
+                    bail!("trace has more than {MAX_EVENTS} events (the limit)");
+                }
+                self.tr.notes.push((k, v));
                 self.note_order.push(i);
                 return Ok(());
             }
@@ -354,9 +373,13 @@ impl Parser {
                 self.end = Some(o.u64("t").with_context(ctx)?);
                 return Ok(());
             }
+            "aborted" => {
+                self.aborted = true;
+                return Ok(());
+            }
             _ => return Ok(()),
         };
-        if self.tr.evs.len() >= MAX_EVENTS {
+        if self.tr.evs.len() + self.tr.notes.len() >= MAX_EVENTS {
             bail!("trace has more than {MAX_EVENTS} events (the limit)");
         }
         self.last_t = self.last_t.max(ev_last_time(&e));
@@ -368,6 +391,13 @@ impl Parser {
     fn finish(mut self) -> Result<Trace> {
         if !self.header {
             bail!("empty trace (no start header)");
+        }
+        if (self.aborted || self.end.is_none()) && !self.allow_truncated {
+            bail!(
+                "trace is truncated ({}): the recorded run did not finish cleanly; pass --allow-truncated to replay \
+                 what it holds",
+                if self.aborted { "the run panicked" } else { "no end record" }
+            );
         }
         if self.version >= 2 {
             let mut ix: Vec<usize> = (0..self.tr.evs.len()).collect();
@@ -391,7 +421,12 @@ impl Trace {
     /// qd > 1 is stably sorted by `seq`. Unknown event kinds are ignored; a missing end record
     /// takes the last time seen. Limits as in [`Trace::load`].
     pub fn parse(text: &str) -> Result<Trace> {
-        let mut p = Parser::default();
+        Self::parse_opts(text, false)
+    }
+
+    /// [`Trace::parse`]; `allow_truncated` accepts a trace without a clean end record.
+    pub fn parse_opts(text: &str, allow_truncated: bool) -> Result<Trace> {
+        let mut p = Parser { allow_truncated, ..Default::default() };
         for (n, line) in text.lines().enumerate() {
             if line.len() > MAX_LINE {
                 bail!("trace line {}: longer than {MAX_LINE} bytes", n + 1);
@@ -405,6 +440,12 @@ impl Trace {
     /// [`MAX_FILE`] bytes, so a huge or hostile file fails with a clear error instead of
     /// exhausting memory.
     pub fn load(path: &Path) -> Result<Trace> {
+        Self::load_opts(path, false)
+    }
+
+    /// [`Trace::load`]; `allow_truncated` accepts a trace without a clean end record (a run
+    /// that panicked or was killed): its ops are replayed as far as they go.
+    pub fn load_opts(path: &Path, allow_truncated: bool) -> Result<Trace> {
         use std::io::{BufRead, Read};
         let f = std::fs::File::open(path).with_context(|| format!("read trace {}", path.display()))?;
         let len = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -412,7 +453,7 @@ impl Trace {
             bail!("trace {} is {len} bytes, more than the {MAX_FILE}-byte limit", path.display());
         }
         let mut r = std::io::BufReader::with_capacity(1 << 20, f);
-        let mut p = Parser::default();
+        let mut p = Parser { allow_truncated, ..Default::default() };
         let mut buf = Vec::new();
         let mut n = 0usize;
         loop {
@@ -639,7 +680,8 @@ mod tests {
         assert!(Trace::parse("").is_err());
         assert!(Trace::parse(r#"{"v":3,"ev":"start","cmd":"x","device":null}"#).is_err());
         assert!(Trace::parse(r#"{"ev":"io"}"#).is_err());
-        let no_dev = Trace::parse(r#"{"v":1,"ev":"start","cmd":"x","device":null}"#).unwrap();
+        let no_dev =
+            Trace::parse("{\"v\":1,\"ev\":\"start\",\"cmd\":\"x\",\"device\":null}\n{\"ev\":\"end\",\"t\":0}").unwrap();
         assert_eq!(no_dev.device, None);
     }
 
@@ -673,6 +715,7 @@ mod tests {
                 k * 10 + 15
             ));
         }
+        s.push_str("{\"ev\":\"end\",\"t\":60}\n");
         let p = Trace::parse(&s).unwrap().plan();
         let deps: Vec<Dep> = p.ops.iter().map(|o| o.dep).collect();
         assert_eq!(deps, vec![Dep::All, Dep::None, Dep::Op(0), Dep::Op(1), Dep::Op(2)]);
@@ -737,5 +780,31 @@ mod tests {
         let e = format!("{:#}", Trace::load(&long).unwrap_err());
         assert!(e.contains("longer than"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn notes_count_toward_the_caps() {
+        // A notes-only flood: refused once the retained note bytes pass the cap.
+        let mut s = String::from("{\"v\":1,\"ev\":\"start\",\"cmd\":\"x\",\"device\":null}\n");
+        let val = "x".repeat(60_000);
+        for _ in 0..(MAX_NOTE_BYTES / val.len() + 2) {
+            s.push_str(&format!("{{\"ev\":\"note\",\"key\":\"k\",\"val\":\"{val}\"}}\n"));
+        }
+        s.push_str("{\"ev\":\"end\",\"t\":1}\n");
+        let e = format!("{:#}", Trace::parse(&s).unwrap_err());
+        assert!(e.contains("notes exceed"), "{e}");
+    }
+
+    #[test]
+    fn truncated_traces_are_rejected_unless_allowed() {
+        let head = "{\"v\":1,\"ev\":\"start\",\"cmd\":\"x\",\"device\":null}\n\
+                    {\"ev\":\"sync\",\"t\":1,\"d\":2}\n";
+        for (text, why) in
+            [(head.to_string(), "no end record"), (format!("{head}{{\"ev\":\"aborted\",\"t\":3}}\n"), "panicked")]
+        {
+            let e = format!("{:#}", Trace::parse(&text).unwrap_err());
+            assert!(e.contains("truncated") && e.contains(why) && e.contains("--allow-truncated"), "{e}");
+            assert_eq!(Trace::parse_opts(&text, true).unwrap().evs.len(), 1);
+        }
     }
 }
