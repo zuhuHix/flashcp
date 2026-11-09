@@ -1417,6 +1417,35 @@ fn five_thousand_renamed_files_of_equal_size_and_time_are_all_moved_fast() {
 }
 
 #[test]
+fn checksum_moves_in_one_bucket_of_three_thousand_are_matched_by_hash_queues() {
+    let dir = test_dir("sync_checksum_moves");
+    let base = dir.join("base");
+    const N: usize = 3000;
+    for i in 0..N {
+        random(&base.join(format!("f{i:04}.bin")), 6000, 7000 + i as u64, T0);
+    }
+    let img = dir.join("disk.img");
+    make_image(&img, 128 * MB);
+    assert_success(&run_build(&base, &img, &["--cluster", "4096"]), "flashcp build");
+    let src = dir.join("src");
+    for i in 0..N {
+        random(&src.join(format!("h{i:04}.bin")), 6000, 7000 + ((i * 7919) % N) as u64, T0);
+    }
+    let t = Instant::now();
+    let plan = plan_line(&sync_ok(&src, &img, &["--delete", "--yes", "--yes-many", "--checksum", "--json"]));
+    let secs = t.elapsed().as_secs_f64();
+    assert_eq!(
+        (json_u64(&plan, "moved"), json_u64(&plan, "new"), json_u64(&plan, "bytes")),
+        (N as u64, 0, 0),
+        "{plan}"
+    );
+    assert!(secs < 30.0, "3000 --checksum moves took {secs:.1} s");
+    fsck_clean(&img);
+    expect_same(&src, &read_ok(&img), "after 3000 --checksum moves");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn equal_samples_with_a_different_middle_are_copied_unless_fast_moves() {
     let dir = test_dir("sync_fast_moves");
     let base = dir.join("base");

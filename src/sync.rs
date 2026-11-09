@@ -902,9 +902,14 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     let mut moves: HashMap<usize, usize> = HashMap::new(); // new file node → gone_files index
     let mut used: HashSet<usize> = HashSet::new();
     if o.checksum {
+        // Consume-once queues by (bucket, full hash), as for fingerprints: no per-candidate scan.
+        let mut by_hash: HashMap<(MoveKey, u128), VecDeque<usize>> = HashMap::new();
+        for &i in &pool_used {
+            by_hash.entry((vol_key(&gone_files[i].ch).unwrap(), vol_hash[&(1, i)])).or_default().push_back(i);
+        }
         for (f, k) in &candidates {
             let Some(h) = src_hash[f] else { continue };
-            if let Some(&i) = pool_by[k].iter().find(|&&i| !used.contains(&i) && vol_hash[&(1, i)] == h) {
+            if let Some(i) = by_hash.get_mut(&(*k, h)).and_then(|q| q.pop_front()) {
                 used.insert(i);
                 moves.insert(*f, i);
                 st.moves_verified += 1;
