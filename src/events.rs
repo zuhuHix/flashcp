@@ -15,6 +15,12 @@
 //!     (a directory with a trailing "/", standing for its whole subtree); paths are absolute
 //!     inside the volume. For sync, "files"/"dirs" count files whose data is written (new and
 //!     changed) and new directories, "bytes" the file data written
+//!     ("relocated", "repaired", "orphans", "moves_verified", "moves_fast", "moves_copied_budget"
+//!     count relocated entry sets, interrupted-sync duplicates resolved, orphan entries cleared,
+//!     and how moves were confirmed)
+//! {"event":"extraneous","entries":[{"path":"rel/path","dir":B,"entries":N},..]}
+//!     pull --delete-extraneous only, right after its plan: what would be deleted (N counts a
+//!     directory's whole subtree)
 //! {"event":"phase","op":"optimize","phase":"pull"|..,"step":N,"steps":N}
 //!     optimize only: a new phase starts; progress events that follow count within it
 //! {"event":"progress","files_done":N,"bytes_done":N}   (at most ~10 per second)
