@@ -1,8 +1,8 @@
 /* flashcp site. Plain browser JS, no libraries.
    Benchmark numbers are the measured tables from README.md (merged work only), taken on
    2026-11-09, Linux 7.0, on two drives: an MSI DATAMAG 20Gbps USB SSD and a SanDisk Cruzer
-   Blade 8 GB USB 2.0 stick. Times are seconds, medians of 3. In-review work (PR #9) is
-   deliberately not included here. Every speedup shown is computed below from these times, except where a case
+   Blade 8 GB USB 2.0 stick. Times are seconds, medians of 3 unless a case says
+   otherwise (single runs and the stick's mkfs + cp range are labelled). Every speedup shown is computed below from these times, except where a case
    carries `x`: the published figure from the unrounded medians (5.58 / 0.38 s rounds to 14.7x; measured 14.6x). */
 (function () {
   'use strict';
@@ -99,9 +99,16 @@
     },
     stick: {
       build: {
-        small: { base: 86.3, flash: 34.6 }
+        // mkfs + cp varied from 110.4 s to 179.6 s across runs on this stick; flashcp is a median of 3.
+        small: { base: 110.4, baseLabel: '110.4–179.6 s', flash: 33.6, flashLabel: '33.6 s', xLabel: '3.3–5.3×' }
       },
-      // add is not shown on the stick: measurements in review
+      add: {
+        small: { cases: [
+          { sub: 'Onto a stick holding 20k files (mkfs default, 32 KB clusters) · single run', base: 209.8, baseLabel: '209.8 s', flash: 84.1, flashLabel: '84.1 s' },
+          { sub: 'Same, onto a stick after flashcp optimize (4 KB clusters) · single run; baseline measured on the mkfs-default stick', base: 209.8, baseLabel: '209.8 s', flash: 36.5, flashLabel: '36.5 s' },
+          { sub: 'First copy onto an empty, freshly formatted stick (written as a build) · median of 3', base: 104.3, baseLabel: '104.3 s', flash: 34.9, flashLabel: '34.9 s' }
+        ] }
+      },
       pull: {
         small: { kernel: { base: 30.86, flash: 29.52 }, built: { base: 32.78, flash: 16.38 } }
       }
@@ -160,11 +167,11 @@
 
   // Rows for one case: normal-copy baseline first, then the flashcp variants.
   function rowsFor(c, op) {
-    var rows = [{ label: NORMAL_LABEL[op], t: c.base, fill: 'fill-normal' }];
+    var rows = [{ label: NORMAL_LABEL[op], t: c.base, tLabel: c.baseLabel, fill: 'fill-normal' }];
     if (op === 'build' && c.copy !== undefined && explorer.extras.copy) {
       rows.push({ label: 'mkfs + smart copy', t: c.copy, fill: 'fill-copy' });
     }
-    rows.push({ label: FLASH_LABEL[op], t: c.flash, x: c.x, fill: 'fill-flash' });
+    rows.push({ label: FLASH_LABEL[op], t: c.flash, tLabel: c.flashLabel, x: c.x, xLabel: c.xLabel, fill: 'fill-flash' });
     if (op === 'build' && c.full !== undefined && explorer.extras.full) {
       rows.push({ label: 'flashcp build, full FAT', t: c.full, fill: 'fill-flash2' });
     }
@@ -189,16 +196,16 @@
       var main = el('div', 'bar-main');
       var track = el('div', 'bar-track');
       track.setAttribute('role', 'img');
-      track.setAttribute('aria-label', r.label + ': ' + formatSeconds(r.t) +
-        (isBase ? ', baseline' : ', ' + formatX(speedup) + ' vs baseline'));
+      track.setAttribute('aria-label', r.label + ': ' + (r.tLabel || formatSeconds(r.t)) +
+        (isBase ? ', baseline' : ', ' + (r.xLabel || formatX(speedup)) + ' vs baseline'));
       var fill = el('div', 'bar-fill ' + r.fill);
       track.appendChild(fill);
       main.appendChild(track);
       row.appendChild(main);
 
       var value = el('div', 'bar-value');
-      value.appendChild(document.createTextNode(formatSeconds(r.t) + '  '));
-      value.appendChild(el('span', 'sp', isBase ? 'baseline' : formatX(speedup)));
+      value.appendChild(document.createTextNode((r.tLabel || formatSeconds(r.t)) + '  '));
+      value.appendChild(el('span', 'sp', isBase ? 'baseline' : (r.xLabel || formatX(speedup))));
       row.appendChild(value);
 
       box.appendChild(row);
@@ -219,10 +226,6 @@
     var drive = explorer.drive;
     var op = explorer.op;
 
-    if (drive === 'stick' && op === 'add') {
-      box.appendChild(el('p', 'empty-msg', 'Add on the stick: measurements in review. The stick was measured for build and pull only.'));
-      return;
-    }
 
     var sets = DRIVE_DATASETS[drive].filter(function (ds) {
       return explorer.dataset === 'all' || ds === explorer.dataset;
@@ -235,10 +238,13 @@
 
       box.appendChild(el('h3', 'bar-group-title', DATASET_LABEL[ds]));
 
-      if (op === 'pull') {
+      if (c.cases) {
+        c.cases.forEach(function (k) { renderBars(box, rowsFor(k, op), k.sub, ''); });
+      } else if (op === 'pull') {
         renderBars(box, rowsFor(c.kernel, op), 'Kernel-filled drive',
           drive === 'stick' ? KERNEL_STICK_NOTE : '');
-        renderBars(box, rowsFor(c.built, op), 'flashcp-built drive', '');
+        renderBars(box, rowsFor(c.built, op), 'flashcp-built drive',
+          drive === 'stick' ? 'After flashcp optimize, pulling a stick that was kernel-filled went from 28.9 s to 16.0 s (1.8×), and optimize itself took 81–103 s once.' : '');
       } else {
         renderBars(box, rowsFor(c, op), '', '');
       }

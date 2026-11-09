@@ -35,8 +35,8 @@ const LANES: Lane[] = [
     neckH: 8,
     body: 'stick',
     chipLabel: 'measured: 6.5 MB/s sequential write',
-    mult: '2.5×',
-    times: '86.3 → 34.6 s',
+    mult: '3.3–5.3×',
+    times: '110.4–179.6 → 33.6 s',
     oy: 10,
     normalOv: 0.6,
     flashOv: 0.12,
@@ -86,8 +86,8 @@ const LaneView: React.FC<{lane: Lane; f: number; P: Palette; fps: number; keep: 
   const ovN = lane.normalOv * BAR_FULL;
   const ovF = lane.flashOv * BAR_FULL;
   const chipW = lane.chip * BAR_FULL;
-  const pillW = 110;
-  const pillCx = 1085;
+  const pillW = Math.max(110, lane.mult.length * 15 + 30);
+  const pillCx = 1060;
 
   return (
     <g>
@@ -185,7 +185,7 @@ const LaneView: React.FC<{lane: Lane; f: number; P: Palette; fps: number; keep: 
           {lane.mult}
         </text>
       </g>
-      <text x={pillCx} y={oy + 132} textAnchor="middle" fontFamily={MONO} fontSize={20} fill={P.text} opacity={subA}>
+      <text x={pillCx} y={oy + 132} textAnchor="middle" fontFamily={MONO} fontSize={18} fill={P.text} opacity={subA}>
         {lane.times}
       </text>
     </g>
