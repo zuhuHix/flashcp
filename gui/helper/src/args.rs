@@ -1,4 +1,4 @@
-//! Strict argv parsing for both programs. The helper accepts exactly four command shapes and
+//! Strict argv parsing for both programs. The helper accepts exactly five command shapes and
 //! builds every flashcp argv itself from the validated values, so nothing the caller sends is
 //! forwarded verbatim.
 
@@ -18,6 +18,10 @@ pub const MAX_KEY: usize = 128;
 pub const MAX_ITEMS: usize = 256;
 /// The fd number flashcp is told to use (`--target-fd`).
 pub const TARGET_FD: i32 = 3;
+/// Where `optimize` keeps its temporary copy, relative to the invoking user's passwd home.
+pub const OPTIMIZE_TEMP: &str = ".cache/flashcp/optimize";
+/// Longest home directory we build the optimize temp path from (leaves room under PATH_MAX).
+const MAX_HOME: usize = 3072;
 
 /// A validated device name: `/dev/sd` + 1-3 lowercase letters + optional 1-3 digits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +87,15 @@ pub enum Request {
         existing: Existing,
         dest: String,
     },
+    /// Rebuild the volume in the flashcp layout without losing data (copy off, verify, erase,
+    /// rebuild, verify, delete the copy). No caller-chosen path: the temporary copy always goes
+    /// to [`optimize_temp`] of the invoking user's home, which the helper never touches itself.
+    /// Re-running the same request after an interruption resumes (flashcp detects the job).
+    Optimize {
+        dev: DevName,
+        expect: String,
+        dry_run: bool,
+    },
 }
 
 /// How the helper opens the device for a request.
@@ -93,7 +106,8 @@ pub enum Access {
     /// `O_RDONLY|O_EXCL`: `pull` reads the whole volume and must see it stay unmounted and
     /// unclaimed for the whole run (see SECURITY-NOTES.md).
     ReadExclusive,
-    /// `O_RDWR|O_EXCL`: `add` and `build`.
+    /// `O_RDWR|O_EXCL`: `add`, `build` and `optimize` (its dry run too: flashcp requires a
+    /// read-write fd for optimize, and the plan is only meaningful on an unclaimed volume).
     WriteExclusive,
 }
 
@@ -123,7 +137,8 @@ impl Request {
             Request::Add { dev, .. }
             | Request::Build { dev, .. }
             | Request::Info { dev, .. }
-            | Request::Pull { dev, .. } => dev,
+            | Request::Pull { dev, .. }
+            | Request::Optimize { dev, .. } => dev,
         }
     }
 
@@ -132,24 +147,27 @@ impl Request {
             Request::Add { expect, .. }
             | Request::Build { expect, .. }
             | Request::Info { expect, .. }
-            | Request::Pull { expect, .. } => expect,
+            | Request::Pull { expect, .. }
+            | Request::Optimize { expect, .. } => expect,
         }
     }
 
-    /// `info` reads briefly, `pull` reads but holds the device exclusively, `add` and `build`
-    /// write and hold it exclusively.
+    /// `info` reads briefly, `pull` reads but holds the device exclusively, `add`, `build` and
+    /// `optimize` write and hold it exclusively.
     pub fn access(&self) -> Access {
         match self {
             Request::Info { .. } => Access::Read,
             Request::Pull { .. } => Access::ReadExclusive,
-            Request::Add { .. } | Request::Build { .. } => Access::WriteExclusive,
+            Request::Add { .. } | Request::Build { .. } | Request::Optimize { .. } => Access::WriteExclusive,
         }
     }
 
     /// The exact argvs (without argv[0]) of the flashcp runs, in order: one per item for `add`,
-    /// one for `build`/`info`.
-    pub fn flashcp_runs(&self) -> Vec<Vec<String>> {
-        match self {
+    /// one for `build`/`info`/`pull`/`optimize`. `home` is the invoking user's home directory
+    /// from the passwd database (never from argv or the environment); only `optimize` uses it,
+    /// and it fails only when that home can't hold the temporary copy (see [`optimize_temp`]).
+    pub fn flashcp_runs(&self, home: &str) -> Result<Vec<Vec<String>>, String> {
+        Ok(match self {
             Request::Add { skip_existing, items, .. } => items
                 .iter()
                 .map(|it| {
@@ -185,8 +203,43 @@ impl Request {
                 v.push("--json".into());
                 vec![v]
             }
-        }
+            Request::Optimize { dry_run, .. } => {
+                let mut v = vec!["optimize".to_string(), "--target-fd".into(), TARGET_FD.to_string()];
+                v.extend(["--temp".into(), optimize_temp(home)?, "--yes".into()]);
+                if *dry_run {
+                    v.push("--dry-run".into());
+                }
+                v.push("--json".into());
+                vec![v]
+            }
+        })
     }
+}
+
+/// The directory `optimize` keeps its temporary copy in: `<home>/.cache/flashcp/optimize`.
+///
+/// Built from the passwd home only, as a string: the helper (root) never stats, creates or
+/// resolves it. flashcp creates it after the privilege drop, so the kernel applies the user's
+/// own rights; it refuses it if it is on RAM (no `--temp-volatile-…` flag is ever passed) or on
+/// the drive being optimized. Being fixed, every run (and every resume) of every drive uses the
+/// same place, so an interrupted job is always found again. Refused: a relative or root (`/`)
+/// home, `.`/`..` components, control characters, or more than 3072 bytes.
+pub fn optimize_temp(home: &str) -> Result<String, String> {
+    let bad = |why: &str| Err(format!("cannot use your home directory {home:?} for optimize's temporary copy: {why}"));
+    let trimmed = home.trim_end_matches('/');
+    if !home.starts_with('/') {
+        return bad("it is not an absolute path");
+    }
+    if trimmed.is_empty() {
+        return bad("it is the root directory");
+    }
+    if home.len() > MAX_HOME || home.chars().any(char::is_control) {
+        return bad("it is too long or contains control characters");
+    }
+    if trimmed.split('/').skip(1).any(|c| c.is_empty() || c == "." || c == "..") {
+        return bad("it is not in canonical form");
+    }
+    Ok(format!("{trimmed}/{OPTIMIZE_TEMP}"))
 }
 
 /// Non-UTF-8 is rejected outright: the GUI only ever sends UTF-8 and it keeps every later check
@@ -288,6 +341,18 @@ pub fn parse(args: &[OsString]) -> Result<Request, String> {
             let expect = expect.ok_or("pull requires --expect")?;
             let dest = dest.ok_or("pull requires a destination directory")?;
             Ok(Request::Pull { dev, expect, from, existing: existing.unwrap_or(Existing::Fail), dest })
+        }
+        "optimize" => {
+            let mut dry_run = false;
+            while let Some(f) = it.next() {
+                match f {
+                    "--expect" => once(&mut expect, f, val(&mut it, f).and_then(check_key))?,
+                    "--dry-run" if !dry_run => dry_run = true,
+                    "--dry-run" => return Err(format!("duplicate flag {f}")),
+                    _ => return Err("unexpected argument for optimize".into()),
+                }
+            }
+            Ok(Request::Optimize { dev, expect: expect.ok_or("optimize requires --expect")?, dry_run })
         }
         _ => Err("unknown operation".into()),
     }
@@ -419,8 +484,10 @@ mod tests {
         parse(&os(a))
     }
 
+    const HOME: &str = "/home/u";
+
     fn runs(a: &[&str]) -> Vec<Vec<String>> {
-        p(a).unwrap().flashcp_runs()
+        p(a).unwrap().flashcp_runs(HOME).unwrap()
     }
 
     fn add(dev: &str, extra: &[&str]) -> Vec<String> {
@@ -438,7 +505,7 @@ mod tests {
         assert_eq!(r.expect(), "SER1");
         assert_eq!(r.access(), Access::WriteExclusive);
         assert_eq!(
-            r.flashcp_runs(),
+            r.flashcp_runs(HOME).unwrap(),
             [
                 vec!["add", "/home/u/a", "--target-fd", "3", "--to", "/Photos", "--json"],
                 vec!["add", "/b c", "--target-fd", "3", "--to", "/", "--json"],
@@ -457,7 +524,7 @@ mod tests {
             many.extend(["--item".into(), format!("/src{i}"), format!("/d{i}")]);
         }
         let refs: Vec<&str> = many.iter().map(String::as_str).collect();
-        assert_eq!(pa("/dev/sdb1", &refs).unwrap().flashcp_runs().len(), 256);
+        assert_eq!(pa("/dev/sdb1", &refs).unwrap().flashcp_runs(HOME).unwrap().len(), 256);
         let mut more = refs.clone();
         more.extend(["--item", "/one", "/more"]);
         assert!(pa("/dev/sdb1", &more).unwrap_err().contains("at most 256"));
@@ -480,10 +547,10 @@ mod tests {
                 src: "/d".into()
             }
         );
-        assert_eq!(r.flashcp_runs(), [vec!["build", "/d", "--target-fd", "3", "--yes-erase", "--json"]]);
+        assert_eq!(r.flashcp_runs(HOME).unwrap(), [vec!["build", "/d", "--target-fd", "3", "--yes-erase", "--json"]]);
         let r = p(&["info", "/dev/sdz9", "--expect", "S"]).unwrap();
         assert_eq!(r.access(), Access::Read);
-        assert_eq!(r.flashcp_runs(), [vec!["info", "--target-fd", "3", "--json"]]);
+        assert_eq!(r.flashcp_runs(HOME).unwrap(), [vec!["info", "--target-fd", "3", "--json"]]);
         assert_eq!(info_args(), ["info", "--target-fd", "3", "--json"]);
     }
 
@@ -502,7 +569,7 @@ mod tests {
             }
         );
         assert_eq!(
-            r.flashcp_runs(),
+            r.flashcp_runs(HOME).unwrap(),
             [vec!["pull", "--target-fd", "3", "/home/u/Downloads/STICK-2026-11-09", "--json"]]
         );
         // Flag order does not matter; the flashcp argv is always built in one fixed order.
@@ -595,6 +662,105 @@ mod tests {
             assert!(check_from(bad).is_err(), "{bad:?} accepted");
             assert!(p(&["pull", "/dev/sdb", "--expect", "S", "--from", bad, "/d"]).is_err(), "{bad:?} accepted");
         }
+    }
+
+    #[test]
+    fn optimize_shapes() {
+        let r = p(&["optimize", "/dev/sdb1", "--expect", "S"]).unwrap();
+        assert_eq!(r, Request::Optimize { dev: parse_dev("/dev/sdb1").unwrap(), expect: "S".into(), dry_run: false });
+        // Writes: O_RDWR|O_EXCL, like add and build, for the dry run too.
+        assert_eq!(r.access(), Access::WriteExclusive);
+        assert_eq!(
+            r.flashcp_runs(HOME).unwrap(),
+            [vec!["optimize", "--target-fd", "3", "--temp", "/home/u/.cache/flashcp/optimize", "--yes", "--json"]]
+        );
+        let r = p(&["optimize", "/dev/sdc", "--dry-run", "--expect", "K"]).unwrap();
+        assert_eq!(r.access(), Access::WriteExclusive);
+        assert_eq!(
+            r.flashcp_runs(HOME).unwrap(),
+            [vec![
+                "optimize",
+                "--target-fd",
+                "3",
+                "--temp",
+                "/home/u/.cache/flashcp/optimize",
+                "--yes",
+                "--dry-run",
+                "--json"
+            ]]
+        );
+        // Resuming is the same request again: the argv (and so the temp dir) never changes
+        // between runs, so flashcp always finds the interrupted job.
+        let a = ["optimize", "/dev/sdb1", "--expect", "S"];
+        assert_eq!(runs(&a), runs(&a));
+        // The temp dir comes from the home handed in (the passwd entry), nothing else.
+        assert_eq!(
+            p(&a).unwrap().flashcp_runs("/srv/home/ä b/").unwrap()[0][4],
+            "/srv/home/ä b/.cache/flashcp/optimize"
+        );
+    }
+
+    #[test]
+    fn optimize_bad_args_rejected() {
+        let cases: &[&[&str]] = &[
+            &["optimize"],
+            &["optimize", "/dev/sdb1"],
+            &["optimize", "/dev/sdb1", "--dry-run"],
+            &["optimize", "/dev/sdb1", "--expect"],
+            &["optimize", "/dev/sdb1", "--expect", ""],
+            &["optimize", "/dev/sdb1", "--expect", "S", "--expect", "S"],
+            &["optimize", "/dev/sdb1", "--expect=S"],
+            &["optimize", "/dev/sdb1", "--expect", "S", "--dry-run", "--dry-run"],
+            &["optimize", "/dev/sdb1", "--expect", "S", "--dry-run=1"],
+            // No caller-chosen temp dir, no volatile-temp override, no --force, no raw flags.
+            &["optimize", "/dev/sdb1", "--expect", "S", "--temp", "/tmp"],
+            &["optimize", "/dev/sdb1", "--expect", "S", "--temp=/tmp"],
+            &["optimize", "/dev/sdb1", "--expect", "S", "--temp", "/tmp", "--temp-volatile-i-accept-data-loss"],
+            &["optimize", "/dev/sdb1", "--expect", "S", "--temp-volatile-i-accept-data-loss"],
+            &["optimize", "/dev/sdb1", "--expect", "S", "--force"],
+            &["optimize", "/dev/sdb1", "--expect", "S", "--yes"],
+            &["optimize", "/dev/sdb1", "--expect", "S", "--json"],
+            &["optimize", "/dev/sdb1", "--expect", "S", "--target-fd", "5"],
+            &["optimize", "/dev/sdb1", "--expect", "S", "--confirm", "S"],
+            &["optimize", "/dev/sdb1", "--expect", "S", "/home/u"],
+            &["optimize", "/dev/sdb1", "--expect", "S", "/dev/sdb1"],
+            &["OPTIMIZE", "/dev/sdb1", "--expect", "S"],
+            &["optimize", "/dev/nvme0n1", "--expect", "S"],
+            &["optimize", "/dev/sdb1/../sda", "--expect", "S"],
+        ];
+        for c in cases {
+            assert!(p(c).is_err(), "{c:?} accepted");
+        }
+        assert!(p(&["optimize", "/dev/sdb1"]).unwrap_err().contains("--expect"));
+    }
+
+    #[test]
+    fn optimize_temp_rules() {
+        assert_eq!(optimize_temp("/home/u").unwrap(), "/home/u/.cache/flashcp/optimize");
+        assert_eq!(optimize_temp("/home/u//").unwrap(), "/home/u/.cache/flashcp/optimize");
+        assert_eq!(optimize_temp("/var/lib/x y").unwrap(), "/var/lib/x y/.cache/flashcp/optimize");
+        let long = format!("/{}", "a".repeat(MAX_HOME));
+        for bad in [
+            "",
+            "/",
+            "//",
+            "home/u",
+            "./u",
+            "~",
+            "/home/../root",
+            "/home/./u",
+            "/home//u",
+            "/home/u\n",
+            "/a\tb",
+            "/a\0b",
+            &long,
+        ] {
+            assert!(optimize_temp(bad).is_err(), "{bad:?} accepted");
+            let r = Request::Optimize { dev: parse_dev("/dev/sdb").unwrap(), expect: "S".into(), dry_run: false };
+            assert!(r.flashcp_runs(bad).is_err(), "{bad:?} accepted");
+        }
+        // Other ops never look at the home.
+        assert!(p(&["info", "/dev/sdb", "--expect", "S"]).unwrap().flashcp_runs("").is_ok());
     }
 
     #[test]
