@@ -14,17 +14,23 @@
 //! or write it between phases. At every instant a complete copy of the data exists, and every
 //! error says which one:
 //!
-//! 1. **pull** into `<tmp>/tree` (synced), then `state=pulled`. The device is only read.
-//! 2. **verify**: a manifest (path, size, order-independent block hash, mtime) of the device,
-//!    read in physical order, must equal one of `<tmp>/tree`; saved to `<tmp>/manifest`,
-//!    `state=verified`, all fsynced. Until here an error or crash leaves the device untouched,
-//!    and the temp dir is deleted (on a crash: by the next run).
+//! 1. **pull** into `<tmp>/tree` (synced), then `state=pulled`. The device is only read, and
+//!    only once: pull hashes every extent it reads (the very bytes it writes to the copy) into
+//!    the device's manifest (path, size, order-independent block hash, mtime; see
+//!    [`crate::verify`]).
+//! 2. **verify**: that manifest must list exactly what the metadata walk of the device lists,
+//!    and equal the manifest of `<tmp>/tree` (hashed from the local disk); saved to
+//!    `<tmp>/manifest`, `state=verified`, all fsynced. Only if pull had to retry a device read
+//!    is the device's data read again for this (in physical order, with pull's planner and
+//!    strategy). Until here an error or crash leaves the device untouched, and the temp dir is
+//!    deleted (on a crash: by the next run).
 //! 3. **build**: re-scan the tree and run the cluster optimizer (fails before any write if
 //!    build would refuse), fsync `state=building`, then `build` onto the held target. `build`
 //!    marks the volume dirty until its very last write. From here until the check passes, the
 //!    verified temp copy is the copy; it is never deleted on error.
 //! 4. **check**: the device, re-parsed, must be a clean volume with the same label whose
-//!    manifest equals `<tmp>/manifest`.
+//!    manifest (read in physical order with pull's planner and strategy) equals
+//!    `<tmp>/manifest`.
 //! 5. **cleanup**: `state=done`, then the tree, the manifest, the state file, the dir.
 //!
 //! The new volume's serial number is chosen before the pull and saved in the state file with a
@@ -54,7 +60,7 @@ use crate::exfat::{
     BuildOpts, FatMode, FlagGuard, Node, SECTOR, SYS_BLOCK, Target, TargetSpec, build_target, choose_cluster,
     related_devs, scan_tree, set_direct, upcase_map, usable_bytes, validate_name,
 };
-use crate::pull::{PullOpts, pull_file};
+use crate::pull::{PullOpts, Strategy, pull_file_hashed, read_strategy};
 use crate::util::human_bytes;
 use crate::verify::{Manifest, Progress, VolTree, hash_tree, hash_volume, walk};
 use crate::volume::Vol;
@@ -75,6 +81,12 @@ const STOP_ENV: &str = "FLASHCP_TEST_OPTIMIZE_STOP";
 const ABORT_ENV: &str = "FLASHCP_TEST_OPTIMIZE_ABORT";
 /// Test hook: flip the first byte of this file (path relative to the tree) right after pull.
 const CORRUPT_ENV: &str = "FLASHCP_TEST_OPTIMIZE_CORRUPT";
+/// Test hook: verify as if pull had retried a read: hash the device again (the fallback), and
+/// also require that hash to equal the one pull computed while reading.
+const VERIFY_DEVICE_ENV: &str = "FLASHCP_TEST_OPTIMIZE_VERIFY_DEVICE";
+/// Test hook (shared with pull): trace device reads to stderr; optimize adds a
+/// "flashcp-phase NAME" line at the start of each phase.
+const TRACE_READS_ENV: &str = "FLASHCP_TEST_TRACE_READS";
 /// Test hook: pretend every temp candidate has this many bytes free.
 const FAKE_FREE_ENV: &str = "FLASHCP_TEST_FAKE_FREE";
 /// Free space kept in reserve on the temp filesystem beyond the copy itself.
@@ -572,6 +584,9 @@ impl<'s> Run<'s> {
     fn phase(&mut self, name: &'static str) {
         self.end_phase();
         self.step += 1;
+        if std::env::var_os(TRACE_READS_ENV).is_some() {
+            eprintln!("flashcp-phase {name}");
+        }
         self.tick.emit(Event::Phase { op: Op::Optimize, phase: name, step: self.step, steps: self.steps });
         self.started = Some((name, Instant::now()));
     }
@@ -616,9 +631,13 @@ fn forward<'a>(tick: &'a mut Ticker<'_>) -> impl FnMut(&Event) + 'a {
     }
 }
 
-fn hash_device(run: &mut Run<'_>, dev: &File, t: &VolTree) -> Result<Manifest> {
+/// Hashes the walked volume on `dev` (read with pull's strategy `s`).
+fn hash_device(run: &mut Run<'_>, dev: &File, t: &VolTree, s: &Strategy) -> Result<Manifest> {
     let p = Progress::default();
-    run.with_progress(|| (p.files.load(Ordering::Relaxed), p.bytes.load(Ordering::Relaxed)), || hash_volume(dev, t, &p))
+    run.with_progress(
+        || (p.files.load(Ordering::Relaxed), p.bytes.load(Ordering::Relaxed)),
+        || hash_volume(dev, t, s, &p),
+    )
 }
 
 fn hash_local(run: &mut Run<'_>, tree: &Path) -> Result<Manifest> {
@@ -898,7 +917,8 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
         run.phase("pull");
         let tree = tmp.join("tree");
         let dup = ctx.held.try_clone().context("dup target fd")?;
-        pull_file(dup, ctx.dev_len, None, &what, &tree, &PullOpts::default(), &mut forward(&mut run.tick))?;
+        let (_, pulled) =
+            pull_file_hashed(dup, ctx.dev_len, &what, &tree, &PullOpts::default(), &mut forward(&mut run.tick))?;
         if let Ok(rel) = std::env::var(CORRUPT_ENV) {
             let f = fs::OpenOptions::new().read(true).write(true).open(tree.join(rel))?;
             let mut b = [0u8];
@@ -909,27 +929,43 @@ pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result
         hook("pull")?;
 
         run.phase("verify");
-        let (dev, local) = {
+        // Pull read and hashed every byte of the drive's files; that hash is the drive's
+        // manifest. It must list exactly what the metadata walk lists.
+        let d = t.listing().diff(&pulled.manifest.without_hashes(), "the drive", "what pull read");
+        ensure!(d.is_empty(), "pull did not read what the drive lists ({} differences): {}", d.len(), first_diffs(&d));
+        // Only if a device read had to be retried is the drive's data read again.
+        let reread = pulled.retries > 0 || std::env::var_os(VERIFY_DEVICE_ENV).is_some();
+        let (dev, local) = if reread {
             let (pd, pl) = (Progress::default(), Progress::default());
             let held = &ctx.held;
-            let tr = &t;
-            let tree = &tree;
+            let (tr, tree, strat) = (&t, &tree, &pulled.strategy);
             // The device and the local disk are read at the same time; progress is the slower.
-            run.with_progress(
+            let (dev, local) = run.with_progress(
                 || {
                     let f = pd.files.load(Ordering::Relaxed).min(pl.files.load(Ordering::Relaxed));
                     (f, pd.bytes.load(Ordering::Relaxed).min(pl.bytes.load(Ordering::Relaxed)))
                 },
                 || {
                     std::thread::scope(|s| {
-                        let d = s.spawn(|| hash_volume(held, tr, &pd));
+                        let d = s.spawn(|| hash_volume(held, tr, strat, &pd));
                         let l = hash_tree(tree, &pl);
                         (d.join().expect("device hash thread panicked"), l)
                     })
                 },
-            )
+            );
+            let dev = dev.context("hash the drive")?;
+            let d = dev.diff(&pulled.manifest, "the drive", "what pull read");
+            ensure!(
+                d.is_empty(),
+                "the drive reads differently now than while it was copied ({} differences): {}",
+                d.len(),
+                first_diffs(&d)
+            );
+            (dev, local)
+        } else {
+            (pulled.manifest, hash_local(&mut run, tree.as_path()))
         };
-        let (dev, local) = (dev.context("hash the drive")?, local.context("hash the temporary copy")?);
+        let local = local.context("hash the temporary copy")?;
         let d = dev.diff(&local, "the drive", "the temporary copy");
         ensure!(
             d.is_empty(),
@@ -1014,8 +1050,9 @@ fn rebuild(
         let (v, t) = open_walk(&ctx.held, ctx.dev_len).context("the rebuilt drive does not parse as a clean volume")?;
         ensure!(v.label == st.label, "the rebuilt volume's label is {:?}, not {:?}", v.label, st.label);
         ensure!(serial_of(&v.sector0) == st.serial, "the drive does not hold the volume this optimize wrote");
+        let strat = read_strategy(&ctx.held, &v);
         drop(v);
-        let m = hash_device(run, &ctx.held, &t).context("hash the rebuilt drive")?;
+        let m = hash_device(run, &ctx.held, &t, &strat).context("hash the rebuilt drive")?;
         let d = manifest.diff(&m, "the original", "the rebuilt drive");
         ensure!(
             d.is_empty(),
@@ -1151,11 +1188,12 @@ fn resume(
     match walked {
         Ok((v, t)) if original || ours => {
             stats.old_cluster = v.cs;
+            let strat = read_strategy(&ctx.held, &v);
             drop(v);
             // Finished: check, cleanup. Still the original volume: check, verify, build, check, cleanup.
             run.steps = if original { 5 } else { 2 };
             run.phase("check");
-            let m = hash_device(run, &ctx.held, &t).context("hash the drive")?;
+            let m = hash_device(run, &ctx.held, &t, &strat).context("hash the drive")?;
             let d = saved.diff(&m, "the saved manifest", "the drive");
             if !d.is_empty() && original {
                 bail!(

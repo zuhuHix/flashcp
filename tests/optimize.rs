@@ -598,16 +598,18 @@ fn patch_set(img: &mut [u8], name: &str, f: impl FnOnce(&mut [u8])) {
     img[set + 2..set + 4].copy_from_slice(&c.to_le_bytes());
 }
 
-/// A file whose FAT chain visits its clusters out of physical order (c, c+2, c+1), so its
-/// logical blocks lie on the device in another order than in the file, and a file whose
-/// ValidDataLength is half its DataLength (the rest must read as zeros, whatever the disk holds).
-#[test]
-fn chained_out_of_order_and_valid_data_length_survive() {
-    let dir = test_dir("opt_crafted");
+/// A kernel-style image: a file whose FAT chain visits its clusters out of physical order
+/// (c, c+2, c+1), so its logical blocks lie on the device in another order than in the file,
+/// a file whose ValidDataLength is half its DataLength (the rest must read as zeros, whatever
+/// the disk holds), and empty files.
+fn crafted_stick(name: &str) -> Stick {
+    let dir = test_dir(name);
     let src = dir.join("src");
     write_random(&src.join("frag.bin"), 3 * OLD_CLUSTER, 11);
     write_random(&src.join("vdl.bin"), 10_000, 12);
     write_random(&src.join("after.bin"), 50_000, 13);
+    write_file(&src.join("empty.bin"), b"");
+    write_file(&src.join("sub/empty-too.bin"), b"");
     let img = dir.join("disk.img");
     make_image(&img, 64 * MB);
     assert_success(&common::run_build(&src, &img, &["--cluster", "32768", "--label", LABEL]), "flashcp build");
@@ -634,8 +636,84 @@ fn chained_out_of_order_and_valid_data_length_survive() {
     for d in ["tmpbase", "cache", "tmp"] {
         fs::create_dir_all(dir.join(d)).unwrap();
     }
-    let s = Stick { base: dir.join("tmpbase"), dir, img, orig };
+    Stick { base: dir.join("tmpbase"), dir, img, orig }
+}
+
+#[test]
+fn chained_out_of_order_and_valid_data_length_survive() {
+    let s = crafted_stick("opt_crafted");
     optimize_ok(&s, &["--yes"]);
+    assert_optimized(&s);
+    fs::remove_dir_all(&s.dir).unwrap();
+}
+
+// ───────────────────────── the device is read once ─────────────────────────
+
+/// Device data bytes read per optimize phase, from the FLASHCP_TEST_TRACE_READS trace.
+fn reads_per_phase(stderr: &str) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    let mut phase = "(before)".to_string();
+    for l in stderr.lines() {
+        if let Some(p) = l.strip_prefix("flashcp-phase ") {
+            phase = p.to_string();
+            out.entry(phase.clone()).or_insert(0);
+        } else if let Some(r) = l.strip_prefix("flashcp-read ") {
+            let len: u64 = r.split(' ').nth(1).unwrap().parse().unwrap();
+            *out.entry(phase.clone()).or_insert(0) += len;
+        }
+    }
+    out
+}
+
+/// Optimizes `s` with the verify fallback forced (the drive's data hashed again, with pull's
+/// planner and strategy) and requires that independent manifest to equal the one pull computed
+/// while reading (optimize fails otherwise).
+fn pull_hash_equals_device_hash(s: &Stick, args: &[&str]) {
+    let mut a = vec!["--yes"];
+    a.extend_from_slice(args);
+    let out = optimize(s, &a, &[("FLASHCP_TEST_OPTIMIZE_VERIFY_DEVICE", "1"), ("FLASHCP_TEST_TRACE_READS", "1")]);
+    assert_success(&out, "flashcp optimize (device re-verified)");
+    let r = reads_per_phase(&String::from_utf8_lossy(&out.stderr));
+    assert!(r["verify"] > 0, "the forced fallback did not read the drive: {r:?}");
+    assert_optimized(s);
+}
+
+#[test]
+fn pull_stream_manifest_equals_device_manifest_on_a_built_image() {
+    let dir = test_dir("opt_hash_built");
+    let src = dir.join("src");
+    make_tricky_tree(&src);
+    let img = dir.join("disk.img");
+    make_image(&img, 64 * MB);
+    assert_success(&common::run_build(&src, &img, &["--cluster", "32768", "--label", LABEL]), "flashcp build");
+    for d in ["tmpbase", "cache", "tmp"] {
+        fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    let s = Stick { orig: snapshot(&read_ok(&img)), base: dir.join("tmpbase"), dir, img };
+    pull_hash_equals_device_hash(&s, &[]);
+    fs::remove_dir_all(&s.dir).unwrap();
+}
+
+#[test]
+fn pull_stream_manifest_equals_device_manifest_on_a_fragmented_image() {
+    let s = crafted_stick("opt_hash_crafted");
+    pull_hash_equals_device_hash(&s, &[]);
+    fs::remove_dir_all(&s.dir).unwrap();
+    let s = stick("opt_hash_stick");
+    pull_hash_equals_device_hash(&s, &[]);
+    fs::remove_dir_all(&s.dir).unwrap();
+}
+
+#[test]
+fn verify_does_not_read_the_drive_again() {
+    let s = stick("opt_read_once");
+    let out = optimize(&s, &["--yes"], &[("FLASHCP_TEST_TRACE_READS", "1")]);
+    assert_success(&out, "flashcp optimize");
+    let r = reads_per_phase(&String::from_utf8_lossy(&out.stderr));
+    eprintln!("device data bytes read per phase: {r:?}");
+    assert_eq!(r.get("(before)"), None, "data read before the pull: {r:?}");
+    assert!(r["pull"] > 0 && r["check"] > 0, "{r:?}");
+    assert_eq!(r["verify"], 0, "verify read the drive again: {r:?}");
     assert_optimized(&s);
     fs::remove_dir_all(&s.dir).unwrap();
 }

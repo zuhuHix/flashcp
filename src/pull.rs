@@ -36,6 +36,7 @@ use crate::dirfd;
 use crate::events::{Event, Op, Sink, Ticker};
 use crate::exfat::{FlagGuard, SYS_BLOCK, TargetSpec, blk_size, open_target_fd, related_devs, set_direct};
 use crate::util::{AlignedBuf, human_bytes};
+use crate::verify::{FileSum, Manifest, hash_extent, zero_tail};
 use crate::volume::*;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use crossbeam_channel::{RecvTimeoutError, bounded};
@@ -432,23 +433,48 @@ struct JobState {
     left: u64,
     /// Temp file name (in the parent) while a replacement is being written.
     tmp: Option<CString>,
+    /// Sum of the block hashes of the bytes written so far (hashing pulls only).
+    hash: u128,
 }
 
 /// `len` bytes at physical offset `phys` belong at offset `foff` of file `file`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Ext {
-    phys: u64,
-    foff: u64,
-    len: u32,
-    file: u32,
+pub(crate) struct Ext {
+    pub(crate) phys: u64,
+    pub(crate) foff: u64,
+    pub(crate) len: u32,
+    pub(crate) file: u32,
 }
 
 /// One device read: `len` bytes at `start` (both aligned), serving `exts`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Chunk {
-    start: u64,
-    len: usize,
-    exts: std::ops::Range<usize>,
+pub(crate) struct Chunk {
+    pub(crate) start: u64,
+    pub(crate) len: usize,
+    pub(crate) exts: std::ops::Range<usize>,
+}
+
+/// Pull's read planner, for other readers of a volume's data (verify): extents sorted by
+/// `phys`, each at most `max - 2 × 4 KB` bytes, become aligned reads of at most `max` bytes
+/// reading through gaps of up to `gap` bytes.
+pub(crate) fn plan_reads(exts: &[Ext], max: usize, gap: u64) -> Vec<Chunk> {
+    coalesce(exts, max, gap)
+}
+
+/// Pull's default read strategy for `file` (holding the volume `v`), for other readers of a
+/// volume's data (verify).
+pub(crate) fn read_strategy(file: &File, v: &Vol) -> Strategy {
+    choose_strategy(file, v, &PullOpts::default())
+}
+
+/// What a hashing pull ([`pull_file_hashed`]) adds: the content manifest of what it read
+/// (see [`crate::verify`]), computed from the very bytes written to the destination.
+pub(crate) struct PullHashes {
+    pub(crate) manifest: Manifest,
+    /// Device reads that failed (or were refused) once and had to be issued again.
+    pub(crate) retries: u64,
+    /// The read strategy pull used.
+    pub(crate) strategy: Strategy,
 }
 
 /// Pushes the extents of `bytes` bytes at physical `phys` (file offset `foff`), split so no
@@ -550,11 +576,15 @@ fn finish(st: &mut JobState, job: &Job, d: &Dest, cache: &mut DirCache) -> Resul
     Ok(())
 }
 
-/// Writes one extent's bytes into its file; returns true when that completed the file.
-fn write_ext(job: &Job, bytes: &[u8], foff: u64, d: &Dest, cache: &mut DirCache) -> Result<bool> {
+/// Writes one extent's bytes into its file; returns true when that completed the file. With
+/// `hash`, the extent's block hashes are added to the file's sum.
+fn write_ext(job: &Job, bytes: &[u8], foff: u64, hash: bool, d: &Dest, cache: &mut DirCache) -> Result<bool> {
+    // Hashed outside the lock (the sum is commutative; only the addition is serialized).
+    let h = if hash { hash_extent(bytes, foff, job.len) } else { 0 };
     let mut st = job.st.lock().unwrap();
     let f = ensure_open(&mut st, job, d, cache)?;
     f.write_all_at(bytes, foff).with_context(|| format!("write {}", d.shown(job.parent, &job.name)))?;
+    st.hash = st.hash.wrapping_add(h);
     st.left -= bytes.len() as u64;
     if st.left == 0 {
         finish(&mut st, job, d, cache)?;
@@ -712,7 +742,7 @@ fn plan(v: &mut Vol, start: Vec<Child>, seen: &mut [u8], root: Option<&OwnedFd>,
                 valid: ch.valid_len,
                 mtime,
                 replace,
-                st: Mutex::new(JobState { file: None, left: ch.valid_len, tmp: None }),
+                st: Mutex::new(JobState { file: None, left: ch.valid_len, tmp: None, hash: 0 }),
             });
         }
     }
@@ -765,6 +795,35 @@ pub(crate) fn pull_file(
     o: &PullOpts,
     sink: Sink<'_>,
 ) -> Result<PullStats> {
+    pull_inner(file, dev_len, mounted, what, dest, o, sink, false).map(|(s, _)| s)
+}
+
+/// [`pull_file`] that also hashes every file as it is pulled (for `optimize`): each extent's
+/// bytes are hashed by the writer that writes them, so the device is read once for both the
+/// copy and its manifest. Plain pulls never hash.
+pub(crate) fn pull_file_hashed(
+    file: File,
+    dev_len: u64,
+    what: &str,
+    dest: &Path,
+    o: &PullOpts,
+    sink: Sink<'_>,
+) -> Result<(PullStats, PullHashes)> {
+    let (s, h) = pull_inner(file, dev_len, None, what, dest, o, sink, true)?;
+    Ok((s, h.expect("a hashing pull returns its hashes")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pull_inner(
+    file: File,
+    dev_len: u64,
+    mounted: Option<MountState>,
+    what: &str,
+    dest: &Path,
+    o: &PullOpts,
+    sink: Sink<'_>,
+    hash: bool,
+) -> Result<(PullStats, Option<PullHashes>)> {
     let t0 = Instant::now();
     ensure!(!(o.skip_existing && o.overwrite), "--skip-existing and --overwrite are mutually exclusive");
     ensure!(
@@ -899,11 +958,15 @@ pub(crate) fn pull_file(
     let jobs = p.jobs;
     let exts = p.exts;
 
-    let res = transfer(&file, &d, &jobs, &exts, &chunks, tail_at, cut, &strat, o, trace, &mut tick);
-    if let Err(e) = res {
-        cleanup_temps(&jobs, &d);
-        return Err(e.context("pull failed; the destination holds a partial copy"));
-    }
+    let res = transfer(&file, &d, &jobs, &exts, &chunks, tail_at, cut, &strat, o, hash, trace, &mut tick);
+    let retries = match res {
+        Ok(r) => r,
+        Err(e) => {
+            cleanup_temps(&jobs, &d);
+            return Err(e.context("pull failed; the destination holds a partial copy"));
+        }
+    };
+    let hashes = hash.then(|| PullHashes { manifest: manifest_of(&d.dirs, &jobs), retries, strategy: strat.clone() });
     // Directory mtimes last (creating entries changed them), deepest first.
     let mut cache = DirCache::default();
     for dn in d.dirs.iter().skip(1).rev() {
@@ -917,7 +980,7 @@ pub(crate) fn pull_file(
     tick.progress(files, data_bytes, true);
     let secs = t0.elapsed().as_secs_f64();
     tick.emit(Event::Done { files, bytes: data_bytes, secs });
-    Ok(PullStats {
+    let stats = PullStats {
         files,
         dirs,
         skipped: p.skipped,
@@ -926,10 +989,32 @@ pub(crate) fn pull_file(
         reads: chunks.len() as u64 + u64::from(tail_bytes > 0),
         cluster: cs,
         secs,
-    })
+    };
+    Ok((stats, hashes))
 }
 
-/// Directories, empty files, then the data: readers → writers, then the buffered tail.
+/// The manifest of a completed hashing pull: every planned directory and file by relative
+/// path, each file's sum completed with the zeros past its ValidDataLength (never read).
+fn manifest_of(dirs: &[DirNode], jobs: &[Job]) -> Manifest {
+    let name = |n: &CString| n.to_str().expect("component() returns UTF-8").to_string();
+    let join = |p: &str, n: &CString| if p.is_empty() { name(n) } else { format!("{p}/{}", name(n)) };
+    let mut m = Manifest::default();
+    let mut paths = vec![String::new()];
+    for dn in dirs.iter().skip(1) {
+        let p = join(&paths[dn.parent as usize], &dn.name);
+        m.dirs.insert(p.clone(), dn.mtime);
+        paths.push(p);
+    }
+    for job in jobs {
+        let h = job.st.lock().unwrap().hash.wrapping_add(zero_tail(job.valid, job.len));
+        m.files
+            .insert(join(&paths[job.parent as usize], &job.name), FileSum { len: job.len, hash: h, mtime: job.mtime });
+    }
+    m
+}
+
+/// Directories, empty files, then the data: readers → writers (which hash each extent too
+/// when `hash`), then the buffered tail. Returns how many device reads had to be retried.
 #[allow(clippy::too_many_arguments)]
 fn transfer(
     file: &File,
@@ -941,9 +1026,10 @@ fn transfer(
     cut: u64,
     strat: &Strategy,
     o: &PullOpts,
+    hash: bool,
     trace: bool,
     tick: &mut Ticker<'_>,
-) -> Result<()> {
+) -> Result<u64> {
     let mut cache = DirCache::default();
     for (i, dn) in d.dirs.iter().enumerate().skip(1) {
         let parent = cache.get(d, dn.parent)?;
@@ -971,6 +1057,7 @@ fn transfer(
         unsafe { libc::posix_fadvise(std::os::fd::AsRawFd::as_raw_fd(file), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
     }
     let next = AtomicUsize::new(0);
+    let retries = AtomicU64::new(0);
     let failed = AtomicBool::new(false);
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let pool = Pool::new(READ_BUDGET);
@@ -992,7 +1079,7 @@ fn transfer(
     std::thread::scope(|s| {
         for _ in 0..strat.inflight {
             let (full_tx, alive, pool) = (full_tx.clone(), alive_tx.clone(), &pool);
-            let (next, failed, direct, fail) = (&next, &failed, &direct, &fail);
+            let (next, failed, direct, fail, retries) = (&next, &failed, &direct, &fail, &retries);
             s.spawn(move || {
                 let _alive = alive;
                 while !failed.load(Ordering::Relaxed) {
@@ -1008,8 +1095,10 @@ fn transfer(
                         && direct.swap(false, Ordering::Relaxed)
                     {
                         set_direct(file, false); // the device refused this alignment
+                        retries.fetch_add(1, Ordering::Relaxed);
                         r = read_full(file, &mut buf.as_mut()[..c.len], c.start);
                     } else if r.is_err() && !direct.load(Ordering::Relaxed) {
+                        retries.fetch_add(1, Ordering::Relaxed);
                         r = read_full(file, &mut buf.as_mut()[..c.len], c.start);
                     }
                     match r {
@@ -1040,7 +1129,7 @@ fn transfer(
                     for e in &exts[c.exts.clone()] {
                         let job = &jobs[e.file as usize];
                         let at = (e.phys - c.start) as usize;
-                        match write_ext(job, &buf.as_ref()[at..at + e.len as usize], e.foff, d, &mut cache) {
+                        match write_ext(job, &buf.as_ref()[at..at + e.len as usize], e.foff, hash, d, &mut cache) {
                             Ok(completed) => done(job, e.len as u64, completed),
                             Err(e) => return fail(e),
                         }
@@ -1074,7 +1163,7 @@ fn transfer(
         for e in tail {
             let job = &jobs[e.file as usize];
             let at = (e.phys - cut) as usize;
-            let completed = write_ext(job, &buf[at..at + e.len as usize], e.foff, d, &mut cache)?;
+            let completed = write_ext(job, &buf[at..at + e.len as usize], e.foff, hash, d, &mut cache)?;
             done(job, e.len as u64, completed);
         }
     }
@@ -1086,7 +1175,7 @@ fn transfer(
             d.shown(job.parent, &job.name)
         );
     }
-    Ok(())
+    Ok(retries.into_inner())
 }
 #[cfg(test)]
 mod tests {
