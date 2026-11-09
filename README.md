@@ -7,7 +7,7 @@
 [![CI](https://github.com/zuhuHix/flashcp/actions/workflows/ci.yml/badge.svg)](https://github.com/zuhuHix/flashcp/actions/workflows/ci.yml)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 [![Interactive site](https://img.shields.io/badge/site-benchmark%20explorer-0f9d8a.svg)](https://zuhuhix.github.io/flashcp/)
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-FFDD00?logo=buymeacoffee&logoColor=000)](https://buymeacoffee.com/zuhuHix)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-FFDD00?logo=buymeacoffee&logoColor=000)](https://buymeacoffee.com/zuhu)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/copy-vs-build-dark.gif">
@@ -178,14 +178,14 @@ flashcp build <src> <device|image> --yes-erase         # whole exFAT volume in O
 - [ ] Verify the drives on Windows and macOS
 - [ ] Benchmarks on cheap USB sticks (BOT)
 - [ ] A small desktop GUI (Tauri)
-- [ ] A supporter edition for [Buy Me a Coffee](https://buymeacoffee.com/zuhuHix) supporters (planned; details to come)
+- [ ] A supporter edition for [Buy Me a Coffee](https://buymeacoffee.com/zuhu) supporters (planned; details to come)
 
 ## Support
 
 If flashcp saved you some waiting, you can buy me a coffee. It helps pay for the time that goes
 into the roadmap above.
 
-<a href="https://buymeacoffee.com/zuhuHix"><img src="https://img.shields.io/badge/☕_Buy_me_a_coffee-zuhuHix-FFDD00?style=for-the-badge&logoColor=000" alt="Buy me a coffee"></a>
+<a href="https://buymeacoffee.com/zuhu"><img src="https://img.shields.io/badge/☕_Buy_me_a_coffee-zuhu-FFDD00?style=for-the-badge&logoColor=000" alt="Buy me a coffee"></a>
 
 ## Contributing
 
