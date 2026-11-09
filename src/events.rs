@@ -133,6 +133,10 @@ impl<'a> Ticker<'a> {
     pub(crate) fn new(sink: Sink<'a>) -> Self {
         Ticker { sink, last: None, every: Duration::from_millis(100) }
     }
+    /// The underlying sink, for handing the whole operation to another one (add → build).
+    pub(crate) fn sink(&mut self) -> Sink<'_> {
+        &mut *self.sink
+    }
     pub(crate) fn emit(&mut self, e: Event) {
         (self.sink)(&e);
     }

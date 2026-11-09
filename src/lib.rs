@@ -3,6 +3,7 @@
 //! ([`info`]). Long operations report through a callback of [`events::Event`]s.
 
 pub mod add;
+pub(crate) mod add_build;
 pub mod bench;
 pub mod copy;
 pub mod dataset;

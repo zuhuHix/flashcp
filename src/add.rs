@@ -501,6 +501,11 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
         "source must be a directory"
     );
     let tgt = target.open_rw()?;
+    // An empty volume with coarse clusters (a fresh stick) is written as a build instead.
+    let tgt = match crate::add_build::empty_as_build(src, tgt, o.to.as_deref(), o.readers, o.dry_run, tick.sink())? {
+        Ok(stats) => return Ok(stats),
+        Err(tgt) => tgt,
+    };
     // The one open file description (exclusively claimed: O_EXCL / flock) is used for
     // everything and stays open until we return, so nobody can mount the device mid-way.
     // Nothing is reopened by path. Metadata I/O is buffered; O_DIRECT is switched on (F_SETFL)
