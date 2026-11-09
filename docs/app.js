@@ -114,7 +114,7 @@
     pull: 'Normal copy: mount + cp'
   };
   var FLASH_LABEL = { build: 'flashcp build', add: 'flashcp add', pull: 'flashcp pull' };
-  var KERNEL_STICK_NOTE = 'on par: the stick’s ~11–14 MB/s read limit';
+  var KERNEL_STICK_NOTE = 'on par: the stick’s measured ≈11 MB/s sequential read is the limit';
 
   // Table B: copies onto an existing mounted volume. Speedup vs naive cp.
   var DATA_B = [

@@ -42,7 +42,7 @@ const PAGES: Page[] = [
       {name: 'pull', sub: 'kernel-filled stick', base: 30.86, flash: 29.52, baseLabel: '30.86', flashLabel: '29.52', pill: '1.05× on par'},
       {name: 'pull', sub: 'flashcp-built stick', base: 32.78, flash: 16.38, baseLabel: '32.78', flashLabel: '16.38', pill: '2.0×'},
     ],
-    note: "the stick's flash chip is the ceiling (~6.9 MB/s write, ~11–14 MB/s read)",
+    note: "the stick's flash chip is the ceiling (measured: 6.5 MB/s write, ≈11 MB/s read)",
     t0: PAGE2_T0,
   },
 ];

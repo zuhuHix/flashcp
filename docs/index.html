@@ -160,11 +160,11 @@
         <div class="kinds">
           <div class="kind">
             <p class="kind-title"><strong>Cheap USB 2.0 stick: about 2&ndash;2.5&times;</strong></p>
-            <p>The stick's flash chip caps writes at about 6.9&nbsp;MB/s (and reads at about 11&ndash;14&nbsp;MB/s). The chip is the limit, so there flashcp gains about 2&ndash;2.5&times;, and pulling from a stick another system filled is on par with <code>cp</code>.</p>
+            <p>The stick measured 6.5&nbsp;MB/s for sequential 8&nbsp;MB writes (2.5&nbsp;MB/s at 4&nbsp;KB) and about 11&nbsp;MB/s for sequential reads; a model fit puts its write ceiling at an estimated &asymp;6.9&nbsp;MB/s. The chip is the limit, so there flashcp gains about 2&ndash;2.5&times;, and pulling from a stick another system filled is on par with <code>cp</code>.</p>
           </div>
           <div class="kind">
             <p class="kind-title"><strong>Fast USB SSD: up to 26.8&times;</strong></p>
-            <p>The chip is not the limit. On fast drives the per-file overhead is most of the time of a normal copy, so one sequential pass gains up to 10.3&times; on writes and 26.8&times; on reads with many small files (about 2&ndash;3&times; with big files, where bandwidth is the limit again).</p>
+            <p>The chip is not the limit. On fast drives the per-file overhead is most of the time of a normal copy, so one sequential pass gains up to 10.3&times; on writes and 26.8&times; on reads with many small files (2.0&ndash;3.2&times; on the mixed 1.4&nbsp;GB dataset, where bandwidth is the limit again).</p>
           </div>
         </div>
       </div>
