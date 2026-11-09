@@ -43,7 +43,7 @@
       <div class="hero-text">
         <p class="eyebrow">Rust CLI &middot; exFAT &middot; GPL-3.0-or-later</p>
         <h1>flashcp</h1>
-        <p class="pitch">Copy thousands of small files to a USB drive up to 10&times; faster, as normal loose files.</p>
+        <p class="pitch">Copy thousands of small files to a USB drive as normal loose files, measured up to 10.3&times; faster on a USB SSD under Linux. Results vary by drive.</p>
 
         <div class="cta-row">
           <a class="btn btn-primary" href="https://github.com/zuhuHix/flashcp">GitHub repo</a>
@@ -70,7 +70,7 @@
       <h2 id="benchmarks-title">Benchmarks</h2>
       <p class="lede">
         Measured 2026-11-09 on an MSI DATAMAG 20Gbps USB SSD (UAS, 10&nbsp;Gb/s link), 1&nbsp;TB exFAT, Linux 7.0.
-        Shorter bars are faster. Every number on this page comes from the measured tables.
+        Shorter bars are faster. Every number in this benchmark section is measured; the visualizer further down is an illustrative model.
       </p>
 
       <div class="tabs" role="group" aria-label="Benchmark view">
@@ -169,13 +169,13 @@
       </figure>
 
       <ul class="model-notes">
-        <li><strong>Normal copy:</strong> at least 3 separate small writes per file (2 metadata writes for the directory entry and allocation bitmap/FAT, plus file data). Large files add one data write per 1&nbsp;MB, as a rough page-cache flush unit. Each metadata-to-data hop is typically a seek.</li>
+        <li><strong>Normal copy:</strong> at least 3 separate small writes per file (2 metadata writes for the directory entry and allocation bitmap/FAT, plus file data). Large files add one data write per 1&nbsp;MB, as a rough page-cache flush unit.</li>
         <li><strong>flashcp:</strong> <span class="num">ceil(total bytes / 8&nbsp;MB)</span> large sequential writes, plus 4 for the boot region and tables.</li>
         <li><strong>Not modelled:</strong> kernel merging of small writes (which real copies do get, see Earlier experiments), queue depth, device firmware. This is a count, not a time prediction.</li>
       </ul>
 
       <p class="why">
-        Flash memory is programmed and erased in large blocks, so a long ascending run lets the controller fill blocks in order instead of rewriting them for each scattered update.
+        On the test SSD, 8&nbsp;MB sequential writes ran at 999&nbsp;MB/s versus 97&nbsp;MB/s for 4&nbsp;KB writes, so turning many small scattered writes into one long ascending run is where the time goes.
         Each USB command also costs a round trip, so a few 8&nbsp;MB requests spend far less time on overhead than thousands of small ones.
       </p>
     </div>
