@@ -1002,8 +1002,15 @@ const ABORT_AT_ENV: &str = "FLASHCP_TEST_BUILD_ABORT_AT";
 /// Volume bytes used on a target of `bytes`: rounded down to 4 KB, so that no write (O_DIRECT
 /// pads to 4 KB) can reach past the end. An image file therefore never changes size.
 pub(crate) fn usable_bytes(bytes: u64) -> u64 {
+    // Test hook: keep a sector-aligned but 4 KB-unaligned length, so tests can craft volumes
+    // whose end is unaligned (other tools make them); such a build may extend an image.
+    if std::env::var_os(UNALIGNED_ENV).is_some() {
+        return bytes / SECTOR * SECTOR;
+    }
     bytes / 4096 * 4096
 }
+
+const UNALIGNED_ENV: &str = "FLASHCP_TEST_UNALIGNED_VOLUME";
 
 /// The target's absolute byte offset on its whole device (partition start), or 0.
 pub(crate) fn device_offset(tgt: &Target) -> u64 {

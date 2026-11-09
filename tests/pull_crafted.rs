@@ -269,14 +269,27 @@ fn reads_never_pass_an_unaligned_volume_end() {
     let img = dir.join("v.img");
     // Size the one file to fill the heap exactly, so it ends at the (unaligned) volume end.
     write_file(&src.join("fill.bin"), &[0u8; 512]);
-    build(&src, &img, vol, &["--cluster", "512"]);
+    // build itself never makes such a volume any more (it rounds down to 4 KB); a test hook
+    // keeps the unaligned length, as other formatters may write it.
+    let build_unaligned = |src: &Path| {
+        make_image(&img, vol);
+        let out = flashcp()
+            .args(["build", "--cluster", "512", "--yes-erase"])
+            .arg(src)
+            .arg(&img)
+            .env("FLASHCP_TEST_UNALIGNED_VOLUME", "1")
+            .output()
+            .unwrap();
+        assert_success(&out, "flashcp build");
+    };
+    build_unaligned(&src);
     let info = flashcp().arg("info").arg(&img).arg("--json").output().unwrap();
     let json = String::from_utf8_lossy(&info.stdout).into_owned();
     let free: u64 = json.split("\"free\":").nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
     let len = 512 + free as usize;
     let data: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
     write_file(&src.join("fill.bin"), &data);
-    build(&src, &img, vol, &["--cluster", "512"]);
+    build_unaligned(&src);
     // Junk after the volume, inside the same image.
     let mut b = fs::read(&img).unwrap();
     // VolumeLength (sectors at offset 72) is the unaligned size we asked for. build's last
