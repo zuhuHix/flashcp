@@ -1,54 +1,94 @@
 //! `flashcp sync`: make a directory of an EXISTING exFAT volume match a local tree, writing only
-//! what differs, without ever overwriting a live cluster.
+//! what differs, without ever overwriting a live cluster, and so that no crash can lose a file
+//! or its name.
 //!
 //! Everything is parsed, verified and planned before the first byte is written (as `add`):
 //! the whole volume's allocation is checked against the bitmap, and every directory under the
 //! destination is kept in memory. Per directory, source and volume entries are matched by
 //! up-cased name:
 //!
-//! - unchanged: same size and LastModified (the quick check, [`same_mtime`]), or with
-//!   `--checksum` the same content (read in physical order); nothing is written;
+//! - unchanged: the QUICK CHECK, same size and same LastModified at exFAT's 10 ms precision
+//!   ([`same_mtime`]); nothing is written. A change that keeps both the size and the
+//!   modification time (`cp -p`, `rsync -t`, some editors and tools restore the time) is NOT
+//!   seen by it: `--checksum` compares the contents instead (read in physical order);
 //! - changed: the new version goes into FRESH clusters (the pre-sync free space only), then the
-//!   existing entry set is re-pointed in place (FirstCluster, flags, lengths, LastModified,
-//!   SetChecksum: the first 64 bytes of the set, one write); the old clusters are freed last;
-//! - a name that differs only by case is rewritten in place (same length and NameHash);
+//!   entry set is switched over to it (FirstCluster, flags, lengths, LastModified,
+//!   SetChecksum); the old clusters are freed last;
+//! - a name that differs only by case is renamed (same length and NameHash);
 //! - new: appended (or written into a new directory) as `add` does;
-//! - extraneous (on the volume, not in the source): kept, unless `--delete`;
-//! - with `--delete`, a new file with the same size and time as a file that is going away, and
-//!   the same content (sampled, or hashed with `--checksum`), is a MOVE: its new entry points at
-//!   the old clusters, nothing is copied.
+//! - extraneous (on the volume, not in the source): kept, unless `--delete` (which needs
+//!   `--yes`, and `--yes-many` past 1000 entries; `--dry-run` lists them without either);
+//! - with `--delete`, a new file and a file that goes away with the same size and the same
+//!   decoded LastModified, whose FINGERPRINTS (a hash of the first and last 4 KB and six 4 KB
+//!   samples between, or of the whole file up to 32 KB) are equal, and (unless `--fast-moves`)
+//!   whose full contents are then compared equal, is a MOVE: its new entry points at the old
+//!   clusters, nothing is copied. Full comparisons are capped at [`VERIFY_BUDGET`] bytes per
+//!   run; pairs past it are copied. `--checksum` already has the full hashes and reuses them.
 //!
-//! A re-point is atomic when the 64 bytes lie in one 512-byte sector (the set does not start at
-//! offset 480 of a sector); otherwise it is one 64-byte write across two adjacent sectors of one
-//! 4 KB page (counted in [`SyncStats::split_repoints`]).
+//! ## Entry-set edits, in place or relocated
 //!
-//! Crash ordering (a sync between every phase; `FLASHCP_TEST_STOP_AFTER=<phase>` stops after it):
-//!   0. `dirty`  VolumeDirty set. Nothing to do → nothing is written at all.
-//!   1. `data`   new files, new versions of changed files, new directories (holding the entries
-//!      of their new files, moved files and subdirectories), extension clusters of existing
-//!      directories: all in clusters the pre-sync bitmap calls free, one ascending stream.
-//!   2. `alloc`  bitmap bits of every new cluster, FAT chains of fragmented new objects.
-//!   3. `fat`    FAT links extending existing directory chains.
-//!   4. `unlink` entry sets of deleted entries, moved-away files and type-conflict losers lose
-//!      their InUse bit; their clusters stay allocated (leaked until `free`).
-//!   5. `link`   appended entry sets, extended directories' lengths, re-points, retimes and
-//!      case renames.
-//!   6. `free`   bitmap bits of the old versions of changed files and of deleted files and
-//!      directories (whole subtrees), except clusters now owned by a move target. FAT entries
-//!      of freed clusters are left alone (the bitmap is authoritative).
-//!   7. clean    VolumeDirty cleared, PercentInUse updated.
+//! An existing entry set is edited IN PLACE only when every byte that changes lies in one
+//! 512-byte sector (directory clusters are sector aligned, so offsets in a directory are
+//! device offsets mod 512): sector writes are atomic, and the unchanged bytes around the change
+//! are rewritten identically. A retime touches bytes 2..4 and 12..24 (always one sector); a
+//! re-point or a directory's new length touches 2..64 (two sectors iff the set starts at
+//! offset 480 of one); a case rename touches 2..4 and the name characters that change.
+//! Otherwise the set is RELOCATED: a complete new set (the old one with the changes applied,
+//! vendor secondaries and creation time kept, valid checksum) is appended at the directory's
+//! end in `link`, and the old set's primary entry is marked deleted (0x85 → 0x05, one byte) in
+//! `retire`; a relocated directory's two sets point at the same clusters. Unlinking any set
+//! (a deletion, a move's source, a type-conflict loser, a duplicate) likewise clears only the
+//! primary's InUse bit in `unlink`; the secondaries' InUse bits are cleared in `free`.
 //!
-//! Crash after dirty/data: the old tree; after alloc/fat: the old tree plus leaked clusters;
-//! after unlink: deleted and moved-away entries are gone (moved files are unreachable until
-//! `link`; their data is intact on the device and in the source, a re-run copies them again),
-//! changed files are still the OLD version; after link: the new tree, old versions leaked;
-//! after free: done but dirty. No phase boundary has two entries referencing one cluster, or
-//! two names in one directory equal case-insensitively (unlink is committed before link).
+//! ## Phases and crash states
+//!
+//! A sync runs between every phase (`FLASHCP_TEST_STOP_AFTER=<phase>` stops after it):
+//!
+//! | phase    | writes                                                                     |
+//! |----------|----------------------------------------------------------------------------|
+//! | `dirty`  | (after the UNDO journal) VolumeDirty set; nothing to do → nothing written   |
+//! | `data`   | new files and versions, new directories, extension clusters (free space)   |
+//! | `alloc`  | (after the REDO journal) bitmap bits of new clusters, chains of new objects |
+//! | `fat`    | FAT links extending existing directory chains                               |
+//! | `unlink` | primaries of deleted / moved-away / conflicting / duplicate sets → 0x05    |
+//! | `link`   | appended sets (new, moved, relocated), lengths, in-place edits             |
+//! | `retire` | primaries of relocated sets' old copies → 0x05                             |
+//! | `free`   | those sets' secondaries and old orphans: InUse cleared; bitmap bits freed  |
+//! | `clean`  | VolumeDirty cleared, PercentInUse; then the journal is removed             |
+//!
+//! The journal (see [`crate::journal`]) holds every write from `alloc` to `clean` with its
+//! before and after bytes, on the local machine; the start of every sync (and
+//! `flashcp sync --recover`) replays it, so with the journal every crash state below simply
+//! completes. Without it (another machine, or the state directory lost) the volume is dirty and
+//! is refused until `fsck.exfat -y` has run; what that leaves, and what the next sync does:
+//!
+//! | crash after | volume                                    | `fsck.exfat -n` / `-y`, then sync     |
+//! |-------------|-------------------------------------------|----------------------------------------|
+//! | dirty, data | old tree; data in free clusters (undo journal: the dirty flag is cleared) | clean / dirty flag cleared; sync redoes it |
+//! | alloc, fat  | old tree, leaked clusters                 | clean; leaks stay allocated (as `add`) |
+//! | unlink      | gone: deleted, moved-away entries (orphan secondaries left); changed files still OLD | "clean" with an "unknown entry type 0xc0" error per orphan; `-y` clears them; moved files no longer in SRC are lost only here and only without the journal |
+//! | link        | the new tree, plus DUPLICATES: each relocated set's old copy is still live | re-point duplicate (same name, other clusters): corrupted, `-y` renames the later (new) set to `FILE0000000.CHK` (sync rewrites the name from SRC; `--delete` removes the .CHK); relocated rename (same clusters): "cluster is already allocated", `-y` truncates the later set to 0 bytes (a directory to DataLength 0); sync keeps the set with the data and renames it again |
+//! | retire      | the new tree, orphan secondaries          | as after unlink                        |
+//! | free        | done but dirty                            | clean                                  |
+//! | torn link   | a relocated set half written (its old copy still live) | "checksum of a file is wrong", corrupted; `-y` deletes the torn set: the file is there with its OLD version, sync redoes it |
+//!
+//! No crash state loses a file that is in SRC, nor any name: a directory never has a name
+//! missing between phases (a new set is live before its old copy dies). The parser accepts the
+//! leftovers: ORPHAN secondaries (in-use secondaries right after a deleted 0x05 file entry,
+//! within its SecondaryCount) are skipped by every command and cleared by sync's `free`
+//! whenever it writes, or on a run that has nothing else to do; DUPLICATE names are accepted by
+//! sync only (everyone else refuses them with a hint to re-run sync). Sync resolves each
+//! duplicate before matching: the KEEPER is the set that matches the source entry best (a
+//! directory owning clusters over a zero-length one, then the source's size and time, then its
+//! exact name, then the higher offset, i.e. the newer set); the others are unlinked (no
+//! `--delete` or `--yes` needed: "repaired N interrupted entries") and their clusters freed
+//! unless the keeper shares them.
 //!
 //! Directory metadata is batched: each phase applies its changes to the in-memory copies of the
 //! directories and writes, per directory, the touched byte ranges rounded to 512 bytes and
-//! merged when less than 64 KB apart (the bytes between are rewritten unchanged).
-//! Appends go at the end of a directory; deleted slots are not reused.
+//! merged when less than 64 KB apart (the bytes between are rewritten unchanged, so every
+//! sector still goes from one consistent state to the next). Appends go at the end of a
+//! directory; deleted slots are not reused.
 
 use crate::add::{
     AddStats, Patches, Seg, SegKind, carve, chain_entries, choose_extents, clean_flags, data_gap_policy,
@@ -58,15 +98,18 @@ use crate::events::{Event, Op, Sink, Ticker, json_str};
 use crate::exfat::{
     Node, TargetSpec, checksum16, entry_set, finish_set, scan_tree, set_bytes, set_direct, ts, validate_name,
 };
+use crate::journal::{self, JWrite, Journal, MoveRec};
 use crate::util::human_bytes;
 use crate::volume::*;
 use anyhow::{Context, Result, bail, ensure};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+pub use crate::journal::Recovery;
 
 #[derive(Clone, Debug, Default)]
 pub struct SyncOpts {
@@ -78,6 +121,12 @@ pub struct SyncOpts {
     pub checksum: bool,
     pub readers: usize,
     pub dry_run: bool,
+    /// Confirm deletions (required when anything would be deleted).
+    pub yes: bool,
+    /// Confirm deleting more than [`MANY_DELETES`] entries.
+    pub yes_many: bool,
+    /// Accept a move on equal fingerprints, without comparing the full contents.
+    pub fast_moves: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -86,7 +135,7 @@ pub struct SyncStats {
     pub new: u64,
     /// Rewritten, or (with --checksum, same content) only retimed.
     pub changed: u64,
-    /// Re-linked under a new path without copying, or renamed in place (case only).
+    /// Re-linked under a new path without copying, or renamed (case only).
     pub moved: u64,
     /// Files deleted, including those inside deleted directories.
     pub deleted: u64,
@@ -100,29 +149,84 @@ pub struct SyncStats {
     pub written: u64,
     pub cluster: u64,
     pub secs: f64,
-    /// Re-pointed entry sets whose first 64 bytes span two 512-byte sectors (test statistic).
-    pub split_repoints: u64,
+    /// Entry sets rewritten at the end of their directory because an in-place edit would have
+    /// crossed a sector boundary.
+    pub relocated: u64,
+    /// Duplicate entry sets an interrupted sync left, unlinked.
+    pub repaired: u64,
+    /// Orphan secondary entries cleared.
+    pub orphans: u64,
+    /// Moves whose full content was compared (or whose fingerprint is the full content).
+    pub moves_verified: u64,
+    /// Moves accepted on their fingerprint alone (--fast-moves).
+    pub moves_fast: u64,
+    /// Move candidates copied instead: past the verification budget, or not worth verifying.
+    pub moves_copied_budget: u64,
 }
+
+/// Deleting more entries than this needs `--yes-many` as well as `--yes`.
+pub const MANY_DELETES: u64 = 1000;
+/// Bytes of full content comparisons of move candidates per run; candidates past it are copied.
+pub const VERIFY_BUDGET: u64 = 2 << 30;
+const TORN_ENV: &str = "FLASHCP_TEST_TORN";
 
 pub fn sync(src: &Path, target: &Path, o: &SyncOpts, sink: Sink<'_>) -> Result<SyncStats> {
     sync_to(src, &TargetSpec::from(target), o, sink)
 }
 
+/// `flashcp sync --recover`: replays the journal of an interrupted sync of `target`, if any.
+pub fn recover(target: &TargetSpec) -> Result<Recovery> {
+    let tgt = target.open_rw()?;
+    set_direct(&tgt.file, false);
+    journal::recover(&tgt.file)
+}
+
+/// The note a recovery prints (None when there was nothing to do).
+pub fn recovery_note(r: &Recovery) -> Option<String> {
+    match r {
+        Recovery::None => None,
+        Recovery::Stale => Some("note: removed a stale sync journal (the volume is clean)".into()),
+        Recovery::Replayed { undo: true, .. } => {
+            Some("note: an interrupted sync had written only file data; its dirty flag is cleared".into())
+        }
+        Recovery::Replayed { writes, .. } => {
+            Some(format!("note: completed an interrupted sync from its journal ({writes} metadata writes replayed)"))
+        }
+    }
+}
+
+/// Whether comparing a move candidate's content (a device read) is worth it against copying
+/// it (a device write of the same size), given the device's rates in bytes/s; unknown → yes.
+pub(crate) fn verify_pays(read_rate: Option<f64>, write_rate: Option<f64>) -> bool {
+    match (read_rate, write_rate) {
+        (Some(r), Some(w)) => r >= w,
+        _ => true,
+    }
+}
+
 // ───────────────────────── plan model ─────────────────────────
 
-/// A change to an existing entry set, applied in the link phase.
-#[derive(Clone, Debug)]
-struct EntryPatch {
-    /// Directory holding the set, and the set's place in it.
-    dir: usize,
-    off: usize,
+/// The changes to one existing entry set (applied in `link`, in place or relocated).
+#[derive(Clone, Debug, Default)]
+struct Edit {
     len: usize,
     /// The source node (new name, mtime, size, allocation).
-    node: usize,
+    node: Option<usize>,
     /// Point the stream at the node's new version.
     repoint: bool,
     mtime: bool,
     name: bool,
+    /// A directory's new DataLength (it grows), and whether it loses NoFatChain.
+    dirlen: Option<u64>,
+    clear_nfc: bool,
+}
+
+/// What a directory gets appended: a new set for a source node, or a relocated set (by its
+/// old offset in the same directory).
+#[derive(Clone, Copy, Debug)]
+enum Item {
+    Node(usize),
+    Reloc(usize),
 }
 
 /// A volume file that goes away (and may be the source of a move).
@@ -139,8 +243,8 @@ struct Repoint {
     len: u64,
 }
 
-/// Applies a re-point, a retime and/or a case rename to an entry set in place (vendor
-/// secondaries and every other byte untouched) and recomputes its SetChecksum.
+/// Applies a re-point, a retime and/or a case rename to an entry set (vendor secondaries and
+/// every other byte untouched) and recomputes its SetChecksum.
 fn patch_set(set: &mut [u8], repoint: Option<Repoint>, mtime: Option<(i64, u32)>, name: Option<&[u16]>) {
     if let Some(r) = repoint {
         let flags = if r.first == 0 || !r.contiguous { 0x01 } else { 0x03 };
@@ -158,7 +262,7 @@ fn patch_set(set: &mut [u8], repoint: Option<Repoint>, mtime: Option<(i64, u32)>
     if let Some(name) = name {
         for (k, chunk) in name.chunks(15).enumerate() {
             for (j, &c) in chunk.iter().enumerate() {
-                let at = 64 + 32 * k + 2 + 2 * j;
+                let at = name_at(k * 15 + j);
                 set[at..at + 2].copy_from_slice(&c.to_le_bytes());
             }
         }
@@ -166,9 +270,39 @@ fn patch_set(set: &mut [u8], repoint: Option<Repoint>, mtime: Option<(i64, u32)>
     fix_checksum(set);
 }
 
+/// Offset in an entry set of name character `i`.
+fn name_at(i: usize) -> usize {
+    64 + 32 * (i / 15) + 2 + 2 * (i % 15)
+}
+
 fn fix_checksum(set: &mut [u8]) {
     let c = checksum16(set, true);
     set[2..4].copy_from_slice(&c.to_le_bytes());
+}
+
+/// One past the last byte of the set `e` changes (the first is always 2, the SetChecksum).
+fn changed_end(e: &Edit, old: &[u8], name: Option<&[u16]>) -> usize {
+    let mut hi = 4;
+    if e.mtime {
+        hi = hi.max(24);
+    }
+    if e.repoint || e.dirlen.is_some() || e.clear_nfc {
+        hi = hi.max(64);
+    }
+    if let (true, Some(name)) = (e.name, name) {
+        for (i, &c) in name.iter().enumerate() {
+            let at = name_at(i);
+            if le16(old, at) != c {
+                hi = hi.max(at + 2);
+            }
+        }
+    }
+    hi
+}
+
+/// Whether bytes [off + 2, off + hi) of a directory lie in one 512-byte sector.
+fn one_sector(off: usize, hi: usize) -> bool {
+    (off + 2) / SECTOR_ALIGN == (off + hi - 1) / SECTOR_ALIGN
 }
 
 /// Touched byte ranges per directory, for one metadata phase.
@@ -239,16 +373,30 @@ fn bitmap_patches(v: &Vol, bm: &mut [u8], runs: &[(u64, u64)], set: bool, p: &mu
     }
 }
 
+/// Clusters a bitmap marks used (padding bits past ClusterCount ignored).
+fn used_clusters(bm: &[u8], cc: u64) -> u64 {
+    let full = (cc / 8) as usize;
+    let mut used: u64 = bm[..full].iter().map(|b| b.count_ones() as u64).sum();
+    for i in full as u64 * 8..cc {
+        used += (bm[(i / 8) as usize] >> (i % 8) & 1) as u64;
+    }
+    used
+}
+
 // ───────────────────────── content comparison ─────────────────────────
 
-/// Bytes per sample of the sampled move check, and samples per file.
+/// Bytes per fingerprint sample, and samples per file.
 const SAMPLE: u64 = 4096;
 const SAMPLES: u64 = 8;
+/// Files up to this size are fingerprinted whole: the fingerprint is the full content.
+const SMALL: u64 = SAMPLES * SAMPLE;
+/// Volume fingerprints are read in batches of this many files (bounded memory).
+const FP_BATCH: usize = 1024;
 
-/// The (offset, length) samples compared for a file of `len` bytes: the whole file when it is
-/// at most SAMPLES × SAMPLE, else the first and last SAMPLE bytes and evenly spaced ones between.
+/// The (offset, length) samples of a file of `len` bytes: the whole file when it is at most
+/// SMALL, else the first and last SAMPLE bytes and six evenly spaced ones between.
 fn sample_ranges(len: u64) -> Vec<(u64, u64)> {
-    if len <= SAMPLES * SAMPLE {
+    if len <= SMALL {
         return vec![(0, len)];
     }
     let span = len - SAMPLE;
@@ -257,44 +405,65 @@ fn sample_ranges(len: u64) -> Vec<(u64, u64)> {
     v
 }
 
-/// Reads bytes [off, off + n) of a volume file stored in `runs` (bytes at or past ValidDataLength
-/// read as zeros).
-fn read_vol_file(v: &Vol, runs: &[(u64, u64)], valid: u64, off: u64, n: u64) -> Result<Vec<u8>> {
-    let mut out = vec![0u8; n as usize];
-    let (mut foff, end) = (0u64, (off + n).min(valid));
-    for &(s, k) in runs {
-        let (a, b) = (foff, foff + k * v.cs);
-        let (lo, hi) = (a.max(off), b.min(end));
-        if lo < hi {
-            let phys = v.cluster_off(s as u32) + (lo - a);
-            let at = (lo - off) as usize;
-            v.dev
-                .read_exact_at(&mut out[at..at + (hi - lo) as usize], phys)
-                .with_context(|| format!("read {} bytes at {phys}", hi - lo))?;
+/// The fingerprint of a local file of `len` bytes (None if it cannot be read as such).
+fn local_fingerprint(p: &Path, len: u64) -> Option<u128> {
+    let f = File::open(p).ok()?;
+    if f.metadata().ok()?.len() != len {
+        return None;
+    }
+    let mut buf = Vec::new();
+    for (off, n) in sample_ranges(len) {
+        let at = buf.len();
+        buf.resize(at + n as usize, 0);
+        f.read_exact_at(&mut buf[at..], off).ok()?;
+    }
+    Some(xxhash_rust::xxh3::xxh3_128(&buf))
+}
+
+/// Fingerprints of volume files (as [`local_fingerprint`]; bytes past ValidDataLength read as
+/// zeros), read in physical order, FP_BATCH files at a time ordered by where they start.
+fn vol_fingerprints(v: &mut Vol, files: &[&Child]) -> Result<Vec<u128>> {
+    let mut runs = Vec::with_capacity(files.len());
+    for ch in files {
+        runs.push(v.runs(ch.first, ch.no_fat_chain, ch.len, "move source")?);
+    }
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by_key(|&k| runs[k].first().map_or(0, |r| r.0));
+    let mut out = vec![0u128; files.len()];
+    for batch in order.chunks(FP_BATCH) {
+        let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(batch.len());
+        let mut pieces: Vec<(u64, usize, usize, usize)> = Vec::new(); // (device, buf, at, len)
+        for (b, &k) in batch.iter().enumerate() {
+            let ch = files[k];
+            let ranges = sample_ranges(ch.len);
+            bufs.push(vec![0u8; ranges.iter().map(|r| r.1 as usize).sum()]);
+            let mut at = 0usize;
+            for (off, n) in ranges {
+                let (end, mut foff) = ((off + n).min(ch.valid_len), 0u64);
+                for &(s, cnt) in &runs[k] {
+                    let (a, z) = (foff, foff + cnt * v.cs);
+                    let (lo, hi) = (a.max(off), z.min(end));
+                    if lo < hi {
+                        let dev = v.cluster_off(s as u32) + (lo - a);
+                        pieces.push((dev, b, at + (lo - off) as usize, (hi - lo) as usize));
+                    }
+                    foff = z;
+                    if foff >= end {
+                        break;
+                    }
+                }
+                at += n as usize;
+            }
         }
-        foff = b;
-        if foff >= end {
-            break;
+        pieces.sort();
+        for (dev, b, at, n) in pieces {
+            v.dev.read_exact_at(&mut bufs[b][at..at + n], dev).with_context(|| format!("read {n} bytes at {dev}"))?;
+        }
+        for (b, &k) in batch.iter().enumerate() {
+            out[k] = xxhash_rust::xxh3::xxh3_128(&bufs[b]);
         }
     }
     Ok(out)
-}
-
-/// The sampled content check of a move candidate: the samples of the local file equal the
-/// volume file's. A local file that cannot be read never matches.
-fn samples_match(v: &mut Vol, ch: &Child, local: &Path, len: u64) -> Result<bool> {
-    let runs = v.runs(ch.first, ch.no_fat_chain, ch.len, "move source")?;
-    let Ok(f) = File::open(local) else { return Ok(false) };
-    for (off, n) in sample_ranges(len) {
-        let mut mine = vec![0u8; n as usize];
-        if f.read_exact_at(&mut mine, off).is_err() {
-            return Ok(false);
-        }
-        if read_vol_file(v, &runs, ch.valid_len, off, n)? != mine {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 /// Hash of a local file as [`crate::verify::hash_vol_files`] computes it; None if it is not
@@ -303,6 +472,40 @@ fn local_hash(p: &Path, len: u64) -> Option<u128> {
     let mut buf = vec![0u8; 1 << 20];
     let (n, h) = crate::verify::hash_file(p, &mut buf, &crate::verify::Progress::default()).ok()?;
     (n == len).then_some(h)
+}
+
+/// A move bucket: size, and LastModified decoded to UTC (secs, nanos).
+type MoveKey = (u64, (i64, u32));
+
+/// The move-bucket key of a source file: its size and its time as flashcp would store it.
+fn src_key(n: &Node) -> Option<MoveKey> {
+    let (t, t10) = ts(n.mtime.0, n.mtime.1);
+    decode_ts(t, t10, 0x80).map(|x| (n.size, x))
+}
+
+/// The move-bucket key of a volume file: its size and its stored time, decoded.
+fn vol_key(ch: &Child) -> Option<MoveKey> {
+    decode_ts(ch.mtime.0, ch.mtime.1, ch.mtime.2).map(|x| (ch.len, x))
+}
+
+// ───────────────────────── duplicates ─────────────────────────
+
+/// What the source has under a name, for choosing the keeper of a duplicate.
+struct Want<'a> {
+    is_dir: bool,
+    name: &'a [u16],
+    size: u64,
+    mtime: Option<(i64, u32)>,
+}
+
+/// How well a set matches the source (higher is better; see the module doc).
+fn keeper_score(c: &Child, w: Option<&Want<'_>>) -> (bool, bool, bool, bool, usize) {
+    let ty = w.is_some_and(|w| w.is_dir == c.is_dir);
+    let owns = !(c.is_dir && c.len == 0);
+    let meta =
+        w.is_some_and(|w| !w.is_dir && !c.is_dir && c.len == w.size && w.mtime.is_some_and(|m| same_mtime(m, c.mtime)));
+    let name = w.is_some_and(|w| w.name == &c.name[..]);
+    (ty, owns, meta, name, c.set_off)
 }
 
 // ───────────────────────── sync ─────────────────────────
@@ -319,6 +522,9 @@ fn json_list(items: impl Iterator<Item = String>) -> String {
     format!("[{}]", items.collect::<Vec<_>>().join(","))
 }
 
+/// The metadata phases after `data`, in order (each one journaled, then committed and synced).
+const META_PHASES: [&str; 7] = ["alloc", "fat", "unlink", "link", "retire", "free", "clean"];
+
 /// [`sync`] onto a [`TargetSpec`] (a path, or an inherited block-device fd).
 pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) -> Result<SyncStats> {
     let t0 = Instant::now();
@@ -328,8 +534,28 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         "source must be a directory"
     );
     let tgt = target.open_rw()?;
+    set_direct(&tgt.file, false);
+    // An interrupted run first: its journal is replayed before anything is planned.
+    if let Some(n) = recovery_note(&journal::recover(&tgt.file)?) {
+        eprintln!("{n}");
+    }
+    {
+        let mut s0 = [0u8; 512];
+        tgt.file.read_exact_at(&mut s0, 0).context("read boot sector")?;
+        ensure!(
+            &s0[3..11] != b"EXFAT   " || u16::from_le_bytes([s0[106], s0[107]]) & FLAG_DIRTY == 0,
+            "volume is marked dirty and there is no sync journal for it here (still mounted, not cleanly \
+             unmounted, or a sync interrupted on another machine): unmount it, or run fsck.exfat -y, then re-run \
+             the sync"
+        );
+    }
+    // Duplicates in the root (an interrupted sync) make the volume non-empty: skip the build.
+    let root_dups = Vol::open_with(tgt.file.try_clone().context("dup target fd")?, tgt.bytes, false, false, true)
+        .map(|p| !p.dirs[0].dups.is_empty())?;
     // An empty volume with coarse clusters (a fresh stick) is written as a build, as by add.
-    let tgt = {
+    let tgt = if root_dups {
+        tgt
+    } else {
         let inner = tick.sink();
         let mut fwd = |e: &Event| match e {
             Event::Plan { files, dirs, bytes, write_bytes, detail, strategy, .. } => {
@@ -356,8 +582,9 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     };
     let excl = Arc::new(tgt.file);
     set_direct(&excl, false);
-    let mut v = Vol::open(excl.try_clone().context("dup target fd")?, tgt.bytes, false, true)?;
+    let mut v = Vol::open_with(excl.try_clone().context("dup target fd")?, tgt.bytes, false, true, true)?;
     let cs = v.cs;
+    let serial = le32(&v.sector0, 100);
     let mut nodes = scan_tree(src, &v.upc)?;
 
     // ── verification walk, keeping every directory on the way to and under the destination ──
@@ -375,9 +602,72 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     let verify_secs = tv.elapsed().as_secs_f64();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
     let now = (now.as_secs() as i64, now.subsec_nanos());
+    let mut st = SyncStats { cluster: cs, ..Default::default() };
+
+    // ── duplicates an interrupted sync left: keep the best match of the source, unlink the rest ──
+    let mut src_dir_of: HashMap<Vec<Vec<u16>>, usize> = HashMap::new();
+    {
+        let mut stack = vec![(0usize, dest.clone())];
+        while let Some((n, key)) = stack.pop() {
+            for &c in &nodes[n].children {
+                if nodes[c].is_dir {
+                    let mut k = key.clone();
+                    k.push(upcase(&nodes[c].name, &v.upc));
+                    stack.push((c, k));
+                }
+            }
+            src_dir_of.insert(key, n);
+        }
+    }
+    let comp_names: Vec<Vec<u16>> = comps.iter().map(|c| c.encode_utf16().collect()).collect();
+    let mut repairs: Vec<(usize, Child)> = Vec::new();
+    let mut freed: Vec<(u64, u64)> = Vec::new();
+    for d in 0..v.dirs.len() {
+        if v.dirs[d].dups.is_empty() {
+            continue;
+        }
+        let dups = std::mem::take(&mut v.dirs[d].dups);
+        let dkey = v.dirs[d].key.clone();
+        let src_kids: HashMap<Vec<u16>, usize> = src_dir_of
+            .get(&dkey)
+            .map(|&n| nodes[n].children.iter().map(|&c| (upcase(&nodes[c].name, &v.upc), c)).collect())
+            .unwrap_or_default();
+        let mut groups: BTreeMap<Vec<u16>, Vec<Child>> = BTreeMap::new();
+        for ch in dups {
+            groups.entry(upcase(&ch.name, &v.upc)).or_default().push(ch);
+        }
+        for (key, mut members) in groups {
+            members.push(v.dirs[d].children[&key].clone());
+            let want = if let Some(&c) = src_kids.get(&key) {
+                let n = &nodes[c];
+                Some(Want { is_dir: n.is_dir, name: &n.name, size: n.size, mtime: Some(n.mtime) })
+            } else if dkey.len() < dest.len() && dest.starts_with(&dkey) && dest[dkey.len()] == key {
+                Some(Want { is_dir: true, name: &comp_names[dkey.len()], size: 0, mtime: None })
+            } else {
+                None
+            };
+            members.sort_by_key(|c| keeper_score(c, want.as_ref()));
+            let keeper = members.pop().unwrap();
+            if keeper.is_dir {
+                let mut ck = dkey.clone();
+                ck.push(key.clone());
+                if let Some(&ki) = v.kept.get(&ck) {
+                    v.dirs[ki].entry = Some((d, keeper.set_off, keeper.set_len));
+                }
+            }
+            for l in members {
+                if !l.is_dir && l.first != 0 && l.first != keeper.first {
+                    freed.extend(v.runs(l.first, l.no_fat_chain, l.len, "duplicate entry")?);
+                }
+                repairs.push((d, l));
+            }
+            v.dirs[d].children.insert(key, keeper);
+        }
+    }
+    st.repaired = repairs.len() as u64;
 
     // ── destination (--to), creating missing parents as new directories ──
-    let mut appends: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut appends: BTreeMap<usize, Vec<Item>> = BTreeMap::new();
     let mut cur = 0usize;
     let mut new_parent: Option<usize> = None;
     for comp in &comps {
@@ -406,14 +696,14 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
             Some(_) => bail!("--to: {}/{comp} exists on the volume and is not a directory", v.dirs[cur].path),
             None => {
                 let k = synth(&mut nodes);
-                appends.entry(cur).or_default().push(k);
+                appends.entry(cur).or_default().push(Item::Node(k));
                 new_parent = Some(k);
             }
         }
     }
 
     // ── match the source tree against the destination ──
-    let mut patches: Vec<EntryPatch> = Vec::new();
+    let mut edits: BTreeMap<(usize, usize), Edit> = BTreeMap::new();
     let mut pairs: Vec<(usize, Child, usize)> = Vec::new(); // (dir, volume file, source file)
     let mut deletes: Vec<(usize, Child)> = Vec::new(); // top-level entries that go away
     let mut conflicts: Vec<String> = Vec::new();
@@ -429,7 +719,7 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
                 let key = upcase(&nodes[c].name, &v.upc);
                 seen.insert(key.clone());
                 let Some(ch) = v.dirs[d].children.get(&key).cloned() else {
-                    appends.entry(d).or_default().push(c);
+                    appends.entry(d).or_default().push(Item::Node(c));
                     continue;
                 };
                 let renamed = ch.name != nodes[c].name;
@@ -438,23 +728,23 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
                         let nd = v.load_child(d, &ch)?;
                         let retime = !same_mtime(nodes[c].mtime, ch.mtime);
                         if retime || renamed {
-                            let (off, len) = (ch.set_off, ch.set_len);
-                            patches.push(EntryPatch {
-                                dir: d,
-                                off,
-                                len,
-                                node: c,
-                                repoint: false,
-                                mtime: retime,
-                                name: renamed,
-                            });
+                            edits.insert(
+                                (d, ch.set_off),
+                                Edit {
+                                    len: ch.set_len,
+                                    node: Some(c),
+                                    mtime: retime,
+                                    name: renamed,
+                                    ..Default::default()
+                                },
+                            );
                         }
                         work.push((nd, nodes[c].children.clone()));
                     }
                     (false, false) => pairs.push((d, ch, c)),
                     _ if o.delete => {
                         deletes.push((d, ch));
-                        appends.entry(d).or_default().push(c);
+                        appends.entry(d).or_default().push(Item::Node(c));
                     }
                     _ => conflicts.push(format!("{}/{}", v.dirs[d].path, String::from_utf16_lossy(&ch.name))),
                 }
@@ -484,7 +774,8 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     let mut new_dirs = Vec::new();
     let mut new_files = Vec::new();
     for (&d, kids) in &appends {
-        for &c in kids {
+        for &it in kids {
+            let Item::Node(c) = it else { continue };
             path_of.insert(c, format!("{}/{}", v.dirs[d].path, String::from_utf16_lossy(&nodes[c].name)));
             if nodes[c].is_dir { new_dirs.push(c) } else { new_files.push(c) }
         }
@@ -528,27 +819,23 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         delete_list.push((path, ch.is_dir, f0..gone_files.len()));
     }
 
-    // ── classification of matched files, move candidates, and the content checks ──
-    // Candidate (new file, pool file) pairs by size and time; checked below.
-    let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
+    // ── move candidates: same size and same decoded time, by bucket ──
+    let mut pool_by: HashMap<MoveKey, Vec<usize>> = HashMap::new();
     for (i, g) in gone_files.iter().enumerate() {
-        if g.ch.len > 0 {
-            by_size.entry(g.ch.len).or_default().push(i);
+        if g.ch.len > 0
+            && let Some(k) = vol_key(&g.ch)
+        {
+            pool_by.entry(k).or_default().push(i);
         }
     }
-    let candidates: Vec<(usize, Vec<usize>)> = new_files
+    let candidates: Vec<(usize, MoveKey)> = new_files
         .iter()
         .filter(|&&f| nodes[f].size > 0)
-        .filter_map(|&f| {
-            let pool: Vec<usize> = by_size
-                .get(&nodes[f].size)?
-                .iter()
-                .copied()
-                .filter(|&i| same_mtime(nodes[f].mtime, gone_files[i].ch.mtime))
-                .collect();
-            (!pool.is_empty()).then_some((f, pool))
-        })
+        .filter_map(|&f| src_key(&nodes[f]).filter(|k| pool_by.contains_key(k)).map(|k| (f, k)))
         .collect();
+    let live_keys: HashSet<MoveKey> = candidates.iter().map(|c| c.1).collect();
+    let pool_used: BTreeSet<usize> = live_keys.iter().flat_map(|k| pool_by[k].iter().copied()).collect();
+
     // --checksum: hash every same-size matched file and every pool file with a candidate.
     let mut vol_hash: HashMap<(usize, usize), u128> = HashMap::new(); // (kind 0 pair / 1 pool, index)
     let mut src_hash: HashMap<usize, Option<u128>> = HashMap::new();
@@ -562,7 +849,6 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
                 src_hash.insert(*c, None);
             }
         }
-        let pool_used: BTreeSet<usize> = candidates.iter().flat_map(|c| c.1.iter().copied()).collect();
         for &i in &pool_used {
             let ch = &gone_files[i].ch;
             want.push((1, i));
@@ -578,9 +864,7 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         }
     }
 
-    let mut st = SyncStats { cluster: cs, ..Default::default() };
     let mut alloc_files: Vec<usize> = Vec::new(); // new and changed files that get new clusters
-    let mut freed: Vec<(u64, u64)> = Vec::new();
     for (i, (d, ch, c)) in pairs.iter().enumerate() {
         let (d, c) = (*d, *c);
         let n = &nodes[c];
@@ -591,30 +875,22 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         } else {
             n.size == ch.len && same_time
         };
-        let base = EntryPatch {
-            dir: d,
-            off: ch.set_off,
-            len: ch.set_len,
-            node: c,
-            repoint: false,
-            mtime: false,
-            name: renamed,
-        };
+        let base = Edit { len: ch.set_len, node: Some(c), name: renamed, ..Default::default() };
         if same_content && same_time {
             if renamed {
                 st.moved += 1;
-                patches.push(base);
+                edits.insert((d, ch.set_off), base);
             } else {
                 st.unchanged += 1;
             }
             st.data_skipped += n.size;
         } else if same_content {
             st.changed += 1; // metadata only
-            patches.push(EntryPatch { mtime: true, ..base });
+            edits.insert((d, ch.set_off), Edit { mtime: true, ..base });
         } else {
             st.changed += 1;
             st.data_written += n.size;
-            patches.push(EntryPatch { repoint: true, mtime: true, ..base });
+            edits.insert((d, ch.set_off), Edit { repoint: true, mtime: true, ..base });
             if n.size > 0 {
                 alloc_files.push(c);
             }
@@ -622,24 +898,63 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         }
     }
 
-    // ── moves: each pool file at most once, first confirmed candidate wins ──
+    // ── moves: equal fingerprints (or hashes), then confirmed; each pool file at most once ──
     let mut moves: HashMap<usize, usize> = HashMap::new(); // new file node → gone_files index
     let mut used: HashSet<usize> = HashSet::new();
-    for (f, pool) in &candidates {
-        for &i in pool {
-            if used.contains(&i) {
-                continue;
-            }
-            let ok = if o.checksum {
-                src_hash[f].is_some_and(|h| vol_hash[&(1, i)] == h)
-            } else {
-                let ch = gone_files[i].ch.clone();
-                samples_match(&mut v, &ch, &nodes[*f].src, nodes[*f].size)?
-            };
-            if ok {
+    if o.checksum {
+        for (f, k) in &candidates {
+            let Some(h) = src_hash[f] else { continue };
+            if let Some(&i) = pool_by[k].iter().find(|&&i| !used.contains(&i) && vol_hash[&(1, i)] == h) {
                 used.insert(i);
                 moves.insert(*f, i);
-                break;
+                st.moves_verified += 1;
+            }
+        }
+    } else if !candidates.is_empty() {
+        let pool: Vec<usize> = pool_used.iter().copied().collect();
+        let refs: Vec<&Child> = pool.iter().map(|&i| &gone_files[i].ch).collect();
+        let fps = vol_fingerprints(&mut v, &refs)?;
+        let mut by_fp: HashMap<(MoveKey, u128), VecDeque<usize>> = HashMap::new();
+        for (k, &i) in pool.iter().enumerate() {
+            by_fp.entry((vol_key(&gone_files[i].ch).unwrap(), fps[k])).or_default().push_back(i);
+        }
+        let pays = verify_pays(None, None);
+        let mut budget = 0u64;
+        let mut check: Vec<(usize, usize)> = Vec::new();
+        for (f, k) in &candidates {
+            let size = nodes[*f].size;
+            let Some(fp) = local_fingerprint(&nodes[*f].src, size) else { continue };
+            let Some(i) = by_fp.get_mut(&(*k, fp)).and_then(|q| q.pop_front()) else { continue };
+            if size <= SMALL {
+                st.moves_verified += 1; // the fingerprint is the whole content
+            } else if o.fast_moves {
+                st.moves_fast += 1;
+            } else if pays && budget + size <= VERIFY_BUDGET {
+                budget += size;
+                check.push((*f, i));
+                continue;
+            } else {
+                st.moves_copied_budget += 1;
+                continue;
+            }
+            used.insert(i);
+            moves.insert(*f, i);
+        }
+        if !check.is_empty() {
+            let objs: Vec<(u32, bool, u64, u64)> = check
+                .iter()
+                .map(|&(_, i)| {
+                    let ch = &gone_files[i].ch;
+                    (ch.first, ch.no_fat_chain, ch.len, ch.valid_len)
+                })
+                .collect();
+            let hs = crate::verify::hash_vol_files(&mut v, &objs)?;
+            for (&(f, i), h) in check.iter().zip(hs) {
+                if local_hash(&nodes[f].src, nodes[f].size) == Some(h) {
+                    st.moves_verified += 1;
+                    used.insert(i);
+                    moves.insert(f, i);
+                }
             }
         }
     }
@@ -663,9 +978,17 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
             freed.extend(v.runs(g.ch.first, g.ch.no_fat_chain, g.ch.len, &g.path)?);
         }
     }
+    let gone_set: HashSet<usize> = gone_dirs.iter().copied().collect();
     for &di in &gone_dirs {
         let r: Vec<(u64, u64)> = v.dirs[di].clusters.iter().map(|&c| (c as u64, 1)).collect();
         freed.extend(r);
+        // Duplicates inside a deleted directory with clusters of their own go too.
+        for l in std::mem::take(&mut v.dirs[di].dups) {
+            let twin = v.dirs[di].children[&upcase(&l.name, &v.upc)].first;
+            if !l.is_dir && l.first != 0 && l.first != twin {
+                freed.extend(v.runs(l.first, l.no_fat_chain, l.len, "duplicate entry")?);
+            }
+        }
     }
     // Every freed cluster is in use before the sync, and freed once.
     let mut seen_free = cluster_set(v.cc);
@@ -677,11 +1000,34 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
             "internal error: freeing a cluster that is already free"
         );
     }
+    // Orphan secondaries of earlier interrupted runs, in the directories that stay.
+    let orphan_dirs: Vec<usize> =
+        (0..v.dirs.len()).filter(|d| !gone_set.contains(d) && !v.dirs[*d].orphans.is_empty()).collect();
+    st.orphans = orphan_dirs.iter().map(|&d| v.dirs[d].orphans.len() as u64).sum();
 
-    // ── sizes ──
+    // ── in place or relocated, and directory growth: deepest directories first, so that a
+    //    directory's own set edit (its new length) is known before its parent is sized ──
+    let item_bytes = |nodes: &[Node], edits: &BTreeMap<(usize, usize), Edit>, d: usize, it: Item| match it {
+        Item::Node(c) => set_bytes(&nodes[c]),
+        Item::Reloc(off) => edits[&(d, off)].len as u64,
+    };
+    let mut depth: Vec<usize> = (0..v.dirs.len()).filter(|d| !gone_set.contains(d)).collect();
+    depth.sort_by_key(|&d| std::cmp::Reverse(v.dirs[d].key.len()));
+    let mut relocs: BTreeSet<(usize, usize)> = BTreeSet::new();
     let mut ext_need: BTreeMap<usize, u64> = BTreeMap::new();
-    for (&d, kids) in &appends {
-        let need: u64 = kids.iter().map(|&c| set_bytes(&nodes[c])).sum();
+    for &d in &depth {
+        let here: Vec<usize> = edits.range((d, 0)..(d + 1, 0)).map(|(k, _)| k.1).collect();
+        for off in here {
+            let e = &edits[&(d, off)];
+            let name = e.node.map(|c| nodes[c].name.as_slice());
+            let hi = changed_end(e, &v.dirs[d].data[off..off + e.len], name);
+            if !one_sector(off, hi) {
+                relocs.insert((d, off));
+                appends.entry(d).or_default().push(Item::Reloc(off));
+            }
+        }
+        let Some(kids) = appends.get(&d) else { continue };
+        let need: u64 = kids.iter().map(|&it| item_bytes(&nodes, &edits, d, it)).sum();
         let dir = &v.dirs[d];
         let free = (dir.data.len() - dir.end) as u64;
         if need > free {
@@ -692,8 +1038,13 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
                 if dir.path.is_empty() { "/" } else { &dir.path }
             );
             ext_need.insert(d, n);
+            if let Some((p, off, len)) = dir.entry {
+                let e = edits.entry((p, off)).or_insert_with(|| Edit { len, ..Default::default() });
+                e.dirlen = Some(dir.data.len() as u64 + n * cs);
+            }
         }
     }
+    st.relocated = relocs.len() as u64;
     for &d in &new_dirs {
         let bytes: u64 = nodes[d].children.iter().map(|&c| set_bytes(&nodes[c])).sum();
         nodes[d].clusters = bytes.div_ceil(cs).max(1);
@@ -734,7 +1085,7 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
             human_bytes((free_total * cs) as f64)
         );
     };
-    let mut ext_q: std::collections::VecDeque<_> = chosen.into();
+    let mut ext_q: VecDeque<_> = chosen.into();
     for &(obj, n) in &order {
         runs.insert(obj, carve(&mut ext_q, n));
     }
@@ -742,6 +1093,21 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     for (&obj, r) in &runs {
         if let Obj::NewDir(i) | Obj::File(i) = obj {
             nodes[i].first_cluster = r[0].0 as u32;
+        }
+    }
+    // A directory extension that is not the next clusters of a NoFatChain run needs a chain.
+    let contiguous_ext: HashSet<usize> = ext_need
+        .keys()
+        .copied()
+        .filter(|&d| {
+            let dir = &v.dirs[d];
+            let r = &runs[&Obj::Ext(d)];
+            dir.no_fat_chain && r.len() == 1 && r[0].0 == *dir.clusters.last().unwrap() as u64 + 1
+        })
+        .collect();
+    for &d in ext_need.keys() {
+        if let (false, Some((p, off, _))) = (contiguous_ext.contains(&d), v.dirs[d].entry) {
+            edits.get_mut(&(p, off)).unwrap().clear_nfc = true;
         }
     }
     let upc = v.upc.clone();
@@ -763,6 +1129,26 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         }
         let len = if n.is_dir { n.clusters * cs } else { n.size };
         finish_set(e, len, len)
+    };
+    // An existing set with its edit applied.
+    let edited = |nodes: &[Node], old: &[u8], e: &Edit| {
+        let mut set = old.to_vec();
+        let n = e.node.map(|c| &nodes[c]);
+        let repoint = n.filter(|_| e.repoint).map(|n| Repoint {
+            first: n.first_cluster,
+            contiguous: !frag(Obj::File(e.node.unwrap())),
+            len: n.size,
+        });
+        patch_set(&mut set, repoint, n.filter(|_| e.mtime).map(|n| n.mtime), n.filter(|_| e.name).map(|n| &n.name[..]));
+        if let Some(l) = e.dirlen {
+            if e.clear_nfc {
+                set[33] &= !0x02;
+            }
+            set[40..48].copy_from_slice(&l.to_le_bytes());
+            set[56..64].copy_from_slice(&l.to_le_bytes());
+            fix_checksum(&mut set);
+        }
+        set
     };
 
     // ── phase-1 content: new directories, extension clusters ──
@@ -787,27 +1173,36 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         push_mem(&mut segs, &mut mems, &runs[&Obj::NewDir(d)], bytes);
     }
 
-    // ── phase 4 (unlink), applied to the working copies first ──
+    // ── unlink: primaries only ──
+    let dead: Vec<(usize, usize, usize)> =
+        deletes.iter().chain(&repairs).map(|(d, ch)| (*d, ch.set_off, ch.set_len)).collect();
     let mut t_unlink = Touched::default();
-    for (d, ch) in &deletes {
-        let data = &mut v.dirs[*d].data;
-        for k in 0..ch.set_len / 32 {
-            data[ch.set_off + 32 * k] &= 0x7F;
-        }
-        t_unlink.mark(*d, ch.set_off, ch.set_off + ch.set_len);
+    for &(d, off, _) in &dead {
+        v.dirs[d].data[off] &= 0x7F;
+        t_unlink.mark(d, off, off + 1);
     }
     let p_unlink = t_unlink.patches(&v);
 
-    // ── phase 5 (link): appends, extended directories, re-points, retimes, renames ──
+    // ── link: appends (new, moved, relocated), extended directories, in-place edits ──
+    let torn_test = std::env::var(TORN_ENV).as_deref() == Ok("relocate");
+    let pre_link: HashMap<usize, Vec<u8>> =
+        if torn_test { relocs.iter().map(|&(d, _)| (d, v.dirs[d].data.clone())).collect() } else { HashMap::new() };
+    let mut new_sets: Vec<(usize, usize, usize)> = Vec::new(); // relocated sets at their new place
     let mut t_link = Touched::default();
-    let mut sets: BTreeSet<(usize, usize, usize)> = BTreeSet::new(); // sets whose checksum to redo
     let mut ext_fat: Vec<(u32, u32)> = Vec::new();
     for (&d, kids) in &appends {
-        let mut bytes = Vec::new();
-        for &c in kids {
-            bytes.extend(set_for(&nodes, c));
-        }
         let (end, dlen) = (v.dirs[d].end, v.dirs[d].data.len());
+        let mut bytes = Vec::new();
+        for &it in kids {
+            match it {
+                Item::Node(c) => bytes.extend(set_for(&nodes, c)),
+                Item::Reloc(off) => {
+                    let e = &edits[&(d, off)];
+                    new_sets.push((d, end + bytes.len(), e.len));
+                    bytes.extend(edited(&nodes, &v.dirs[d].data[off..off + e.len], e));
+                }
+            }
+        }
         let tail = bytes.len().min(dlen - end);
         v.dirs[d].data[end..end + tail].copy_from_slice(&bytes[..tail]);
         let after = end + tail;
@@ -820,46 +1215,35 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         let Some(r) = runs.get(&Obj::Ext(d)).cloned() else { continue };
         push_mem(&mut segs, &mut mems, &r, bytes[tail..].to_vec());
         let dir = &v.dirs[d];
-        let ext = run_clusters(&r);
-        let last = *dir.clusters.last().unwrap();
-        let contiguous_ext = dir.no_fat_chain && r.len() == 1 && r[0].0 == last as u64 + 1;
-        let new_len = (dir.clusters.len() + ext.len()) as u64 * cs;
-        if !contiguous_ext {
+        if !contiguous_ext.contains(&d) {
             // Existing chain → extension. A NoFatChain directory needs its chain written first.
+            let last = *dir.clusters.last().unwrap();
             let mut all = if dir.no_fat_chain { dir.clusters.clone() } else { vec![last] };
-            all.extend(&ext);
+            all.extend(run_clusters(&r));
             chain_entries(&all, &mut ext_fat);
         }
-        if let Some((p, off, len)) = dir.entry {
-            let set = &mut v.dirs[p].data[off..off + len];
-            if !contiguous_ext {
-                set[33] &= !0x02;
-            }
-            set[40..48].copy_from_slice(&new_len.to_le_bytes());
-            set[56..64].copy_from_slice(&new_len.to_le_bytes());
-            sets.insert((p, off, len));
-        }
     }
-    for p in &patches {
-        let n = &nodes[p.node];
-        let repoint =
-            p.repoint.then(|| Repoint { first: n.first_cluster, contiguous: !frag(Obj::File(p.node)), len: n.size });
-        if p.repoint && p.off % 512 == 480 {
-            st.split_repoints += 1;
+    for (&(d, off), e) in &edits {
+        if relocs.contains(&(d, off)) {
+            continue;
         }
-        let set = &mut v.dirs[p.dir].data[p.off..p.off + p.len];
-        patch_set(set, repoint, p.mtime.then_some(n.mtime), p.name.then_some(&n.name[..]));
-        sets.insert((p.dir, p.off, p.len));
-    }
-    for &(d, off, len) in &sets {
-        fix_checksum(&mut v.dirs[d].data[off..off + len]);
-        t_link.mark(d, off, off + len);
+        let new = edited(&nodes, &v.dirs[d].data[off..off + e.len], e);
+        v.dirs[d].data[off..off + e.len].copy_from_slice(&new);
+        t_link.mark(d, off, off + e.len);
     }
     let p_link = t_link.patches(&v);
     let mut p_fat = Patches::default();
     p_fat.fat(&v, &ext_fat);
 
-    // ── phase 2 (alloc) and phase 6 (free) ──
+    // ── retire: the relocated sets' old copies ──
+    let mut t_retire = Touched::default();
+    for &(d, off) in &relocs {
+        v.dirs[d].data[off] &= 0x7F;
+        t_retire.mark(d, off, off + 1);
+    }
+    let p_retire = t_retire.patches(&v);
+
+    // ── alloc, and free: secondaries of every set that died, old orphans, bitmap bits ──
     let mut bm = v.bitmap.clone();
     let mut p_alloc = Patches::default();
     let all_runs: Vec<(u64, u64)> = runs.values().flatten().copied().collect();
@@ -871,8 +1255,32 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         }
     }
     p_alloc.fat(&v, &new_fat);
-    let mut p_free = Patches::default();
+    let mut t_free = Touched::default();
+    let retired: Vec<(usize, usize, usize)> = relocs.iter().map(|&(d, off)| (d, off, edits[&(d, off)].len)).collect();
+    for &(d, off, len) in dead.iter().chain(&retired) {
+        for k in 1..len / 32 {
+            v.dirs[d].data[off + 32 * k] &= 0x7F;
+        }
+        t_free.mark(d, off + 32, off + len);
+    }
+    for &d in &orphan_dirs {
+        for o in std::mem::take(&mut v.dirs[d].orphans) {
+            v.dirs[d].data[o] &= 0x7F;
+            t_free.mark(d, o, o + 1);
+        }
+    }
+    let mut p_free = t_free.patches(&v);
     bitmap_patches(&v, &mut bm, &freed, false, &mut p_free);
+    // clean: VolumeDirty cleared, PercentInUse of the final bitmap.
+    let pct = (used_clusters(&bm, v.cc) * 100 / v.cc).min(100) as u8;
+    let orig_s0 = v.sector0.clone();
+    let mut dirty_s0 = orig_s0.clone();
+    dirty_s0[106..108].copy_from_slice(&working_flags(v.flags).to_le_bytes());
+    let mut clean_s0 = orig_s0.clone();
+    clean_s0[106..108].copy_from_slice(&clean_flags(v.flags).to_le_bytes());
+    clean_s0[112] = pct;
+    let mut p_clean = Patches::default();
+    p_clean.add(0, clean_s0);
 
     // ── plan ──
     segs.sort_by_key(|s| s.dev);
@@ -888,22 +1296,27 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     segs.sort_by_key(|s| s.dev);
     let sizes: Vec<u64> = file_order.iter().map(|&f| nodes[f].size).collect();
     let data_write = data_write_bytes(&segs, &sizes);
-    let nothing = appends.is_empty() && patches.is_empty() && deletes.is_empty();
-    let write_bytes = if nothing {
-        0
-    } else {
-        data_write + p_alloc.bytes() + p_fat.bytes() + p_unlink.bytes() + p_link.bytes() + p_free.bytes() + 2 * bps
-    };
+    let nothing = appends.is_empty() && edits.is_empty() && deletes.is_empty() && repairs.is_empty() && st.orphans == 0;
+    let meta: Vec<(&str, Patches)> = vec![
+        ("alloc", p_alloc),
+        ("fat", p_fat),
+        ("unlink", p_unlink),
+        ("link", p_link),
+        ("retire", p_retire),
+        ("free", p_free),
+        ("clean", p_clean),
+    ];
+    let write_bytes = if nothing { 0 } else { data_write + meta.iter().map(|(_, p)| p.bytes()).sum::<u64>() + bps };
     let direct = tgt.direct && cs.is_multiple_of(4096) && v.heap_off.is_multiple_of(4096);
     let pol = data_gap_policy(&excl, direct, &v, tgt.part_off * 512, o.dry_run, &segs, &sizes);
 
     let (files, dirs, bytes) = (st.new + st.changed, st.new_dirs, st.data_written);
-    let mut moves_list: Vec<(String, String)> =
-        moves.iter().map(|(&f, &g)| (gone_files[g].path.clone(), path_of[&f].clone())).collect();
+    let mut moves_list: Vec<(String, String, usize)> =
+        moves.iter().map(|(&f, &g)| (gone_files[g].path.clone(), path_of[&f].clone(), g)).collect();
     moves_list.sort();
     let shown = |p: &str, dir: bool| if dir { format!("{p}/") } else { p.to_string() };
     let sync_json = format!(
-        r#"{{"unchanged":{},"new":{},"changed":{},"moved":{},"deleted":{},"deleted_dirs":{},"new_dirs":{},"bytes_skipped":{},"delete":{},"moves":{}}}"#,
+        r#"{{"unchanged":{},"new":{},"changed":{},"moved":{},"deleted":{},"deleted_dirs":{},"new_dirs":{},"bytes_skipped":{},"relocated":{},"repaired":{},"orphans":{},"moves_verified":{},"moves_fast":{},"moves_copied_budget":{},"delete":{},"moves":{}}}"#,
         st.unchanged,
         st.new,
         st.changed,
@@ -912,13 +1325,19 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         st.deleted_dirs,
         st.new_dirs,
         st.data_skipped,
+        st.relocated,
+        st.repaired,
+        st.orphans,
+        st.moves_verified,
+        st.moves_fast,
+        st.moves_copied_budget,
         json_list(
             delete_list
                 .iter()
                 .filter(|(_, d, r)| *d || !used.contains(&r.start))
                 .map(|(p, d, _)| json_str(&shown(p, *d)))
         ),
-        json_list(moves_list.iter().map(|(a, b)| format!(r#"{{"from":{},"to":{}}}"#, json_str(a), json_str(b))))
+        json_list(moves_list.iter().map(|(a, b, _)| format!(r#"{{"from":{},"to":{}}}"#, json_str(a), json_str(b))))
     );
     let mut detail = format!(
         "plan: sync {} unchanged, {} new, {} changed, {} moved, {} deleted ({} dirs), {} new dirs │ {} of file data \
@@ -938,6 +1357,20 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         pol.describe(),
         verify_secs * 1e3
     );
+    if !candidates.is_empty() {
+        detail += &format!(" │ {} moves verified, {} copied (budget)", st.moves_verified, st.moves_copied_budget);
+        if st.moves_fast > 0 {
+            detail += &format!(", {} on fingerprints only (--fast-moves)", st.moves_fast);
+        }
+    }
+    if st.repaired > 0 || st.orphans > 0 {
+        detail += &format!(
+            " │ repaired {} interrupted entries ({} duplicate sets, {} orphan secondaries)",
+            st.repaired + st.orphans,
+            st.repaired,
+            st.orphans
+        );
+    }
     if extra_kept > 0 {
         detail += &format!(" │ {extra_kept} extra entries kept (pass --delete to remove them)");
     }
@@ -949,7 +1382,7 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
             detail += &format!("\ndelete: {p}");
         }
     }
-    for (a, b) in &moves_list {
+    for (a, b, _) in &moves_list {
         detail += &format!("\nmove: {a} → {b}");
     }
     tick.emit(Event::Plan {
@@ -967,8 +1400,30 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         tick.emit(Event::Done { files, bytes, secs: st.secs });
         return Ok(st);
     }
+    let deleting = st.deleted + st.deleted_dirs;
+    ensure!(
+        deleting == 0 || o.yes,
+        "this sync would delete {deleting} entries (listed above); pass --yes to confirm (nothing was written)"
+    );
+    ensure!(
+        deleting <= MANY_DELETES || o.yes_many,
+        "this sync would delete {deleting} entries, more than {MANY_DELETES}; pass --yes-many as well as --yes to \
+         confirm (nothing was written)"
+    );
 
-    // ── phase 0: mark dirty ──
+    // ── phase 0: the undo journal, then mark dirty ──
+    let device = match target {
+        TargetSpec::Path(p) => p.display().to_string(),
+        TargetSpec::Fd(fd) => format!("fd {fd}"),
+    };
+    let mut j = Journal {
+        serial,
+        device: format!("{device} ({} bytes)", tgt.bytes),
+        mode: "undo".into(),
+        moves: Vec::new(),
+        writes: vec![JWrite { phase: "clean".into(), off: 0, pre: dirty_s0, post: orig_s0.clone() }],
+    };
+    journal::save(&j).context("write the sync journal (nothing was written to the volume)")?;
     let flags = v.flags;
     write_flags(&mut v, working_flags(flags), None)?;
     stop_after("dirty")?;
@@ -978,29 +1433,52 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     tick.progress(done0, 0, true);
     let reads: Vec<(PathBuf, u64)> = file_order.iter().map(|&i| (nodes[i].src.clone(), nodes[i].size)).collect();
     write_data(&excl, direct, &v, &segs, &mems, reads, &pol, o.readers, &mut tick, done0)?;
+    excl.sync_all().context("sync")?;
     stop_after("data")?;
 
-    // ── phase 2: bitmap + new chains ──
-    p_alloc.commit(&v.dev)?;
-    stop_after("alloc")?;
-    // ── phase 3: links into existing directory chains ──
-    p_fat.commit(&v.dev)?;
-    stop_after("fat")?;
-    // ── phase 4: unlink ──
-    p_unlink.commit(&v.dev)?;
-    stop_after("unlink")?;
-    // ── phase 5: link ──
-    p_link.commit(&v.dev)?;
-    stop_after("link")?;
-    // ── phase 6: free ──
-    p_free.commit(&v.dev)?;
-    v.bitmap = bm;
-    stop_after("free")?;
+    // ── the redo journal: every metadata write from here on, with its before and after bytes ──
+    let journaled = journal::plan_writes(&v.dev, meta).and_then(|writes| {
+        j.mode = "redo".into();
+        j.writes = writes;
+        j.moves = moves_list
+            .iter()
+            .map(|(a, b, g)| {
+                let ch = &gone_files[*g].ch;
+                MoveRec {
+                    from: a.clone(),
+                    to: b.clone(),
+                    first: ch.first,
+                    len: ch.len,
+                    valid_len: ch.valid_len,
+                    no_fat_chain: ch.no_fat_chain,
+                    mtime: ch.mtime,
+                }
+            })
+            .collect();
+        journal::save(&j)
+    });
+    if let Err(e) = journaled {
+        // Only data was written, into free clusters: nothing references it.
+        write_flags(&mut v, flags, None)?;
+        journal::remove(serial)?;
+        return Err(e.context("write the sync journal (the volume is unchanged)"));
+    }
 
-    // ── phase 7: clean ──
-    let used_clusters = v.cc - v.free_clusters();
-    let pct = (used_clusters * 100 / v.cc).min(100) as u8;
-    write_flags(&mut v, clean_flags(flags), Some(pct))?;
+    // ── phases 2..8: alloc, fat, unlink, link, retire, free, clean ──
+    let mut by_phase: HashMap<String, Vec<JWrite>> = HashMap::new();
+    for w in &j.writes {
+        by_phase.entry(w.phase.clone()).or_default().push(w.clone());
+    }
+    for phase in META_PHASES {
+        journal::apply(&v.dev, by_phase.get(phase).map_or(&[][..], |w| &w[..]))?;
+        if phase == "link" && torn_test {
+            torn_write(&v, &new_sets, &pre_link)?;
+        }
+        if phase != "clean" {
+            stop_after(phase)?;
+        }
+    }
+    journal::remove(serial)?;
     tick.progress(files, bytes, true);
     if !tgt.direct {
         eprintln!("note: target does not support O_DIRECT, used buffered writes");
@@ -1010,6 +1488,27 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     tick.emit(Event::Done { files, bytes, secs: st.secs });
     drop(excl);
     Ok(st)
+}
+
+/// Test hook (FLASHCP_TEST_TORN=relocate): the first relocated set that crosses a sector
+/// boundary gets only its first sector written: the rest is put back as it was before `link`.
+fn torn_write(v: &Vol, new_sets: &[(usize, usize, usize)], pre: &HashMap<usize, Vec<u8>>) -> Result<()> {
+    let Some(&(d, off, len)) =
+        new_sets.iter().find(|&&(_, off, len)| off / SECTOR_ALIGN != (off + len - 1) / SECTOR_ALIGN)
+    else {
+        return Ok(());
+    };
+    let a = (off / SECTOR_ALIGN + 1) * SECTOR_ALIGN;
+    let b = (off + len).min(pre[&d].len());
+    if a < b {
+        let mut p = Patches::default();
+        p.object(v, &v.dirs[d].clusters, a, &pre[&d][a..b]);
+        for (at, bytes) in p.into_inner() {
+            v.dev.write_all_at(&bytes, at).context("torn write")?;
+        }
+        v.dev.sync_all().context("sync")?;
+    }
+    bail!("simulated torn write of a relocated entry set ({TORN_ENV})")
 }
 
 fn clone_node(n: &Node) -> Node {
@@ -1108,7 +1607,7 @@ mod tests {
         // The parser accepts it and sees the new name and stream.
         let mut d = set.clone();
         d.resize(4096, 0);
-        let (_, kids) = parse_dir(&d, None, "/", 4096).unwrap();
+        let (_, kids, _) = parse_dir(&d, None, "/", 4096, false).unwrap();
         assert_eq!(String::from_utf16_lossy(&kids[0].name), "hello.txt");
         assert!(!kids[0].no_fat_chain && kids[0].first == 99 && kids[0].len == 70_000);
         // Contiguous, and empty.
@@ -1117,6 +1616,77 @@ mod tests {
         patch_set(&mut set, Some(Repoint { first: 0, contiguous: true, len: 0 }), None, None);
         assert_eq!((set[33] & 0x03, le32(&set, 52)), (0x01, 0));
         assert_eq!(le16(&set, 2), checksum16(&set, true));
+    }
+
+    #[test]
+    fn in_place_only_when_every_changed_byte_is_in_one_sector() {
+        let set = file_set("Hello.TXT", 10, 5000, false);
+        let retime = Edit { len: set.len(), mtime: true, ..Default::default() };
+        let repoint = Edit { len: set.len(), repoint: true, mtime: true, ..Default::default() };
+        for off in (0..4096).step_by(32) {
+            // A retime (2..24) never crosses; a re-point (2..64) crosses only from offset 480.
+            assert!(one_sector(off, changed_end(&retime, &set, None)), "retime at {off}");
+            assert_eq!(one_sector(off, changed_end(&repoint, &set, None)), off % 512 != 480, "re-point at {off}");
+        }
+        let dirlen = Edit { len: set.len(), dirlen: Some(8192), ..Default::default() };
+        assert_eq!(changed_end(&dirlen, &set, None), 64);
+        // A case rename changes the checksum and the characters that differ: "hello.txt" vs
+        // "Hello.TXT" differ at characters 0, 6, 7, 8.
+        let name: Vec<u16> = "hello.txt".encode_utf16().collect();
+        let rename = Edit { len: set.len(), name: true, ..Default::default() };
+        assert_eq!(changed_end(&rename, &set, Some(&name)), name_at(8) + 2);
+        assert!(one_sector(0, name_at(8) + 2));
+        assert!(!one_sector(448, name_at(8) + 2), "the last changed character is in the next sector");
+        let same: Vec<u16> = "Hello.TXT".encode_utf16().collect();
+        assert_eq!(changed_end(&rename, &set, Some(&same)), 4);
+    }
+
+    #[test]
+    fn verifying_pays_unless_reads_are_slower_than_writes() {
+        assert!(verify_pays(None, None) && verify_pays(Some(1.0), None) && verify_pays(None, Some(1.0)));
+        assert!(verify_pays(Some(40e6), Some(20e6)) && verify_pays(Some(20e6), Some(20e6)));
+        assert!(!verify_pays(Some(10e6), Some(20e6)));
+    }
+
+    #[test]
+    fn the_keeper_owns_its_clusters_then_matches_the_source_then_is_newer() {
+        let ch = |name: &str, is_dir: bool, len: u64, mtime: i64, off: usize| {
+            let (t, t10) = ts(mtime, 0);
+            Child {
+                name: name.encode_utf16().collect(),
+                is_dir,
+                first: if len > 0 { 9 } else { 0 },
+                no_fat_chain: true,
+                len,
+                valid_len: len,
+                mtime: (t, t10, 0x80),
+                set_off: off,
+                set_len: 96,
+            }
+        };
+        let best = |members: &[Child], w: Option<&Want<'_>>| {
+            members.iter().max_by_key(|c| keeper_score(c, w)).unwrap().set_off
+        };
+        let name: Vec<u16> = "A.txt".encode_utf16().collect();
+        let w = Want { is_dir: false, name: &name, size: 100, mtime: Some((1_700_000_000, 0)) };
+        // The set with the source's size and time wins over the newer one with the source's name.
+        let m = [ch("a.txt", false, 100, 1_700_000_000, 0), ch("A.txt", false, 0, 1_700_000_000, 96)];
+        assert_eq!(best(&m, Some(&w)), 0);
+        // Both match: the exact name, then the newer.
+        let m = [ch("a.txt", false, 100, 1_700_000_000, 0), ch("A.txt", false, 100, 1_700_000_000, 96)];
+        assert_eq!(best(&m, Some(&w)), 96);
+        let m = [ch("A.txt", false, 100, 1_700_000_000, 0), ch("A.txt", false, 100, 1_700_000_000, 96)];
+        assert_eq!(best(&m, Some(&w)), 96);
+        // Neither matches: the newer. No source at all: the newer.
+        let m = [ch("A.txt", false, 5, 1, 0), ch("A.txt", false, 6, 2, 96)];
+        assert_eq!(best(&m, Some(&w)), 96);
+        assert_eq!(best(&m, None), 96);
+        // A directory owning clusters wins over the zero-length one fsck leaves.
+        let dname: Vec<u16> = "docs".encode_utf16().collect();
+        let wd = Want { is_dir: true, name: &dname, size: 0, mtime: None };
+        let m = [ch("Docs", true, 4096, 1, 0), ch("docs", true, 0, 1, 96)];
+        assert_eq!(best(&m, Some(&wd)), 0);
+        assert_eq!(best(&m, None), 0);
     }
 
     #[test]
