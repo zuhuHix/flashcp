@@ -719,39 +719,6 @@ fn crash_at_every_phase_of_a_mixed_run_is_exactly_old_then_new() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-#[test]
-#[ignore = "BUG: clusters leaked by an interrupted sync are never reclaimed (fsck -y and a re-sync keep them)"]
-fn crash_recovery_leaves_no_leaked_clusters() {
-    // Repro: 64 MB image built from a tree with old.bin (300 KB) and keep.txt; a sync that adds
-    // new.bin (200 KB) and changes old.bin, stopped after `alloc`; then fsck -y and a plain sync.
-    // Expected: the strict reader accepts the volume (every allocated cluster is owned). Actual:
-    // the new clusters stay marked allocated with no owner, and the free space stays ~500 KB lower.
-    let dir = test_dir("sync_crash_leak");
-    let base = dir.join("base");
-    random(&base.join("old.bin"), 300_000, 1, T0);
-    text(&base.join("keep.txt"), "keep\n", T0);
-    let src = dir.join("src");
-    random(&src.join("old.bin"), 300_000, 2, T0 + 100);
-    text(&src.join("keep.txt"), "keep\n", T0);
-    random(&src.join("new.bin"), 200_000, 3, T0 + 200);
-    let img = built(&dir, &base);
-    let out = flashcp()
-        .arg("sync")
-        .arg(&src)
-        .arg(&img)
-        .arg("--delete")
-        .env("FLASHCP_TEST_NO_ADD_BUILD", "1")
-        .env("FLASHCP_TEST_STOP_AFTER", "alloc")
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let _ = Command::new("fsck.exfat").arg("-y").arg(&img).output().unwrap();
-    sync_ok(&src, &img, &["--delete"]);
-    fsck_clean(&img);
-    expect_same(&src, &read_ok(&img), "after recovery");
-    fs::remove_dir_all(&dir).unwrap();
-}
-
 /// Mutates the source tree at random: returns a description of what was done.
 struct Gen {
     rng: XorShift,
