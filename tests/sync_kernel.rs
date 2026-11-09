@@ -169,3 +169,43 @@ fn mount_sync_reverts_a_kernel_edit_on_a_flashcp_built_image() {
     fsck_strict(&img);
     fs::remove_dir_all(&dir).expect("remove scratch dir");
 }
+
+// ───────────────────────── 3. the journal's leftovers are plain deleted entries ─────────────────────────
+
+#[test]
+fn mount_after_a_sync_whose_journal_needed_padding_shows_only_the_source() {
+    if !kernel::gated() {
+        return;
+    }
+    let dir = test_dir("mount_sync_journal_padding");
+    let img = dir.join("vol.img");
+    make_image(&img, 64 * MB);
+    // Nine 3-character names after the three system entries: the root ends at 960, so the
+    // journal's 128-byte entry set would cross the sector boundary at 1024; deleted entries pad
+    // up to it, and after the run its own set is deleted too.
+    let base = dir.join("base");
+    for i in 0..9u64 {
+        write_pattern(&base.join(format!("e{i:02}")), i + 1, 5000);
+    }
+    assert_success(&run_build(&base, &img, &["--cluster", "4096"]), "flashcp build");
+    let src = dir.join("src");
+    copy_tree(&base, &src);
+    write_pattern(&src.join("e03"), 99, 7000);
+    write_pattern(&src.join("new/n.bin"), 98, 3000);
+    sync_ok(&src, &img, &["--delete", "--yes"]);
+    fsck_strict(&img);
+    let problems = compare_trees(&read_source_tree(&src), &read_back(&img));
+    assert!(problems.is_empty(), "after the sync:\n{}", problems.join("\n"));
+    let m = Mounted::new(&img);
+    assert!(!m.at.join(".flashcp-sync-journal").exists(), "the kernel sees the journal");
+    diff_r(&src, &m.at, &[]);
+    // The kernel writes into the directory after the padding and the deleted sets.
+    write_file(&m.at.join("kernel.txt"), b"kernel\n");
+    m.unmount();
+    fsck_strict(&img);
+    sync_ok(&src, &img, &["--delete", "--yes"]);
+    fsck_strict(&img);
+    let problems = compare_trees(&read_source_tree(&src), &read_back(&img));
+    assert!(problems.is_empty(), "after the second sync:\n{}", problems.join("\n"));
+    fs::remove_dir_all(&dir).expect("remove scratch dir");
+}
