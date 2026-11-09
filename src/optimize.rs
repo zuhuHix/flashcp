@@ -1,2 +1,1053 @@
 //! `flashcp optimize`: rewrite an existing exFAT volume into the flashcp layout without losing
 //! data (pull to a local temp copy, verify, build, verify, delete the copy).
+//!
+//! The result is what `flashcp build` would have made from the same files: every file one
+//! contiguous extent, all directories together right after the system structures, files
+//! packed in directory order, and the cluster size the optimizer picks for this data (the
+//! "reformat for small files" path that keeps the data). Kept: every file's contents and path,
+//! empty directories, modification times (10 ms, as exFAT stores them) and the volume label.
+//! Not kept (`build` cannot write them): file attributes (read-only, hidden, system, archive),
+//! creation and access times, the volume serial number and GUID.
+//!
+//! Safety argument, phase by phase. The target is opened ONCE, exclusively (O_EXCL on a block
+//! device, flock on an image), and a dup of that fd is held until the end, so nothing can mount
+//! or write it between phases. At every instant a complete copy of the data exists, and every
+//! error says which one:
+//!
+//! 1. **pull** into `<tmp>/tree` (synced), then `state=pulled`. The device is only read.
+//! 2. **verify**: a manifest (path, size, order-independent block hash, mtime) of the device,
+//!    read in physical order, must equal one of `<tmp>/tree`; saved to `<tmp>/manifest`,
+//!    `state=verified`, all fsynced. Until here an error or crash leaves the device untouched,
+//!    and the temp dir is deleted (on a crash: by the next run).
+//! 3. **build**: re-scan the tree and run the cluster optimizer (fails before any write if
+//!    build would refuse), fsync `state=building`, then `build` onto the held target. `build`
+//!    marks the volume dirty until its very last write. From here until the check passes, the
+//!    verified temp copy is the copy; it is never deleted on error.
+//! 4. **check**: the device, re-parsed, must be a clean volume with the same label whose
+//!    manifest equals `<tmp>/manifest`.
+//! 5. **cleanup**: `state=done`, then the tree, the manifest, the state file, the dir.
+//!
+//! A later run finds the temp dir by the drive's identity (USB serial / WWID; for an image its
+//! inode) and resumes: no state, `pulled` or `verified` (device never written) or `done`
+//! (checked) → the dir is discarded and a fresh run starts. `building` → if the device holds a
+//! clean volume whose manifest equals the saved one and whose boot sector is not the original
+//! one, the build had finished: clean up. If it holds the original volume with the original
+//! content, or a dirty / unparsable / half-written one: re-verify the temp tree against the
+//! manifest and rebuild from it. Anything else (a clean volume with other content: someone
+//! reformatted or wrote to it) is refused, naming the temp dir; user data is never erased
+//! automatically.
+
+use crate::events::{Event, Op, Sink, Ticker};
+use crate::exfat::{
+    BuildOpts, FatMode, FlagGuard, Node, SECTOR, SYS_BLOCK, Target, TargetSpec, build_target, choose_cluster,
+    related_devs, scan_tree, set_direct, upcase_map, usable_bytes, validate_name,
+};
+use crate::pull::{PullOpts, pull_file};
+use crate::util::human_bytes;
+use crate::verify::{Manifest, Progress, VolTree, hash_tree, hash_volume, walk};
+use crate::volume::Vol;
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use std::collections::HashSet;
+use std::ffi::CString;
+use std::fs::{self, File};
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+/// Test hook: stop at a point (pull | verify | building | build | cleanup), with an error, or
+/// with abort() (as if killed) when FLASHCP_TEST_OPTIMIZE_ABORT=1.
+const STOP_ENV: &str = "FLASHCP_TEST_OPTIMIZE_STOP";
+const ABORT_ENV: &str = "FLASHCP_TEST_OPTIMIZE_ABORT";
+/// Test hook: flip the first byte of this file (path relative to the tree) right after pull.
+const CORRUPT_ENV: &str = "FLASHCP_TEST_OPTIMIZE_CORRUPT";
+/// Test hook: pretend every temp candidate has this many bytes free.
+const FAKE_FREE_ENV: &str = "FLASHCP_TEST_FAKE_FREE";
+/// Free space kept in reserve on the temp filesystem beyond the copy itself.
+const MARGIN: u64 = 64 << 20;
+/// Metadata slack per file and directory of the copy.
+const PER_ENTRY: u64 = 4096;
+const TMPFS_MAGIC: i64 = 0x0102_1994;
+const RAMFS_MAGIC: i64 = 0x8584_58f6;
+const STATE_MAGIC: &str = "flashcp-optimize-state 1";
+
+#[derive(Clone, Debug, Default)]
+pub struct OptimizeOpts {
+    /// Directory to hold the temporary copy (default: picked automatically, see [`optimize`]).
+    pub temp: Option<PathBuf>,
+    /// Only print the plan.
+    pub dry_run: bool,
+    /// Rebuild even if the volume is already in the flashcp layout.
+    pub force: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct OptimizeStats {
+    pub files: u64,
+    pub dirs: u64,
+    pub data_bytes: u64,
+    /// Bytes `build` wrote (0 when nothing was rebuilt).
+    pub written: u64,
+    pub old_cluster: u64,
+    pub cluster: u64,
+    /// The volume already had the flashcp layout; nothing was done.
+    pub already: bool,
+    /// This run finished an interrupted one.
+    pub resumed: bool,
+    /// The temp dir used (deleted on success).
+    pub temp: Option<PathBuf>,
+    /// Seconds per phase, in order.
+    pub phases: Vec<(&'static str, f64)>,
+    pub secs: f64,
+}
+
+fn hook(point: &str) -> Result<()> {
+    if std::env::var(STOP_ENV).as_deref() == Ok(point) {
+        if std::env::var(ABORT_ENV).as_deref() == Ok("1") {
+            std::process::abort();
+        }
+        bail!("stopped at {point} ({STOP_ENV})");
+    }
+    Ok(())
+}
+
+// ───────────────────────── state file ─────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Phase {
+    /// No state file: the pull never finished.
+    None,
+    Pulled,
+    Verified,
+    Building,
+    Done,
+}
+
+#[derive(Clone, Debug)]
+struct State {
+    phase: Phase,
+    label: String,
+    /// Fingerprint of the original volume's boot sector (see [`fingerprint`]).
+    orig: u64,
+}
+
+fn hex(s: &str) -> String {
+    s.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Option<String> {
+    let b: Option<Vec<u8>> =
+        (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok())).collect();
+    String::from_utf8(b?).ok()
+}
+
+impl State {
+    fn encode(&self) -> String {
+        let p = match self.phase {
+            Phase::None => "none",
+            Phase::Pulled => "pulled",
+            Phase::Verified => "verified",
+            Phase::Building => "building",
+            Phase::Done => "done",
+        };
+        format!("{STATE_MAGIC}\nstate={p}\nlabel={}\noriginal={:016x}\n", hex(&self.label), self.orig)
+    }
+
+    /// The state in `dir`; Ok(None) when there is no state file, Err when it is unreadable.
+    fn load(dir: &Path) -> Result<Option<State>> {
+        let s = match fs::read_to_string(dir.join("state")) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).context("read the state file"),
+        };
+        let mut lines = s.lines();
+        ensure!(lines.next() == Some(STATE_MAGIC), "the state file is not a flashcp optimize state");
+        let (mut phase, mut label, mut orig) = (None, None, None);
+        for l in lines {
+            match l.split_once('=') {
+                Some(("state", v)) => {
+                    phase = Some(match v {
+                        "none" => Phase::None,
+                        "pulled" => Phase::Pulled,
+                        "verified" => Phase::Verified,
+                        "building" => Phase::Building,
+                        "done" => Phase::Done,
+                        _ => bail!("unknown state {v:?}"),
+                    })
+                }
+                Some(("label", v)) => label = unhex(v),
+                Some(("original", v)) => orig = u64::from_str_radix(v, 16).ok(),
+                _ => {}
+            }
+        }
+        match (phase, label, orig) {
+            (Some(phase), Some(label), Some(orig)) => Ok(Some(State { phase, label, orig })),
+            _ => bail!("the state file is incomplete"),
+        }
+    }
+}
+
+/// Writes `name` in `dir` atomically and durably: temp file, fsync, rename, fsync the dir.
+fn write_durable(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
+    let tmp = dir.join(format!("{name}.tmp"));
+    let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+    f.write_all(data).and_then(|_| f.sync_all()).with_context(|| format!("write {}", tmp.display()))?;
+    drop(f);
+    fs::rename(&tmp, dir.join(name)).with_context(|| format!("rename {} into place", tmp.display()))?;
+    File::open(dir).and_then(|d| d.sync_all()).with_context(|| format!("fsync {}", dir.display()))
+}
+
+fn save_state(dir: &Path, st: &State) -> Result<()> {
+    write_durable(dir, "state", st.encode().as_bytes())
+}
+
+/// The original volume's identity: its boot sector without VolumeFlags and PercentInUse (which
+/// a mount changes). The serial number is in it, so a reformat changes it, and so does build.
+fn fingerprint(sector0: &[u8]) -> u64 {
+    let mut s = sector0.to_vec();
+    for i in [106, 107, 112] {
+        s[i] = 0;
+    }
+    xxhash_rust::xxh3::xxh3_64(&s)
+}
+
+// ───────────────────────── where the copy goes ─────────────────────────
+
+/// The drive's stable identity (names the temp dir) and the "maj:min" of every block device
+/// the copy must not live on (the whole disk, its partitions and holders; empty for an image).
+fn identity(md: &fs::Metadata) -> Result<(String, Vec<String>)> {
+    if !md.file_type().is_block_device() {
+        return Ok((format!("img-{}-{}", md.dev(), md.ino()), Vec::new()));
+    }
+    let rdev = md.rdev();
+    let (maj, min) = (libc::major(rdev), libc::minor(rdev));
+    let key = crate::devprofile::device_key(rdev).unwrap_or_else(|| format!("dev-{maj}-{min}"));
+    // A partition's siblings are on the same stick: avoid the whole disk.
+    let node = Path::new(SYS_BLOCK).join(format!("{maj}:{min}"));
+    let disk = if node.join("partition").exists() {
+        fs::read_to_string(node.join("../dev")).map(|s| s.trim().to_string()).unwrap_or(format!("{maj}:{min}"))
+    } else {
+        format!("{maj}:{min}")
+    };
+    let devs = related_devs(Path::new(SYS_BLOCK), &disk).context("list the drive's partitions and holders")?;
+    Ok((key, devs))
+}
+
+/// Candidate base directories, in order: --temp alone if given; else $FLASHCP_TMPDIR,
+/// /var/tmp (disk-backed and kept across reboots on most systems), $TMPDIR or /tmp, and
+/// $XDG_CACHE_HOME or ~/.cache. (path, may be created)
+fn candidates(explicit: Option<&Path>) -> Vec<(PathBuf, bool)> {
+    if let Some(p) = explicit {
+        return vec![(p.to_path_buf(), true)];
+    }
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let mut v = Vec::new();
+    if let Some(p) = env("FLASHCP_TMPDIR") {
+        v.push((p, false));
+    }
+    v.push((PathBuf::from("/var/tmp"), false));
+    v.push((env("TMPDIR").unwrap_or_else(|| PathBuf::from("/tmp")), false));
+    if let Some(p) = env("XDG_CACHE_HOME").or_else(|| env("HOME").map(|h| h.join(".cache"))) {
+        v.push((p, true));
+    }
+    let mut seen = HashSet::new();
+    v.retain(|(p, _)| p.is_absolute() && seen.insert(fs::canonicalize(p).unwrap_or_else(|_| p.clone())));
+    v
+}
+
+/// The nearest existing ancestor of `p` (what a not-yet-created directory would live on).
+fn existing_ancestor(p: &Path) -> Option<&Path> {
+    p.ancestors().find(|a| a.exists())
+}
+
+fn fs_type(p: &Path) -> Result<i64> {
+    let c = CString::new(p.as_os_str().as_bytes())?;
+    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    ensure!(unsafe { libc::statfs(c.as_ptr(), &mut s) } == 0, "statfs: {}", std::io::Error::last_os_error());
+    Ok(s.f_type as i64)
+}
+
+fn free_bytes(p: &Path) -> Result<u64> {
+    if let Some(v) = std::env::var(FAKE_FREE_ENV).ok().and_then(|v| v.parse().ok()) {
+        return Ok(v);
+    }
+    crate::util::statfs_free(p)
+}
+
+/// Picks the first candidate that is disk-backed (not tmpfs / ramfs: RAM is gone after a power
+/// loss while the drive is erased; allowed only when given explicitly), not on the drive
+/// being optimized, writable, and has `need` bytes free. Lists every rejection otherwise.
+fn pick_base(cands: &[(PathBuf, bool)], need: u64, avoid: &[String], what: &str) -> Result<PathBuf> {
+    let explicit = cands.len() == 1 && cands[0].1;
+    let mut why = Vec::new();
+    for (p, create) in cands {
+        let r = (|| -> Result<std::result::Result<(), String>> {
+            let at = match existing_ancestor(p) {
+                Some(a) if a == p.as_path() || *create => a,
+                _ => return Ok(Err("does not exist".into())),
+            };
+            let md = fs::metadata(at).with_context(|| format!("stat {}", at.display()))?;
+            if !md.is_dir() {
+                return Ok(Err("is not a directory".into()));
+            }
+            if avoid.contains(&format!("{}:{}", libc::major(md.dev()), libc::minor(md.dev()))) {
+                return Ok(Err(format!("is on {what} itself")));
+            }
+            let t = fs_type(at)?;
+            if (t == TMPFS_MAGIC || t == RAMFS_MAGIC) && !explicit {
+                return Ok(Err("is in RAM (tmpfs), lost on a power loss; pass it with --temp to use it anyway".into()));
+            }
+            let c = CString::new(at.as_os_str().as_bytes())?;
+            if unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
+                return Ok(Err("is not writable".into()));
+            }
+            let free = free_bytes(at)?;
+            if free < need {
+                return Ok(Err(format!("has only {} free", human_bytes(free as f64))));
+            }
+            if t == TMPFS_MAGIC || t == RAMFS_MAGIC {
+                eprintln!(
+                    "warning: {} is in RAM (tmpfs): if the power fails while the drive is rebuilt, the copy is lost",
+                    p.display()
+                );
+            }
+            Ok(Ok(()))
+        })();
+        match r {
+            Ok(Ok(())) => return Ok(p.clone()),
+            Ok(Err(reason)) => why.push(format!("  {} {reason}", p.display())),
+            Err(e) => why.push(format!("  {}: {e:#}", p.display())),
+        }
+    }
+    bail!(
+        "no place for the temporary copy: optimize needs {} free (outside {what}, not in RAM) to hold a verified \
+         copy of your files while the drive is rebuilt. Checked:\n{}\nFree some space or pass --temp DIR on \
+         another disk",
+        human_bytes(need as f64),
+        why.join("\n")
+    )
+}
+
+fn temp_name(key: &str) -> String {
+    format!("flashcp-optimize-{key}")
+}
+
+/// Fails unless `p` is a real directory (not a symlink) owned by us: in a shared /tmp another
+/// user could have planted it.
+fn check_ours(p: &Path) -> Result<()> {
+    let md = fs::symlink_metadata(p).with_context(|| format!("stat {}", p.display()))?;
+    ensure!(
+        md.is_dir() && md.uid() == unsafe { libc::geteuid() },
+        "{} exists but is not a directory owned by you; remove it (or pass --temp elsewhere) and run again",
+        p.display()
+    );
+    Ok(())
+}
+
+// ───────────────────────── planning ─────────────────────────
+
+/// What a node of the build plan is on the old volume.
+#[derive(Clone, Copy)]
+enum Ref {
+    Dir(u32),
+    File(u32),
+}
+
+/// The tree as `scan_tree` would see it after the pull (breadth-first, children sorted by
+/// name bytes), so the planned layout is exactly what the rebuild will write. Refuses names
+/// `build` cannot write (forbidden characters, names equal under flashcp's up-case table).
+fn nodes_of(t: &VolTree) -> Result<(Vec<Node>, Vec<Ref>)> {
+    let upc = upcase_map();
+    let node = |name: Vec<u16>, src: PathBuf, is_dir: bool, size: u64| Node {
+        name,
+        src,
+        is_dir,
+        size,
+        mtime: (0, 0),
+        children: vec![],
+        first_cluster: 0,
+        clusters: 0,
+    };
+    let mut nodes = vec![node(vec![], PathBuf::new(), true, 0)];
+    let mut refs = vec![Ref::Dir(0)];
+    let mut queue = std::collections::VecDeque::from([(0usize, 0u32)]);
+    while let Some((ni, di)) = queue.pop_front() {
+        let d = &t.dirs[di as usize];
+        let mut kids: Vec<(String, Ref)> =
+            d.dirs.iter().map(|&i| (t.dirs[i as usize].path.clone(), Ref::Dir(i))).collect();
+        kids.extend(d.files.iter().map(|&i| (t.files[i as usize].path.clone(), Ref::File(i))));
+        let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+        kids.sort_by_key(|(p, _)| base(p));
+        let mut seen = HashSet::new();
+        for (path, r) in kids {
+            let (name, is_dir, size) = match r {
+                Ref::Dir(i) => (&t.dirs[i as usize].name, true, 0),
+                Ref::File(i) => (&t.files[i as usize].name, false, t.files[i as usize].len),
+            };
+            validate_name(name, &upc, &mut seen, Path::new(&path))
+                .context("flashcp build cannot write this name, so this volume cannot be optimized")?;
+            // exFAT allows 255 UTF-16 units; the local copy needs ≤ 255 bytes of UTF-8 per name
+            // and ≤ 4096 per path. Refused now rather than after copying gigabytes.
+            ensure!(
+                base(&path).len() <= 255 && path.len() < crate::pull::MAX_PATH,
+                "{path}: the name is too long for a local copy (more than 255 bytes of UTF-8, or a path over \
+                 {} bytes), so this volume cannot be optimized",
+                crate::pull::MAX_PATH
+            );
+            let idx = nodes.len();
+            nodes.push(node(name.clone(), PathBuf::from(&path), is_dir, size));
+            refs.push(r);
+            nodes[ni].children.push(idx);
+            if let Ref::Dir(i) = r {
+                queue.push_back((idx, i));
+            }
+        }
+    }
+    Ok((nodes, refs))
+}
+
+/// Whether the volume already is exactly what a rebuild would write: same cluster size and
+/// geometry, system structures and directories where the plan puts them, every file one
+/// contiguous NoFatChain extent at its planned cluster.
+fn in_layout(v: &Vol, t: &VolTree, nodes: &[Node], refs: &[Ref], p: &crate::exfat::Plan, tgt: &Target) -> bool {
+    let g = &p.g;
+    let contiguous = |c: &[u32], first: u64| c.iter().enumerate().all(|(i, &x)| x as u64 == first + i as u64);
+    let geometry = v.bps == SECTOR
+        && v.cs == g.cluster
+        && v.fat_off == g.fat_off * SECTOR
+        && v.heap_off == g.heap_off * SECTOR
+        && v.cc == g.cluster_count
+        && v.vol_bytes == usable_bytes(tgt.bytes);
+    let system = v.bitmap_clusters.len() as u64 == p.bitmap_clusters
+        && contiguous(&v.bitmap_clusters, 2)
+        && v.upcase_clusters.len() as u64 == p.upcase_clusters
+        && contiguous(&v.upcase_clusters, 2 + p.bitmap_clusters)
+        && t.root_clusters.len() as u64 == nodes[0].clusters
+        && contiguous(&t.root_clusters, nodes[0].first_cluster as u64);
+    geometry
+        && system
+        && nodes.iter().zip(refs).skip(1).all(|(n, r)| match *r {
+            Ref::Dir(i) => {
+                let d = &t.dirs[i as usize];
+                d.no_fat_chain && d.first == n.first_cluster && d.len == n.clusters * g.cluster
+            }
+            Ref::File(i) => {
+                let f = &t.files[i as usize];
+                f.len == 0 || (f.no_fat_chain && f.first == n.first_cluster && f.valid == f.len)
+            }
+        })
+}
+
+fn build_opts(label: &str) -> BuildOpts {
+    BuildOpts { cluster: None, label: label.to_string(), fat: FatMode::Prefix, readers: 12, dry_run: false }
+}
+
+// ───────────────────────── running phases ─────────────────────────
+
+struct Run<'s> {
+    tick: Ticker<'s>,
+    steps: u32,
+    step: u32,
+    phases: Vec<(&'static str, f64)>,
+    started: Option<(&'static str, Instant)>,
+}
+
+impl<'s> Run<'s> {
+    fn phase(&mut self, name: &'static str) {
+        self.end_phase();
+        self.step += 1;
+        self.tick.emit(Event::Phase { op: Op::Optimize, phase: name, step: self.step, steps: self.steps });
+        self.started = Some((name, Instant::now()));
+    }
+
+    fn end_phase(&mut self) {
+        if let Some((n, t)) = self.started.take() {
+            self.phases.push((n, t.elapsed().as_secs_f64()));
+        }
+    }
+
+    /// Runs `f` on a worker thread while this thread reports `progress()` about 10× a second.
+    fn with_progress<T: Send>(&mut self, progress: impl Fn() -> (u64, u64), f: impl FnOnce() -> T + Send) -> T {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let _ = tx.send(f());
+            });
+            loop {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(v) => {
+                        let (f, b) = progress();
+                        self.tick.progress(f, b, true);
+                        return v;
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        let (f, b) = progress();
+                        self.tick.progress(f, b, false);
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => panic!("hash worker died"),
+                }
+            }
+        })
+    }
+}
+
+/// Inner `pull` / `build` events: progress is forwarded, their own plan and done are not.
+fn forward<'a>(tick: &'a mut Ticker<'_>) -> impl FnMut(&Event) + 'a {
+    move |e: &Event| {
+        if let Event::Progress { .. } = e {
+            tick.emit(e.clone());
+        }
+    }
+}
+
+fn hash_device(run: &mut Run<'_>, dev: &File, t: &VolTree) -> Result<Manifest> {
+    let p = Progress::default();
+    run.with_progress(|| (p.files.load(Ordering::Relaxed), p.bytes.load(Ordering::Relaxed)), || hash_volume(dev, t, &p))
+}
+
+fn hash_local(run: &mut Run<'_>, tree: &Path) -> Result<Manifest> {
+    let p = Progress::default();
+    run.with_progress(|| (p.files.load(Ordering::Relaxed), p.bytes.load(Ordering::Relaxed)), || hash_tree(tree, &p))
+}
+
+fn first_diffs(d: &[String]) -> String {
+    let mut s = d.iter().take(10).cloned().collect::<Vec<_>>().join("; ");
+    if d.len() > 10 {
+        s += &format!("; … ({} differences in all)", d.len());
+    }
+    s
+}
+
+/// Parses the device (clean volumes only) and walks it.
+fn open_walk(held: &File, dev_len: u64) -> Result<(Vol, VolTree)> {
+    set_direct(held, false); // the parser reads unaligned
+    // Drop cached pages of the device, so the parser reads what is on the medium now (after a
+    // build, not metadata cached while reading the old volume).
+    unsafe { libc::posix_fadvise(std::os::fd::AsRawFd::as_raw_fd(held), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    let mut v = Vol::open(held.try_clone().context("dup target fd")?, dev_len, false, false)?;
+    let t = walk(&mut v)?;
+    Ok((v, t))
+}
+
+/// What to tell the user once the device may be half-written: the copy is safe, here is how
+/// to finish.
+fn recovery(what: &str, tmp: &Path, base: &Path, label: &str, fd: bool) -> String {
+    let again = if fd {
+        format!("run the same `flashcp optimize` again on this drive with --temp {}", base.display())
+    } else {
+        format!("run `flashcp optimize {what} --yes --temp {}` again", base.display())
+    };
+    format!(
+        "{what} may be incomplete, but all your files are safe in {} (verified against {}). To finish, {again}: \
+         it picks up where this run stopped. Or rebuild the drive yourself with `flashcp build {} {} --label {:?} \
+         --yes-erase`",
+        tmp.join("tree").display(),
+        tmp.join("manifest").display(),
+        tmp.join("tree").display(),
+        if fd { "<device>" } else { what },
+        label
+    )
+}
+
+/// Everything about the target the phases share.
+struct Ctx {
+    what: String,
+    fd: bool,
+    held: File,
+    dev_len: u64,
+    _flags: FlagGuard,
+}
+
+/// `optimize` of `target`: see the module docs. Temp location: `o.temp` if given, else the
+/// first suitable of $FLASHCP_TMPDIR, /var/tmp, $TMPDIR or /tmp, $XDG_CACHE_HOME or ~/.cache.
+pub fn optimize(target: &TargetSpec, o: &OptimizeOpts, sink: Sink<'_>) -> Result<OptimizeStats> {
+    let what = target.describe();
+    let untouched = |e: anyhow::Error| e.context(format!("nothing was changed on {what}"));
+    let tgt = target.open_rw().map_err(untouched)?;
+    // A dup of the exclusive fd (same open file description, so the same O_EXCL claim / flock)
+    // is held to the very end: build_target consumes the Target, and between the phases nobody
+    // may mount or write the drive.
+    let held = tgt.file.try_clone().context("dup target fd").map_err(untouched)?;
+    set_direct(&held, false);
+    // Restores the description's flags (shared with a --target-fd helper) on every exit; the
+    // Target's own guard only covers the build.
+    let flags = FlagGuard::new(&held).map_err(untouched)?;
+    let md = held.metadata().context("fstat target").map_err(untouched)?;
+    let (key, avoid) = identity(&md).map_err(untouched)?;
+    let ctx =
+        Ctx { what: what.clone(), fd: matches!(target, TargetSpec::Fd(_)), held, dev_len: tgt.bytes, _flags: flags };
+    let mut run = Run { tick: Ticker::new(sink), steps: 0, step: 0, phases: Vec::new(), started: None };
+    let t0 = Instant::now();
+    let cands = candidates(o.temp.as_deref());
+
+    // ── an earlier, interrupted run? ──
+    let mut building = Vec::new();
+    for (base, _) in &cands {
+        let dir = base.join(temp_name(&key));
+        match fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            _ => {}
+        }
+        check_ours(&dir).map_err(untouched)?;
+        let st = State::load(&dir).with_context(|| {
+            format!(
+                "{} holds a copy from an earlier optimize of this drive, but its state file is unreadable, so \
+                 flashcp cannot tell whether the drive was already being rebuilt. Check the files in {} and \
+                 remove the directory when you no longer need them",
+                dir.display(),
+                dir.join("tree").display()
+            )
+        })?;
+        match st.as_ref().map(|s| &s.phase) {
+            Some(Phase::Building) => building.push((base.clone(), dir, st.unwrap())),
+            _ if o.dry_run => {
+                eprintln!(
+                    "note: {} holds an unfinished copy from an earlier run (the drive was not changed)",
+                    dir.display()
+                )
+            }
+            _ => {
+                // The device was never written by that run (or the run finished and checked).
+                eprintln!("note: discarding {} from an earlier run (the drive was not changed by it)", dir.display());
+                fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display())).map_err(untouched)?;
+            }
+        }
+    }
+    ensure!(
+        building.len() <= 1,
+        "more than one interrupted optimize of this drive exists ({}); keep the one you trust and remove the other",
+        building.iter().map(|(_, d, _)| d.display().to_string()).collect::<Vec<_>>().join(", ")
+    );
+    if let Some((base, dir, st)) = building.pop() {
+        return resume(&mut run, ctx, tgt, &base, &dir, st, o, t0);
+    }
+
+    // ── read and plan ──
+    let (v, t) = open_walk(&ctx.held, ctx.dev_len)
+        .context(
+            "if an earlier `flashcp optimize` of this drive was interrupted and used --temp DIR, run it again with the \
+             same --temp",
+        )
+        .map_err(untouched)?;
+    let orig = fingerprint(&v.sector0);
+    let label = v.label.clone();
+    let old_cs = v.cs;
+    let (mut nodes, refs) = nodes_of(&t).map_err(untouched)?;
+    let p = choose_cluster(&mut nodes, &tgt, &build_opts(&label))
+        .context("flashcp build cannot lay out this data on the drive")
+        .map_err(untouched)?;
+    let already = in_layout(&v, &t, &nodes, &refs, &p, &tgt);
+    drop(v);
+    let (files, dirs, data) = (t.files.len() as u64, t.dirs.len() as u64 - 1, t.data_bytes());
+    let mut stats = OptimizeStats {
+        files,
+        dirs,
+        data_bytes: data,
+        written: 0,
+        old_cluster: old_cs,
+        cluster: p.g.cluster,
+        already,
+        resumed: false,
+        temp: None,
+        phases: Vec::new(),
+        secs: 0.0,
+    };
+    let info = |temp: Option<&Path>, already: bool| {
+        format!(
+            r#"{{"temp":{},"cluster":{old_cs},"new_cluster":{},"label":{},"already_optimized":{already},"resume":false}}"#,
+            temp.map_or("null".into(), |p| crate::events::json_str(&p.display().to_string())),
+            p.g.cluster,
+            crate::events::json_str(&label)
+        )
+    };
+    if already && !o.force {
+        let detail = format!(
+            "optimize: {what} is already optimized ({files} files, {dirs} dirs, {} of data, cluster {}): every file \
+             is contiguous and in place, and the cluster size is the optimizer's choice; nothing to do (--force \
+             rebuilds anyway)",
+            human_bytes(data as f64),
+            human_bytes(old_cs as f64)
+        );
+        run.tick.emit(Event::Plan {
+            op: Op::Optimize,
+            files,
+            dirs,
+            bytes: data,
+            write_bytes: 0,
+            detail,
+            strategy: Some(info(None, true)),
+        });
+        stats.secs = t0.elapsed().as_secs_f64();
+        run.tick.emit(Event::Done { files, bytes: data, secs: stats.secs });
+        return Ok(stats);
+    }
+    let need = data + (files + dirs) * PER_ENTRY + MARGIN;
+    let base = pick_base(&cands, need, &avoid, &what).map_err(untouched)?;
+    let tmp = base.join(temp_name(&key));
+    let detail = format!(
+        "optimize: {files} files, {dirs} dirs, {} of data on {what} (label {label:?}, cluster {}) → rebuilt as one \
+         contiguous flashcp layout with cluster {}, writing {} │ temporary copy in {} ({} needed) │ kept: contents, \
+         names, empty dirs, modification times, label; lost: file attributes, creation and access times",
+        human_bytes(data as f64),
+        human_bytes(old_cs as f64),
+        human_bytes(p.g.cluster as f64),
+        human_bytes(p.write_bytes as f64),
+        tmp.display(),
+        human_bytes(need as f64)
+    );
+    run.tick.emit(Event::Plan {
+        op: Op::Optimize,
+        files,
+        dirs,
+        bytes: data,
+        write_bytes: p.write_bytes,
+        detail,
+        strategy: Some(info(Some(&tmp), already)),
+    });
+    stats.temp = Some(tmp.clone());
+    if o.dry_run {
+        stats.secs = t0.elapsed().as_secs_f64();
+        run.tick.emit(Event::Done { files, bytes: data, secs: stats.secs });
+        return Ok(stats);
+    }
+    drop(nodes);
+
+    // ── pull + verify: the device is only read; on any error the copy is deleted ──
+    run.steps = 5;
+    let st = State { phase: Phase::None, label: label.clone(), orig };
+    // Created here, exclusively (EEXIST if anything appeared since the lookup above): only a
+    // directory this run created is ever deleted on error.
+    fs::DirBuilder::new()
+        .recursive(true)
+        .create(&base)
+        .and_then(|_| fs::DirBuilder::new().mode(0o700).create(&tmp))
+        .with_context(|| format!("create {}", tmp.display()))
+        .and_then(|_| check_ours(&tmp))
+        .map_err(untouched)?;
+    let copied = (|| -> Result<Manifest> {
+        run.phase("pull");
+        let tree = tmp.join("tree");
+        let dup = ctx.held.try_clone().context("dup target fd")?;
+        pull_file(dup, ctx.dev_len, None, &what, &tree, &PullOpts::default(), &mut forward(&mut run.tick))?;
+        if let Ok(rel) = std::env::var(CORRUPT_ENV) {
+            let f = fs::OpenOptions::new().read(true).write(true).open(tree.join(rel))?;
+            let mut b = [0u8];
+            std::os::unix::fs::FileExt::read_exact_at(&f, &mut b, 0)?;
+            std::os::unix::fs::FileExt::write_all_at(&f, &[b[0] ^ 0xFF], 0)?;
+        }
+        save_state(&tmp, &State { phase: Phase::Pulled, ..st.clone() })?;
+        hook("pull")?;
+
+        run.phase("verify");
+        let (dev, local) = {
+            let (pd, pl) = (Progress::default(), Progress::default());
+            let held = &ctx.held;
+            let tr = &t;
+            let tree = &tree;
+            // The device and the local disk are read at the same time; progress is the slower.
+            run.with_progress(
+                || {
+                    let f = pd.files.load(Ordering::Relaxed).min(pl.files.load(Ordering::Relaxed));
+                    (f, pd.bytes.load(Ordering::Relaxed).min(pl.bytes.load(Ordering::Relaxed)))
+                },
+                || {
+                    std::thread::scope(|s| {
+                        let d = s.spawn(|| hash_volume(held, tr, &pd));
+                        let l = hash_tree(tree, &pl);
+                        (d.join().expect("device hash thread panicked"), l)
+                    })
+                },
+            )
+        };
+        let (dev, local) = (dev.context("hash the drive")?, local.context("hash the temporary copy")?);
+        let d = dev.diff(&local, "the drive", "the temporary copy");
+        ensure!(
+            d.is_empty(),
+            "the temporary copy does not match the drive ({} differences): {}",
+            d.len(),
+            first_diffs(&d)
+        );
+        write_durable(&tmp, "manifest", dev.encode().as_bytes())?;
+        save_state(&tmp, &State { phase: Phase::Verified, ..st.clone() })?;
+        hook("verify")?;
+        Ok(dev)
+    })();
+    let manifest = match copied {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(e.context(format!(
+                "optimize stopped before writing anything: your data on {what} is untouched (the temporary copy \
+                 in {} was deleted)",
+                tmp.display()
+            )));
+        }
+    };
+    drop(t);
+    stats.phases = rebuild(&mut run, &ctx, tgt, &base, &tmp, &st, &manifest, true)?;
+    stats.written = p.write_bytes;
+    stats.secs = t0.elapsed().as_secs_f64();
+    run.tick.emit(Event::Done { files, bytes: data, secs: stats.secs });
+    Ok(stats)
+}
+
+/// Build from `<tmp>/tree` onto the held target, check the result against `manifest`, clean
+/// up. `fresh`: this run just verified the copy (state is `verified`; a failure before
+/// `building` is saved still leaves the device untouched).
+#[allow(clippy::too_many_arguments)]
+fn rebuild(
+    run: &mut Run<'_>,
+    ctx: &Ctx,
+    tgt: Target,
+    base: &Path,
+    tmp: &Path,
+    st: &State,
+    manifest: &Manifest,
+    fresh: bool,
+) -> Result<Vec<(&'static str, f64)>> {
+    let what = &ctx.what;
+    let hint = || recovery(what, tmp, base, &st.label, ctx.fd);
+    let tree = tmp.join("tree");
+    run.phase("build");
+    // Re-scan the copy exactly as build will, and plan it, before the device is touched.
+    let prepared = (|| -> Result<Vec<Node>> {
+        let mut nodes = scan_tree(&tree, &upcase_map()).context("scan the temporary copy")?;
+        choose_cluster(&mut nodes, &tgt, &build_opts(&st.label)).context("plan the rebuild")?;
+        Ok(nodes)
+    })();
+    let nodes = match prepared {
+        Ok(n) => n,
+        Err(e) if fresh => {
+            let _ = fs::remove_dir_all(tmp);
+            return Err(e.context(format!(
+                "optimize stopped before writing anything: your data on {what} is untouched (the temporary copy \
+                 was deleted)"
+            )));
+        }
+        Err(e) => return Err(e.context(hint())),
+    };
+    if fresh && let Err(e) = save_state(tmp, &State { phase: Phase::Building, ..st.clone() }) {
+        let _ = fs::remove_dir_all(tmp);
+        return Err(e.context(format!("optimize stopped before writing anything: your data on {what} is untouched")));
+    }
+    // From here on the verified copy in <tmp> is never deleted until the check passes.
+    hook("building").map_err(|e| e.context(hint()))?;
+    set_direct(&tgt.file, tgt.direct);
+    build_target(nodes, tgt, &build_opts(&st.label), &mut forward(&mut run.tick)).map_err(|e| e.context(hint()))?;
+    hook("build").map_err(|e| e.context(hint()))?;
+
+    run.phase("check");
+    let checked = (|| -> Result<()> {
+        let (v, t) = open_walk(&ctx.held, ctx.dev_len).context("the rebuilt drive does not parse as a clean volume")?;
+        ensure!(v.label == st.label, "the rebuilt volume's label is {:?}, not {:?}", v.label, st.label);
+        drop(v);
+        let m = hash_device(run, &ctx.held, &t).context("hash the rebuilt drive")?;
+        let d = manifest.diff(&m, "the original", "the rebuilt drive");
+        ensure!(
+            d.is_empty(),
+            "the rebuilt drive differs from the original ({} differences): {}",
+            d.len(),
+            first_diffs(&d)
+        );
+        Ok(())
+    })();
+    checked.map_err(|e| e.context(hint()))?;
+
+    run.phase("cleanup");
+    cleanup(tmp).map_err(|e| {
+        e.context(format!("{what} is optimized and checked; only removing the temporary copy {} failed", tmp.display()))
+    })?;
+    run.end_phase();
+    Ok(std::mem::take(&mut run.phases))
+}
+
+/// state=done first (a crash from here on is "finished"), then the tree, the manifest, the
+/// state file and the directory.
+fn cleanup(tmp: &Path) -> Result<()> {
+    let st = State::load(tmp)?.ok_or_else(|| anyhow!("state file vanished"))?;
+    save_state(tmp, &State { phase: Phase::Done, ..st })?;
+    let tree = tmp.join("tree");
+    if tree.exists() {
+        fs::remove_dir_all(&tree).with_context(|| format!("remove {}", tree.display()))?;
+    }
+    hook("cleanup")?;
+    for f in ["manifest", "state"] {
+        match fs::remove_file(tmp.join(f)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+    }
+    fs::remove_dir(tmp).with_context(|| format!("remove {}", tmp.display()))
+}
+
+/// Continues a run that stopped in state `building` (see the module docs).
+#[allow(clippy::too_many_arguments)]
+fn resume(
+    run: &mut Run<'_>,
+    ctx: Ctx,
+    tgt: Target,
+    base: &Path,
+    tmp: &Path,
+    st: State,
+    o: &OptimizeOpts,
+    t0: Instant,
+) -> Result<OptimizeStats> {
+    let what = &ctx.what;
+    let hint = || recovery(what, tmp, base, &st.label, ctx.fd);
+    let tree = tmp.join("tree");
+    let saved = fs::read_to_string(tmp.join("manifest"))
+        .map_err(anyhow::Error::from)
+        .and_then(|s| Manifest::decode(&s))
+        .with_context(|| {
+            format!(
+                "an interrupted optimize of {what} had started rebuilding it, but its manifest {} is missing or \
+                 damaged, so flashcp cannot prove the copy in {} is complete and will not continue on its own. \
+                 Check those files, then rebuild the drive with `flashcp build {} <device> --label {:?} --yes-erase`",
+                tmp.join("manifest").display(),
+                tree.display(),
+                tree.display(),
+                st.label
+            )
+        })?;
+    let (files, dirs, data) = (saved.files.len() as u64, saved.dirs.len() as u64, saved.bytes());
+    // What a rebuild from the copy would write (a damaged copy fails later, with the hint).
+    let planned = scan_tree(&tree, &upcase_map())
+        .and_then(|mut n| choose_cluster(&mut n, &tgt, &build_opts(&st.label)).map(|p| (p.g.cluster, p.write_bytes)));
+    let (cluster, write_bytes) = planned.as_ref().map_or((0, 0), |x| *x);
+    run.tick.emit(Event::Plan {
+        op: Op::Optimize,
+        files,
+        dirs,
+        bytes: data,
+        write_bytes,
+        detail: format!(
+            "optimize: resuming an interrupted optimize of {what} from {} ({files} files, {dirs} dirs, {} of data) → \
+             cluster {}, writing up to {}",
+            tmp.display(),
+            human_bytes(data as f64),
+            human_bytes(cluster as f64),
+            human_bytes(write_bytes as f64)
+        ),
+        strategy: Some(format!(
+            r#"{{"temp":{},"cluster":null,"new_cluster":{cluster},"label":{},"already_optimized":false,"resume":true}}"#,
+            crate::events::json_str(&tmp.display().to_string()),
+            crate::events::json_str(&st.label)
+        )),
+    });
+    let mut stats = OptimizeStats {
+        files,
+        dirs,
+        data_bytes: data,
+        written: 0,
+        old_cluster: 0,
+        cluster,
+        already: false,
+        resumed: true,
+        temp: Some(tmp.to_path_buf()),
+        phases: Vec::new(),
+        secs: 0.0,
+    };
+    let finish = |run: &mut Run<'_>, mut stats: OptimizeStats| {
+        run.end_phase();
+        stats.phases = std::mem::take(&mut run.phases);
+        stats.secs = t0.elapsed().as_secs_f64();
+        run.tick.emit(Event::Done { files, bytes: data, secs: stats.secs });
+        stats
+    };
+
+    // What is on the drive now? Only a clean volume with exactly the saved content counts as
+    // ours; a clean volume with other content is someone else's and is never erased.
+    match open_walk(&ctx.held, ctx.dev_len) {
+        Ok((v, t)) => {
+            let original = fingerprint(&v.sector0) == st.orig;
+            stats.old_cluster = v.cs;
+            drop(v);
+            // Finished: check, cleanup. Still the original volume: check, verify, build, check, cleanup.
+            run.steps = if original { 5 } else { 2 };
+            run.phase("check");
+            let m = hash_device(run, &ctx.held, &t).context("hash the drive")?;
+            let d = saved.diff(&m, "the saved manifest", "the drive");
+            ensure!(
+                d.is_empty(),
+                "{what} holds a clean exFAT volume whose files differ from the interrupted optimize's copy in {} \
+                 ({} differences, e.g. {}). Someone may have reformatted or written to the drive since, so flashcp \
+                 will not erase it. To put the copy back on the drive, run `flashcp build {} <device> --label {:?} \
+                 --yes-erase`; otherwise delete {}",
+                tmp.display(),
+                d.len(),
+                first_diffs(&d[..d.len().min(3)]),
+                tree.display(),
+                st.label,
+                tmp.display()
+            );
+            if !original {
+                // The rebuilt volume, complete and checked: only the cleanup was missing.
+                stats.cluster = stats.old_cluster;
+                if o.dry_run {
+                    return Ok(finish(run, stats));
+                }
+                eprintln!("note: the interrupted optimize of {what} had finished; removing its temporary copy");
+                run.phase("cleanup");
+                cleanup(tmp).with_context(|| format!("{what} is optimized; only removing {} failed", tmp.display()))?;
+                return Ok(finish(run, stats));
+            }
+            eprintln!("note: {what} still holds the original volume; resuming the interrupted optimize");
+        }
+        Err(e) => {
+            eprintln!("note: {what} holds an unfinished rebuild ({e:#}); resuming the interrupted optimize");
+            run.steps = 4;
+        }
+    }
+    if o.dry_run {
+        return Ok(finish(run, stats));
+    }
+    planned.with_context(hint)?;
+    run.phase("verify");
+    let local = hash_local(run, &tree).with_context(hint)?;
+    let d = saved.diff(&local, "the saved manifest", "the temporary copy");
+    ensure!(
+        d.is_empty(),
+        "an interrupted optimize left {what} unfinished, and its temporary copy {} no longer matches its manifest \
+         ({} differences: {}). flashcp will not write that copy to the drive. It is kept as it is",
+        tree.display(),
+        d.len(),
+        first_diffs(&d)
+    );
+    stats.phases = rebuild(run, &ctx, tgt, base, tmp, &st, &saved, false)?;
+    stats.written = write_bytes;
+    stats.secs = t0.elapsed().as_secs_f64();
+    run.tick.emit(Event::Done { files, bytes: data, secs: stats.secs });
+    Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_round_trips() {
+        let d = std::env::temp_dir().join(format!("flashcp-optstate-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        assert!(State::load(&d).unwrap().is_none());
+        let st = State { phase: Phase::Building, label: "Mÿ\n=Stick".into(), orig: 0xDEAD_BEEF_0123 };
+        save_state(&d, &st).unwrap();
+        let back = State::load(&d).unwrap().unwrap();
+        assert_eq!((back.phase, back.label, back.orig), (st.phase, st.label, st.orig));
+        fs::write(d.join("state"), "garbage").unwrap();
+        assert!(State::load(&d).is_err());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn fingerprint_ignores_flags_and_percent_only() {
+        let s: Vec<u8> = (0..512).map(|i| i as u8).collect();
+        let mut t = s.clone();
+        t[106] ^= 2;
+        t[112] = 99;
+        assert_eq!(fingerprint(&s), fingerprint(&t));
+        t[100] ^= 1; // serial
+        assert_ne!(fingerprint(&s), fingerprint(&t));
+    }
+}
