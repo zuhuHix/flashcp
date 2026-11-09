@@ -55,7 +55,7 @@ two more volumes:
 | `prefix-4k` | 512 MiB, `--fat prefix --cluster 4096` | |
 | `prefix-128k` | 512 MiB, `--fat prefix --cluster 131072` | |
 | `prefix-1g` | 1 GiB, `--fat prefix` | |
-| `superfloppy` | The `prefix-auto` volume with no partition table | Raw volume as `.img` and `.vhd`. Report-only. |
+| `superfloppy` | The `prefix-auto` volume with no partition table | Raw volume as `.img` and `.vhd`. flashcp's default output, so it gates the workflow. |
 | `control-mkfs` | `mkfs.exfat -L XOSTEST`, then `sudo cp -r --preserve=timestamps` on Linux | Not written by flashcp. Report-only. |
 
 Before any volume is wrapped, `build_images.sh` runs `fsck.exfat -n` on it. If passwordless sudo
@@ -74,9 +74,8 @@ with it.
 - `mkvhd.py` appends the 512-byte footer of a fixed VHD (disk type 2) so Windows can attach the
   image with `Mount-DiskImage`. The raw image is padded to a multiple of 512 bytes first.
 
-The `superfloppy` entry has no MBR. It is report-only because support for partitionless disks
-differs between OSes and disk types, but in practice both Windows and macOS accept it (see the
-results below).
+The `superfloppy` entry has no MBR. That is what flashcp writes by default, so a failure on it
+fails the workflow just like the MBR volumes.
 
 ### The manifest and the verify rules
 
@@ -120,10 +119,8 @@ whether a difference comes from flashcp or from the OS driver.
 
 ### Report-only entries
 
-`superfloppy` and `control-mkfs` use `continue-on-error` in both the Windows and macOS jobs.
-A superfloppy disk has no partition table, and OS support for those varies by OS and disk type, so
-failure there does not necessarily mean the volume is bad. `control-mkfs` is a reference: the
-same tree written by a different tool. If `control-mkfs` fails the same way a flashcp volume
+Only `control-mkfs` uses `continue-on-error`, in both the Windows and macOS jobs. It is a
+reference: the same tree written by a different tool. If `control-mkfs` fails the same way a flashcp volume
 does, the cause is the OS driver, not flashcp. If only the flashcp volume fails, the cause is
 flashcp.
 
@@ -198,7 +195,7 @@ Always unmount or eject the drive before you unplug it.
    the volume `appears to be OK`.
 4. Mount it with `diskutil mount /dev/disk4` (or `/dev/disk4s1`).
 5. Compare the files with `verify.py` and a manifest made on the source machine, or with
-   `shasum -a 256` on individual files. macOS lists exFAT names in NFD, so a byte-for-byte
+   `shasum -a 256` on individual files. macOS lists accented exFAT names in NFD, so a byte-for-byte
    `diff -r` against an NFC source made on another OS can report false differences. `verify.py`
    normalizes names and reports NFD names as warnings only.
 6. Run `diskutil eject /dev/disk4` before you unplug it.
@@ -235,9 +232,10 @@ Unicode names (from `nfc_probe.py`; identical on flashcp volumes and on `control
 
 - Windows returns names exactly as stored (NFC) and matches them exactly: an NFD spelling of an
   NFC name is a different name.
-- macOS returns every non-ASCII name in NFD. Stat, open and rename find a name in either form.
-  Unlink only works when the name is given in the form it was stored in on disk. Unlinking an
-  NFC-stored name by its NFD spelling, which is the form `readdir` returns, fails with ENOENT.
-  This happens on the mkfs.exfat control volume too, so it is a macOS driver behaviour, not a
-  flashcp one. Not yet checked: whether Finder is affected. Scripts that delete files by the
-  names `readdir` returns are.
+- macOS, for the decomposable accented names the probe covers (`café.txt`, `cafè.txt`,
+  `cafê.txt`, `é-*.txt`), on flashcp and mkfs.exfat volumes alike: `readdir` returns them in
+  NFD, and stat, open and rename find them in either form, but unlink only works with the
+  spelling stored on disk. Unlinking an NFC-stored name by its NFD spelling (the form `readdir`
+  returns) fails with ENOENT. Because the control volume behaves the same, this is the macOS
+  driver, not flashcp. Other non-ASCII names (CJK, emoji, names with no decomposition) were not
+  probed. Whether Finder is affected was not checked either.

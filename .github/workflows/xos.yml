@@ -26,27 +26,30 @@ jobs:
     name: build images (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Same rustc that ci.yml's `stable` resolved to on 2026-11-09.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install exfatprogs
         run: sudo apt-get update && sudo apt-get install -y exfatprogs
       - run: cargo build --release --locked
       - name: Build volumes, fsck.exfat + Linux mount + verify, wrap in MBR / VHD
         run: scripts/xos/build_images.sh target/release/flashcp out
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: xos-prefix-auto, path: out/prefix-auto, retention-days: 3, compression-level: 1 }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: xos-full-auto, path: out/full-auto, retention-days: 3, compression-level: 1 }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: xos-prefix-4k, path: out/prefix-4k, retention-days: 3, compression-level: 1 }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: xos-prefix-128k, path: out/prefix-128k, retention-days: 3, compression-level: 1 }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: xos-prefix-1g, path: out/prefix-1g, retention-days: 3, compression-level: 1 }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: xos-superfloppy, path: out/superfloppy, retention-days: 3, compression-level: 1 }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: xos-control-mkfs, path: out/control-mkfs, retention-days: 3, compression-level: 1 }
 
   windows:
@@ -57,15 +60,16 @@ jobs:
       fail-fast: false
       matrix:
         vol: [prefix-auto, full-auto, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs]
-    # Report-only entries, never fail the build: superfloppy (no partition table), and
-    # control-mkfs (the same tree written by mkfs.exfat + Linux, a reference for attributing failures).
-    continue-on-error: ${{ matrix.vol == 'superfloppy' || matrix.vol == 'control-mkfs' }}
+    # superfloppy (no partition table) is flashcp's default output, so it gates like the others.
+    # control-mkfs (the same tree written by mkfs.exfat + Linux) is a reference for attributing
+    # failures to flashcp or to the OS, so it is report-only.
+    continue-on-error: ${{ matrix.vol == 'control-mkfs' }}
     defaults:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { name: "xos-${{ matrix.vol }}", path: vol }
       # A non-UTC zone makes a mishandled exFAT UTC-offset field show up as a 5:30 h mtime error.
       - run: Set-TimeZone -Id "India Standard Time"; Get-TimeZone
@@ -74,7 +78,7 @@ jobs:
           scripts/xos/win_check.ps1 -Vhd "vol/${{ matrix.vol }}.vhd" -Manifest vol/manifest.json
           -Label "${{ matrix.vol }}" -LogDir logs ${{ matrix.vol == 'superfloppy' && '-Superfloppy' || '' }}
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: "logs-windows-${{ matrix.vol }}", path: logs, retention-days: 14 }
 
   macos:
@@ -85,10 +89,10 @@ jobs:
       fail-fast: false
       matrix:
         vol: [prefix-auto, full-auto, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs]
-    continue-on-error: ${{ matrix.vol == 'superfloppy' || matrix.vol == 'control-mkfs' }}
+    continue-on-error: ${{ matrix.vol == 'control-mkfs' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { name: "xos-${{ matrix.vol }}", path: vol }
       - name: Use a non-UTC time zone
         run: sudo ln -sf /usr/share/zoneinfo/Asia/Kolkata /etc/localtime && date
@@ -97,5 +101,5 @@ jobs:
           scripts/xos/mac_check.sh "vol/${{ matrix.vol }}.img" vol/manifest.json "${{ matrix.vol }}" logs
           ${{ matrix.vol == 'superfloppy' && 'superfloppy' || '' }}
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: "logs-macos-${{ matrix.vol }}", path: logs, retention-days: 14 }
