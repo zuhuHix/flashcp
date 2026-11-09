@@ -1,0 +1,14 @@
+flashcp-devprofile 1
+# What flashcp sees on the MSI DATAMAG 20Gbps (UAS, 1 TB): used to RECORD traces on an image
+# as if it were the target (FLASHCP_SIM_DEVICE). Probe: 999 MB/s at 8 MB writes.
+seq_write_bps=999000000
+write_skip_s=0.00004
+transport=uas
+sim.name=msi-datamag-uas
+# GUESS (not recorded in the PRs): typical UAS bridge values.
+sim.max_sectors_kb=1024
+sim.logical_block=512
+sim.removable=1
+sim.probe_choice=skip:8
+sim.part_start_sectors=2048
+sim.size_bytes=1000156102656

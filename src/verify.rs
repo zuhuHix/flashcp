@@ -20,6 +20,7 @@
 
 use crate::exfat::set_direct;
 use crate::pull::{Ext, MAX_DEPTH, MAX_ENTRIES, MAX_EXTENTS, READ_BUDGET, Strategy, plan_reads};
+use crate::sim::trace;
 use crate::util::AlignedBuf;
 use crate::volume::*;
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -491,6 +492,7 @@ pub(crate) fn hash_volume(dev: &File, t: &VolTree, s: &Strategy, prog: &Progress
         unsafe { libc::posix_fadvise(std::os::fd::AsRawFd::as_raw_fd(dev), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
     }
     let next = AtomicUsize::new(0);
+    let grp = trace::group();
     let failed = AtomicBool::new(false);
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     // Each reader collects (file, partial sum) pairs; summed per file at the end.
@@ -510,14 +512,16 @@ pub(crate) fn hash_volume(dev: &File, t: &VolTree, s: &Strategy, prog: &Progress
                         if trace {
                             eprintln!("flashcp-read {} {}", c.start, c.len);
                         }
-                        let mut r = read_full(dev, b, c.start);
+                        let (cs, cl) = (c.start, c.len as u64);
+                        let mut r =
+                            trace::io(trace::Op::Read, cs, cl, readers, grp, i as u64, || read_full(dev, b, cs));
                         // A device that refuses this alignment (or a short direct read at the
                         // very end): fall back to buffered reads for the rest of the run.
                         if (r.is_err() || r.as_ref().is_ok_and(|&n| (n as u64) < need))
                             && direct.swap(false, Ordering::Relaxed)
                         {
                             set_direct(dev, false);
-                            r = read_full(dev, b, c.start);
+                            r = trace::io(trace::Op::Read, cs, cl, readers, grp, i as u64, || read_full(dev, b, cs));
                         }
                         let n = r.with_context(|| format!("read {} bytes at byte {} of the drive", c.len, c.start))?;
                         ensure!(n as u64 >= need, "short read at byte {}: {n} of {need} bytes", c.start);

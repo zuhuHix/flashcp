@@ -854,6 +854,7 @@ impl<'s> Run<'s> {
     fn phase(&mut self, name: &'static str) {
         self.end_phase();
         self.step += 1;
+        crate::sim::trace::phase(name);
         if std::env::var_os(TRACE_READS_ENV).is_some() {
             eprintln!("flashcp-phase {name}");
         }
@@ -1006,12 +1007,14 @@ fn read_raw(held: &File, off: u64, len: u64) -> Vec<u8> {
     unsafe { libc::posix_fadvise(std::os::fd::AsRawFd::as_raw_fd(held), 0, 0, libc::POSIX_FADV_DONTNEED) };
     let mut b = vec![0u8; len as usize];
     let mut n = 0;
-    while n < b.len() {
-        match held.read_at(&mut b[n..], off + n as u64) {
-            Ok(0) | Err(_) => break,
-            Ok(k) => n += k,
+    crate::sim::trace::serial(crate::sim::trace::Op::Read, off, len, || {
+        while n < b.len() {
+            match held.read_at(&mut b[n..], off + n as u64) {
+                Ok(0) | Err(_) => break,
+                Ok(k) => n += k,
+            }
         }
-    }
+    });
     b.truncate(n);
     b
 }

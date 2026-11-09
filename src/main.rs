@@ -10,6 +10,10 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Record every device op to FILE as JSON lines, for `flashcp sim` (same as
+    /// FLASHCP_TRACE=FILE; see SIMULATION.md)
+    #[arg(id = "trace_out", long = "trace", global = true, value_name = "FILE", hide = true)]
+    trace_out: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -196,6 +200,11 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Trace-driven device simulator: replay, sweep and calibrate (see SIMULATION.md)
+    Sim {
+        #[command(subcommand)]
+        cmd: flashcp::sim::cli::SimCmd,
+    },
     /// Benchmark every method against DEST
     Bench {
         src: PathBuf,
@@ -233,6 +242,27 @@ fn spec(target: Option<PathBuf>, fd: Option<i32>) -> TargetSpec {
 
 fn main() {
     let cli = Cli::parse();
+    let mut args = std::env::args().skip(1);
+    let mut cmd_name = String::new();
+    while let Some(a) = args.next() {
+        if a == "--trace" {
+            args.next();
+        } else if !a.starts_with('-') {
+            cmd_name = a;
+            break;
+        }
+    }
+    // `flashcp sim` replays traces and never touches a device: it is not traced itself (its
+    // recordings run flashcp in child processes, each with its own trace file).
+    let traced = match (&cli.trace_out, &cli.cmd) {
+        (_, Cmd::Sim { .. }) => Ok(()),
+        (Some(p), _) => flashcp::sim::trace::init(p, &cmd_name),
+        (None, _) => flashcp::sim::trace::init_from_env(&cmd_name),
+    };
+    if let Err(e) = traced {
+        eprintln!("Error: {e:#}");
+        std::process::exit(2);
+    }
     let json = matches!(
         cli.cmd,
         Cmd::Build { json: true, .. }
@@ -241,7 +271,9 @@ fn main() {
             | Cmd::Optimize { json: true, .. }
             | Cmd::Info { json: true, .. }
     );
-    if let Err(e) = run(cli.cmd) {
+    let r = run(cli.cmd);
+    flashcp::sim::trace::finish();
+    if let Err(e) = r {
         if json {
             println!("{}", error_json(&format!("{e:#}"), optimize::recovery_of(&e)));
         } else {
@@ -434,6 +466,7 @@ fn run(cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Sim { cmd } => flashcp::sim::cli::run(cmd),
         Cmd::Bench { src, dest, methods, runs } => {
             let ms: Vec<String> = methods.split(',').map(|s| s.trim().to_string()).collect();
             std::fs::create_dir_all(&dest)?;

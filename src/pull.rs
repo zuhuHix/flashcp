@@ -35,6 +35,7 @@
 use crate::dirfd;
 use crate::events::{Event, Op, Sink, Ticker};
 use crate::exfat::{FlagGuard, SYS_BLOCK, TargetSpec, blk_size, open_target_fd, related_devs, set_direct};
+use crate::sim::trace;
 use crate::util::{AlignedBuf, human_bytes};
 use crate::verify::{FileSum, Manifest, hash_extent, zero_tail};
 use crate::volume::*;
@@ -187,7 +188,9 @@ fn micro_probe(file: &File, v: &Vol) -> Option<(f64, f64)> {
     let mut buf = AlignedBuf::new(4 << 20);
     let timed = |buf: &mut [u8], off: u64| -> Option<f64> {
         let t = Instant::now();
-        (read_full(file, buf, off).ok()? == buf.len()).then(|| t.elapsed().as_secs_f64().max(1e-6))
+        let n = buf.len() as u64;
+        let r = trace::serial(trace::Op::Read, off, n, || read_full(file, buf, off));
+        (r.ok()? == buf.len()).then(|| t.elapsed().as_secs_f64().max(1e-6))
     };
     timed(&mut buf.as_mut()[..4096], start)?; // wake the device up
     let bw = (4u64 << 20) as f64 / timed(buf.as_mut(), start)?;
@@ -277,6 +280,9 @@ const TAIL4K_ENV: &str = "FLASHCP_TEST_TAIL_4K";
 /// Logical block size of a block device (BLKSSZGET), None for anything else.
 fn logical_block(f: &File) -> Option<u64> {
     use std::os::unix::io::AsRawFd;
+    if let Some(d) = crate::sim::device::sim_device() {
+        return d.logical_block;
+    }
     if !f.metadata().ok()?.file_type().is_block_device() {
         return None;
     }
@@ -943,6 +949,8 @@ fn pull_inner(
     drop(cur);
     // The strategy fixes the read size, which bounds how the plan splits extents.
     let strat = choose_strategy(&file, &v, o);
+    trace::note("strategy", || strat.to_json());
+    trace::phase("read");
     let o = &PullOpts { chunk: Some(strat.chunk), ..o.clone() };
     let mut p = plan(&mut v, start, &mut seen, root.as_ref(), o)?;
     drop(seen);
@@ -1113,6 +1121,12 @@ fn transfer(
         unsafe { libc::posix_fadvise(std::os::fd::AsRawFd::as_raw_fd(file), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
     }
     let next = AtomicUsize::new(0);
+    let grp = trace::group();
+    let rd = |buf: &mut [u8], c: &Chunk, i: usize| {
+        trace::io(trace::Op::Read, c.start, c.len as u64, strat.inflight, grp, i as u64, || {
+            read_full(file, buf, c.start)
+        })
+    };
     let retries = AtomicU64::new(0);
     let failed = AtomicBool::new(false);
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
@@ -1135,7 +1149,7 @@ fn transfer(
     std::thread::scope(|s| {
         for _ in 0..strat.inflight {
             let (full_tx, alive, pool) = (full_tx.clone(), alive_tx.clone(), &pool);
-            let (next, failed, direct, fail, retries) = (&next, &failed, &direct, &fail, &retries);
+            let (next, failed, direct, fail, retries, rd) = (&next, &failed, &direct, &fail, &retries, &rd);
             s.spawn(move || {
                 let _alive = alive;
                 while !failed.load(Ordering::Relaxed) {
@@ -1146,16 +1160,16 @@ fn transfer(
                     if trace {
                         eprintln!("flashcp-read {} {}", c.start, c.len);
                     }
-                    let mut r = read_full(file, &mut buf.as_mut()[..c.len], c.start);
+                    let mut r = rd(&mut buf.as_mut()[..c.len], c, i);
                     if matches!(&r, Err(e) if e.raw_os_error() == Some(libc::EINVAL))
                         && direct.swap(false, Ordering::Relaxed)
                     {
                         set_direct(file, false); // the device refused this alignment
                         retries.fetch_add(1, Ordering::Relaxed);
-                        r = read_full(file, &mut buf.as_mut()[..c.len], c.start);
+                        r = rd(&mut buf.as_mut()[..c.len], c, i);
                     } else if r.is_err() && !direct.load(Ordering::Relaxed) {
                         retries.fetch_add(1, Ordering::Relaxed);
-                        r = read_full(file, &mut buf.as_mut()[..c.len], c.start);
+                        r = rd(&mut buf.as_mut()[..c.len], c, i);
                     }
                     match r {
                         Ok(n) if n as u64 >= need => {}
@@ -1214,7 +1228,9 @@ fn transfer(
         if trace {
             eprintln!("flashcp-read {cut} {}", buf.len());
         }
-        let n = read_full(file, &mut buf, cut).with_context(|| format!("read {} bytes at {cut}", buf.len()))?;
+        let bl = buf.len() as u64;
+        let n = trace::serial(trace::Op::Read, cut, bl, || read_full(file, &mut buf, cut))
+            .with_context(|| format!("read {} bytes at {cut}", buf.len()))?;
         ensure!(n == buf.len(), "short read at byte {cut}: {n} of {} bytes", buf.len());
         for e in tail {
             let job = &jobs[e.file as usize];

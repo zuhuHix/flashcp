@@ -238,18 +238,27 @@ pub fn save_to(dir: &Path, key: &str, p: &DevProfile) -> std::io::Result<()> {
 /// have none, so they are never cached, even though the disk they live on has a key.
 pub fn block_dev_of(f: &fs::File) -> Option<u64> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    if crate::sim::device::sim_device().is_some() {
+        return Some(crate::sim::device::SIM_RDEV);
+    }
     let md = f.metadata().ok()?;
     md.file_type().is_block_device().then(|| md.rdev())
 }
 
 /// The cached profile of the disk holding block device `dev` (see [`device_key`]).
 pub fn load(dev: u64) -> Option<DevProfile> {
+    if let Some(d) = crate::sim::device::sim_device() {
+        return Some(d.profile.clone());
+    }
     load_from(&cache_dir()?, &device_key(dev)?)
 }
 
 /// Merges `p` into the cache of the disk holding `dev`. Silently does nothing for a device
 /// without a key, and ignores every I/O error: caching never fails a command.
 pub fn save(dev: u64, p: &DevProfile) {
+    if crate::sim::device::sim_device().is_some() {
+        return;
+    }
     if let (Some(dir), Some(key)) = (cache_dir(), device_key(dev)) {
         let _ = save_to(&dir, &key, p);
     }
