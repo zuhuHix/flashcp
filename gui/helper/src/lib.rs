@@ -141,9 +141,11 @@ pub fn expected_confirm(info_ok: bool, info_stdout: &[u8], key: &str) -> String 
 }
 
 /// Run the flashcp side of a validated, trusted request. `base` carries program, env, creds and
-/// the target fd; its args are replaced per run. Returns the first non-zero flashcp exit code,
-/// or 0.
-pub fn run_job(req: &Request, key: &str, base: &ExecPlan) -> Result<i32, Fail> {
+/// the target fd; its args are replaced per run. `home` is the invoking user's passwd home
+/// (only `optimize` uses it, as a string; see [`args::optimize_temp`]). Returns the first
+/// non-zero flashcp exit code, or 0.
+pub fn run_job(req: &Request, key: &str, home: &str, base: &ExecPlan) -> Result<i32, Fail> {
+    let runs = req.flashcp_runs(home).map_err(Validation)?;
     let with = |args: Vec<String>| ExecPlan { args, ..base.clone() };
     let cannot = |e: io::Error| Internal(format!("cannot run {}: {e}", base.program.display()));
     if let Request::Build { confirm, .. } = req {
@@ -152,7 +154,7 @@ pub fn run_job(req: &Request, key: &str, base: &ExecPlan) -> Result<i32, Fail> {
             return Err(Validation("confirmation text does not match the drive's label (or serial number)".into()));
         }
     }
-    for args in req.flashcp_runs() {
+    for args in runs {
         if let Some(sig) = exec::take_pending_signal() {
             return Ok(128 + sig);
         }
@@ -171,6 +173,8 @@ fn helper(argv: &[OsString]) -> Result<i32, Fail> {
     let sudo_uid = std::env::var("SUDO_UID").ok();
     let uid = exec::invoking_uid(pkexec_uid.as_deref(), sudo_uid.as_deref()).map_err(Validation)?;
     let creds = exec::lookup_user(uid).map_err(Validation)?;
+    // Refuse an unusable home (optimize only) before the device is even opened.
+    req.flashcp_runs(&creds.home).map_err(Validation)?;
 
     // Open once; everything below is about this fd, and flashcp gets this fd.
     let roots = Roots::system();
@@ -181,6 +185,7 @@ fn helper(argv: &[OsString]) -> Result<i32, Fail> {
     require_trusted(&entries, &id).map_err(Validation)?;
 
     exec::block_signals().map_err(|e| Internal(format!("sigprocmask: {e}")))?;
+    let home = creds.home.clone();
     let base = ExecPlan {
         program: exec::FLASHCP.into(),
         args: Vec::new(),
@@ -188,7 +193,7 @@ fn helper(argv: &[OsString]) -> Result<i32, Fail> {
         drop: Some(creds),
         target_fd: Some(fd.as_raw_fd()),
     };
-    run_job(&req, &id.key, &base)
+    run_job(&req, &id.key, &home, &base)
 }
 
 fn trust(argv: &[OsString]) -> Result<i32, Fail> {
@@ -324,6 +329,10 @@ mod tests {
     }
 
     fn job(dir: &Path, prog: &Path, a: &[&str]) -> Result<i32, Fail> {
+        job_home(dir, prog, a, &dir.join("home").display().to_string())
+    }
+
+    fn job_home(dir: &Path, prog: &Path, a: &[&str], home: &str) -> Result<i32, Fail> {
         let req = args::parse(&a.iter().map(OsString::from).collect::<Vec<_>>()).unwrap();
         let target = fs::File::create(dir.join("target")).unwrap();
         let base = ExecPlan {
@@ -333,7 +342,7 @@ mod tests {
             env: exec::user_env("/nonexistent"),
             target_fd: Some(target.as_raw_fd()),
         };
-        run_job(&req, "SER1", &base)
+        run_job(&req, "SER1", home, &base)
     }
 
     fn log_lines(log: &Path) -> Vec<String> {
@@ -392,6 +401,44 @@ mod tests {
         assert_eq!(log_lines(&log), ["pull --target-fd 3 /home/u/Downloads/S --from DCIM --overwrite --json"]);
         // The helper itself never creates or inspects the destination.
         assert!(!Path::new("/home/u/Downloads/S").exists());
+    }
+
+    #[test]
+    fn optimize_runs_once_without_confirm_and_never_touches_the_temp_dir() {
+        let t = tempfile::tempdir().unwrap();
+        let (prog, log) = fake_flashcp(t.path(), r#"{"label":"MY STICK"}"#, 0);
+        let home = t.path().join("home");
+        let temp = home.join(".cache/flashcp/optimize");
+        assert_eq!(job(t.path(), &prog, &["optimize", "/dev/sdb1", "--expect", "SER1", "--dry-run"]), Ok(0));
+        assert_eq!(job(t.path(), &prog, &["optimize", "/dev/sdb1", "--expect", "SER1"]), Ok(0));
+        // Again, as a resume after an interruption: the very same argv.
+        assert_eq!(job(t.path(), &prog, &["optimize", "/dev/sdb1", "--expect", "SER1"]), Ok(0));
+        let t3 = temp.display();
+        assert_eq!(
+            log_lines(&log),
+            [
+                format!("optimize --target-fd 3 --temp {t3} --yes --dry-run --json"),
+                format!("optimize --target-fd 3 --temp {t3} --yes --json"),
+                format!("optimize --target-fd 3 --temp {t3} --yes --json"),
+            ],
+            "no info/confirm run, one flashcp run per request"
+        );
+        // The helper (here: the test process standing in for root) created nothing on the user's
+        // side: neither the temp dir nor any of its parents. flashcp does that as the user.
+        assert!(!home.exists(), "the helper must not create the user's cache directory");
+    }
+
+    #[test]
+    fn optimize_with_an_unusable_home_runs_nothing() {
+        let t = tempfile::tempdir().unwrap();
+        let (prog, log) = fake_flashcp(t.path(), "{}", 0);
+        for home in ["/", "", "relative/home", "/home/../root"] {
+            let r = job_home(t.path(), &prog, &["optimize", "/dev/sdb1", "--expect", "SER1"], home);
+            assert!(matches!(&r, Err(Validation(m)) if m.contains("home directory")), "{home:?}: {r:?}");
+        }
+        assert!(log_lines(&log).is_empty());
+        // Other ops do not depend on the home at all.
+        assert_eq!(job_home(t.path(), &prog, &["info", "/dev/sdb1", "--expect", "SER1"], "/"), Ok(0));
     }
 
     #[test]
