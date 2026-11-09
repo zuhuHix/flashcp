@@ -1,0 +1,4 @@
+/target
+*.img
+/data
+node_modules/

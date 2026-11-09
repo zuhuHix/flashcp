@@ -1,0 +1,23 @@
+[package]
+name = "flashcp"
+version = "0.1.0"
+edition = "2024"
+description = "Fast file transfers to USB sticks and external drives: builds a whole exFAT volume in one sequential pass"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/zuhuHix/flashcp"
+readme = "README.md"
+keywords = ["exfat", "usb", "copy", "filesystem", "flash"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+crossbeam-channel = "0.5.17"
+libc = "0.2.191"
+tar = "0.4.46"
+walkdir = "2.5.0"
+zstd = { version = "0.14.3", features = ["zstdmt"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
