@@ -281,10 +281,11 @@ fn dry_run_and_missing_yes_write_nothing() {
     let out = optimize_ok(&s, &["--dry-run"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("optimize:") && text.contains("temporary copy in"), "{text}");
+    assert!(text.contains("Windows") && text.contains("FORMAT") && text.contains("re-run `flashcp optimize"), "{text}");
     assert_eq!(digest(&s.img), before, "--dry-run changed the image");
     assert!(temp_dirs(&s).is_empty(), "--dry-run created a temp dir");
     let e = optimize_fails(&s, &[], &[]);
-    assert!(e.contains("--yes") && e.contains("nothing was changed"), "{e}");
+    assert!(e.contains("--yes") && e.contains("nothing was changed") && e.contains("FORMAT"), "{e}");
     assert_eq!(digest(&s.img), before);
     remove_all(&s.dir);
 }
@@ -478,6 +479,117 @@ fn set_dirty(img: &Path) {
 fn serial_in(img: &Path) -> u32 {
     let b = fs::read(img).unwrap();
     le32(&b, 100)
+}
+
+fn state_field(tmp: &Path, key: &str) -> String {
+    let s = fs::read_to_string(tmp.join("state")).unwrap();
+    s.lines().find_map(|l| l.strip_prefix(&format!("{key}="))).unwrap_or_else(|| panic!("no {key} line")).to_string()
+}
+
+/// Replaces the `key=` line of the state file.
+fn set_state_field(tmp: &Path, key: &str, value: &str) {
+    let s = fs::read_to_string(tmp.join("state")).unwrap();
+    let out: Vec<String> = s
+        .lines()
+        .map(|l| if l.starts_with(&format!("{key}=")) { format!("{key}={value}") } else { l.to_string() })
+        .collect();
+    fs::write(tmp.join("state"), out.join("\n") + "\n").unwrap();
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// An aborted mid-build: the drive holds our half-written volume (main boot region zeros, the
+/// backup with our serial, job id and geometry).
+fn half_written(name: &str) -> (Stick, PathBuf) {
+    let s = stick(name);
+    optimize_fails(&s, &["--yes"], &[("FLASHCP_TEST_BUILD_ABORT_AT", "3000000")]);
+    let t = the_temp_dir(&s);
+    assert_eq!(state_of(&t), "building");
+    (s, t)
+}
+
+/// A refusal of a half-written drive: nothing written, the copy kept as it was.
+fn refused(s: &Stick, t: &Path, want: &[&str]) -> String {
+    let before = digest(&s.img);
+    let e = optimize_fails(s, &["--yes"], &[]);
+    for w in want {
+        assert!(e.contains(w), "missing {w:?} in: {e}");
+    }
+    assert!(e.contains(&t.display().to_string()), "{e}");
+    assert_eq!(digest(&s.img), before, "a drive that is not this optimize's was written");
+    assert_eq!(the_temp_dir(s), *t, "temp copy removed");
+    assert_eq!(state_of(t), "building");
+    assert!(t.join("tree/docs/random-5mb.bin").is_file(), "copy removed");
+    e
+}
+
+/// Our serial in the backup boot sector, but another job id (a reused identity and a foreign
+/// volume with that serial): refused; with the right id it resumes.
+#[test]
+fn resume_refuses_our_serial_with_another_job_id() {
+    let (s, t) = half_written("opt_resume_other_job");
+    let job = state_field(&t, "job");
+    set_state_field(&t, "job", &"5a".repeat(16));
+    refused(&s, &t, &["serial number", "another optimize job", "will not write"]);
+    set_state_field(&t, "job", &job);
+    optimize_ok(&s, &["--yes"]);
+    assert_optimized(&s);
+    remove_all(&s.dir);
+}
+
+/// Our serial and job id, but the backup's geometry is not what this optimize planned.
+#[test]
+fn resume_refuses_our_job_id_with_another_geometry() {
+    let (s, t) = half_written("opt_resume_other_geometry");
+    let mut b = fs::read(&s.img).unwrap();
+    let fat_len = le32(&b, 12 * 512 + 84);
+    b[12 * 512 + 84..12 * 512 + 88].copy_from_slice(&(fat_len + 1).to_le_bytes());
+    fs::write(&s.img, &b).unwrap();
+    let e = refused(&s, &t, &["geometry differs", "FatLength", "will not write"]);
+    assert!(!e.contains("another optimize job"), "{e}");
+    remove_all(&s.dir);
+}
+
+/// The temp dir found by the drive's identity, but the state was saved for another drive
+/// (another identity, or another size): refused before anything is read as ours.
+#[test]
+fn resume_refuses_another_device_identity_or_size() {
+    let (s, t) = half_written("opt_resume_other_device");
+    let dev = state_field(&t, "device");
+    set_state_field(&t, "device", &hex(b"img-1-2"));
+    refused(&s, &t, &["not the drive it was made from", "img-1-2", "Nothing was changed"]);
+    set_state_field(&t, "device", &dev);
+    // The same image file (same inode), one MB larger.
+    let f = fs::OpenOptions::new().write(true).open(&s.img).unwrap();
+    f.set_len(fs::metadata(&s.img).unwrap().len() + MB).unwrap();
+    drop(f);
+    refused(&s, &t, &["not the drive it was made from", "size"]);
+    remove_all(&s.dir);
+}
+
+/// After the drive may have been written, the JSON error carries "recovery" with the FORMAT
+/// warning; before that, it does not.
+#[test]
+fn json_error_carries_recovery_once_the_drive_was_written() {
+    let s = stick("opt_json_recovery");
+    let out = optimize(&s, &["--yes", "--json"], &[("FLASHCP_TEST_OPTIMIZE_STOP", "pull")]);
+    let err = String::from_utf8_lossy(&out.stdout).lines().last().unwrap_or_default().to_string();
+    assert!(err.starts_with(r#"{"event":"error","message":"#) && !err.contains(r#""recovery""#), "{err}");
+    let out = optimize(&s, &["--yes", "--json"], &[("FLASHCP_TEST_OPTIMIZE_STOP", "build")]);
+    let err = String::from_utf8_lossy(&out.stdout).lines().last().unwrap_or_default().to_string();
+    assert!(err.starts_with(r#"{"event":"error","message":"#) && err.contains(r#","recovery":""#), "{err}");
+    let rec = &err[err.find(r#""recovery""#).unwrap()..];
+    assert!(rec.contains("Windows") && rec.contains("FORMAT") && rec.contains("flashcp optimize"), "{rec}");
+    // The human error says it too (our volume, made dirty: this run rebuilds it and stops
+    // after the build again).
+    set_dirty(&s.img);
+    let e = optimize_fails(&s, &["--yes"], &[("FLASHCP_TEST_OPTIMIZE_STOP", "build")]);
+    assert!(e.contains("all your files are safe in") && e.contains("Windows") && e.contains("FORMAT"), "{e}");
+    optimize_ok(&s, &["--yes"]);
+    assert_optimized(&s);
+    remove_all(&s.dir);
 }
 
 fn saved_serial(tmp: &Path) -> u32 {
@@ -822,6 +934,8 @@ fn assert_unfinished_rebuild(s: &Stick, t: &Path) {
     assert!(b[..12 * 512].iter().all(|&x| x == 0), "main boot region written before the end");
     assert_eq!(&b[12 * 512 + 3..12 * 512 + 11], b"EXFAT   ", "no backup boot sector");
     assert_eq!(le32(&b, 12 * 512 + 100), saved_serial(t), "backup boot sector without our serial");
+    assert_eq!(&b[12 * 512 + 120..12 * 512 + 131], b"flashcp-job", "backup boot sector without our job tag");
+    assert_eq!(hex(&b[12 * 512 + 131..12 * 512 + 147]), state_field(t, "job"), "backup boot sector without our job id");
     assert!(exfat_reader::read_volume(&s.img).is_err(), "an aborted build reads as a volume");
     if let Ok(o) = Command::new("fsck.exfat").arg("-n").arg(&s.img).output() {
         assert!(!o.status.success(), "fsck.exfat accepts an aborted build");

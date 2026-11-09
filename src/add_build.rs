@@ -92,6 +92,7 @@ pub(crate) fn empty_as_build(
         readers: readers.max(1),
         dry_run,
         serial: None,
+        job: None,
     };
     let (p, _) = choose_cluster(&mut nodes, &tgt, &bo)?;
     if p.g.cluster >= v.cs {
