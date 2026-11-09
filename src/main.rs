@@ -107,6 +107,37 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Make a directory of an EXISTING exFAT volume on TARGET (unmounted block device or image
+    /// file) match SRC: copies new and changed files (into free space; a changed file is switched
+    /// over only once its new version is on the device), leaves unchanged ones alone
+    Sync {
+        src: PathBuf,
+        /// Block device or image file (or use --target-fd)
+        #[arg(required_unless_present = "target_fd", conflicts_with = "target_fd")]
+        target: Option<PathBuf>,
+        /// Use this inherited, already-open block-device fd (O_RDWR|O_EXCL) instead of opening
+        /// TARGET, e.g. from a privileged helper
+        #[arg(long, value_name = "N")]
+        target_fd: Option<i32>,
+        /// Directory inside the volume to sync, e.g. "Backups/laptop" (created if missing)
+        #[arg(long)]
+        to: Option<String>,
+        /// Delete files and directories that are not in SRC (and re-link moved files instead of
+        /// copying them again)
+        #[arg(long)]
+        delete: bool,
+        /// Compare contents instead of size and modification time
+        #[arg(long)]
+        checksum: bool,
+        #[arg(long, default_value_t = 12)]
+        readers: usize,
+        /// Only print the plan
+        #[arg(long)]
+        dry_run: bool,
+        /// Print progress as JSON lines on stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// Copy the files of an exFAT volume on TARGET (block device or image file, opened
     /// read-only; preferably unmounted) into DEST, reading the volume in large sequential chunks
     Pull {
@@ -267,6 +298,7 @@ fn main() {
         cli.cmd,
         Cmd::Build { json: true, .. }
             | Cmd::Add { json: true, .. }
+            | Cmd::Sync { json: true, .. }
             | Cmd::Pull { json: true, .. }
             | Cmd::Optimize { json: true, .. }
             | Cmd::Info { json: true, .. }
@@ -361,6 +393,28 @@ fn run(cmd: Cmd) -> Result<()> {
                     s.secs,
                     s.files as f64 / s.secs,
                     s.data_bytes as f64 / 1e6 / s.secs
+                );
+            }
+            Ok(())
+        }
+        Cmd::Sync { src, target, target_fd, to, delete, checksum, readers, dry_run, json } => {
+            let target = spec(target, target_fd);
+            let o = flashcp::SyncOpts { to, delete, checksum, readers, dry_run };
+            let s = flashcp::sync_to(&src, &target, &o, &mut sink(json))?;
+            if !dry_run && !json {
+                println!(
+                    "synced: {} unchanged, {} new, {} changed, {} moved, {} deleted ({} dirs); wrote {} of file data \
+                     ({} in all), skipped {} in {:.2} s",
+                    s.unchanged,
+                    s.new,
+                    s.changed,
+                    s.moved,
+                    s.deleted,
+                    s.deleted_dirs,
+                    util::human_bytes(s.data_written as f64),
+                    util::human_bytes(s.written as f64),
+                    util::human_bytes(s.data_skipped as f64),
+                    s.secs
                 );
             }
             Ok(())

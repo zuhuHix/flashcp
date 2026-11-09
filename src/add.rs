@@ -563,7 +563,14 @@ fn forced_policy(v: &str, qd: usize) -> Option<GapPolicy> {
 /// never in a dry run), else a cached write model, else the fallback. Writes in flight never
 /// come from a random-write benchmark: USB BOT gets 1 (strictly ascending), the rest 8.
 /// Image files always use the fallback (their cost is the page cache's).
-pub(crate) fn choose_gap_policy(dev: &File, direct: bool, v: &Vol, dev_off: u64, dry_run: bool, segs: &[ProbeSeg]) -> GapPolicy {
+pub(crate) fn choose_gap_policy(
+    dev: &File,
+    direct: bool,
+    v: &Vol,
+    dev_off: u64,
+    dry_run: bool,
+    segs: &[ProbeSeg],
+) -> GapPolicy {
     use crate::devprofile as dp;
     let rdev = dp::block_dev_of(dev);
     let transport = rdev.and_then(|r| crate::probe::device_info_of(r).transport);
@@ -1223,7 +1230,16 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
         pol.describe(),
         verify_secs * 1e3
     );
-    tick.emit(Event::Plan { op: Op::Add, files, dirs, bytes: data_bytes, write_bytes, detail, strategy: None, sync: None });
+    tick.emit(Event::Plan {
+        op: Op::Add,
+        files,
+        dirs,
+        bytes: data_bytes,
+        write_bytes,
+        detail,
+        strategy: None,
+        sync: None,
+    });
     let stats = |written: u64| AddStats {
         files,
         dirs,
