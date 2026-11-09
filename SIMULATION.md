@@ -20,17 +20,35 @@ FLASHCP_SIM_DEVICE=src/sim/devices/sandisk.dev flashcp --trace pull.jsonl pull s
 flashcp sim run pull.jsonl --profile sandisk --profile msi --seeds 16
 ```
 
+`flashcp sim calibrate --fast` runs in about 2 minutes (a quarter of the optimizer evaluations, 5 point-wise folds). The full `calibrate` takes about 5 minutes on a 12-thread laptop with a warm cache: ~1.5 min for the SanDisk fit, ~3 min for the MSI fit, whose 100k-file traces are the largest. Recording all 44 scenarios from scratch adds 2–4 minutes; MSI scenarios are recorded one at a time. The fits run in parallel: one held-out fit per thread.
+
 `sweep` and `calibrate` keep their datasets, images and traces under `$XDG_CACHE_HOME/flashcp/sim` (or `--work DIR`). A trace is cached by a hash of everything that affects the run, including the flashcp binary's size and mtime, so a rebuilt binary re-records. Host time is part of the trace (see below). Re-record on an idle machine before trusting numbers for host-bound drives (UAS SSDs): delete `traces/` under the work directory. `sweep` records UAS profiles one at a time for this reason.
 
 ## The trace (`src/sim/trace.rs`)
 
-The trace is one JSON object per line: a `start` header (command, simulated device), then `io` (`op` r/w, `off`, `len`, `qd`, `grp`, `seq`, `q`, `t`, `d`), `sync`, `direct` (O_DIRECT toggles), `phase` markers (add: dirty/probe/data/alloc/fat+dir/clean, build: boot/stream/boot-final, pull: read, optimize: its phases), `note` (pull's strategy, add's gap policy) and `end`.
+### What a trace contains (privacy)
+
+A trace holds:
+
+- byte offsets and lengths of device ops;
+- timestamps (µs since the start) and queue depths;
+- phase names;
+- strategy notes: pull's strategy object (transport, gap, in-flight, chunk size, probe numbers) and add's gap-policy text;
+- in the header, the command name and the simulated device's name.
+
+It holds **no file names, paths, labels or file contents**. Offsets and sizes still reveal the shape of the data on the drive: how many files there are, their sizes and how they are laid out. Treat a trace of a private drive as potentially sensitive, and share it only as you would share a directory listing without names.
+
+### Format
+
+The trace is one JSON object per line (format version 2): a `start` header (command, simulated device), then `io` (`op` r/w, `off`, `len`, `qd`, `grp`, `seq`, `q`, `t`, `d`), `sync`, `direct` (O_DIRECT toggles), `phase` markers (add: dirty/probe/data/alloc/fat+dir/clean, build: boot/stream/boot-final, pull: read, optimize: its phases), `note` (pull's strategy, add's gap policy) and `end`.
 
 Which ops can overlap is part of the format:
 
 - An op with `qd` 1, or in a different `grp` than the op before it, starts only after everything before it has finished.
 - Within a group, op k waits for op k − qd of the same group.
 - `seq` is the issuing code's own order. Racing threads may write lines of one group out of order, so the replay sorts by `seq`.
+- `i` is the global issue order: an atomic counter taken when the op is issued. Each thread buffers its records in its own buffer and writes them in 64 KB batches, so threads issuing I/O in parallel never wait for each other per op, and the reader restores the order from `i`. Timestamps are monotonic (`Instant`) and are taken around the syscall, outside any lock.
+- **Limits** (`src/sim/replay.rs`): the reader streams the file and refuses a line longer than 64 KB, more than 20 M events (≈1.2 GB in memory) or a file larger than 4 GiB, with a clear error. A 100k-file pull is ~100k events.
 
 The hooks sit in flashcp's own I/O layer:
 
@@ -43,11 +61,21 @@ The hooks sit in flashcp's own I/O layer:
 
 When tracing is off, every hook costs one relaxed atomic load before the syscall it wraps. The volume bytes are identical, and `tests/sim_trace.rs` checks that traced and untraced builds write the same volume. Interleaved medians against `main` (image on NVMe, 21 pulls each): pull 0.366 s vs 0.366 s. Build and add were within ±6 % noise in both directions over 7 runs.
 
+**Tracing on**, measured on the heaviest case: a pull of `many` (100k files, kernel-like layout, 100,405 traced reads) with 32 reads in flight, 11 interleaved runs each, trace file on tmpfs.
+
+| | median | min |
+|---|---:|---:|
+| untraced | 2.622 s | 1.450 s |
+| traced (per-thread buffers) | 2.616 s | 1.452 s |
+| traced (the earlier single-mutex sink) | 2.640 s | 1.437 s |
+
+The residual overhead is below the noise (< 1 %). On this machine every variant is bimodal (≈1.5 s or ≈2.6 s), depending on the destination's `syncfs` and writeback, not on tracing. Keep the trace file off the destination filesystem: pull's final `syncfs` would flush it too, and that counts as host time.
+
 One property of flashcp shows up in traces: pull's metadata walk reads directories in an order that changes from process to process. The data reads are the same sequence every time.
 
 ### Simulated devices (`src/sim/device.rs`, `src/sim/devices/*.dev`)
 
-A sim-device file is a devprofile cache file (the format of `~/.cache/flashcp/devices/*`) plus `sim.*` keys: `name`, `max_sectors_kb`, `logical_block`, `removable`, `probe_choice`, `part_start_sectors` and `size_bytes`.
+A sim-device file is a devprofile cache file (the format of `~/.cache/flashcp/devices/*`) plus `sim.*` keys: `name`, `max_sectors_kb`, `logical_block`, `removable`, `probe_choice`, `part_start_sectors` and `size_bytes`. The `sim.*` keys are validated strictly. An unknown `sim.*` key, a malformed or out-of-range value, or a key given twice is an error naming the line (exit 2), because a silently ignored override would record the wrong strategy.
 
 `sim.probe_choice` is what add's in-situ gap probe decides when the profile has no pattern for this add. The probe's writes still run and are traced; only its decision, which would be timed on the image, is replaced. While the variable is set, nothing is written to the real profile cache.
 
@@ -104,71 +132,92 @@ The error reported is held out. Each point's "held-out" prediction comes from a 
 
 Kernel layouts are approximated by `mkfs.exfat -c <C>` plus `flashcp add` (no root or loop mount is needed). Real kernel `cp -r` layouts may differ in directory placement.
 
-### Results (flashcp at this commit; held-out = cross-validated)
+### Results (flashcp at this commit)
 
-**SanDisk Cruzer Blade 8 GB (USB 2, BOT):** median |error| 3.7 % fitted, **4.9 % held out**, **rankings 11/11** correct (held out and fitted).
+Three numbers per point:
 
-| scenario | real s | range | held-out s | error | flag |
-|---|---:|---|---:|---:|---|
-| sd-build-small | 33.6 | – | 33.63 | +0.1 % | |
-| sd-build-small-512 | 28.5 | – | 28.67 | +0.6 % | |
-| sd-build-small-1k | 29.6 | – | 29.20 | −1.4 % | |
-| sd-build-512mb | 87.5 | – | 85.56 | −2.2 % | |
-| sd-build-512mb-512 | 86.7 | – | 86.53 | −0.2 % | |
-| sd-pull-flashcp | 16.0 | 15.6–16.6 | 16.74 | +4.7 % | |
-| sd-pull-flashcp-8m | 17.6 | 17.6–22.1 | 19.16 | +8.9 % | |
-| sd-pull-flashcp-qd4 | 27.9 | – | 21.40 | −23.3 % | |
-| sd-pull-flashcp-1k | 15.2 | – | 16.05 | +5.6 % | |
-| sd-pull-flashcp-512 | 14.8 | – | 17.88 | +20.8 % | |
-| sd-pull-kernel | 27.0 | – | 27.15 | +0.5 % | |
-| sd-pull-kernel-tail4k | 28.7 | – | 30.11 | +4.9 % | |
-| sd-pull-kernel-v1 | 62.9 | – | 81.77 | +30.0 % | > 25 % |
-| sd-add-32k-skip1 | 105 | 96–114 | 73.45 | −30.0 % | > 25 %, gapped writes |
-| sd-add-32k-skip8 | 138 | 128–148 | 89.37 | −35.2 % | > 25 %, gapped writes |
-| sd-add-32k-fill | 146 | 120–173 | 104.94 | −28.1 % | > 25 %, gapped writes |
-| sd-add-32k-pad16k | 163 | 119–207 | 90.74 | −44.3 % | > 25 %, gapped writes |
-| sd-add-4k | 36.5 | – | 38.80 | +6.3 % | |
-| sd-add-1k | 29.7 | – | 30.27 | +1.9 % | |
-| sd-add-512 | 28.8 | – | 29.69 | +3.1 % | |
-| sd-add-empty32k | 34.9 | – | 33.79 | −3.2 % | |
-| sd-add-empty32k-nobuild | 64 | – | 120.07 | +87.6 % | > 25 %, gapped writes |
-| sd-micro-seqw4k | 26.84 | – | 21.11 | −21.3 % | |
-| sd-micro-seqw64k | 10.82 | – | 10.91 | +0.8 % | |
-| sd-micro-seqw1m | 10.49 | – | 10.54 | +0.5 % | |
-| sd-micro-seqw8m | 10.32 | – | 10.46 | +1.4 % | |
-| sd-micro-randw4k | 10.67 | – | 10.92 | +2.3 % | |
-| sd-micro-flush | 0.135 | – | 0.170 | +26.0 % | > 25 % |
-| sd-micro-seqr1m | 6.10 | – | 4.11 | −32.6 % | > 25 % |
+- **held out**: 10-fold cross-validation, point by point;
+- **family held out**: leave-one-family-out. A family is drive × op × dataset × layout (micro-probe points: drive × kind), so scenarios that differ only in a flashcp setting (e.g. `sd-pull-flashcp`, `-8m`, `-qd4`) are held out together and cannot help predict each other;
+- **fit**: the full fit (not shown in the tables below; in `calibrate`'s output).
 
-**MSI DATAMAG 20Gbps (UAS):** median |error| 7.9 % fitted, **11.6 % held out**, **rankings 3/3** correct.
+The family number is the honest one for "a workload the model has not seen".
 
-| scenario | real s | held-out s | error | flag |
-|---|---:|---:|---:|---|
-| msi-build-small | 0.31 | 0.301 | −2.8 % | |
-| msi-build-512mb | 0.57 | 0.686 | +20.3 % | |
-| msi-pull-flashcp | 0.37 | 0.330 | −10.9 % | |
-| msi-pull-kernel | 0.66 | 0.562 | −14.8 % | |
-| msi-pull-many-flashcp | 1.17 | 1.220 | +4.2 % | |
-| msi-pull-many-kernel | 2.27 | 2.721 | +19.8 % | |
-| msi-pull-mixed-flashcp | 1.68 | 1.591 | −5.3 % | |
-| msi-pull-mixed-kernel | 1.82 | 2.197 | +20.7 % | |
-| msi-add-onto-flashcp | 0.41 | 0.381 | −7.1 % | |
-| msi-add-small-preload | 0.48 | 0.530 | +10.5 % | |
-| msi-add-many-preload | 1.75 | 1.912 | +9.2 % | |
-| msi-add-mixed-preload | 1.57 | 1.803 | +14.9 % | |
-| msi-add-empty128k | 0.41 | 0.285 | −30.5 % | > 25 % |
-| msi-micro-seqw8m | 1.075 | 1.199 | +11.6 % | |
-| msi-micro-seqw4k | 2.767 | 1.822 | −34.1 % | > 25 % |
+**SanDisk Cruzer Blade 8 GB (USB 2, BOT), 29 points in 15 families:**
+
+| | fitted | held out | family held out |
+|---|---:|---:|---:|
+| median abs error | 3.1 % | 4.3 % | **7.1 %** |
+| rankings | 11/11 | 11/11 | **11/11** |
+
+| scenario | real s | range | held-out s | error | family held-out s | error | flag |
+|---|---:|---|---:|---:|---:|---:|---|
+| sd-build-small | 33.6 | – | 33.72 | +0.4 % | 33.81 | +0.6 % |  |
+| sd-build-small-512 | 28.5 | – | 28.65 | +0.5 % | 28.68 | +0.6 % |  |
+| sd-build-small-1k | 29.6 | – | 29.20 | −1.3 % | 29.25 | −1.2 % |  |
+| sd-build-512mb | 87.5 | – | 84.74 | −3.2 % | 84.49 | −3.4 % |  |
+| sd-build-512mb-512 | 86.7 | – | 85.74 | −1.1 % | 85.38 | −1.5 % |  |
+| sd-pull-flashcp | 16 | 15.6–16.6 | 16.68 | +4.3 % | 16.48 | +3.0 % |  |
+| sd-pull-flashcp-8m | 17.6 | 17.6–22.1 | 18.27 | +3.8 % | 18.15 | +3.1 % |  |
+| sd-pull-flashcp-qd4 | 27.9 | – | 20.77 | −25.6 % | 20.80 | −25.4 % | > 25 % |
+| sd-pull-flashcp-1k | 15.2 | – | 16.10 | +5.9 % | 17.09 | +12.4 % |  |
+| sd-pull-flashcp-512 | 14.8 | – | 17.83 | +20.5 % | 17.82 | +20.4 % |  |
+| sd-pull-kernel | 27 | – | 27.17 | +0.6 % | 31.73 | +17.5 % |  |
+| sd-pull-kernel-tail4k | 28.7 | – | 30.19 | +5.2 % | 34.20 | +19.2 % |  |
+| sd-pull-kernel-v1 | 62.9 | – | 83.98 | +33.5 % | 83.92 | +33.4 % | > 25 % |
+| sd-add-32k-skip1 | 105 | 96–114 | 73.60 | −29.9 % | 69.36 | −33.9 % | > 25 % |
+| sd-add-32k-skip8 | 138 | 128–148 | 89.62 | −35.1 % | 80.07 | −42.0 % | > 25 % |
+| sd-add-32k-fill | 146 | 120–173 | 105.17 | −28.0 % | 104.67 | −28.3 % | > 25 % |
+| sd-add-32k-pad16k | 163 | 119–207 | 90.73 | −44.3 % | 82.33 | −49.5 % | > 25 % |
+| sd-add-4k | 36.5 | – | 38.94 | +6.7 % | 39.08 | +7.1 % |  |
+| sd-add-1k | 29.7 | – | 30.33 | +2.1 % | 30.19 | +1.7 % |  |
+| sd-add-512 | 28.8 | – | 29.71 | +3.2 % | 29.68 | +3.0 % |  |
+| sd-add-empty32k | 34.9 | – | 33.75 | −3.3 % | 33.77 | −3.2 % |  |
+| sd-add-empty32k-nobuild | 64 | – | 119.60 | +86.9 % | 119.65 | +87.0 % | > 25 % |
+| sd-micro-seqw4k | 26.84 | – | 21.12 | −21.3 % | 21.13 | −21.3 % |  |
+| sd-micro-seqw64k | 10.82 | – | 10.93 | +1.0 % | 10.90 | +0.7 % |  |
+| sd-micro-seqw1m | 10.49 | – | 10.57 | +0.7 % | 10.60 | +1.0 % |  |
+| sd-micro-seqw8m | 10.32 | – | 10.49 | +1.7 % | 10.58 | +2.5 % |  |
+| sd-micro-randw4k | 10.67 | – | 10.47 | −1.8 % | 10.48 | −1.8 % |  |
+| sd-micro-flush | 0.135 | – | 0.17 | +26.0 % | 0.17 | +25.8 % | > 25 % |
+| sd-micro-seqr1m | 6.1 | – | 4.37 | −28.4 % | 4.32 | −29.2 % | > 25 % |
+
+**MSI DATAMAG 20Gbps (UAS), 15 points in 14 families:**
+
+| | fitted | held out | family held out |
+|---|---:|---:|---:|
+| median abs error | 3.9 % | 12.8 % | **9.0 %** |
+| rankings | 3/3 | 3/3 | **3/3** |
+
+Almost every MSI scenario is a family of its own, so the family CV is close to leave-one-out. With only 3 ranking pairs, the MSI validation is weak: treat MSI predictions as rough. MSI runs are host-bound, and their numbers move by a few points between recordings: an earlier recording gave 11.6 % held out.
+
+| scenario | real s | range | held-out s | error | family held-out s | error | flag |
+|---|---:|---|---:|---:|---:|---:|---|
+| msi-build-small | 0.31 | – | 0.30 | −2.6 % | 0.30 | −2.6 % |  |
+| msi-build-512mb | 0.57 | – | 0.64 | +12.8 % | 0.62 | +9.0 % |  |
+| msi-pull-flashcp | 0.37 | 0.36–0.38 | 0.36 | −3.6 % | 0.36 | −3.1 % |  |
+| msi-pull-kernel | 0.66 | – | 0.62 | −6.0 % | 0.62 | −5.9 % |  |
+| msi-pull-many-flashcp | 1.17 | – | 1.16 | −0.7 % | 1.16 | −1.0 % |  |
+| msi-pull-many-kernel | 2.27 | – | 2.42 | +6.8 % | 2.42 | +6.8 % |  |
+| msi-pull-mixed-flashcp | 1.68 | – | 1.19 | −29.3 % | 1.19 | −29.3 % | > 25 % |
+| msi-pull-mixed-kernel | 1.82 | – | 2.31 | +26.9 % | 2.31 | +26.9 % | > 25 % |
+| msi-add-onto-flashcp | 0.41 | – | 0.39 | −4.3 % | 0.39 | −4.3 % |  |
+| msi-add-small-preload | 0.48 | – | 0.55 | +13.6 % | 0.55 | +13.6 % |  |
+| msi-add-many-preload | 1.75 | – | 1.77 | +1.1 % | 1.77 | +1.1 % |  |
+| msi-add-mixed-preload | 1.57 | – | 1.83 | +16.5 % | 1.78 | +13.5 % |  |
+| msi-add-empty128k | 0.41 | – | 0.28 | −31.3 % | 0.28 | −31.3 % | > 25 % |
+| msi-micro-seqw8m | 1.075 | – | 1.24 | +15.0 % | 1.24 | +15.0 % |  |
+| msi-micro-seqw4k | 2.767 | – | 1.88 | −32.2 % | 1.87 | −32.5 % | > 25 % |
 
 ### Where the model is wrong, and why
 
-- **add's gapped writes on 32 KB clusters (SanDisk, −28 to −44 %), and add into an empty 32 KB volume with build disabled (+88 %).** These have the same write pattern (one ascending stream skipping cluster slack), yet measured 105 s onto a used stick and 64 s onto a fresh mkfs. A trace cannot tell them apart; the stick's history can (which AUs hold old data that a merge must copy, and how much the FTL's spare pool has been used). The FTL layer models merge costs, but not that state.
+- **add's gapped writes on 32 KB clusters (SanDisk, −28 to −50 %), and add into an empty 32 KB volume with build disabled (+87 %).** These have the same write pattern (one ascending stream skipping cluster slack), yet measured 105 s onto a used stick and 64 s onto a fresh mkfs. A trace cannot tell them apart; the stick's history can (which AUs hold old data that a merge must copy, and how much the FTL's spare pool has been used). The FTL layer models merge costs, but not that state.
   - Zero-filling is purely sequential (662 MB), yet it measured 4.5 MB/s against the 512 MB build's 6.1 MB/s. That also points at state (GC under a fuller medium) rather than at the op pattern.
   - The rankings among these strategies are right (skip:1 < skip:8 < fill and pad), and that is what the decisions rest on.
   - To fix: an FTL model with persistent medium state (prior occupancy and spare blocks), calibrated by measurements that record the stick's history (see below).
-- **Reads with 4 and with 32 requests in flight (SanDisk, −23 % and +30 %).** One `rd.thrash` value cannot satisfy both: the stick's read-ahead behaves differently when 4 streams compete and when 32 do. The ranking holds.
+- **Reads with 4 and with 32 requests in flight (SanDisk, −25 % and +33 %).** One `rd.thrash` value cannot satisfy both: the stick's read-ahead behaves differently when 4 streams compete and when 32 do. The ranking holds.
 - **512 B-cluster pull (+21 %), 4K writes and 1 MB reads in the probe:** these are small effects of request alignment that the model does not have.
-- **MSI** is host-bound. Its error depends on how closely the recording machine matches the measuring one, and on recording one at a time. The fit absorbs part of the difference into `host_scale` (≈0.5). `msi-add-empty128k` and the 4K probe are the outliers.
+- **Kernel-layout pulls held out as a family (SanDisk, +18–19 %):** with the whole kernel-layout family withheld, nothing constrains the forward-jump cost, and the prior's generic value is too high. Point-wise they are within 6 %.
+- **MSI** is host-bound. Its error depends on how closely the recording machine matches the measuring one, and on recording one at a time. The fit absorbs part of the difference into `host_scale` (≈0.5). The outliers are the `mixed` pulls (±27–29 %), `msi-add-empty128k` and the 4K probe.
 
 ## Sweeps that reproduce known decisions
 

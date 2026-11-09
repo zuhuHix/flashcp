@@ -223,8 +223,7 @@ impl Workbench {
             bail!("{}: micro scenarios are synthesized by the simulator, not recorded", sc.id);
         }
         let dev_text = device_file_text(&sc.drive).ok_or_else(|| anyhow!("{}: unknown drive `{}`", sc.id, sc.drive))?;
-        let dev = SimDevice::parse(dev_text)
-            .ok_or_else(|| anyhow!("{}: device file of `{}` is not a flashcp-devprofile", sc.id, sc.drive))?;
+        let dev = SimDevice::parse(dev_text).map_err(|e| anyhow!("{}: device file of `{}`: {e}", sc.id, sc.drive))?;
         let size =
             dev.size_bytes.ok_or_else(|| anyhow!("{}: device file of `{}` has no sim.size_bytes", sc.id, sc.drive))?;
         let exe_stamp = self.exe_stamp()?;
@@ -833,7 +832,7 @@ mod tests {
         let path = wb.record(sc).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         let first = text.lines().next().unwrap();
-        assert!(first.starts_with(r#"{"v":1,"ev":"start""#), "{first}");
+        assert!(first.starts_with(r#"{"v":2,"ev":"start""#), "{first}");
         assert!(first.contains(r#""device":"sandisk-cruzer-usb2""#), "{first}");
         assert!(text.lines().any(|l| l.contains(r#""ev":"io""#) && l.contains(r#""op":"r""#)));
         let mtime = fs::metadata(&path).unwrap().modified().unwrap();

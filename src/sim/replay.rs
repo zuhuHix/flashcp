@@ -270,90 +270,171 @@ impl Obj<'_> {
     }
 }
 
-impl Trace {
-    /// Parses a version-1 trace (see [`crate::sim::trace`]). Each consecutive run of ios of the
-    /// same group with qd > 1 is stably sorted by `seq` (racing threads write them out of order).
-    /// Unknown event kinds are ignored; a missing end record takes the last time seen.
-    pub fn parse(text: &str) -> Result<Trace> {
-        let mut tr = Trace::default();
-        let mut header = false;
-        let mut end = None;
-        let mut last_t = 0u64;
-        for (n, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let ctx = || format!("trace line {}", n + 1);
-            let o = Obj(P { s: line, b: line.as_bytes(), i: 0 }.object().with_context(ctx)?);
-            let ev = o.str("ev").with_context(ctx)?;
-            if !header {
-                if ev != "start" {
-                    bail!("trace line {}: the first record must be the start header", n + 1);
-                }
-                let v = o.u64("v").with_context(ctx)?;
-                if v != 1 {
-                    bail!("trace format version {v} is not supported (only 1)");
-                }
-                tr.cmd = o.str("cmd").with_context(ctx)?;
-                tr.device = o.opt_str("device");
-                header = true;
-                continue;
-            }
-            let e = match ev.as_str() {
-                "io" => {
-                    let op = o.str("op").with_context(ctx)?;
-                    let write = match op.as_str() {
-                        "w" => true,
-                        "r" => false,
-                        _ => bail!("trace line {}: unknown op {op:?}", n + 1),
-                    };
-                    let qd = o.u64("qd").with_context(ctx)?.max(1) as usize;
-                    Ev::Io {
-                        write,
-                        off: o.u64("off").with_context(ctx)?,
-                        len: o.u64("len").with_context(ctx)?,
-                        qd,
-                        grp: o.u64("grp").with_context(ctx)? as u32,
-                        seq: o.u64("seq").with_context(ctx)?,
-                        t: o.u64("t").with_context(ctx)?,
-                        d: o.u64("d").with_context(ctx)?,
-                    }
-                }
-                "sync" => Ev::Sync { t: o.u64("t").with_context(ctx)?, d: o.u64("d").with_context(ctx)? },
-                "phase" => Ev::Phase { name: o.str("name").with_context(ctx)?, t: o.u64("t").with_context(ctx)? },
-                "direct" => {
-                    let on = match o.raw("on").with_context(ctx)?.as_str() {
-                        "true" => true,
-                        "false" => false,
-                        r => bail!("trace line {}: direct.on is not a bool: {r}", n + 1),
-                    };
-                    Ev::Direct { on, t: o.u64("t").with_context(ctx)? }
-                }
-                "note" => {
-                    tr.notes.push((o.str("key").with_context(ctx)?, o.raw("val").with_context(ctx)?));
-                    continue;
-                }
-                "end" => {
-                    end = Some(o.u64("t").with_context(ctx)?);
-                    continue;
-                }
-                _ => continue,
-            };
-            last_t = last_t.max(ev_last_time(&e));
-            tr.evs.push(e);
+/// Longest accepted trace line, in bytes (a record is ~150 bytes; a note a few hundred).
+pub const MAX_LINE: usize = 64 << 10;
+/// Most events accepted in one trace (~60 bytes each in memory: ≈1.2 GB). A 100k-file pull
+/// records ~100k events.
+pub const MAX_EVENTS: usize = 20_000_000;
+/// Largest accepted trace file.
+pub const MAX_FILE: u64 = 4 << 30;
+
+/// Line-by-line trace parser (shared by [`Trace::parse`] and the streaming [`Trace::load`]).
+#[derive(Default)]
+struct Parser {
+    tr: Trace,
+    header: bool,
+    version: u64,
+    end: Option<u64>,
+    last_t: u64,
+    /// Issue order of each event (version 2), parallel to `tr.evs`.
+    order: Vec<u64>,
+    note_order: Vec<u64>,
+}
+
+impl Parser {
+    fn line(&mut self, n: usize, line: &str) -> Result<()> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(());
         }
-        if !header {
-            bail!("empty trace (no start header)");
+        let ctx = || format!("trace line {n}");
+        let o = Obj(P { s: line, b: line.as_bytes(), i: 0 }.object().with_context(ctx)?);
+        let ev = o.str("ev").with_context(ctx)?;
+        if !self.header {
+            if ev != "start" {
+                bail!("trace line {n}: the first record must be the start header");
+            }
+            let v = o.u64("v").with_context(ctx)?;
+            if v != 1 && v != 2 {
+                bail!("trace format version {v} is not supported (only 1 and 2)");
+            }
+            self.version = v;
+            self.tr.cmd = o.str("cmd").with_context(ctx)?;
+            self.tr.device = o.opt_str("device");
+            self.header = true;
+            return Ok(());
         }
-        tr.end_us = end.unwrap_or(last_t).max(last_t);
-        tr.sort_groups();
-        Ok(tr)
+        let i = if self.version >= 2 && ev != "end" { o.u64("i").with_context(ctx)? } else { self.order.len() as u64 };
+        let e = match ev.as_str() {
+            "io" => {
+                let op = o.str("op").with_context(ctx)?;
+                let write = match op.as_str() {
+                    "w" => true,
+                    "r" => false,
+                    _ => bail!("trace line {n}: unknown op {op:?}"),
+                };
+                let qd = o.u64("qd").with_context(ctx)?.max(1) as usize;
+                Ev::Io {
+                    write,
+                    off: o.u64("off").with_context(ctx)?,
+                    len: o.u64("len").with_context(ctx)?,
+                    qd,
+                    grp: o.u64("grp").with_context(ctx)? as u32,
+                    seq: o.u64("seq").with_context(ctx)?,
+                    t: o.u64("t").with_context(ctx)?,
+                    d: o.u64("d").with_context(ctx)?,
+                }
+            }
+            "sync" => Ev::Sync { t: o.u64("t").with_context(ctx)?, d: o.u64("d").with_context(ctx)? },
+            "phase" => Ev::Phase { name: o.str("name").with_context(ctx)?, t: o.u64("t").with_context(ctx)? },
+            "direct" => {
+                let on = match o.raw("on").with_context(ctx)?.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    r => bail!("trace line {n}: direct.on is not a bool: {r}"),
+                };
+                Ev::Direct { on, t: o.u64("t").with_context(ctx)? }
+            }
+            "note" => {
+                self.tr.notes.push((o.str("key").with_context(ctx)?, o.raw("val").with_context(ctx)?));
+                self.note_order.push(i);
+                return Ok(());
+            }
+            "end" => {
+                self.end = Some(o.u64("t").with_context(ctx)?);
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        if self.tr.evs.len() >= MAX_EVENTS {
+            bail!("trace has more than {MAX_EVENTS} events (the limit)");
+        }
+        self.last_t = self.last_t.max(ev_last_time(&e));
+        self.tr.evs.push(e);
+        self.order.push(i);
+        Ok(())
     }
 
+    fn finish(mut self) -> Result<Trace> {
+        if !self.header {
+            bail!("empty trace (no start header)");
+        }
+        if self.version >= 2 {
+            let mut ix: Vec<usize> = (0..self.tr.evs.len()).collect();
+            ix.sort_by_key(|&k| self.order[k]);
+            let mut evs: Vec<Option<Ev>> = std::mem::take(&mut self.tr.evs).into_iter().map(Some).collect();
+            self.tr.evs = ix.iter().map(|&k| evs[k].take().expect("each event once")).collect();
+            let mut nx: Vec<usize> = (0..self.tr.notes.len()).collect();
+            nx.sort_by_key(|&k| self.note_order[k]);
+            let notes = std::mem::take(&mut self.tr.notes);
+            self.tr.notes = nx.iter().map(|&k| notes[k].clone()).collect();
+        }
+        self.tr.end_us = self.end.unwrap_or(self.last_t).max(self.last_t);
+        self.tr.sort_groups();
+        Ok(self.tr)
+    }
+}
+
+impl Trace {
+    /// Parses a version-1 or -2 trace (see [`crate::sim::trace`]). Version-2 records are put
+    /// back in issue order (`i`); then each consecutive run of ios of the same group with
+    /// qd > 1 is stably sorted by `seq`. Unknown event kinds are ignored; a missing end record
+    /// takes the last time seen. Limits as in [`Trace::load`].
+    pub fn parse(text: &str) -> Result<Trace> {
+        let mut p = Parser::default();
+        for (n, line) in text.lines().enumerate() {
+            if line.len() > MAX_LINE {
+                bail!("trace line {}: longer than {MAX_LINE} bytes", n + 1);
+            }
+            p.line(n + 1, line)?;
+        }
+        p.finish()
+    }
+
+    /// Streams a trace file: at most [`MAX_LINE`] bytes per line, [`MAX_EVENTS`] events and
+    /// [`MAX_FILE`] bytes, so a huge or hostile file fails with a clear error instead of
+    /// exhausting memory.
     pub fn load(path: &Path) -> Result<Trace> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("read trace {}", path.display()))?;
-        Trace::parse(&text).with_context(|| format!("parse trace {}", path.display()))
+        use std::io::{BufRead, Read};
+        let f = std::fs::File::open(path).with_context(|| format!("read trace {}", path.display()))?;
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len > MAX_FILE {
+            bail!("trace {} is {len} bytes, more than the {MAX_FILE}-byte limit", path.display());
+        }
+        let mut r = std::io::BufReader::with_capacity(1 << 20, f);
+        let mut p = Parser::default();
+        let mut buf = Vec::new();
+        let mut n = 0usize;
+        loop {
+            buf.clear();
+            // Bounded: never buffers more than MAX_LINE + 1 bytes of one line.
+            let got = (&mut r)
+                .take(MAX_LINE as u64 + 1)
+                .read_until(b'\n', &mut buf)
+                .with_context(|| format!("read trace {}", path.display()))?;
+            if got == 0 {
+                break;
+            }
+            n += 1;
+            if buf.len() > MAX_LINE && buf.last() != Some(&b'\n') {
+                bail!("trace {} line {n}: longer than {MAX_LINE} bytes", path.display());
+            }
+            let line =
+                std::str::from_utf8(&buf).with_context(|| format!("trace {} line {n}: not UTF-8", path.display()))?;
+            p.line(n, line.trim_end_matches(['\n', '\r']))
+                .with_context(|| format!("parse trace {}", path.display()))?;
+        }
+        p.finish().with_context(|| format!("parse trace {}", path.display()))
     }
 
     fn sort_groups(&mut self) {
@@ -556,7 +637,7 @@ mod tests {
         let s = t.stats();
         assert_eq!((s.reads, s.writes, s.read_bytes, s.write_bytes, s.syncs), (2, 1, 245760, 512, 1));
         assert!(Trace::parse("").is_err());
-        assert!(Trace::parse(r#"{"v":2,"ev":"start","cmd":"x","device":null}"#).is_err());
+        assert!(Trace::parse(r#"{"v":3,"ev":"start","cmd":"x","device":null}"#).is_err());
         assert!(Trace::parse(r#"{"ev":"io"}"#).is_err());
         let no_dev = Trace::parse(r#"{"v":1,"ev":"start","cmd":"x","device":null}"#).unwrap();
         assert_eq!(no_dev.device, None);
@@ -615,5 +696,46 @@ mod tests {
         let q = Trace::micro("seqr", 1 << 20, 4, 8 << 20).unwrap();
         assert_eq!(q.plan().ops[4].dep, Dep::Op(0));
         assert!(Trace::micro("nope", 4096, 1, 4096).is_err());
+    }
+
+    #[test]
+    fn v2_records_are_put_back_in_issue_order() {
+        // Two threads' batches, interleaved in chunks: file order is not issue order.
+        let t = Trace::parse(concat!(
+            r#"{"v":2,"ev":"start","cmd":"pull","device":null}"#,
+            "\n",
+            r#"{"i":2,"ev":"io","op":"r","off":300,"len":100,"qd":1,"grp":0,"seq":0,"q":1,"t":30,"d":31}"#,
+            "\n",
+            r#"{"i":0,"ev":"io","op":"r","off":100,"len":100,"qd":1,"grp":0,"seq":0,"q":1,"t":10,"d":11}"#,
+            "\n",
+            r#"{"i":3,"ev":"note","key":"b","val":2}"#,
+            "\n",
+            r#"{"i":1,"ev":"note","key":"a","val":1}"#,
+            "\n",
+            r#"{"ev":"end","t":40}"#,
+        ))
+        .unwrap();
+        let offs: Vec<u64> = t.evs.iter().map(|e| if let Ev::Io { off, .. } = e { *off } else { 0 }).collect();
+        assert_eq!(offs, [100, 300]);
+        assert_eq!(t.notes[0].0, "a");
+        // v2 records must carry `i`.
+        let bad = "{\"v\":2,\"ev\":\"start\",\"cmd\":\"x\",\"device\":null}\n{\"ev\":\"sync\",\"t\":1,\"d\":2}";
+        assert!(Trace::parse(bad).is_err());
+    }
+
+    #[test]
+    fn load_streams_and_refuses_overlong_lines() {
+        let dir = std::env::temp_dir().join(format!("flashcp-replay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("ok.jsonl");
+        std::fs::write(&ok, SAMPLE).unwrap();
+        assert_eq!(Trace::load(&ok).unwrap().evs.len(), Trace::parse(SAMPLE).unwrap().evs.len());
+        let long = dir.join("long.jsonl");
+        let mut text = String::from("{\"v\":1,\"ev\":\"start\",\"cmd\":\"x\",\"device\":null}\n");
+        text.push_str(&"x".repeat(MAX_LINE + 10));
+        std::fs::write(&long, text).unwrap();
+        let e = format!("{:#}", Trace::load(&long).unwrap_err());
+        assert!(e.contains("longer than"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -30,11 +30,14 @@ fn ios(trace: &str) -> Vec<Io> {
         let i = l.find(&format!("\"{k}\":")).unwrap_or_else(|| panic!("no {k} in {l}")) + k.len() + 3;
         l[i..].chars().take_while(|c| *c != ',' && *c != '}').collect::<String>().trim_matches('"').to_string()
     };
-    let mut v: Vec<(u64, u64, Io)> = Vec::new();
+    let mut v: Vec<(u64, u64, u64, Io)> = Vec::new();
     for l in trace.lines().filter(|l| l.contains(r#""ev":"io""#)) {
         let n = |k| field(l, k).parse::<u64>().unwrap();
-        v.push((n("grp"), n("seq"), (field(l, "op"), n("off"), n("len"), n("qd"))));
+        v.push((n("i"), n("grp"), n("seq"), (field(l, "op"), n("off"), n("len"), n("qd"))));
     }
+    // Threads write their records in batches: issue order is `i`.
+    v.sort_by_key(|r| r.0);
+    let v: Vec<(u64, u64, Io)> = v.into_iter().map(|r| (r.1, r.2, r.3)).collect();
     let mut out = Vec::new();
     let mut i = 0;
     while i < v.len() {
@@ -71,7 +74,7 @@ fn tracing_off_and_on_write_identical_volumes() {
     let diff = va[..skip].iter().zip(&vb[..skip]).filter(|(x, y)| x != y).count();
     assert!(diff <= 2 * (4 + 512), "boot regions differ in {diff} bytes");
     let t = fs::read_to_string(&tr).unwrap();
-    assert!(t.lines().next().unwrap().starts_with(r#"{"v":1,"ev":"start","cmd":"build""#), "{t}");
+    assert!(t.lines().next().unwrap().starts_with(r#"{"v":2,"ev":"start","cmd":"build""#), "{t}");
     assert!(t.lines().last().unwrap().starts_with(r#"{"ev":"end""#));
     let w: u64 = ios(&t).iter().filter(|o| o.0 == "w").map(|o| o.2).sum();
     assert!(w >= 4 << 20, "build wrote only {w} traced bytes");

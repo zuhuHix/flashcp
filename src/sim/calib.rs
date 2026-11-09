@@ -21,10 +21,21 @@
 //! and the fold's points are predicted with it: every "CV" number is a prediction for a point
 //! the fit did not see (it cannot depend on the point's own `real`). Ranking accuracy on the
 //! pairs uses these held-out predictions (and is also reported for the full fit).
+//!
+//! Point-wise folds still let near-duplicates leak: `sd-pull-flashcp` and `sd-pull-flashcp-8m`
+//! are the same workload with one setting changed, so a fit that saw one predicts the other
+//! well. The stricter number is **leave-one-family-out** (LOFO): points are grouped by
+//! [`CalPoint::family`] (drive × op × dataset × layout; micro-probe points by kind) and every
+//! family is predicted by a fit that saw none of its members. Both are reported.
+//!
+//! The full fit and every held-out fit run in parallel threads (one fit per thread, its
+//! simulations serial). [`CalOpts::fast`] caps the optimizer at a quarter of the evaluations
+//! and uses 5 point-wise folds.
 
 use crate::sim::model::{Model, simulate_plan};
 use crate::sim::replay::{Plan, Trace};
 use anyhow::{Result, bail};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 /// Prior width in ln units (see the module docs).
 pub const PRIOR_SIGMA: f64 = 6.907_755_278_982_137; // ln 1000
@@ -42,7 +53,17 @@ pub struct CalPoint {
     pub real: f64,
     pub lo: Option<f64>,
     pub hi: Option<f64>,
+    /// Workload family for grouped cross-validation (drive × op × dataset × layout); points
+    /// with the same family are held out together. Empty = the point is its own family.
+    pub family: String,
     pub trace: Trace,
+}
+
+/// Calibration options.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CalOpts {
+    /// Fewer optimizer evaluations (a quarter) and 5 point-wise folds: a quick look.
+    pub fast: bool,
 }
 
 /// One point's row in the report.
@@ -57,9 +78,13 @@ pub struct PointRow {
     pub sim_base: f64,
     pub sim_full: f64,
     pub sim_cv: f64,
+    /// Held out with its whole family (leave-one-family-out).
+    pub sim_lofo: f64,
+    pub family: String,
     /// Relative errors (sim / real − 1).
     pub err_full: f64,
     pub err_cv: f64,
+    pub err_lofo: f64,
     /// The model has no FTL and most of the point's writes are gapped (forward skips inside a
     /// 4 MiB unit, e.g. add's skipped cluster slack): its cost lies in AU merges, which only
     /// the FTL layer models.
@@ -84,6 +109,7 @@ pub struct PairRow {
     pub real_ok: bool,
     pub full_ok: bool,
     pub cv_ok: bool,
+    pub lofo_ok: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +118,8 @@ pub struct CalReport {
     pub base: Model,
     pub free: Vec<String>,
     pub folds: usize,
+    /// Number of workload families (leave-one-family-out folds).
+    pub families: usize,
     pub points: Vec<PointRow>,
     pub pairs: Vec<PairRow>,
     /// Pairs naming a point that is not among the calibration points.
@@ -118,6 +146,16 @@ impl CalReport {
     /// (correct, total) ranking pairs on held-out predictions.
     pub fn ranking(&self) -> (usize, usize) {
         (self.pairs.iter().filter(|p| p.cv_ok).count(), self.pairs.len())
+    }
+
+    /// (correct, total) ranking pairs on leave-one-family-out predictions.
+    pub fn ranking_lofo(&self) -> (usize, usize) {
+        (self.pairs.iter().filter(|p| p.lofo_ok).count(), self.pairs.len())
+    }
+
+    /// Median |leave-one-family-out error| (relative).
+    pub fn median_abs_err_lofo(&self) -> f64 {
+        median(self.points.iter().map(|p| p.err_lofo.abs()).collect())
     }
 
     /// (correct, total) ranking pairs with the full fit.
@@ -150,28 +188,32 @@ impl CalReport {
         };
         let (cv_ok, n) = self.ranking();
         let (full_ok, _) = self.ranking_full();
+        let (lofo_ok, _) = self.ranking_lofo();
         let mut s = format!(
-            "**{}** · free: {} · {} points, {} folds{} · median |err| fit {:.1} %, held out {:.1} % · \
-             ranking held out {cv_ok}/{n}, fit {full_ok}/{n}\n\n",
+            "**{}** · free: {} · {} points, {} folds{}, {} families · median |err| fit {:.1} %, held out \
+             {:.1} %, family held out {:.1} % · ranking held out {cv_ok}/{n}, family held out {lofo_ok}/{n}, \
+             fit {full_ok}/{n}\n\n",
             self.fitted.name,
             if self.free.is_empty() { "none".to_string() } else { self.free.join(", ") },
             self.points.len(),
             self.folds,
             if self.folds == self.points.len() { " (leave-one-out)" } else { "" },
+            self.families,
             self.median_abs_err_full() * 100.0,
             self.median_abs_err_cv() * 100.0,
+            self.median_abs_err_lofo() * 100.0,
         );
-        s.push_str("| point | drive | real s | range | base s | fit s | err | held-out s | err | in range (fit / held-out) | flag |\n");
-        s.push_str("|---|---|---:|---|---:|---:|---:|---:|---:|---|---|\n");
+        s.push_str("| point | family | real s | range | base s | fit s | err | held-out s | err | family held-out s | err | in range (fit / held-out) | flag |\n");
+        s.push_str("|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|---|\n");
         for p in &self.points {
             let range = match (p.lo, p.hi) {
                 (Some(lo), Some(hi)) => format!("{lo}–{hi}"),
                 _ => "–".into(),
             };
             s.push_str(&format!(
-                "| {} | {} | {} | {} | {:.3} | {:.3} | {} | {:.3} | {} | {} / {} | {} |\n",
+                "| {} | {} | {} | {} | {:.3} | {:.3} | {} | {:.3} | {} | {:.3} | {} | {} / {} | {} |\n",
                 p.id,
-                p.drive,
+                p.family,
                 p.real,
                 range,
                 p.sim_base,
@@ -179,9 +221,11 @@ impl CalReport {
                 pct(p.err_full),
                 p.sim_cv,
                 pct(p.err_cv),
+                p.sim_lofo,
+                pct(p.err_lofo),
                 rng(p, p.sim_full),
                 rng(p, p.sim_cv),
-                match (p.err_cv.abs() > FLAG_ERR, p.needs_ftl) {
+                match (p.err_cv.abs().max(p.err_lofo.abs()) > FLAG_ERR, p.needs_ftl) {
                     (true, true) => "**> 25 %**, gapped writes: stick history / GC not in the trace",
                     (true, false) => "**> 25 %**",
                     (false, true) => "",
@@ -190,16 +234,17 @@ impl CalReport {
             ));
         }
         if !self.pairs.is_empty() {
-            s.push_str("\n| faster | slower | real | fit | held out |\n|---|---|---|---|---|\n");
+            s.push_str("\n| faster | slower | real | fit | held out | family held out |\n|---|---|---|---|---|---|\n");
             let ok = |b: bool| if b { "ok" } else { "**WRONG**" };
             for p in &self.pairs {
                 s.push_str(&format!(
-                    "| {} | {} | {} | {} | {} |\n",
+                    "| {} | {} | {} | {} | {} | {} |\n",
                     p.faster,
                     p.slower,
                     ok(p.real_ok),
                     ok(p.full_ok),
-                    ok(p.cv_ok)
+                    ok(p.cv_ok),
+                    ok(p.lofo_ok)
                 ));
             }
         }
@@ -236,10 +281,14 @@ impl Problem<'_> {
         m
     }
 
-    fn objective(&self, theta: &[f64], idx: &[usize], evals: &mut usize) -> f64 {
+    fn objective(&self, theta: &[f64], idx: &[usize], evals: &AtomicUsize, parallel: bool) -> f64 {
         let m = self.model(theta);
-        let sims = sim_all(self.plans, idx, &m);
-        *evals += idx.len();
+        let sims = if parallel {
+            sim_all(self.plans, idx, &m)
+        } else {
+            idx.iter().map(|&i| simulate_plan(&self.plans[i], &m, None).secs).collect()
+        };
+        evals.fetch_add(idx.len(), Relaxed);
         let mut f = 0.0;
         for (&i, s) in idx.iter().zip(&sims) {
             let r = (s.max(1e-12) / self.reals[i]).ln();
@@ -379,6 +428,17 @@ fn nelder_mead(f: &mut dyn FnMut(&[f64]) -> f64, x0: &[f64], step: f64, max_eval
 /// Fits `free` parameters of `base` to `points` (see the module docs) and cross-validates.
 /// All points are simulated on the same model: calibrate one drive at a time.
 pub fn calibrate(points: &[CalPoint], pairs: &[(String, String)], base: &Model, free: &[&str]) -> Result<CalReport> {
+    calibrate_opts(points, pairs, base, free, CalOpts::default())
+}
+
+/// [`calibrate`] with options.
+pub fn calibrate_opts(
+    points: &[CalPoint],
+    pairs: &[(String, String)],
+    base: &Model,
+    free: &[&str],
+    opts: CalOpts,
+) -> Result<CalReport> {
     if points.is_empty() {
         bail!("calibration needs at least one point");
     }
@@ -410,31 +470,56 @@ pub fn calibrate(points: &[CalPoint], pairs: &[(String, String)], base: &Model, 
     let prob = Problem { plans: &plans, reals: points.iter().map(|p| p.real).collect(), weights, base, free, theta0 };
     let n = points.len();
     let all: Vec<usize> = (0..n).collect();
-    let max_evals = 300 + 150 * free.len();
-    let mut evals = 0usize;
-    let fit = |idx: &[usize], evals: &mut usize| -> (Vec<f64>, f64) {
-        let mut obj = |th: &[f64]| prob.objective(th, idx, evals);
+    let max_evals = (300 + 150 * free.len()) / if opts.fast { 4 } else { 1 };
+    let evals = AtomicUsize::new(0);
+    let fit = |idx: &[usize], parallel: bool| -> (Vec<f64>, f64) {
+        let mut obj = |th: &[f64]| prob.objective(th, idx, &evals, parallel);
         nelder_mead(&mut obj, &prob.theta0, 0.5, max_evals)
     };
-    let (theta_full, objective) = fit(&all, &mut evals);
+    // Held-out sets: point-wise folds (point i → fold i mod k) and one per family.
+    let folds = n.min(if opts.fast { 5 } else { MAX_FOLDS });
+    let fam_of = |i: usize| if points[i].family.is_empty() { points[i].id.clone() } else { points[i].family.clone() };
+    let mut fams: Vec<String> = (0..n).map(fam_of).collect();
+    fams.sort();
+    fams.dedup();
+    let mut tests: Vec<(bool, Vec<usize>)> =
+        (0..folds).map(|f| (false, (0..n).filter(|i| i % folds == f).collect())).collect();
+    tests.extend(fams.iter().map(|fam| (true, (0..n).filter(|&i| &fam_of(i) == fam).collect())));
+    // The full fit (simulations in parallel) runs while the held-out fits (one per thread,
+    // simulations serial) share the remaining cores.
+    let next = AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(1, |t| t.get()).max(1);
+    let results: std::sync::Mutex<Vec<(usize, Model)>> = std::sync::Mutex::new(Vec::new());
+    let (theta_full, objective) = std::thread::scope(|s| {
+        for _ in 0..threads.saturating_sub(1).max(1) {
+            s.spawn(|| {
+                loop {
+                    let t = next.fetch_add(1, Relaxed);
+                    let Some((_, test)) = tests.get(t) else { return };
+                    let train: Vec<usize> = (0..n).filter(|i| !test.contains(i)).collect();
+                    let m = if train.is_empty() || free.is_empty() {
+                        base.clone()
+                    } else {
+                        prob.model(&fit(&train, false).0)
+                    };
+                    results.lock().unwrap().push((t, m));
+                }
+            });
+        }
+        fit(&all, true)
+    });
     let fitted = {
         let mut m = prob.model(&theta_full);
         m.name = base.name.clone();
         m
     };
-    let folds = n.min(MAX_FOLDS);
     let mut sim_cv = vec![0.0; n];
-    for f in 0..folds {
-        let train: Vec<usize> = (0..n).filter(|i| i % folds != f).collect();
-        let test: Vec<usize> = (0..n).filter(|i| i % folds == f).collect();
-        let m = if train.is_empty() || free.is_empty() {
-            base.clone()
-        } else {
-            let (th, _) = fit(&train, &mut evals);
-            prob.model(&th)
-        };
-        for (i, s) in test.iter().zip(sim_all(&plans, &test, &m)) {
-            sim_cv[*i] = s;
+    let mut sim_lofo = vec![0.0; n];
+    for (t, m) in results.into_inner().unwrap() {
+        let (family, test) = &tests[t];
+        let out = if *family { &mut sim_lofo } else { &mut sim_cv };
+        for (i, s) in test.iter().zip(sim_all(&plans, test, &m)) {
+            out[*i] = s;
         }
     }
     let sim_full = sim_all(&plans, &all, &fitted);
@@ -451,8 +536,11 @@ pub fn calibrate(points: &[CalPoint], pairs: &[(String, String)], base: &Model, 
             sim_base: sim_base[i],
             sim_full: sim_full[i],
             sim_cv: sim_cv[i],
+            sim_lofo: sim_lofo[i],
+            family: fam_of(i),
             err_full: sim_full[i] / p.real - 1.0,
             err_cv: sim_cv[i] / p.real - 1.0,
+            err_lofo: sim_lofo[i] / p.real - 1.0,
             needs_ftl: base.ftl.is_none() && gapped_writes(&p.trace),
         })
         .collect();
@@ -466,6 +554,7 @@ pub fn calibrate(points: &[CalPoint], pairs: &[(String, String)], base: &Model, 
                 real_ok: x.real < y.real,
                 full_ok: x.sim_full < y.sim_full,
                 cv_ok: x.sim_cv < y.sim_cv,
+                lofo_ok: x.sim_lofo < y.sim_lofo,
             }),
             _ => skipped.push((a.clone(), b.clone())),
         }
@@ -475,11 +564,12 @@ pub fn calibrate(points: &[CalPoint], pairs: &[(String, String)], base: &Model, 
         base: base.clone(),
         free: free.iter().map(|s| s.to_string()).collect(),
         folds,
+        families: fams.len(),
         points: rows,
         pairs: prs,
         skipped_pairs: skipped,
         objective,
-        evals,
+        evals: evals.into_inner(),
     })
 }
 
@@ -504,7 +594,15 @@ mod tests {
             .map(|&(id, kind, bs, qd, bytes)| {
                 let trace = Trace::micro(kind, bs, qd, bytes).unwrap();
                 let real = simulate_det(&trace, truth).secs;
-                CalPoint { id: id.into(), drive: "synthetic".into(), real, lo: None, hi: None, trace }
+                CalPoint {
+                    id: id.into(),
+                    drive: "synthetic".into(),
+                    real,
+                    lo: None,
+                    hi: None,
+                    family: String::new(),
+                    trace,
+                }
             })
             .collect()
     }
@@ -587,7 +685,15 @@ mod tests {
                 .collect(),
             ..Trace::default()
         };
-        let gp = CalPoint { id: "g".into(), drive: "s".into(), real: 1.0, lo: None, hi: None, trace: g };
+        let gp = CalPoint {
+            id: "g".into(),
+            drive: "s".into(),
+            real: 1.0,
+            lo: None,
+            hi: None,
+            family: String::new(),
+            trace: g,
+        };
         let r = calibrate(std::slice::from_ref(&gp), &[], &base(), &[]).unwrap();
         assert!(r.points[0].needs_ftl);
         assert!(!calibrate(&[gp], &[], &profiles::sandisk(), &[]).unwrap().points[0].needs_ftl);
@@ -652,6 +758,7 @@ mod dev {
                 real: num("real").unwrap(),
                 lo: num("lo"),
                 hi: num("hi"),
+                family: String::new(),
                 trace,
             });
         }

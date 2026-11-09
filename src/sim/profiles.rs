@@ -305,7 +305,13 @@ pub fn resolve(spec: &str) -> Result<Model> {
     if first.starts_with("flashcp-simmodel") {
         return Model::parse(&text).with_context(|| format!("model file {}", path.display()));
     }
-    if let Some(d) = crate::sim::device::SimDevice::parse(&text) {
+    let parsed = crate::sim::device::SimDevice::parse(&text);
+    if let Err(e) = &parsed
+        && first.starts_with("flashcp-devprofile")
+    {
+        bail!("device file {}: {e}", path.display());
+    }
+    if let Ok(d) = parsed {
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "device".into());
         let has_name = text.lines().any(|l| l.trim_start().starts_with("sim.name="));
         let mut m = from_devprofile(&d.profile, if has_name { &d.name } else { &stem });
