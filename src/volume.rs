@@ -54,6 +54,12 @@ pub(crate) struct Dir {
     pub(crate) path: String,
     /// Up-cased path components from the root (the key into `Vol::kept`).
     pub(crate) key: Vec<Vec<u16>>,
+    /// Further live entry sets whose up-cased name equals one in `children` (the window of an
+    /// interrupted `flashcp sync`; only with [`Vol::tolerate_dups`], otherwise refused).
+    pub(crate) dups: Vec<Child>,
+    /// Offsets of orphan secondaries: in-use secondary entries left after a deleted file entry
+    /// (0x05) by an interrupted `flashcp sync`, within that entry's SecondaryCount. Skipped.
+    pub(crate) orphans: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -86,6 +92,9 @@ pub(crate) struct Vol {
     pub(crate) upc: Vec<u16>,
     pub(crate) label: String,
     pub(crate) dirs: Vec<Dir>,
+    /// Accept duplicate names (into `Dir::dups`) and the zero-length directory entries
+    /// `fsck.exfat -y` leaves of one: only `sync`, which repairs them, sets it.
+    pub(crate) tolerate_dups: bool,
 }
 
 pub(crate) fn le16(b: &[u8], o: usize) -> u16 {
@@ -114,6 +123,17 @@ impl Vol {
     /// `read_bitmap: false` validates the bitmap's entry and chain but does not load it (for
     /// read-only walks that never consult it; `bitmap` stays empty).
     pub(crate) fn open(dev: File, dev_len: u64, allow_dirty: bool, read_bitmap: bool) -> Result<Vol> {
+        Vol::open_with(dev, dev_len, allow_dirty, read_bitmap, false)
+    }
+
+    /// [`Vol::open`], optionally tolerating duplicate names (see [`Vol::tolerate_dups`]).
+    pub(crate) fn open_with(
+        dev: File,
+        dev_len: u64,
+        allow_dirty: bool,
+        read_bitmap: bool,
+        tolerate_dups: bool,
+    ) -> Result<Vol> {
         ensure!(dev_len >= 24 * 512, "target is too small to hold an exFAT volume");
         let mut s0 = vec![0u8; 512];
         crate::sim::trace::serial(crate::sim::trace::Op::Read, 0, 512, || dev.read_exact_at(&mut s0, 0))
@@ -180,12 +200,13 @@ impl Vol {
             upc: Vec::new(),
             label: String::new(),
             dirs: Vec::new(),
+            tolerate_dups,
         };
         let root_clusters = v.chain(root, "root directory", MAX_DIR_BYTES / cs)?;
         ensure!(root_clusters.len() as u64 * cs <= MAX_DIR_BYTES, "root directory is larger than 256 MB");
         let data = v.read_clusters(&root_clusters, root_clusters.len() as u64 * cs)?;
         let mut extras = RootExtras::default();
-        let (end, children) = parse_dir(&data, Some(&mut extras), "/", cs)?;
+        let (end, children, orphans) = parse_dir(&data, Some(&mut extras), "/", cs, tolerate_dups)?;
 
         ensure!(!extras.bitmaps.is_empty(), "root directory has no allocation bitmap entry");
         ensure!(
@@ -210,7 +231,7 @@ impl Vol {
         ensure!(checksum32(&raw, &[], 0) == le32(&uc, 4), "up-case table checksum mismatch");
         v.upc = upcase_from(&raw);
         v.label = extras.label;
-        let children = rekey(children, &v.upc)?;
+        let (children, dups) = rekey(children, &v.upc, "/", tolerate_dups)?;
         v.dirs.push(Dir {
             clusters: root_clusters,
             no_fat_chain: false,
@@ -220,6 +241,8 @@ impl Vol {
             entry: None,
             path: String::new(),
             key: Vec::new(),
+            dups,
+            orphans,
         });
         v.kept.insert(Vec::new(), 0);
         Ok(v)
@@ -346,8 +369,8 @@ impl Vol {
         );
         let clusters = self.object_clusters(ch.first, ch.no_fat_chain, ch.len, &path)?;
         let data = self.read_clusters(&clusters, ch.len)?;
-        let (end, children) = parse_dir(&data, None, &path, self.cs)?;
-        let children = rekey(children, &self.upc)?;
+        let (end, children, orphans) = parse_dir(&data, None, &path, self.cs, self.tolerate_dups)?;
+        let (children, dups) = rekey(children, &self.upc, &path, self.tolerate_dups)?;
         Ok(Dir {
             clusters,
             no_fat_chain: ch.no_fat_chain,
@@ -357,6 +380,8 @@ impl Vol {
             entry: Some((parent, ch.set_off, ch.set_len)),
             path,
             key: Vec::new(),
+            dups,
+            orphans,
         })
     }
 
@@ -389,6 +414,8 @@ impl Vol {
             }
             objects += 1;
         }
+        let root_dups = (self.dirs[0].dups.clone(), self.dirs[0].children.clone());
+        objects += self.claim_dups(&mut refd, "", &root_dups.0, &root_dups.1)?;
         // (key, path, children, index in dirs if kept)
         type Work = (Vec<Vec<u16>>, String, Vec<Child>, Option<usize>);
         let mut stack: Vec<Work> =
@@ -406,6 +433,7 @@ impl Vol {
                     ckey.push(upcase(&ch.name, &self.upc));
                     let grand: Vec<Child> = d.children.values().cloned().collect();
                     let dpath = d.path.clone();
+                    objects += self.claim_dups(&mut refd, &dpath, &d.dups, &d.children)?;
                     // A wanted directory's parent is wanted too (prefixes), so kept_at is Some.
                     let at = if kept_at.is_some() && keep(&ckey) {
                         d.key = ckey.clone();
@@ -423,6 +451,37 @@ impl Vol {
             }
         }
         Ok(objects)
+    }
+
+    /// Claims the clusters of a directory's duplicate entry sets. A duplicate sharing its
+    /// twin's FirstCluster (a relocated entry set: one object under two sets) is claimed once,
+    /// through the twin; a zero-length directory (what `fsck.exfat -y` leaves of such a pair)
+    /// owns nothing. A duplicate directory with clusters of its own is no state flashcp leaves.
+    fn claim_dups(
+        &mut self,
+        refd: &mut [u8],
+        path: &str,
+        dups: &[Child],
+        children: &HashMap<Vec<u16>, Child>,
+    ) -> Result<u64> {
+        for ch in dups {
+            let twin = &children[&upcase(&ch.name, &self.upc)];
+            let what = || format!("{path}/{}", String::from_utf16_lossy(&ch.name));
+            if ch.first != 0 && ch.first == twin.first {
+                ensure!(
+                    ch.is_dir == twin.is_dir && ch.len == twin.len && ch.no_fat_chain == twin.no_fat_chain,
+                    "{}: two entries share a first cluster but differ; run fsck.exfat",
+                    what()
+                );
+                continue;
+            }
+            if ch.is_dir {
+                ensure!(ch.len == 0, "{}: a duplicate directory with clusters of its own; run fsck.exfat", what());
+                continue;
+            }
+            self.claim_stream(refd, ch, &what)?;
+        }
+        Ok(dups.len() as u64)
     }
 
     /// Claims a file's clusters without materializing them (files can be huge).
@@ -557,14 +616,48 @@ pub(crate) fn claim(refd: &mut [u8], bitmap: &[u8], c: u32, what: &dyn Fn() -> S
     Ok(())
 }
 
-pub(crate) fn rekey(children: Vec<Child>, upc: &[u16]) -> Result<HashMap<Vec<u16>, Child>> {
-    let mut m = HashMap::with_capacity(children.len());
+/// Children of a directory by up-cased name.
+pub(crate) type Children = HashMap<Vec<u16>, Child>;
+
+/// The hint for a volume in the window of an interrupted `flashcp sync`.
+pub(crate) const SYNC_HINT: &str =
+    "an interrupted flashcp sync: run `flashcp sync --recover <target>` or re-run the sync";
+
+/// Children by up-cased name. Two live sets with one up-cased name are refused, unless
+/// `tolerate` (sync): then, per name, one set stays in the map (a directory with clusters if
+/// there is one, else the lowest offset) and the others are returned as duplicates. A
+/// zero-length directory (only accepted by a tolerant parse) must have such a twin.
+pub(crate) fn rekey(children: Vec<Child>, upc: &[u16], path: &str, tolerate: bool) -> Result<(Children, Vec<Child>)> {
+    let mut m: HashMap<Vec<u16>, Child> = HashMap::with_capacity(children.len());
+    let mut dups = Vec::new();
+    let shown = |c: &Child| format!("{}/{}", path.trim_end_matches('/'), String::from_utf16_lossy(&c.name));
     for c in children {
         let key = upcase(&c.name, upc);
-        let name = String::from_utf16_lossy(&c.name);
-        ensure!(m.insert(key, c).is_none(), "directory holds two entries named {name:?}; run fsck.exfat");
+        match m.get_mut(&key) {
+            None => {
+                m.insert(key, c);
+            }
+            Some(_) if !tolerate => {
+                bail!("{} is there twice (two entries with one name; {SYNC_HINT}; otherwise run fsck.exfat)", shown(&c))
+            }
+            Some(have) => {
+                // A directory that owns clusters wins over a zero-length one.
+                if have.is_dir && have.len == 0 && !(c.is_dir && c.len == 0) {
+                    dups.push(std::mem::replace(have, c));
+                } else {
+                    dups.push(c);
+                }
+            }
+        }
     }
-    Ok(m)
+    for c in m.values() {
+        ensure!(
+            !(c.is_dir && c.len == 0),
+            "directory {}: DataLength 0 is not a non-zero multiple of the cluster size; run fsck.exfat",
+            shown(c)
+        );
+    }
+    Ok((m, dups))
 }
 
 pub(crate) fn upcase(name: &[u16], upc: &[u16]) -> Vec<u16> {
@@ -576,22 +669,44 @@ pub(crate) fn upcase(name: &[u16], upc: &[u16]) -> Vec<u16> {
 /// Every file's ValidDataLength ≤ DataLength and every directory's ValidDataLength ==
 /// DataLength, a non-zero multiple of the cluster size `cs` (≤ 256 MB) is checked here, for
 /// every entry.
+///
+/// Orphan secondaries (in-use secondary entries after a deleted file entry 0x05, within its
+/// SecondaryCount: what an interrupted `flashcp sync` leaves between its unlink and free
+/// phases) are skipped and their offsets returned. With `lax`, a directory entry with
+/// DataLength 0 and no cluster (what `fsck.exfat -y` makes of the second of two sets sharing
+/// clusters) is returned as such; [`rekey`] then demands its twin.
+pub(crate) type Parsed = (usize, Vec<Child>, Vec<usize>);
+
 pub(crate) fn parse_dir(
     data: &[u8],
     mut root: Option<&mut RootExtras>,
     path: &str,
     cs: u64,
-) -> Result<(usize, Vec<Child>)> {
+    lax: bool,
+) -> Result<Parsed> {
     let mut kids = Vec::new();
+    let mut orphans = Vec::new();
     let mut i = 0usize;
     let at = |i: usize| format!("directory {path}, entry {}", i / 32);
     while i + 32 <= data.len() {
         let t = data[i];
         if t == 0 {
-            return Ok((i, kids));
+            return Ok((i, kids, orphans));
         }
         if t & 0x80 == 0 {
-            i += 32; // unused / deleted entry
+            // Unused / deleted entry. After a deleted file entry, in-use secondaries within its
+            // SecondaryCount are orphans; the scan stops at the first primary or end marker.
+            let sc = if t == 0x05 { data[i + 1] as usize } else { 0 };
+            i += 32;
+            for _ in 0..sc {
+                if i + 32 > data.len() || data[i] & 0x40 == 0 {
+                    break;
+                }
+                if data[i] & 0x80 != 0 {
+                    orphans.push(i);
+                }
+                i += 32;
+            }
             continue;
         }
         let secondary = t & 0x40 != 0;
@@ -643,7 +758,9 @@ pub(crate) fn parse_dir(
                 let (is_dir, data_len, valid_len) = (le16(set, 4) & 0x10 != 0, le64(set, 56), le64(set, 40));
                 // Every stream entry, before anyone branches on its type or skips it.
                 let shown = || format!("{}/{}", path.trim_end_matches('/'), String::from_utf16_lossy(&name));
-                if is_dir {
+                if is_dir && lax && data_len == 0 && valid_len == 0 && le32(set, 52) == 0 {
+                    // fsck.exfat's remains of a cross-linked twin: rekey checks there is one.
+                } else if is_dir {
                     ensure!(
                         valid_len == data_len,
                         "directory {}: ValidDataLength {valid_len} differs from DataLength {data_len}; run fsck.exfat",
@@ -685,7 +802,7 @@ pub(crate) fn parse_dir(
         }
         i += 32;
     }
-    Ok((data.len().min(i), kids))
+    Ok((data.len().min(i), kids, orphans))
 }
 
 /// Decodes a stored timestamp (DOS-style field, 10 ms increment, UTC offset byte) to UTC
@@ -873,6 +990,7 @@ mod tests {
             upc: vec![],
             label: String::new(),
             dirs: vec![],
+            tolerate_dups: false,
         };
         // Stride through the whole 256 MB FAT (4096 distinct pages), then revisit.
         for round in 0..2 {
@@ -920,7 +1038,8 @@ mod tests {
         d.extend(set("Sub Dir", true, 12, 4096, false));
         let end = d.len();
         d.resize(4096, 0);
-        let (e, kids) = parse_dir(&d, None, "/", 4096).unwrap();
+        let (e, kids, orphans) = parse_dir(&d, None, "/", 4096, false).unwrap();
+        assert!(orphans.is_empty());
         assert_eq!(e, end);
         assert_eq!(kids.len(), 2);
         assert_eq!(String::from_utf16_lossy(&kids[1].name), "Sub Dir");
@@ -929,13 +1048,82 @@ mod tests {
     }
 
     #[test]
+    fn orphan_secondaries_after_a_deleted_file_entry_are_skipped_and_reported() {
+        let mut d = Vec::new();
+        let mut gone = set("a long name that needs two name entries", false, 10, 5, true);
+        gone[0] &= 0x7F; // only the primary deleted: 3 orphans
+        let sc = gone[1] as usize;
+        d.extend(&gone);
+        let mut half = set("half", false, 11, 5, true);
+        half[0] &= 0x7F;
+        half[32] &= 0x7F; // stream already cleared, name entry still in use: 1 orphan
+        d.extend(&half);
+        d.extend(set("live", false, 12, 5, true));
+        let mut dead = set("dead", false, 13, 5, true);
+        for k in 0..dead.len() / 32 {
+            dead[32 * k] &= 0x7F;
+        }
+        d.extend(dead);
+        d.resize(4096, 0);
+        let (_, kids, orphans) = parse_dir(&d, None, "/", 4096, false).unwrap();
+        assert_eq!(kids.len(), 1);
+        assert_eq!(String::from_utf16_lossy(&kids[0].name), "live");
+        let first: Vec<usize> = (1..=sc).map(|k| 32 * k).collect();
+        assert_eq!(orphans[..sc], first[..]);
+        assert_eq!(orphans[sc..], [gone.len() + 64]);
+        // A deleted entry's SecondaryCount bounds the scan: a stray secondary past it is refused.
+        let mut d = set("x", false, 10, 5, true);
+        d[0] &= 0x7F;
+        d.extend(&d.clone()[32..64]);
+        d.resize(4096, 0);
+        assert!(format!("{:#}", parse_dir(&d, None, "/", 4096, false).unwrap_err()).contains("outside an entry set"));
+    }
+
+    #[test]
+    fn duplicates_are_refused_with_a_hint_unless_tolerated() {
+        let upc = crate::exfat::upcase_map();
+        let mut d = Vec::new();
+        d.extend(set("Docs", true, 12, 4096, false));
+        d.extend(set("x.txt", false, 20, 5, true));
+        let mut zero = set("docs", true, 0, 4096, false);
+        // What fsck.exfat -y makes of the second set sharing clusters: DataLength 0, no cluster.
+        zero[32 + 8..32 + 16].fill(0);
+        zero[32 + 20..32 + 32].fill(0);
+        let c = checksum16(&zero, true);
+        zero[2..4].copy_from_slice(&c.to_le_bytes());
+        d.extend(zero);
+        d.extend(set("X.TXT", false, 21, 5, true));
+        d.resize(4096, 0);
+        assert!(format!("{:#}", parse_dir(&d, None, "/", 4096, false).unwrap_err()).contains("DataLength 0"));
+        let (_, kids, _) = parse_dir(&d, None, "/", 4096, true).unwrap();
+        let e = format!("{:#}", rekey(kids.clone(), &upc, "/", false).unwrap_err());
+        assert!(e.contains("flashcp sync --recover"), "{e}");
+        let (m, dups) = rekey(kids, &upc, "/", true).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(dups.len(), 2);
+        let key: Vec<u16> = "DOCS".encode_utf16().collect();
+        assert_eq!(m[&key].len, 4096, "the directory with clusters is the one in the map");
+        // A zero-length directory without a twin is refused even when tolerated.
+        let mut d = Vec::new();
+        let mut z = set("lonely", true, 0, 4096, false);
+        z[32 + 8..32 + 16].fill(0);
+        z[32 + 24..32 + 32].fill(0);
+        let c = checksum16(&z, true);
+        z[2..4].copy_from_slice(&c.to_le_bytes());
+        d.extend(z);
+        d.resize(4096, 0);
+        let (_, kids, _) = parse_dir(&d, None, "/", 4096, true).unwrap();
+        assert!(rekey(kids, &upc, "/", true).is_err());
+    }
+
+    #[test]
     fn parse_dir_refuses_bad_checksum_and_unknown_critical() {
         let mut d = set("a.txt", false, 10, 5, true);
         d[64 + 2] ^= 1;
         d.resize(4096, 0);
-        assert!(format!("{:#}", parse_dir(&d, None, "/", 4096).unwrap_err()).contains("checksum"));
+        assert!(format!("{:#}", parse_dir(&d, None, "/", 4096, false).unwrap_err()).contains("checksum"));
         let mut d = vec![0u8; 4096];
         d[0] = 0x86;
-        assert!(format!("{:#}", parse_dir(&d, None, "/", 4096).unwrap_err()).contains("unknown critical"));
+        assert!(format!("{:#}", parse_dir(&d, None, "/", 4096, false).unwrap_err()).contains("unknown critical"));
     }
 }

@@ -109,26 +109,47 @@ enum Cmd {
     },
     /// Make a directory of an EXISTING exFAT volume on TARGET (unmounted block device or image
     /// file) match SRC: copies new and changed files (into free space; a changed file is switched
-    /// over only once its new version is on the device), leaves unchanged ones alone
+    /// over only once its new version is on the device), leaves unchanged ones alone.
+    ///
+    /// A file is taken as unchanged when its size and modification time (at exFAT's 10 ms
+    /// precision) match: a change that keeps both (`cp -p`, `rsync -t`, some editors and tools
+    /// restore the time) is skipped unless --checksum. Every metadata write is journaled under
+    /// $XDG_STATE_HOME/flashcp/sync-journal first: an interrupted sync is completed by the next
+    /// sync of that volume (or by --recover)
     Sync {
-        src: PathBuf,
-        /// Block device or image file (or use --target-fd)
-        #[arg(required_unless_present = "target_fd", conflicts_with = "target_fd")]
-        target: Option<PathBuf>,
+        /// SRC TARGET: the local tree, then the block device or image file. With --target-fd,
+        /// only SRC; with --recover, only TARGET (or nothing with --target-fd)
+        #[arg(value_name = "SRC TARGET", num_args = 0..=2)]
+        paths: Vec<PathBuf>,
         /// Use this inherited, already-open block-device fd (O_RDWR|O_EXCL) instead of opening
         /// TARGET, e.g. from a privileged helper
         #[arg(long, value_name = "N")]
         target_fd: Option<i32>,
+        /// Only complete (replay the journal of) an interrupted sync of TARGET, then exit
+        #[arg(long)]
+        recover: bool,
         /// Directory inside the volume to sync, e.g. "Backups/laptop" (created if missing)
         #[arg(long)]
         to: Option<String>,
         /// Delete files and directories that are not in SRC (and re-link moved files instead of
-        /// copying them again)
+        /// copying them again). Needs --yes when anything would be deleted
         #[arg(long)]
         delete: bool,
-        /// Compare contents instead of size and modification time
+        /// Confirm the deletions the plan lists (--dry-run shows them without it)
+        #[arg(long)]
+        yes: bool,
+        /// Confirm deleting more than 1000 entries (files and directories, counted recursively)
+        #[arg(long)]
+        yes_many: bool,
+        /// Compare contents instead of the quick check (size and modification time at 10 ms):
+        /// catches changes that kept both
         #[arg(long)]
         checksum: bool,
+        /// Take a move (same size, time and sampled fingerprint) without comparing the full
+        /// contents. RISKY: a different file with equal size, time and samples would be taken
+        /// as a move of the old one
+        #[arg(long)]
+        fast_moves: bool,
         #[arg(long, default_value_t = 12)]
         readers: usize,
         /// Only print the plan
@@ -403,9 +424,40 @@ fn run(cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Sync { src, target, target_fd, to, delete, checksum, readers, dry_run, json } => {
-            let target = spec(target, target_fd);
-            let o = flashcp::SyncOpts { to, delete, checksum, readers, dry_run };
+        Cmd::Sync {
+            paths,
+            target_fd,
+            recover,
+            to,
+            delete,
+            yes,
+            yes_many,
+            checksum,
+            fast_moves,
+            readers,
+            dry_run,
+            json,
+        } => {
+            let mut paths = paths.into_iter();
+            if recover {
+                let target = match (target_fd, paths.next(), paths.next()) {
+                    (Some(fd), None, _) => TargetSpec::Fd(fd),
+                    (None, Some(t), None) => TargetSpec::Path(t),
+                    _ => anyhow::bail!("sync --recover takes TARGET (or --target-fd) and nothing else"),
+                };
+                let r = flashcp::sync::recover(&target)?;
+                match flashcp::sync::recovery_note(&r) {
+                    Some(n) => println!("{}", n.trim_start_matches("note: ")),
+                    None => println!("no interrupted sync to complete for this volume"),
+                }
+                return Ok(());
+            }
+            let (src, target) = match (target_fd, paths.next(), paths.next(), paths.next()) {
+                (Some(fd), Some(s), None, _) => (s, TargetSpec::Fd(fd)),
+                (None, Some(s), Some(t), None) => (s, TargetSpec::Path(t)),
+                _ => anyhow::bail!("sync takes SRC TARGET (or SRC with --target-fd)"),
+            };
+            let o = flashcp::SyncOpts { to, delete, checksum, readers, dry_run, yes, yes_many, fast_moves };
             let s = flashcp::sync_to(&src, &target, &o, &mut sink(json))?;
             if !dry_run && !json {
                 println!(
