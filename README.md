@@ -81,7 +81,8 @@ first and is then written to the drive in order, so an app can be done before th
 - **Eject is the guarantee.** Use Eject (in the file manager, the tray, or
   `flashcp drive-mode eject <device>`) and wait for "can be removed".
 - Closing a file starts saving it 150 ms later. A `cp -r` of many files is saved as one batch,
-  150 ms after its last file. A file that an app keeps open is saved within 1 s of its last write.
+  150 ms after its last file. For a file that an app keeps open, saving starts within 1 s of its
+  last write.
 - A program that calls `fsync` on a file (an explicit save in most editors) waits until that
   file is on the drive.
 - **`sync` is not a guarantee.** Linux never forwards `sync`, `sync -f` or `syncfs` to a driver
