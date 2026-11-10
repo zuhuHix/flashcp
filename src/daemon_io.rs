@@ -706,7 +706,8 @@ fn kernel_mountpoint(dev: &str) -> Option<String> {
 /// FUSE mounts of ours whose driver is gone (the daemon was killed): unmount them lazily.
 fn cleanup_stale_mounts() {
     for m in mountinfo() {
-        if m.fstype == "fuse.flashcp" && std::fs::metadata(&m.target).is_err() {
+        // `flashcp mount` mounts as fsname "flashcp", type fuse.exfat.
+        if m.source == "flashcp" && m.fstype.starts_with("fuse") && std::fs::metadata(&m.target).is_err() {
             let _ = run_ok("fusermount3", &["-u", "-z", &m.target]);
         }
     }
