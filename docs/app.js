@@ -1,7 +1,8 @@
 /* flashcp site. Plain browser JS, no libraries.
    Benchmark numbers are the measured tables from README.md (merged work only), taken on
-   2026-11-09, Linux 7.0, on two drives: an MSI DATAMAG 20Gbps USB SSD and a SanDisk Cruzer
-   Blade 8 GB USB 2.0 stick. Times are seconds, medians of 3 unless a case says
+   2026-11-09, Linux 7.0, on an MSI DATAMAG 20Gbps USB SSD and a SanDisk Cruzer Blade 8 GB
+   USB 2.0 stick, and 2026-11-10 on a Kingston DataTraveler 3.0 128 GB USB 3 stick (#18; its
+   speedups are the published figures, carried as xLabel). Times are seconds, medians of 3 unless a case says
    otherwise (single runs and the stick's mkfs + cp range are labelled). Every speedup shown is computed below from these times, except where a case
    carries `x`: the published figure from the unrounded medians (5.58 / 0.38 s rounds to 14.7x; measured 14.6x). */
 (function () {
@@ -76,7 +77,8 @@
   };
   var DRIVE_DATASETS = {
     ssd: ['small', 'many', 'mixed'],
-    stick: ['small'] // the stick was measured on the 20k-file dataset only
+    stick: ['small'], // the stick was measured on the 20k-file dataset only
+    usb3: ['small', 'many']
   };
 
   var BENCH = {
@@ -111,6 +113,21 @@
       },
       pull: {
         small: { kernel: { base: 30.86, flash: 29.52 }, built: { base: 32.78, flash: 16.38 } }
+      }
+    },
+    usb3: {
+      build: {
+        // mkfs + cp: one run. build of `many` has no baseline (not run, ≈25 min), so it is not shown.
+        small: { base: 304, baseLabel: '304 s (1 run)', flash: 9.02, xLabel: '34×' }
+      },
+      add: {
+        small: { cases: [
+          { sub: 'Onto a kernel-filled stick · single run each; flashcp’s probe chose to zero-fill gaps (skipping took 144 s)', base: 527, baseLabel: '527 s', flash: 93.3, flashLabel: '93.3 s', xLabel: '5.7×' }
+        ] }
+      },
+      pull: {
+        small: { kernel: { base: 11.3, flash: 7.96, xLabel: '1.4×' }, built: { base: 7.2, flash: 1.15, xLabel: '6.2×' } },
+        many:  { built: { base: 38.6, flash: 3.60, xLabel: '10.7×' } } // kernel-filled layout not measured on `many`
       }
     }
   };
@@ -234,16 +251,19 @@
     sets.forEach(function (ds) {
       var ops = BENCH[drive][op];
       var c = ops && ops[ds];
-      if (!c) return;
+      if (!c) {
+        if (explorer.dataset !== 'all') box.appendChild(el('p', 'note', 'Not measured on this drive for this dataset.'));
+        return;
+      }
 
       box.appendChild(el('h3', 'bar-group-title', DATASET_LABEL[ds]));
 
       if (c.cases) {
         c.cases.forEach(function (k) { renderBars(box, rowsFor(k, op), k.sub, ''); });
       } else if (op === 'pull') {
-        renderBars(box, rowsFor(c.kernel, op), 'Kernel-filled drive',
+        if (c.kernel) renderBars(box, rowsFor(c.kernel, op), 'Kernel-filled drive',
           drive === 'stick' ? KERNEL_STICK_NOTE : '');
-        renderBars(box, rowsFor(c.built, op), 'flashcp-built drive',
+        if (c.built) renderBars(box, rowsFor(c.built, op), 'flashcp-built drive',
           drive === 'stick' ? 'After flashcp optimize, pulling a stick that was kernel-filled went from 28.9 s to 16.0 s (1.8×), and optimize itself took 81–103 s once.' : '');
       } else {
         renderBars(box, rowsFor(c, op), '', '');
@@ -281,6 +301,9 @@
     if (note) {
       if (drive === 'stick') {
         note.textContent = 'The stick was measured only on the 20k-file dataset, so the other sizes are not offered.';
+        note.hidden = false;
+      } else if (drive === 'usb3') {
+        note.textContent = 'The Kingston stick was measured on the 20k and 100k-file datasets. On 100k files only a pull from a flashcp-built stick has a baseline; add was measured on 20k files only.';
         note.hidden = false;
       } else {
         note.textContent = '';

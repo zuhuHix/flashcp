@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>flashcp: fast small-file copies to and from USB drives</title>
-  <meta name="description" content="flashcp builds, adds to and pulls from exFAT USB drives as normal loose files. Measured up to 10.3x faster writes and 26.8x faster reads than mount + cp on a USB SSD under Linux; 2.5-5.7x on a cheap USB 2.0 stick. Results vary by drive.">
+  <meta name="description" content="flashcp builds, adds to and pulls from exFAT USB drives as normal loose files. Measured up to 10.3x faster writes and 26.8x faster reads than mount + cp on a USB SSD under Linux; 2.5-5.7x on a cheap USB 2.0 stick; 34x writing 20k small files to a blank Kingston DataTraveler 3.0 USB 3 stick vs mkfs + cp. Results vary by drive.">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
   <script>
@@ -45,7 +45,7 @@
       <div class="hero-text">
         <p class="eyebrow">Rust CLI &middot; exFAT &middot; GPL-3.0-or-later</p>
         <h1>flashcp</h1>
-        <p class="pitch">Copy thousands of small files to and from USB drives as normal loose files. Measured up to 10.3&times; faster writes and up to 26.8&times; faster reads than <code>mount</code> + <code>cp</code> on a USB SSD under Linux, and up to 5.7&times; on a cheap USB 2.0 stick. Results vary by drive. <a href="#benchmarks">See the benchmarks</a>.</p>
+        <p class="pitch">Copy thousands of small files to and from USB drives as normal loose files. Measured up to 10.3&times; faster writes and up to 26.8&times; faster reads than <code>mount</code> + <code>cp</code> on a USB SSD under Linux, and up to 5.7&times; on a cheap USB 2.0 stick. On a Kingston DataTraveler 3.0 USB 3 stick, writing 20k small files to a blank stick was 34&times; faster than <code>mkfs</code> + <code>cp</code> (9.02&nbsp;s vs 304&nbsp;s, baseline single run). Results vary by drive. <a href="#benchmarks">See the benchmarks</a>.</p>
 
         <div class="cta-row">
           <a class="btn btn-primary" href="https://github.com/zuhuHix/flashcp">GitHub repo</a>
@@ -60,6 +60,8 @@
           <pre class="command"><code>flashcp add ./photos /dev/sdX1</code></pre>
           <p class="cmd-label">Pull files off a drive</p>
           <pre class="command"><code>flashcp pull /dev/sdX1 ./photos-back</code></pre>
+          <p class="cmd-label">Repeat a copy: write only what changed (crash-safe journal)</p>
+          <pre class="command"><code>flashcp sync ./photos /dev/sdX1 --to photos</code></pre>
           <p class="cmd-label">Make a stick that was filled file by file fast (files kept)</p>
           <pre class="command"><code>flashcp optimize /dev/sdX1 --yes</code></pre>
         </div>
@@ -81,7 +83,7 @@
     <div class="container">
       <h2 id="benchmarks-title">Benchmarks</h2>
       <p class="lede">
-        Measured 2026-11-09 on Linux 7.0, medians of 3 runs, on an MSI DATAMAG 20Gbps USB SSD (UAS, 10&nbsp;Gb/s link, 1&nbsp;TB exFAT) and a SanDisk Cruzer Blade 8&nbsp;GB USB 2.0 stick.
+        Measured 2026-11-09 on Linux 7.0, medians of 3 runs, on an MSI DATAMAG 20Gbps USB SSD (UAS, 10&nbsp;Gb/s link, 1&nbsp;TB exFAT) and a SanDisk Cruzer Blade 8&nbsp;GB USB 2.0 stick, and 2026-11-10 on Linux on a Kingston DataTraveler 3.0 128&nbsp;GB USB 3 stick (usb-storage/BOT).
         Each normal-copy baseline is the manual route: <code>mkfs.exfat</code> + <code>cp -r</code> + <code>sync</code> for build, and mount + <code>cp -r</code> + <code>sync</code> + unmount for add and pull. For build, flashcp times include its own formatting.
         Shorter bars are faster. Cheap sticks vary a lot: the same mkfs + cp took 110.4&nbsp;s in one run and 179.6&nbsp;s in another, so the stick's build baseline is shown as that range; single-run rows on the stick are labelled.
       </p>
@@ -98,6 +100,7 @@
             <div class="chip-row" id="drive-buttons">
               <button type="button" class="chip" data-drive="ssd" aria-pressed="true">USB SSD</button>
               <button type="button" class="chip" data-drive="stick" aria-pressed="false">USB 2.0 stick</button>
+              <button type="button" class="chip" data-drive="usb3" aria-pressed="false">USB 3 stick</button>
             </div>
           </fieldset>
 
@@ -278,7 +281,7 @@
           <span class="step-num num">7</span>
           <div>
             <h3>What the speed council concluded</h3>
-            <p>A 10-agent speed council worked through the stick, and each fix was measured: pull reads now merge adjacent files and match the stick's maximum request size (1&nbsp;KB layout 39.5&nbsp;s to 15.9&nbsp;s, 4&nbsp;KB layout 22.1&nbsp;s to 16.6&nbsp;s), <code>optimize</code> reads the stick only once (81&ndash;103&nbsp;s), and the first copy onto an empty stick runs as a build (104.3&nbsp;s to 34.9&nbsp;s). Its conclusion: the next big win is not the drive's physics. It is not re-sending data you already copied. That is sync, which is planned.</p>
+            <p>A 10-agent speed council worked through the stick, and each fix was measured: pull reads now merge adjacent files and match the stick's maximum request size (1&nbsp;KB layout 39.5&nbsp;s to 15.9&nbsp;s, 4&nbsp;KB layout 22.1&nbsp;s to 16.6&nbsp;s), <code>optimize</code> reads the stick only once (81&ndash;103&nbsp;s), and the first copy onto an empty stick runs as a build (104.3&nbsp;s to 34.9&nbsp;s). Its conclusion: the next big win is not the drive's physics. It is not re-sending data you already copied. That became <code>flashcp sync</code>: on a 1&nbsp;GB image with 20k small files, a repeat sync with nothing changed writes 0&nbsp;bytes, and with 1&nbsp;% of the files changed 2.4&nbsp;MB (1.1&nbsp;% of a full build). It has not been timed on a real stick yet.</p>
           </div>
         </li>
       </ol>
@@ -293,6 +296,7 @@
       <ul class="plain-list">
         <li><strong>Linux tray app, as a .deb.</strong> It starts at login. It has two modes, Copy to USB and Copy from USB, and the app unmounts and remounts the drive for you.</li>
         <li><strong>File manager entries.</strong> Right-click in Nemo, Nautilus or Dolphin for <em>Fast copy to USB (flashcp)</em> or <em>Fast copy from USB (flashcp)</em>. Normal file-manager copies are not intercepted.</li>
+        <li><strong>Optimize this stick.</strong> The app shows the plan (time estimate, space needed on this computer, what is kept), copies the stick to <code>~/.cache/flashcp/optimize</code>, verifies it, rebuilds the stick, verifies again and deletes the copy. An interrupted run offers <em>Resume optimize</em>.</li>
         <li><strong>Trusted drives only.</strong> You trust a drive once with an admin password. After that, a small pkexec helper only touches trusted, unmounted USB drives, and runs flashcp as the user.</li>
       </ul>
       <p class="note"><strong>Windows and macOS:</strong> flashcp volumes are checked in CI with Windows chkdsk and macOS fsck_exfat on disk images, not yet on physical USB drives. The desktop app is Linux only.</p>
@@ -310,6 +314,8 @@
         <li><strong>Add refuses what it does not fully understand.</strong> Volumes that are TexFAT, dirty, or mounted are refused.</li>
         <li><strong>Cheap sticks are chip-bound.</strong> Expect about 2&ndash;5&times; there, not the up to 26.8&times; of a fast SSD.</li>
         <li><strong>Optimize needs local disk space</strong> for a full copy of the stick (never tmpfs or other volatile storage). If an optimize is interrupted, Windows may offer to format the stick: decline, and run the same optimize again on Linux.</li>
+        <li><strong>Sync trusts size and modification time</strong> unless you pass <code>--checksum</code>. Its speed is measured on image files only so far.</li>
+        <li><strong>Simulator accuracy varies by drive.</strong> <code>flashcp sim</code> held-out error by workload family: SanDisk 7.1&nbsp;%, MSI 14.9&nbsp;%, Kingston 53.5&nbsp;% (the model lacks a sustained write rate). Real drives remain the judge; see <a href="https://github.com/zuhuHix/flashcp/blob/main/SIMULATION.md">SIMULATION.md</a>.</li>
         <li><strong>Unmount first.</strong> The device must be unmounted for build and add. The desktop app handles that.</li>
       </ul>
     </div>
@@ -322,8 +328,8 @@
       <p class="lede">In no fixed order. No dates are promised.</p>
       <ul class="roadmap">
         <li><span class="tag tag-shipped">Shipped</span> <code>flashcp optimize</code> (rewrites a stick into the fast layout, files kept: copy, verify, rebuild, verify; resumable), automatic cluster size, a per-device speed profile, the device-aware add gap policy, and the first copy onto an empty stick running as a build.</li>
-        <li><span class="tag">Planned</span> <code>flashcp sync</code> and <code>pull --update</code>, so repeat copies take seconds.</li>
-        <li><span class="tag tag-explore">Exploring</span> Drive mode: a native FUSE mount, so every app's copies get faster. A spike is running.</li>
+        <li><span class="tag tag-shipped">Shipped</span> <code>flashcp sync</code> and <code>pull --update</code> / <code>--delete-extraneous</code> (only what changed, with a crash-safe journal), the desktop app's Optimize button, <code>flashcp --version</code>, and the trace-driven simulator <code>flashcp sim</code>.</li>
+        <li><span class="tag tag-explore">In progress</span> Drive mode for v0.3.0: a native FUSE mount, so every app's copies get faster.</li>
         <li><span class="tag">Planned</span> Write-behind and one-click jobs.</li>
         <li><span class="tag">Planned</span> Windows and macOS versions. Buy Me a Coffee supporters get them first.</li>
       </ul>
