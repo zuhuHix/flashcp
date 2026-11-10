@@ -167,6 +167,30 @@ planning time, and a read in flight at that moment is discarded on completion (e
 
 ## Safety
 
+**Trust model of the journal.** The on-volume journal is exactly as trusted as the volume it
+is on, and recovery is not a security boundary against it. Recovery only ever writes inside
+the volume the journal came from. Anyone who can plant a forged journal there can just as
+well write the same sectors directly. So recovery's checks exist to stop corruption from
+spreading (a torn or buggy journal, another system's later changes), not to stop an attacker
+who controls the volume:
+- the serial and the geometry must match;
+- the data samples must still hash the same;
+- every touched sector must hold one of the journaled states;
+- every record must be one a commit writes: VolumeFlags and PercentInUse, whole FAT entries,
+  bitmap clusters, or directory clusters of the post-replay tree. Never file data, the up-case
+  table, the journal itself, or the backup boot region.
+
+Recovery's own resources are bounded before anything is allocated:
+- the compressed body is at most 8 MiB, the decoded body at most 16 MiB (commits are split
+  to stay under both);
+- the touched bytes are at most 32 MiB.
+Past either limit the mount is refused (exit 6).
+
+Not checked: whether each directory or FAT record belongs to the files the transaction meant
+to change. A link record relocates sets into slots of deleted entries, and moved sets keep
+pointing at clusters committed long before, so that check would need a model of the whole
+transaction.
+
 - The device is claimed exclusively (`O_EXCL` on block devices, `flock` on images, refused
   when a partition or holder is mounted), and the mount runs as the unprivileged user.
 - The parser is the validating one shared with `add` and `pull` (checksums, chain bounds, the

@@ -29,6 +29,17 @@ use anyhow::{Context, Result, bail, ensure};
 
 pub(crate) const NAME: &str = ".flashcp-drive-journal";
 pub(crate) const ATTRS: u16 = super::set::ATTR_HIDDEN | super::set::ATTR_SYSTEM | super::set::ATTR_ARCHIVE;
+/// The largest journal body a commit writes (compressed) and decodes to (raw): a commit is
+/// split until it fits both, and recovery refuses anything bigger before allocating for it.
+pub(crate) const MAX_BODY: u64 = 8 << 20;
+pub(crate) const MAX_RAW: usize = 16 << 20;
+
+/// Bytes the encoded (uncompressed) body of `writes` and `samples` takes.
+pub(crate) fn raw_len(v: &Vol, writes: &[JW], samples: usize) -> usize {
+    let geom = ident(v).1.len();
+    4 + 4 + 2 + geom + 4 + writes.iter().map(|w| 13 + 2 * w.post.len()).sum::<usize>() + 4 + 20 * samples
+}
+
 /// Test hook: the size of a journal file created now.
 pub(crate) const JOURNAL_BYTES_ENV: &str = "FLASHCP_TEST_JOURNAL_BYTES";
 const MAGIC: &[u8; 16] = b"FLASHCP-DRIVEJ1\0";
@@ -300,11 +311,20 @@ fn load(v: &Vol, p: &Place) -> Result<Option<(Header, Body)>> {
     if h.body_len == 0 || 512 + h.body_len > p.len {
         return Ok(None);
     }
+    if h.body_len > MAX_BODY {
+        bail!(Refused(format!("{NAME} claims a body of {} bytes, more than a commit writes", h.body_len)));
+    }
     let z = v.read_at(base(v, p) + 512, h.body_len)?;
     if xxhash_rust::xxh3::xxh3_128(&z) != h.body_hash {
         return Ok(None); // a torn journal write: its commit never started its metadata
     }
-    let body = decode_body(&z, 512 << 20).map_err(|e| Refused(format!("{NAME}: {e:#}")))?;
+    // the decoded size is checked before anything is allocated for it
+    match zstd::zstd_safe::get_frame_content_size(&z) {
+        Ok(Some(n)) if n <= MAX_RAW as u64 => {}
+        Ok(Some(n)) => bail!(Refused(format!("{NAME} decodes to {n} bytes, more than a commit writes"))),
+        _ => bail!(Refused(format!("{NAME}: the body does not state its size"))),
+    }
+    let body = decode_body(&z, MAX_RAW).map_err(|e| Refused(format!("{NAME}: {e:#}")))?;
     Ok(Some((h, body)))
 }
 
@@ -379,28 +399,42 @@ pub(crate) fn validate(v: &Vol, writes: &[JW]) -> Result<()> {
     let fat_len = le32(&v.sector0, 84) as u64 * bps;
     let (fat_a, fat_b) = (v.fat_off, v.fat_off + fat_len);
     let (heap_a, heap_b) = (v.heap_off, v.heap_off + v.cc * v.cs);
-    // the post-replay image of every touched sector
-    let mut img: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    // the post-replay image of the touched bytes, as merged sector-aligned ranges (their
+    // total is bounded by the body's size, checked before anything is read)
+    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(writes.len());
     for w in writes {
         ensure!(!w.post.is_empty() && w.pre.len() == w.post.len(), "a journaled write is malformed");
         let end = w.off.checked_add(w.post.len() as u64).context("a journaled write overflows")?;
         ensure!(end <= v.vol_bytes, "a journaled write at byte {} lies outside the volume", w.off);
-        for s in w.off / 512..end.div_ceil(512) {
-            if let std::collections::btree_map::Entry::Vacant(e) = img.entry(s) {
-                e.insert(v.read_at(s * 512, 512)?);
-            }
+        spans.push((w.off / 512 * 512, end.div_ceil(512) * 512));
+    }
+    spans.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (a, z) in spans {
+        match merged.last_mut() {
+            Some(l) if a <= l.1 => l.1 = l.1.max(z),
+            _ => merged.push((a, z)),
         }
-        for (i, &b) in w.post.iter().enumerate() {
-            let at = w.off + i as u64;
-            img.get_mut(&(at / 512)).unwrap()[(at % 512) as usize] = b;
-        }
+    }
+    let total: u64 = merged.iter().map(|r| r.1 - r.0).sum();
+    ensure!(total <= 2 * MAX_RAW as u64, "the journal touches {total} bytes, more than a commit writes");
+    let mut img: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    for (a, z) in merged {
+        img.insert(a, v.read_at(a, z - a)?);
+    }
+    for w in writes {
+        let (&a, b) = img.range_mut(..=w.off).next_back().unwrap();
+        let o = (w.off - a) as usize;
+        b[o..o + w.post.len()].copy_from_slice(&w.post);
     }
     let read = |off: u64, len: u64| -> Result<Vec<u8>> {
         let mut out = v.read_at(off, len)?;
-        for (&s, b) in img.range(off / 512..(off + len).div_ceil(512)) {
-            let (a, z) = ((s * 512).max(off), ((s + 1) * 512).min(off + len));
-            out[(a - off) as usize..(z - off) as usize]
-                .copy_from_slice(&b[(a - s * 512) as usize..(z - s * 512) as usize]);
+        let first = img.range(..=off).next_back().map_or(off, |(&a, _)| a);
+        for (&s, b) in img.range(first..off + len) {
+            let (a, z) = (s.max(off), (s + b.len() as u64).min(off + len));
+            if a < z {
+                out[(a - off) as usize..(z - off) as usize].copy_from_slice(&b[(a - s) as usize..(z - s) as usize]);
+            }
         }
         Ok(out)
     };

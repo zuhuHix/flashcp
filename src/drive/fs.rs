@@ -801,7 +801,8 @@ impl Fs {
                 let est = djournal::encode_body(&c.vol, &plan.writes, &[])?.len() as u64
                     + 2 * 20 * plan.segs.len() as u64
                     + 1024;
-                if est <= cap {
+                let raw = djournal::raw_len(&c.vol, &plan.writes, 2 * plan.segs.len());
+                if est <= cap.min(djournal::MAX_BODY) && raw <= djournal::MAX_RAW {
                     break plan;
                 }
                 let next = limit.unwrap_or(plan.inodes).min(plan.inodes) / 2;
