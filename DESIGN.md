@@ -30,7 +30,7 @@ read-write exFAT implementation with crash ordering for every operation.
 - Create, write, overwrite, append, truncate (down and up, sparse), unlink, mkdir, rmdir,
   rename within and across directories, onto an existing target (atomically replacing it),
   `RENAME_NOREPLACE` and `RENAME_EXCHANGE`, case-only renames, utimens (mtime, atime, creation
-  time), chmod as the read-only attribute, statfs, fsync, fsyncdir, `sync`.
+  time), chmod as the read-only attribute, statfs, fsync, fsyncdir. **Not `sync`/`syncfs`**: see *Durability and the loss window* below.
 - Unlinking an open file: its content stays readable until the last close. A commit that
   frees its clusters first copies the committed bytes into staging.
 - Reads of any volume the parser accepts: FAT chains and NoFatChain runs, any cluster size from
@@ -48,10 +48,37 @@ read-write exFAT implementation with crash ordering for every operation.
 ## Commits
 
 Writes are staged, and nothing on the volume changes until a commit. A commit is triggered by:
-1 s without writes (idle), half the write window staged (pressure, so writers keep going while
+the last file open for writing being closed (after a 150 ms linger, `--close-ms`; every close
+restarts it, so a `cp -r` of many files commits once, 150 ms after its last file), 1 s without
+writes (idle), half the write window staged (pressure, so writers keep going while
 the first half is written), fsync/fsyncdir/flush, `prepare-eject`, unmount, SIGTERM. Writers
 block once the window is full, 256 MB by default (`--max-dirty-mb`). That is also the most a
 yank can lose.
+
+### Durability and the loss window
+
+`sync(1)`, `sync -f` and `syncfs(2)` do **not** reach the driver. The kernel sends FUSE_SYNCFS
+only to virtiofs and `fuseblk` servers; for a plain FUSE mount it returns 0 at once (unprivileged
+servers could otherwise hang every `sync`). A `fuseblk` mount needs root: `fusermount3` refuses
+the `blkdev` option for other users ("option blkdev is privileged"), and fuser 0.18 has no
+syncfs callback either. So what bounds the loss is when commits happen, not `sync`:
+
+- `fsync`/`fdatasync`/`fsyncdir`, the control socket's `flush` and `prepare-eject`, and SIGTERM
+  wait until everything written before them is durable;
+- **after the last write handle is closed** (`cp`, `rsync`, a saved document): durable within
+  the 150 ms linger plus one commit;
+- **a file kept open for writing**: durable within the 1 s idle after its last write plus one
+  commit, or earlier once half the 256 MB window is staged;
+- `dirty_bytes` reaches 0 when that commit finishes; nothing stays pending on an idle mount.
+
+The commit after the linger is what `cp … && sync && pull the stick` relies on: the worst case
+is 150 ms + one commit after `cp` returns (one small commit simulates to 0.27 s on the SanDisk
+USB 2 model, 0.39 s on the Kingston, 0.05 s on the MSI; a big one is the device's sequential
+write time). Unplugging inside that window can lose what was not committed yet. That is the
+same class of risk as the kernel's own write-back, but much shorter. Eject (prepare-eject)
+remains the safe way. During a copy, the linger adds no commits: every close restarts it, so
+it fires once, after the last file (measured: the same commits as without it, the last one
+150 ms after `cp` returned instead of 1 s).
 
 Planning runs under the core lock. It is memory work, plus FAT reads and, for unlinked open
 files, the copy into staging. Execution runs without the lock, so readers, lookups and new

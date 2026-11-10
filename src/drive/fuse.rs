@@ -234,12 +234,12 @@ impl Filesystem for Adapter {
         _req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
-        _flags: OpenFlags,
+        flags: OpenFlags,
         _lock: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.fs.release(ino.0);
+        self.fs.release_handle(ino.0, flags.0 & libc::O_ACCMODE != libc::O_RDONLY);
         reply.ok();
     }
 

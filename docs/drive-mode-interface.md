@@ -24,6 +24,10 @@ flashcp mount --check <DEVICE> [--json] [--device-fd N]
   sees the files: run one `flashcp mount` per seat user).
 - The process runs in the foreground until the volume is unmounted (by `unmount` on the
   control socket, `fusermount3 -u`, or SIGTERM/SIGINT). It never daemonizes.
+- `--close-ms` (default 150, 0 = off): commit this long after the last file open for writing
+  is closed. **`sync`/`syncfs` are not forwarded to FUSE servers** (only to virtiofs and root-only
+  `fuseblk` mounts), so this is what makes `cp … && sync` close to durable: a closed file is on
+  the medium within 150 ms + one commit. Eject through `prepare-eject` stays the safe way.
 - `--idle-ms` (default 1000): commit this long after the last write. `--max-dirty-mb`
   (default 256): writers block once this much is staged and not yet durable (a commit starts
   at half of it). It is also the most a yank can lose. 256 MB keeps `cp` of a typical tree
@@ -89,7 +93,7 @@ One object per line, flushed after each. Human-readable messages go to stderr re
  "serial":"1a2b3c4d","size":N,"free":N,"cluster":N,"pid":N,"recovered":null|"replayed"|"dirty_cleared"}
 {"event":"dirty_bytes","bytes":N,"files":N}        pending (not durable) data; at most ~4 per second,
                                                    and always once when it drops to 0
-{"event":"committing","bytes":N,"files":N,"reason":"idle"|"fsync"|"flush"|"eject"|"pressure"|"unmount"}
+{"event":"committing","bytes":N,"files":N,"reason":"close"|"idle"|"fsync"|"flush"|"eject"|"pressure"|"unmount"}
 {"event":"committed","bytes":N,"files":N,"secs":F}   everything up to here is durable on the medium
 {"event":"error","message":"...","fatal":B}          fatal=true: the mount is going away (exit 1)
 {"event":"unmounted","clean":B}                      last line; clean=false only after a forced exit

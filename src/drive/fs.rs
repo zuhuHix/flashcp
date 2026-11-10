@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 pub struct FsOpts {
     /// Commit this long after the last write.
     pub idle: Duration,
+    /// Commit this long after the last file open for writing is closed (zero: only idle,
+    /// pressure and explicit commits). `sync(1)`/`syncfs(2)` never reach a FUSE server that is
+    /// not `fuseblk`, so this bounds what a "cp && sync && pull" can lose.
+    pub close_linger: Duration,
     /// Writers block while this many bytes are staged.
     pub max_dirty: u64,
     /// Staged bytes kept in RAM before spilling to the cache directory.
@@ -32,6 +36,7 @@ impl Default for FsOpts {
     fn default() -> Self {
         FsOpts {
             idle: Duration::from_millis(1000),
+            close_linger: Duration::from_millis(150),
             max_dirty: 256 << 20,
             ram_cap: 512 << 20,
             auto_commit: true,
@@ -164,6 +169,8 @@ const RA_DIR_MAX: u64 = 1 << 30;
 #[derive(Default)]
 struct Ctl {
     last_write: Option<Instant>,
+    /// When the last write handle was closed (a close commit is due `close_linger` later).
+    closed: Option<Instant>,
     /// Commit requests: a generation number per request, the last one completed.
     want: u64,
     done: u64,
@@ -377,6 +384,7 @@ impl Fs {
             n.nlookup += 1;
             n.opens += 1;
             c.opened += 1;
+            c.writers += 1;
             c.attr(i)
         })?;
         self.wrote();
@@ -411,10 +419,23 @@ impl Fs {
         }
         c.ino_mut(ino)?.opens += 1;
         c.opened += 1;
+        if write {
+            c.writers += 1;
+        }
         Ok(())
     }
     pub fn release(&self, ino: Ino) {
+        self.release_handle(ino, false)
+    }
+
+    /// Releases a handle; `write`: it was opened for writing (create, or open with write
+    /// access). Closing the last write handle schedules a close commit.
+    pub fn release_handle(&self, ino: Ino, write: bool) {
         let mut c = self.core();
+        if write && c.writers > 0 {
+            c.writers -= 1;
+        }
+        let last = write && c.writers == 0 && !c.dirty.is_empty();
         if let Some(n) = c.inodes.get_mut(&ino)
             && n.opens > 0
         {
@@ -422,6 +443,11 @@ impl Fs {
             c.opened -= 1;
         }
         c.gc(ino);
+        drop(c); // lock order: core, then st
+        if last && !self.sh.opts.close_linger.is_zero() {
+            self.sh.st.lock().unwrap().closed = Some(Instant::now());
+            self.sh.cv.notify_all();
+        }
     }
     pub fn read(&self, ino: Ino, off: u64, size: u32) -> R<Vec<u8>> {
         let (plan, _gate) = {
@@ -732,13 +758,32 @@ impl Fs {
                 let idle_due = st.last_write.map(|t| t.elapsed() >= self.sh.opts.idle).unwrap_or(false);
                 if idle_due {
                     st.last_write = None;
+                    st.closed = None;
                     st.want += 1;
                     st.reason = "idle";
                     break;
                 }
-                let wait = st.last_write.map_or(Duration::from_millis(250), |t| {
+                let linger = self.sh.opts.close_linger;
+                if let Some(t) = st.closed
+                    && t.elapsed() >= linger
+                {
+                    st.closed = None;
+                    drop(st);
+                    let quiet = self.core().writers == 0;
+                    st = self.sh.st.lock().unwrap();
+                    if quiet {
+                        st.want += 1;
+                        st.reason = "close";
+                        break;
+                    }
+                    continue;
+                }
+                let mut wait = st.last_write.map_or(Duration::from_millis(250), |t| {
                     self.sh.opts.idle.saturating_sub(t.elapsed()).max(Duration::from_millis(5))
                 });
+                if let Some(t) = st.closed {
+                    wait = wait.min(linger.saturating_sub(t.elapsed()).max(Duration::from_millis(1)));
+                }
                 st = self.sh.cv.wait_timeout(st, wait.min(Duration::from_millis(250))).unwrap().0;
                 drop(st);
                 let s = self.status();

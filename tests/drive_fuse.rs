@@ -359,7 +359,7 @@ fn control_socket_prepare_eject_and_resume() {
     }
     let d = Dir::new("ctl");
     let img = image(&d, 64);
-    let m = Mount::start(&d, &img, &["--idle-ms", "60000"]);
+    let m = Mount::start(&d, &img, &["--idle-ms", "60000", "--close-ms", "0"]);
     let st = m.ctl("status");
     assert!(st.contains("\"proto\":1") && st.contains("\"state\":\"idle\""), "{st}");
     std::fs::write(m.mnt.join("a.txt"), vec![7u8; 100_000]).unwrap();
@@ -396,7 +396,7 @@ fn sigterm_while_dirty_commits() {
     let img = image(&d, 64);
     let src = d.p("src");
     make_tree(&src);
-    let mut m = Mount::start(&d, &img, &["--idle-ms", "60000"]);
+    let mut m = Mount::start(&d, &img, &["--idle-ms", "60000", "--close-ms", "0"]);
     run(Command::new("cp").arg("-r").arg(&src).arg(m.mnt.join("t")));
     assert!(m.ctl("status").contains("\"state\":\"dirty\""));
     unsafe { libc::kill(m.child.id() as i32, libc::SIGTERM) };
@@ -418,7 +418,7 @@ fn lazy_detach_while_dirty_still_commits() {
     let img = image(&d, 64);
     let src = d.p("src");
     make_tree(&src);
-    let mut m = Mount::start(&d, &img, &["--idle-ms", "60000"]);
+    let mut m = Mount::start(&d, &img, &["--idle-ms", "60000", "--close-ms", "0"]);
     run(Command::new("cp").arg("-r").arg(&src).arg(m.mnt.join("t")));
     assert!(m.ctl("status").contains("\"state\":\"dirty\""));
     // what `gio mount -u` / `umount -l` does: the mount is gone at once, nothing was flushed
@@ -500,4 +500,49 @@ fn check_exit_codes() {
     assert_eq!(o.status.code(), Some(4), "{}", String::from_utf8_lossy(&o.stdout));
     assert!(String::from_utf8_lossy(&o.stdout).contains("\"event\":\"busy\""));
     m.unmount();
+}
+
+/// `sync -f` and `syncfs(2)` never reach a FUSE driver mounted without `fuseblk` (the kernel
+/// forwards FUSE_SYNCFS only to virtiofs and fuseblk servers): they return at once and commit
+/// nothing. What bounds the loss after `cp && sync` is the close commit: closing the last file
+/// open for writing commits after --close-ms (150 ms). fsync commits at once.
+#[test]
+fn sync_is_not_forwarded_but_closing_commits() {
+    if !gate() {
+        return;
+    }
+    let d = Dir::new("syncfs");
+    let img = image(&d, 64);
+    let m = Mount::start(&d, &img, &["--idle-ms", "600000"]);
+    let mut f = std::fs::File::create(m.mnt.join("open.bin")).unwrap();
+    f.write_all(&vec![3u8; 300_000]).unwrap();
+    let st = Command::new("sync").arg("-f").arg(&m.mnt).status().unwrap();
+    assert!(st.success());
+    assert_eq!(unsafe { libc::syncfs(std::os::unix::io::AsRawFd::as_raw_fd(&f)) }, 0);
+    std::thread::sleep(Duration::from_millis(400));
+    let s = m.ctl("status");
+    assert!(s.contains("\"dirty_bytes\":300000"), "sync/syncfs committed after all (update DESIGN.md): {s}");
+    assert!(!m.has_event("\"event\":\"committing\""));
+    // the last write handle closes: committed within the linger (plus the commit)
+    let t = Instant::now();
+    drop(f);
+    m.wait_event("\"event\":\"committed\"");
+    let took = t.elapsed();
+    assert!(took < Duration::from_secs(2), "close commit took {took:?}");
+    assert!(m.wait_event("\"reason\":\"close\"").contains("committing"));
+    assert!(m.ctl("status").contains("\"dirty_bytes\":0"));
+    // a whole-file write (open, write, close) is durable a linger later, no sync needed
+    std::fs::write(m.mnt.join("second.txt"), b"second").unwrap();
+    let t = Instant::now();
+    loop {
+        if m.ctl("status").contains("\"dirty_bytes\":0")
+            && m.events.lock().unwrap().iter().filter(|l| l.contains("\"event\":\"committed\"")).count() >= 2
+        {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(2), "second close commit missing");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    m.unmount();
+    fsck(&img);
 }
