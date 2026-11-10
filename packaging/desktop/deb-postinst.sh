@@ -3,8 +3,9 @@
 set -e
 if [ "$1" = configure ]; then
   udevadm control --reload 2>/dev/null || true
-  # Fresh install only: an upgrade keeps an admin's `--global disable` and users' opt-outs.
-  if [ -z "$2" ]; then
+  # A fresh install, or an upgrade from a version that had no drive mode (before 0.3.0): turn it
+  # on. A later upgrade keeps an admin's `--global disable` and users' opt-outs.
+  if [ -z "$2" ] || dpkg --compare-versions "$2" lt 0.3.0; then
     systemctl --global preset flashcp-drived.service 2>/dev/null || true
   fi
   # Users logged in right now: (re)start their daemon if it is enabled for them (others get it

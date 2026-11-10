@@ -116,6 +116,8 @@ jobs:
             systemd-analyze --user verify packaging/desktop/flashcp-drived.service 2>&1 | grep -q "/usr/bin/flashcp"
           grep -qx 'enable flashcp-drived.service' packaging/desktop/80-flashcp-drived.preset
           for f in packaging/desktop/deb-*.sh packaging/desktop/test-drive-mode-root.sh; do bash -n "$f"; done
+          # Drive mode is turned on by a fresh install and by an upgrade from before 0.3.0 only.
+          sh packaging/desktop/test-postinst.sh
           xmllint --noout packaging/desktop/io.github.zuhuhix.flashcp.mountpoint.policy
           # The mountpoint helper is allow_active only.
           grep -A4 '<defaults>' packaging/desktop/io.github.zuhuhix.flashcp.mountpoint.policy | grep -q '<allow_any>no</allow_any>'

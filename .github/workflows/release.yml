@@ -239,6 +239,8 @@ jobs:
           # cargo-deb adds a Debian revision (0.1.0-1); compare the upstream part.
           test "$(dpkg-query -W -f '${Version}' flashcp | sed 's/-[^-]*$//')" = "$VERSION"
           test "$(dpkg-query -W -f '${Version}' flashcp-gui)" = "$VERSION"
+          # A fresh install turns drive mode on for every user (the systemd user preset).
+          test "$(systemctl --global is-enabled flashcp-drived.service)" = enabled
           for f in \
             /usr/bin/flashcp \
             /usr/bin/flashcp-gui \
