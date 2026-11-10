@@ -28,7 +28,6 @@ struct Chunk {
     want: u64,
     served: u64,
     data: Option<Arc<AlignedBuf>>,
-    failed: bool,
     born: u64,
     /// Unique per queued chunk: a read completes only the very chunk it reserved (a commit may
     /// have invalidated it and a new prefetch queued another at the same offset meanwhile).
@@ -60,6 +59,9 @@ pub(crate) struct Ra {
     /// Trace group of the worker reads (they run `inflight` deep among themselves).
     grp: u32,
     st: Mutex<St>,
+    /// Test hook: this many of the next reads fail.
+    #[cfg(test)]
+    pub(crate) fail_next: std::sync::atomic::AtomicU64,
     /// Test hook: the next read waits at these two barriers before storing its chunk.
     #[cfg(test)]
     pub(crate) pause: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
@@ -79,6 +81,8 @@ impl Ra {
             st: Mutex::new(St::default()),
             #[cfg(test)]
             pause: Mutex::new(None),
+            #[cfg(test)]
+            fail_next: std::sync::atomic::AtomicU64::new(0),
             work: Condvar::new(),
             ready: Condvar::new(),
         });
@@ -147,20 +151,27 @@ impl Ra {
             a.wait();
             b.wait();
         }
+        #[cfg(test)]
+        let ok = if self.fail_next.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            self.fail_next.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Err(std::io::Error::other("injected read error"))
+        } else {
+            ok
+        };
         let mut st = self.st.lock().unwrap();
         st.read_bytes += len as u64;
         let stale = st.epoch != epoch;
         // only the chunk this read reserved; if it is gone (invalidated, replaced), whoever
         // removed it already gave its bytes back
         if let Some(c) = st.chunks.get_mut(&start).filter(|c| c.token == token) {
-            if stale || c.born != epoch {
-                let l = c.len as u64;
-                st.chunks.remove(&start);
-                unbook(&mut st, l); // counted: it was taken
-            } else {
-                match ok {
-                    Ok(n) if n >= len.min(1) => c.data = Some(Arc::new(buf)),
-                    _ => c.failed = true,
+            match ok {
+                Ok(n) if n >= len.min(1) && !stale && c.born == epoch => c.data = Some(Arc::new(buf)),
+                _ => {
+                    // stale, or the read failed (a flaky stick): the chunk goes and its bytes
+                    // come back, so errors never use up the cache; readers read directly
+                    let l = c.len as u64;
+                    st.chunks.remove(&start);
+                    unbook(&mut st, l); // counted: it was taken
                 }
             }
         }
@@ -191,12 +202,12 @@ impl Ra {
         let epoch = st.epoch;
         for ch in plan {
             let payload: u64 = exts[ch.exts.clone()].iter().map(|e| e.len as u64).sum();
-            // a chunk queued or being read over the same bytes stays (no double read); ready or
-            // failed leftovers (a reader that skipped files, an earlier pass) are replaced
+            // a chunk queued or being read over the same bytes stays (no double read); ready
+            // leftovers (a reader that skipped files, an earlier pass) are replaced
             let end = ch.start + ch.len as u64;
             let over: Vec<u64> =
                 st.chunks.range(..end).filter(|(s, c)| **s + c.len as u64 > ch.start).map(|(s, _)| *s).collect();
-            if over.iter().any(|s| st.chunks[s].data.is_none() && !st.chunks[s].failed) {
+            if over.iter().any(|s| st.chunks[s].data.is_none()) {
                 continue;
             }
             for o in over {
@@ -216,7 +227,6 @@ impl Ra {
                     want: payload,
                     served: 0,
                     data: None,
-                    failed: false,
                     born: epoch,
                     token,
                 },
@@ -263,10 +273,6 @@ impl Ra {
                 return (0, n as usize);
             };
             let c = st.chunks.get(&s).unwrap();
-            if c.failed {
-                let n = (s + c.len as u64 - off).min(out.len() as u64) as usize;
-                return (0, n);
-            }
             if let Some(d) = c.data.clone() {
                 let a = (off - c.start) as usize;
                 let n = (c.len - a).min(out.len());
@@ -428,6 +434,58 @@ mod tests {
         let counted: u64 = st.chunks.values().filter(|c| c.counted).map(|c| c.len as u64).sum();
         assert_eq!(st.bytes, counted, "byte accounting drifted");
         drop(st);
+        ra.stop();
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Failed reads (a flaky stick) give their bytes back: after many of them the readahead
+    /// still prefetches, and the accounting is back to zero.
+    #[test]
+    fn failed_reads_do_not_use_up_the_cache() {
+        let p = std::env::temp_dir().join(format!("fcp-ra-fail-{}", std::process::id()));
+        std::fs::write(&p, vec![0x33u8; 4 << 20]).unwrap();
+        let f = Arc::new(File::open(&p).unwrap());
+        let strat = Strategy {
+            transport: "other".into(),
+            gap: 0,
+            inflight: 1,
+            direct: false,
+            overhead_ms: None,
+            mbps: None,
+            chunk: 64 << 10,
+            tail: 4096,
+        };
+        // a cache that 8 leaked chunks of 64 KB would fill
+        let ra = Ra::new(f, strat, 512 << 10);
+        ra.fail_next.store(32, std::sync::atomic::Ordering::SeqCst);
+        let ranges: Vec<(u64, u64)> = (0..32u64).map(|k| (k * (128 << 10), 60 << 10)).collect();
+        ra.prefetch(&ranges);
+        let t = Instant::now();
+        while ra.fail_next.load(std::sync::atomic::Ordering::SeqCst) > 0 || !ra.st.lock().unwrap().queue.is_empty() {
+            assert!(t.elapsed() < Duration::from_secs(30), "the failing reads did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let t = Instant::now();
+        while ra.st.lock().unwrap().bytes != 0 {
+            assert!(
+                t.elapsed() < Duration::from_secs(30),
+                "failed reads kept their bytes: {}",
+                ra.st.lock().unwrap().bytes
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // the readahead still works: a new range is read by a worker and served from the cache
+        let off = 3u64 << 20;
+        ra.prefetch(&[(off, 60 << 10)]);
+        let t = Instant::now();
+        while !ra.st.lock().unwrap().chunks.values().any(|c| c.data.is_some()) {
+            assert!(t.elapsed() < Duration::from_secs(30), "no worker read the new range");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut out = vec![0u8; 4096];
+        let (got, _) = ra.read_some(off, &mut out);
+        assert_eq!(got, 4096);
+        assert!(out.iter().all(|&b| b == 0x33));
         ra.stop();
         let _ = std::fs::remove_file(&p);
     }
