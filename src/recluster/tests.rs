@@ -685,6 +685,34 @@ fn hardware_serial_from_sysfs() {
     assert_eq!(hw_serial_in(&d, libc::makedev(8, 33)), None, "no such device");
     std::fs::remove_file(usb.join("serial")).unwrap();
     assert_eq!(hw_serial_in(&d, libc::makedev(8, 17)), None, "no serial");
+    // Behind a hub, under a root hub, both with serials: the stick's own, and with none of its
+    // own never the hub's or the controller's.
+    let root = d.join("devices/pci0/usb4");
+    let hub = root.join("4-1");
+    let stick = hub.join("4-1.2");
+    let part = stick.join("4-1.2:1.0/host7/target7:0:0/7:0:0:0/block/sdc/sdc1");
+    std::fs::create_dir_all(&part).unwrap();
+    for (dir, vendor, serial) in
+        [(&root, "1d6b", "0000:00:14.0"), (&hub, "05e3", "HUB0001"), (&stick, "0951", "C87F54C6")]
+    {
+        std::fs::write(dir.join("idVendor"), format!("{vendor}\n")).unwrap();
+        std::fs::write(dir.join("serial"), format!("{serial}\n")).unwrap();
+    }
+    std::os::unix::fs::symlink(&part, d.join("dev/block/8:33")).unwrap();
+    assert_eq!(hw_serial_in(&d, libc::makedev(8, 33)).as_deref(), Some("C87F54C6"));
+    std::fs::remove_file(stick.join("serial")).unwrap();
+    assert_eq!(hw_serial_in(&d, libc::makedev(8, 33)), None, "a hub's serial was taken");
+    std::fs::remove_dir_all(&hub).unwrap();
+    std::fs::create_dir_all(part.to_string_lossy().replace("/4-1/4-1.2", "/4-1.2")).unwrap();
+    let direct = root.join("4-1.2");
+    std::fs::write(direct.join("idVendor"), "0951\n").unwrap();
+    std::fs::remove_file(d.join("dev/block/8:33")).unwrap();
+    std::os::unix::fs::symlink(
+        direct.join("4-1.2:1.0/host7/target7:0:0/7:0:0:0/block/sdc/sdc1"),
+        d.join("dev/block/8:33"),
+    )
+    .unwrap();
+    assert_eq!(hw_serial_in(&d, libc::makedev(8, 33)), None, "the root hub's serial was taken");
     let _ = std::fs::remove_dir_all(&d);
 }
 

@@ -173,7 +173,7 @@ pub(crate) fn fresh_sector0(f: &File) -> Result<Vec<u8>> {
 
 /// The hardware serial of the disk behind an open block device, from sysfs: `rdev` →
 /// `/sys/dev/block/MAJ:MIN` → the first parent that is a USB device (`idVendor`) → its
-/// `serial` (what udev's `ID_SERIAL_SHORT` is made from). None for an image file or a device
+/// `serial` (what udev's `ID_SERIAL_SHORT` is made from), or None if it has none. None for an image file or a device
 /// without one. Whitespace and control characters become `_`.
 pub fn hw_serial_of(f: &File) -> Option<String> {
     #[cfg(test)]
@@ -191,9 +191,10 @@ pub fn hw_serial_in(sys: &std::path::Path, rdev: u64) -> Option<String> {
     let mut dir = std::fs::canonicalize(sys.join(format!("dev/block/{maj}:{min}"))).ok()?;
     let top = std::fs::canonicalize(sys).ok()?;
     while dir.starts_with(&top) && dir != top {
-        if dir.join("idVendor").is_file()
-            && let Ok(s) = std::fs::read_to_string(dir.join("serial"))
-        {
+        // The first parent with `idVendor` is the stick's own USB device: its serial or none
+        // (as udev: no `serial` there, no ID_SERIAL_SHORT). Never a hub's or the controller's.
+        if dir.join("idVendor").is_file() {
+            let s = std::fs::read_to_string(dir.join("serial")).ok()?;
             let s: String =
                 s.trim().chars().map(|c| if c.is_whitespace() || c.is_control() { '_' } else { c }).collect();
             return (!s.is_empty()).then_some(s);
