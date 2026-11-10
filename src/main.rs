@@ -273,6 +273,36 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Serve an exFAT volume read-write through FUSE (drive mode), or `--check` whether flashcp
+    /// would. See docs/drive-mode-interface.md for the exit codes and the JSON events.
+    Mount {
+        /// Block device or image file (with --device-fd: only used in messages)
+        device: PathBuf,
+        /// Existing, empty directory to mount on (not used with --check)
+        #[arg(required_unless_present = "check")]
+        mountpoint: Option<PathBuf>,
+        /// Only decide whether flashcp serves the volume; never writes, exit 0 = yes, 3 = no, 4 = busy
+        #[arg(long)]
+        check: bool,
+        /// Print events as JSON lines on stdout
+        #[arg(long)]
+        json: bool,
+        /// Unix control socket (status, flush, prepare-eject, resume, unmount)
+        #[arg(long, value_name = "SOCKET")]
+        control: Option<PathBuf>,
+        /// Use this inherited, already-open fd of the device instead of opening DEVICE
+        #[arg(long, value_name = "N")]
+        device_fd: Option<i32>,
+        /// Commit this long after the last write
+        #[arg(long, default_value_t = 1000, value_name = "MS")]
+        idle_ms: u64,
+        /// Writers block once this many MB are pending (default 256)
+        #[arg(long, value_name = "MB")]
+        max_dirty_mb: Option<u64>,
+        /// FUSE session threads
+        #[arg(long, default_value_t = 1)]
+        threads: usize,
+    },
     /// Trace-driven device simulator: replay, sweep and calibrate (see SIMULATION.md)
     Sim {
         #[command(subcommand)]
@@ -327,6 +357,25 @@ fn main() {
     }
     // `flashcp sim` replays traces and never touches a device: it is not traced itself (its
     // recordings run flashcp in child processes, each with its own trace file).
+    if let Cmd::Mount { device, mountpoint, check, json, control, device_fd, idle_ms, max_dirty_mb, threads } = cli.cmd
+    {
+        // No trace, no environment: --check runs in a sandbox that allows almost nothing.
+        let code = if check {
+            flashcp::drive::mount::run_check(&device, device_fd, json)
+        } else {
+            flashcp::drive::mount::run_mount(flashcp::drive::mount::MountArgs {
+                device,
+                mountpoint: mountpoint.expect("clap requires MOUNTPOINT"),
+                json,
+                control,
+                device_fd,
+                idle_ms,
+                max_dirty_mb,
+                threads,
+            })
+        };
+        std::process::exit(code);
+    }
     let traced = match (&cli.trace_out, &cli.cmd) {
         (_, Cmd::Sim { .. }) => Ok(()),
         (Some(p), _) => flashcp::sim::trace::init(p, &cmd_name),
@@ -613,6 +662,7 @@ fn run(cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Mount { .. } => unreachable!("handled in main"),
         Cmd::Sim { cmd } => flashcp::sim::cli::run(cmd),
         Cmd::Bench { src, dest, methods, runs } => {
             let ms: Vec<String> = methods.split(',').map(|s| s.trim().to_string()).collect();
