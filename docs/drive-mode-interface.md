@@ -229,7 +229,12 @@ again with `flashcp mount`. One JSON object per line on stdout:
 **If it is interrupted** (yanked, power loss, killed): the volume is the old one or the new
 one, complete and fsck-clean, never a mix: every write goes to free space until one 512-byte
 write of the boot sector switches over. Nothing has to be cleaned up and nothing is kept on the
-host. On the next arrival run `--check` again: `finish` → complete it as above; `benefit`
+host. One exception, measured: a yank in the few milliseconds between the main and the backup
+boot sector write (once per switch) leaves a volume that Linux and macOS mount but **Windows
+does not** (it wants both boot regions equal, and may offer to format the stick). The data is
+intact; plugging it into a machine with flashcp completes it (`--check` reports `finish`, run
+`flashcp recluster` once). So: run it only from drive mode, never ask the user to unplug
+during it, and say "do not unplug" in the progress UI. On the next arrival run `--check` again: `finish` → complete it as above; `benefit`
 still true → the conversion did not happen (or got halfway: the second run is then shorter);
 offer or resume it as the product decides.
 

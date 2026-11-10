@@ -120,6 +120,11 @@ it tunes lie below offset 440, clear of that area, and the checksum sector is no
 `control-mkfs-superfloppy` is `mkfs.exfat`'s own volume without a partition table, never
 re-clustered and report-only: it shows what each OS does with that layout by itself.
 
+`recl-backup-zero` and `recl-backup-badsum` (report-only) are finished re-clusters whose backup
+boot sector is then zeroed, or given one wrong byte (so its checksum no longer fits). They ask
+whether an OS mounts a volume whose main boot region is right and whose backup is invalid
+(Windows: no; it also refuses `recl-crash-window`, whose backup is valid but older).
+
 `recl-crash-window` runs the recluster with `FLASHCP_TEST_RECLUSTER_STOP=reclustered`. The command
 stops with exit 1 (the build requires exactly that, and the hook's message in the output) after
 writing the main boot sector of the final switch and before the backup boot sector. The main boot

@@ -54,7 +54,14 @@
 //! of `recluster` (and `--check`, which reports it as `"finish":true`) looks for exactly this
 //! state (sectors 13..=23 equal 1..=11, sector 12 differs from sector 0, both regions
 //! checksum-valid) and completes the backup write once the main volume has passed validation,
-//! before anything else (also when it then refuses). Both boot sector writes go through an
+//! before anything else (also when it then refuses). What the window means elsewhere
+//! (measured in CI, `recl-crash-window`): Linux mounts the new volume and `fsck.exfat` calls it
+//! clean; macOS mounts it, `fsck_exfat` asks to update the alternate boot region; Windows does
+//! NOT mount it ("not a recognized file system", while `chkdsk` finds no problems), and it does
+//! not mount a volume whose backup region is invalid either (`recl-backup-zero`,
+//! `recl-backup-badsum`): it wants the backup to equal the main region. No order of two
+//! one-sector writes avoids a moment where they differ, so this window (one sync, per
+//! switch) stays; the next `flashcp recluster`, or drive mode's `--check` → `finish`, closes it. Both boot sector writes go through an
 //! O_DIRECT handle on a block device, so each reaches the device as one sector, not as the
 //! page cache's 4 KiB block.
 //!

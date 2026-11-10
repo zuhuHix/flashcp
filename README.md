@@ -428,7 +428,9 @@ where it is, except what lies in the first 0.1 % of the stick, where the bigger 
 `optimize` it needs no local copy and takes seconds, and it does not reorder the files (they read
 as fast as before; small files written afterwards need much smaller writes). It refuses, writing
 nothing, when it cannot do it safely (exit code 3 and a reason: a dirty volume, too little free
-space, ...). Going back to bigger clusters would mean moving every file.
+space, ...). Going back to bigger clusters would mean moving every file. One caveat: if the stick is pulled in
+the few milliseconds between its last two writes, Windows will not open it (Linux and macOS
+will) until `flashcp recluster` runs on it once more; the files are intact either way.
 
 **Automatic tuning.** flashcp measures each drive once (about a second, inside free space) and
 remembers it in `~/.cache/flashcp/devices/`. It uses that to decide how to write: whether to
