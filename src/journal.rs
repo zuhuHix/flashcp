@@ -52,6 +52,7 @@
 //! and the sectors the run would have changed hold its states.
 
 use crate::add::Patches;
+use crate::sim::trace::{self, Op as TOp};
 use crate::volume::{
     FLAG_DIRTY, MAX_DIR_BYTES, SYNC_JOURNAL_NAME, checksum_ok_set, is_sync_journal_set, le16, le32, le64,
 };
@@ -489,12 +490,14 @@ fn on_volume(dev: &File, s0: &[u8]) -> Result<Option<Journal>> {
     }
     let fat = |c: u32| -> Result<u32> {
         let mut b = [0u8; 4];
-        dev.read_exact_at(&mut b, fat_off + c as u64 * 4).context("read the FAT")?;
+        let at = fat_off + c as u64 * 4;
+        trace::serial(TOp::Read, at, 4, || dev.read_exact_at(&mut b, at)).context("read the FAT")?;
         Ok(u32::from_le_bytes(b))
     };
     let read = |c: u32, len: u64| -> Result<Vec<u8>> {
         let mut b = vec![0u8; len as usize];
-        dev.read_exact_at(&mut b, heap_off + (c as u64 - 2) * cs).context("read a cluster")?;
+        let at = heap_off + (c as u64 - 2) * cs;
+        trace::serial(TOp::Read, at, len, || dev.read_exact_at(&mut b, at)).context("read a cluster")?;
         Ok(b)
     };
     let mut data = Vec::new();
@@ -564,7 +567,8 @@ pub(crate) fn plan_writes(dev: &File, phases: Vec<(&str, Patches)>) -> Result<Ve
             let (s0, s1) = (off / SECTOR, (off + post.len() as u64).div_ceil(SECTOR));
             if (s0..s1).any(|s| !model.contains_key(&s)) {
                 let mut buf = vec![0u8; ((s1 - s0) * SECTOR) as usize];
-                dev.read_exact_at(&mut buf, s0 * SECTOR).with_context(|| format!("read metadata at {off}"))?;
+                trace::serial(TOp::Read, s0 * SECTOR, buf.len() as u64, || dev.read_exact_at(&mut buf, s0 * SECTOR))
+                    .with_context(|| format!("read metadata at {off}"))?;
                 for (k, s) in (s0..s1).enumerate() {
                     model.entry(s).or_insert_with(|| buf[k * SECTOR as usize..(k + 1) * SECTOR as usize].to_vec());
                 }
@@ -600,9 +604,10 @@ pub(crate) fn phases(writes: &[JWrite]) -> Vec<(&str, &[JWrite])> {
 /// Writes one phase's `post`s and syncs.
 pub(crate) fn apply(dev: &File, ws: &[JWrite]) -> Result<()> {
     for w in ws {
-        dev.write_all_at(&w.post, w.off).with_context(|| format!("write metadata at {}", w.off))?;
+        trace::serial(TOp::Write, w.off, w.post.len() as u64, || dev.write_all_at(&w.post, w.off))
+            .with_context(|| format!("write metadata at {}", w.off))?;
     }
-    dev.sync_all().context("sync")
+    trace::sync(|| dev.sync_all()).context("sync")
 }
 
 /// Per touched sector: the bytes some write covers (mask) and every state they go through.
@@ -648,7 +653,8 @@ pub(crate) fn check(dev: &File, writes: &[JWrite]) -> Result<()> {
     }
     for (&s, h) in &hist {
         let mut cur = vec![0u8; SECTOR as usize];
-        dev.read_exact_at(&mut cur, s * SECTOR).with_context(|| format!("read sector {s}"))?;
+        trace::serial(TOp::Read, s * SECTOR, SECTOR, || dev.read_exact_at(&mut cur, s * SECTOR))
+            .with_context(|| format!("read sector {s}"))?;
         let same = |st: &Vec<u8>| (0..SECTOR as usize).all(|k| !h.mask[k] || st[k] == cur[k]);
         if !h.states.iter().any(same) {
             bail!(
@@ -682,15 +688,15 @@ fn warn_kept(p: &Path, why: &str) {
 fn set_dirty(dev: &File, s0: &[u8], dirty: bool) -> Result<()> {
     let f = le16(s0, 106);
     let f = if dirty { f | FLAG_DIRTY } else { f & !FLAG_DIRTY };
-    dev.write_all_at(&f.to_le_bytes(), 106).context("write VolumeFlags")?;
-    dev.sync_all().context("sync")
+    trace::serial(TOp::Write, 106, 2, || dev.write_all_at(&f.to_le_bytes(), 106)).context("write VolumeFlags")?;
+    trace::sync(|| dev.sync_all()).context("sync")
 }
 
 /// Completes (or cleans up after) an interrupted sync of the volume on `dev` (see the module
 /// doc). Writes nothing unless the decision table says so.
 pub(crate) fn recover(dev: &File) -> Result<Recovery> {
     let mut s0 = vec![0u8; 512];
-    if dev.read_exact_at(&mut s0, 0).is_err() || &s0[3..11] != b"EXFAT   " {
+    if trace::serial(TOp::Read, 0, 512, || dev.read_exact_at(&mut s0, 0)).is_err() || &s0[3..11] != b"EXFAT   " {
         return Ok(Recovery::None);
     }
     let me = ident_of(dev, &s0);
