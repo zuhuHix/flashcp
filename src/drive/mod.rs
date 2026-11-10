@@ -15,6 +15,8 @@ pub mod core;
 pub(crate) mod dev;
 pub mod djournal;
 pub mod fs;
+pub mod fuse;
+pub mod mount;
 pub(crate) mod set;
 pub(crate) mod stage;
 #[cfg(test)]
