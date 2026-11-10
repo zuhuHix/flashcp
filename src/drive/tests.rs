@@ -68,7 +68,12 @@ pub(crate) fn manual() -> FsOpts {
 
 pub(crate) fn open_with(path: &Path, dev: Arc<dyn Dev>, opts: FsOpts) -> anyhow::Result<Fs> {
     let f = File::options().read(true).write(true).open(path)?;
-    let len = f.metadata()?.len();
+    let md = f.metadata()?;
+    let len = if std::os::unix::fs::FileTypeExt::is_block_device(&md.file_type()) {
+        crate::exfat::blk_size(&f)?
+    } else {
+        md.len()
+    };
     let (core, _) = open_core(f, len, &*dev, &opts)?;
     Ok(Fs::new(core, dev, opts))
 }

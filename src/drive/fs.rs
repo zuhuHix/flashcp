@@ -84,8 +84,67 @@ struct Shared {
 /// reader is and how far ahead of it is queued.
 #[derive(Default)]
 struct Track {
-    dirs: std::collections::HashMap<Ino, (u32, bool)>,
+    dirs: std::collections::HashMap<Ino, DirTrack>,
     files: std::collections::HashMap<Ino, (u64, u64)>,
+    /// When a bulk copy was last seen.
+    bulk: Option<Instant>,
+}
+
+#[derive(Default)]
+struct DirTrack {
+    opened: u32,
+    queued: bool,
+    next: bool,
+}
+
+/// Device ranges of `dir`'s committed files after set offset `after`, in its order (up to
+/// [`RA_DIR_FILE_MAX`] each, [`RA_DIR_MAX`] in all); marks them queued for the sequential
+/// readahead.
+fn dir_ranges(c: &mut Core, tr: &mut Track, dir: Ino, after: usize) -> Vec<(u64, u64)> {
+    let mut files: Vec<(usize, Ino)> = c
+        .ino(dir)
+        .ok()
+        .and_then(|p| p.kids.as_ref())
+        .map(|k| {
+            k.values()
+                .filter_map(|&k| {
+                    let x = c.inodes.get(&k)?;
+                    let d = x.disk?;
+                    (!x.is_dir && d.dir == dir && d.off > after && x.ov.is_empty() && x.keep > 0).then_some((d.off, k))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    let mut out = Vec::new();
+    let mut total = 0u64;
+    for (_, k) in files {
+        let keep = c.inodes[&k].keep.min(RA_DIR_FILE_MAX);
+        total += keep;
+        if total > RA_DIR_MAX {
+            break;
+        }
+        out.extend(base_ranges(c, k, 0, keep));
+        tr.files.insert(k, (0, keep));
+    }
+    out
+}
+
+/// The directory after `dir` in its parent's order (readdir order: `cp -r` goes there next).
+fn next_sibling(c: &Core, dir: Ino) -> Option<Ino> {
+    let n = c.ino(dir).ok()?;
+    let (parent, me) = (n.parent, n.disk?.off);
+    let p = c.ino(parent).ok()?;
+    p.kids
+        .as_ref()?
+        .values()
+        .filter_map(|&k| {
+            let x = c.inodes.get(&k)?;
+            let d = x.disk?;
+            (x.is_dir && d.dir == parent && d.off > me).then_some((d.off, k))
+        })
+        .min()
+        .map(|(_, k)| k)
 }
 
 /// Bytes of a big file queued ahead of its sequential reader.
@@ -153,6 +212,12 @@ pub fn mount_file(file: std::fs::File, len: u64, opts: FsOpts) -> Result<(Fs, Re
         // never accept writes that no commit could make durable
         eprintln!("flashcp mount: read-only: {why}");
         core.read_only = Some(libc::EROFS);
+    } else if core.journal.is_none() {
+        // now rather than in the first commit, which would hold the lock through three syncs
+        if let Err(e) = bootstrap(&mut core, &*dev) {
+            eprintln!("flashcp mount: read-only: creating the drive journal failed: {e:#}");
+            core.read_only = Some(libc::EROFS);
+        }
     }
     Ok((Fs::new(core, dev, opts), rec))
 }
@@ -199,6 +264,10 @@ impl Fs {
             }
             let mut strat = strat;
             strat.direct = direct;
+            // benchmark hook: the readahead depth
+            if let Some(n) = std::env::var("FLASHCP_RA_INFLIGHT").ok().and_then(|v| v.parse().ok()) {
+                strat.inflight = n;
+            }
             Some(super::readahead::Ra::new(Arc::new(f), strat, opts.ra_cap))
         } else {
             None
@@ -377,37 +446,30 @@ impl Fs {
             }
         }
         if off == 0 {
-            let d = tr.dirs.entry(parent).or_insert((0, false));
-            d.0 += 1;
-            if d.0 >= 2 && !d.1 {
-                d.1 = true;
-                // the directory's remaining committed files, in its order
+            // a bulk copy (a second file of a directory read from its start, or any first
+            // file while one was seen within the last 2 s): queue this directory's remaining
+            // files and its next sibling directory's, so the device never idles at a boundary
+            let bulk = tr.bulk.is_some_and(|t| t.elapsed() < Duration::from_secs(2));
+            let d = tr.dirs.entry(parent).or_default();
+            d.opened += 1;
+            if d.opened >= 2 || bulk {
+                tr.bulk = Some(Instant::now());
                 let my = c.ino(ino).ok().and_then(|n| n.disk).map_or(0, |d| d.off);
-                let mut files: Vec<(usize, Ino)> = c
-                    .ino(parent)
-                    .ok()
-                    .and_then(|p| p.kids.as_ref())
-                    .map(|k| {
-                        k.values()
-                            .filter_map(|&k| {
-                                let x = c.inodes.get(&k)?;
-                                let d = x.disk?;
-                                (!x.is_dir && d.dir == parent && d.off > my && x.ov.is_empty() && x.keep > 0)
-                                    .then_some((d.off, k))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                files.sort();
-                let mut total = 0u64;
-                for (_, k) in files {
-                    let keep = c.inodes[&k].keep.min(RA_DIR_FILE_MAX);
-                    total += keep;
-                    if total > RA_DIR_MAX {
-                        break;
+                let d = tr.dirs.get_mut(&parent).unwrap();
+                let (queue_me, queue_next) = (!d.queued, !d.next);
+                d.queued = true;
+                d.next = true;
+                if queue_me {
+                    out.extend(dir_ranges(c, &mut tr, parent, my));
+                }
+                if queue_next && let Some(sib) = next_sibling(c, parent) {
+                    let sd = tr.dirs.entry(sib).or_default();
+                    if !sd.queued {
+                        sd.queued = true;
+                        if c.load(sib).is_ok() {
+                            out.extend(dir_ranges(c, &mut tr, sib, 0));
+                        }
                     }
-                    out.extend(base_ranges(c, k, 0, keep));
-                    tr.files.insert(k, (0, keep));
                 }
             }
         }

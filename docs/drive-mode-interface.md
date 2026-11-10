@@ -106,7 +106,8 @@ unmounting).
 
 ## Control socket (`--control <SOCKET>`)
 
-A Unix stream socket created by the driver (mode 0600; an existing stale socket file is
+A Unix stream socket created by the driver (the path must fit `sun_path`, at most 107 bytes;
+use e.g. `$XDG_RUNTIME_DIR/flashcp/<serial>.sock`; mode 0600; an existing stale socket file is
 replaced). One request per line, one JSON reply per line; several requests may be sent on one
 connection, and several connections may be open.
 
