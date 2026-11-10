@@ -71,6 +71,10 @@ jobs:
         with: { name: xos-recl-crash-window, path: out/recl-crash-window, retention-days: 3, compression-level: 1 }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: xos-control-mkfs-superfloppy, path: out/control-mkfs-superfloppy, retention-days: 3, compression-level: 1 }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: xos-recl-backup-zero, path: out/recl-backup-zero, retention-days: 3, compression-level: 1 }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: xos-recl-backup-badsum, path: out/recl-backup-badsum, retention-days: 3, compression-level: 1 }
 
   windows:
     name: windows chkdsk (${{ matrix.vol }})
@@ -79,7 +83,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        vol: [prefix-auto, full-auto, prefix-512, prefix-1k, prefix-2k, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs, recl-32k, recl-128k, recl-frag-32k, recl-frag-128k, recl-superfloppy, recl-crash-window, control-mkfs-superfloppy]
+        vol: [prefix-auto, full-auto, prefix-512, prefix-1k, prefix-2k, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs, recl-32k, recl-128k, recl-frag-32k, recl-frag-128k, recl-superfloppy, recl-crash-window, control-mkfs-superfloppy, recl-backup-zero, recl-backup-badsum]
     # superfloppy (no partition table) is flashcp's default output, so it gates like the others.
     # control-mkfs (the same tree written by mkfs.exfat + Linux) is a reference for attributing
     # failures to flashcp or to the OS, so it is report-only. So is recl-crash-window, the state a
@@ -87,7 +91,7 @@ jobs:
     # control-mkfs-superfloppy (mkfs.exfat's own volume without a partition table, never
     # re-clustered). The other recl-* volumes (re-clustered in place, see TESTING.md) gate.
     # recl-superfloppy and control-mkfs-superfloppy have no partition table.
-    continue-on-error: ${{ contains(fromJSON('["control-mkfs","control-mkfs-superfloppy","recl-crash-window"]'), matrix.vol) }}
+    continue-on-error: ${{ contains(fromJSON('["control-mkfs","control-mkfs-superfloppy","recl-crash-window","recl-backup-zero","recl-backup-badsum"]'), matrix.vol) }}
     defaults:
       run:
         shell: pwsh
@@ -112,8 +116,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        vol: [prefix-auto, full-auto, prefix-512, prefix-1k, prefix-2k, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs, recl-32k, recl-128k, recl-frag-32k, recl-frag-128k, recl-superfloppy, recl-crash-window, control-mkfs-superfloppy]
-    continue-on-error: ${{ contains(fromJSON('["control-mkfs","control-mkfs-superfloppy","recl-crash-window"]'), matrix.vol) }}
+        vol: [prefix-auto, full-auto, prefix-512, prefix-1k, prefix-2k, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs, recl-32k, recl-128k, recl-frag-32k, recl-frag-128k, recl-superfloppy, recl-crash-window, control-mkfs-superfloppy, recl-backup-zero, recl-backup-badsum]
+    continue-on-error: ${{ contains(fromJSON('["control-mkfs","control-mkfs-superfloppy","recl-crash-window","recl-backup-zero","recl-backup-badsum"]'), matrix.vol) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0

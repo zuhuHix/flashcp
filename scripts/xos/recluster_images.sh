@@ -65,7 +65,9 @@ done
 # `flashcp build` writes the volume (no mkfs, no mount).
 # expect: moves = "switches":2 and move_bytes > 0, sw2 = "switches":2, frag = the plan counts
 # fragmented files, crash = stop after the main boot sector of the final switch (see
-# FLASHCP_TEST_RECLUSTER_STOP), control = no recluster at all.
+# FLASHCP_TEST_RECLUSTER_STOP), control = no recluster at all, backup-zero / backup-badsum = a
+# finished recluster whose backup boot sector (12) is then zeroed / given one wrong byte, so the
+# backup boot region is invalid while the main one is right (what does each OS do then?).
 #
 # The two volumes without a partition table: Windows only shows such a disk image when its
 # sector 0 cannot be taken for an MBR. mkfs.exfat leaves zeros where an MBR has its partition
@@ -79,6 +81,8 @@ VOLUMES=(
   "recl-frag-128k 2G 128K part frag default frag"
   "recl-superfloppy 2G 128K whole build default sw2"
   "recl-crash-window 1G 32K part cp default crash"
+  "recl-backup-zero 1G 32K part cp default backup-zero"
+  "recl-backup-badsum 1G 32K part cp default backup-badsum"
   "control-mkfs-superfloppy 512M 32K whole cp default control"
 )
 
@@ -274,6 +278,25 @@ build_one() { # name size cluster layout fill fat expect
 
     sudo fsck.exfat -n "$DEV"
     verify_dev "$DEV" "linux-after:$name"
+    case "$want" in
+      backup-zero)
+        sudo dd if=/dev/zero of="$DEV" bs=512 seek=12 count=1 conv=notrunc,fsync status=none
+        ;;
+      backup-badsum)
+        # one byte of the backup sector's boot code area: its checksum (sector 23) no longer fits
+        printf '\x5a' | sudo dd of="$DEV" bs=1 seek=$((12 * 512 + 300)) count=1 conv=notrunc,fsync status=none
+        ;;
+    esac
+    case "$want" in
+      backup-*)
+        if sudo fsck.exfat -n "$DEV"; then
+          echo "fsck.exfat -n with an invalid backup boot region: clean"
+        else
+          echo "fsck.exfat -n with an invalid backup boot region: reports problems (reported, not fatal)"
+        fi
+        verify_dev "$DEV" "linux-backup-invalid:$name"
+        ;;
+    esac
   fi
   detach
 
