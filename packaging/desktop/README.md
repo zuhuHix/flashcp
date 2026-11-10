@@ -177,7 +177,8 @@ serve (not exFAT, not clean, damaged, unsupported, in use) is mounted normally b
    matches USB + exFAT + filesystem partitions (or an exFAT disk without a partition table)
    and runs `flashcp-udev-check`, which answers yes only if the active seat user's
    `flashcp-drived` runs with drive mode on (`/run/user/<uid>/flashcp/drive-mode-on`) and a
-   sandboxed `flashcp mount --check` accepts the volume within 1.5 s.
+   sandboxed `flashcp mount --check` accepts the volume within 1.5 s. It tags the device with
+   that user's uid (`FLASHCP_DRIVE_UID`): other users' daemons ignore it.
 2. Yes: the rule sets `UDISKS_IGNORE=1` (udisks neither mounts nor shows the partition) and
    tags it `uaccess` (the seat user gets rw on the node). No, or no answer: nothing is set, and
    udisks and the desktop automount it as they always did.
@@ -208,9 +209,14 @@ completes or rolls back the interrupted commit, and a notification says so.
 
 **Robustness.** A driver that dies is restarted once (its recovery runs); a second failure
 falls back to the kernel driver with a notification. systemd restarts the daemon itself
-(`Restart=on-failure`). While data is pending the daemon holds a logind *delay* inhibitor for
-sleep and shutdown. On `PrepareForSleep` it flushes every drive and releases the lock once
-nothing is pending. Logout or `systemctl --user stop` sends SIGTERM: every drive is flushed and
+(`Restart=on-failure`); if it dies, its drivers are killed with it (systemd), and the restarted
+daemon serves the drives again after the driver's journal recovery (data that was still pending
+is lost, as with a crash of the kernel's page cache), and `ExecStopPost` makes sure new drives
+go to udisks while it is down. While data is pending the daemon holds a logind *delay*
+inhibitor for sleep and shutdown. On `PrepareForSleep` it flushes every drive and releases the
+lock once nothing is pending. logind waits at most `InhibitDelayMaxSec` (5 s by default); the
+driver keeps at most about 2 s of the drive's write speed pending, so that is normally enough,
+but a stick that slows down while saving can be suspended with data pending. Logout or `systemctl --user stop` sends SIGTERM: every drive is flushed and
 unmounted before the daemon exits.
 
 **Switches.**

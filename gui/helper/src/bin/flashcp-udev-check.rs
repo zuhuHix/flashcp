@@ -23,7 +23,7 @@ fn main() {
     }
 }
 
-fn decide(args: &[String]) -> Option<&'static str> {
+fn decide(args: &[String]) -> Option<String> {
     let [_, dev] = args else { return None };
     if !dev.starts_with("/dev/") || dev.contains("/../") || dev.len() > 64 {
         return None;
@@ -32,11 +32,15 @@ fn decide(args: &[String]) -> Option<&'static str> {
     let uuid = std::env::var("ID_FS_UUID").ok().filter(|u| valid_key(u));
     if !daemon_wants(uid, uuid.as_deref(), dev.rsplit('/').next()?)? {
         // The daemon gave this drive to the kernel driver: visible to udisks, it mounts it itself.
-        return Some("UDISKS_AUTO=0\n");
+        return Some("UDISKS_AUTO=0\n".into());
     }
-    match check(dev)? {
-        0 => Some("FLASHCP_DRIVE_MODE=1\nUDISKS_IGNORE=1\n"),
-        4 => Some("FLASHCP_KEEP=1\n"),
+    let (code, out) = check(dev)?;
+    match code {
+        // busy_unknown: the check could not see the holders/mounts, so it is no takeover.
+        0 if !out.contains("busy_unknown") => {
+            Some(format!("FLASHCP_DRIVE_MODE=1\nFLASHCP_DRIVE_UID={uid}\nUDISKS_IGNORE=1\n"))
+        }
+        4 => Some("FLASHCP_KEEP=1\n".into()),
         _ => None,
     }
 }
@@ -65,8 +69,9 @@ fn daemon_wants(uid: u32, uuid: Option<&str>, devname: &str) -> Option<bool> {
     Some(!(uuid.is_some_and(flag) || (valid_key(devname) && flag(devname))))
 }
 
-/// Runs the check in a sandboxed child; returns its exit code, or None on timeout/oddity.
-fn check(dev: &str) -> Option<i32> {
+/// Runs the check in a sandboxed child; returns its exit code and (up to 4 KB of) its stdout, or
+/// None on timeout/oddity.
+fn check(dev: &str) -> Option<(i32, String)> {
     let devc = CString::new(dev).ok()?;
     let fd = unsafe { libc::open(devc.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOCTTY | libc::O_NONBLOCK) };
     if fd < 0 || !fs::metadata(format!("/proc/self/fd/{fd}")).is_ok_and(|m| m.file_type().is_block_device()) {
@@ -82,18 +87,26 @@ fn check(dev: &str) -> Option<i32> {
     argp.push(std::ptr::null());
     let envp: [*const libc::c_char; 1] = [std::ptr::null()];
     let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-    let ll = landlock_ruleset();
+    let mut pipe = [-1; 2];
+    if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return None;
+    }
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return None;
     }
     if pid == 0 {
         unsafe {
-            // Only 0-2 (/dev/null) and 3 (the device) survive the exec (close_range below).
-            if null < 0 || libc::dup2(null, 0) < 0 || libc::dup2(null, 1) < 0 || libc::dup2(null, 2) < 0 {
+            // Only 0, 2 (/dev/null), 1 (the pipe) and 3 (the device) survive the exec.
+            // (Allocating after fork is fine: this process is single-threaded.)
+            let ll = landlock_ruleset();
+            if null < 0 || libc::dup2(null, 0) < 0 || libc::dup2(pipe[1], 1) < 0 || libc::dup2(null, 2) < 0 {
                 libc::_exit(127);
             }
-            if libc::dup2(fd, 3) < 0 {
+            // udev starts us with only 0-2 open, so the device usually IS fd 3: dup2 would then be a
+            // no-op that keeps O_CLOEXEC, and exec would close it.
+            let moved = if fd == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd, 3) };
+            if moved < 0 {
                 libc::_exit(127);
             }
             for (res, v) in [
@@ -126,12 +139,26 @@ fn check(dev: &str) -> Option<i32> {
             libc::_exit(127);
         }
     }
+    unsafe { libc::close(pipe[1]) };
     let deadline = Instant::now() + TIMEOUT;
+    let (mut out, mut eof) = (Vec::new(), false);
     loop {
+        let left = deadline.saturating_duration_since(Instant::now()).as_millis().min(10) as i32;
+        let mut p = libc::pollfd { fd: pipe[0], events: libc::POLLIN, revents: 0 };
+        if !eof && unsafe { libc::poll(&mut p, 1, left) } > 0 {
+            let mut b = [0u8; 4096];
+            let n = unsafe { libc::read(pipe[0], b.as_mut_ptr().cast(), b.len()) };
+            eof = n <= 0;
+            out.extend_from_slice(&b[..n.max(0) as usize]);
+            out.truncate(4096);
+        } else if eof {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let mut status = 0;
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if r == pid {
-            return libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status));
+            let code = libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status))?;
+            return Some((code, String::from_utf8_lossy(&out).into_owned()));
         }
         if r < 0 || Instant::now() >= deadline {
             unsafe { libc::kill(pid, libc::SIGKILL) }; // and do not wait: it may be stuck in D state
@@ -141,13 +168,15 @@ fn check(dev: &str) -> Option<i32> {
     }
 }
 
-/// A Landlock ruleset that allows only reading and executing below /usr, /lib*, and reading
-/// /etc/ld.so.cache (what exec of a dynamically linked /usr/bin/flashcp needs). None if the
-/// kernel has no Landlock: the other layers still apply.
+/// A Landlock ruleset (built in the child) that allows only reading and executing below /usr and
+/// /lib* and reading /etc/ld.so.cache (exec of a dynamically linked /usr/bin/flashcp), reading
+/// /sys and the child's own mountinfo (the check's busy test). None if the kernel has no
+/// Landlock: the other layers still apply.
 fn landlock_ruleset() -> Option<libc::c_long> {
     #[repr(C)]
     struct Attr {
         handled_access_fs: u64,
+        handled_access_net: u64,
     }
     #[repr(C, packed)]
     struct PathBeneath {
@@ -160,8 +189,10 @@ fn landlock_ruleset() -> Option<libc::c_long> {
     }
     // EXECUTE..MAKE_SYM (ABI 1), REFER (2), TRUNCATE (3).
     let handled: u64 = ((1 << 13) - 1) | if abi >= 2 { 1 << 13 } else { 0 } | if abi >= 3 { 1 << 14 } else { 0 };
-    let attr = Attr { handled_access_fs: handled };
-    let rs = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, &attr, size_of::<Attr>(), 0u32) };
+    // ABI 4: also deny TCP bind/connect (no rules allow any port). Older ABIs take only the first field.
+    let attr = Attr { handled_access_fs: handled, handled_access_net: if abi >= 4 { 3 } else { 0 } };
+    let size = if abi >= 4 { size_of::<Attr>() } else { size_of::<u64>() };
+    let rs = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, &attr, size, 0u32) };
     if rs < 0 {
         return None;
     }
@@ -171,6 +202,8 @@ fn landlock_ruleset() -> Option<libc::c_long> {
         (c"/lib", exec | read_file | read_dir),
         (c"/lib64", exec | read_file | read_dir),
         (c"/etc/ld.so.cache", read_file),
+        (c"/sys", read_file | read_dir),
+        (c"/proc/self/mountinfo", read_file),
     ] {
         let pfd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         if pfd >= 0 {

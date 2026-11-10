@@ -25,7 +25,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 pub enum Msg {
@@ -99,6 +99,11 @@ pub fn write_enabled(config: &Path, on: bool) -> Result<()> {
 }
 
 static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
+static MONITOR_DIED: AtomicBool = AtomicBool::new(false);
+
+fn system_off() -> bool {
+    Path::new(crate::daemon_cli::SYSTEM_OFF).exists()
+}
 
 extern "C" fn on_signal(_: libc::c_int) {
     let fd = SIGNAL_PIPE.load(Ordering::Relaxed);
@@ -140,10 +145,9 @@ pub fn run(env: Env) -> Result<()> {
     let t = tx.clone();
     std::thread::spawn(move || serve_control(listener, t));
 
-    let enabled = read_enabled(&env.config);
+    let enabled = read_enabled(&env.config) && !system_off();
     let mut io =
         Io { env: env.clone(), tx: tx.clone(), drivers: HashMap::new(), notes: HashMap::new(), inhibitor: None };
-    io.set_marker(enabled);
     let mut core = Core::new(enabled);
     cleanup_stale_mounts();
 
@@ -168,8 +172,9 @@ pub fn run(env: Env) -> Result<()> {
             std::thread::spawn(move || {
                 read_udev_blocks(BufReader::new(out), &t);
                 let _ = child.wait();
-                eprintln!("flashcp drived: udevadm monitor ended");
-                std::process::exit(1); // systemd restarts us
+                eprintln!("flashcp drived: udevadm monitor ended; stopping (systemd restarts us)");
+                MONITOR_DIED.store(true, Ordering::Relaxed);
+                let _ = t.send(Msg::In(Input::Shutdown)); // flush and unmount first
             });
             std::thread::sleep(Duration::from_millis(100));
             for props in enumerate() {
@@ -184,11 +189,28 @@ pub fn run(env: Env) -> Result<()> {
         let gdbus = env.gdbus.clone();
         std::thread::spawn(move || watch_login1(&gdbus, &t));
     }
+    // The administrator's switch (`drive-mode off --system`): looked at every 2 s.
+    let t = tx.clone();
+    let config = env.config.clone();
+    std::thread::spawn(move || {
+        let mut off = system_off();
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            if system_off() != off {
+                off = !off;
+                let _ = t.send(Msg::In(Input::SetEnabled(!off && read_enabled(&config))));
+            }
+        }
+    });
+    // Last: from now on the udev rule hides drives from udisks for us (ExecStopPost removes it
+    // again if we die).
+    io.set_marker(enabled);
     eprintln!("flashcp drived: running (drive mode {})", if enabled { "on" } else { "off" });
 
     main_loop(&mut core, &mut io, &rx);
     io.set_marker(false);
     let _ = std::fs::remove_file(&sock);
+    anyhow::ensure!(!MONITOR_DIED.load(Ordering::Relaxed), "udevadm monitor ended");
     Ok(())
 }
 
@@ -210,9 +232,6 @@ fn main_loop(core: &mut Core, io: &mut Io, rx: &Receiver<Msg>) {
                     (Some("eject"), Some(_)) => ("{\"ok\":false,\"error\":\"no such drive\"}".into(), None),
                     _ => ("{\"ok\":false,\"error\":\"unknown command\"}".into(), None),
                 };
-                if let Some(Input::SetEnabled(on)) = &input {
-                    io.set_marker(*on);
-                }
                 let _ = reply.send(r);
                 match input {
                     Some(i) => i,
@@ -220,9 +239,28 @@ fn main_loop(core: &mut Core, io: &mut Io, rx: &Receiver<Msg>) {
                 }
             }
         };
-        if input == Input::Shutdown {
-            io.set_marker(false); // from now on new drives go to udisks
-        }
+        let input = match input {
+            Input::SetEnabled(on) => {
+                let on = on && !system_off();
+                io.set_marker(on);
+                if on {
+                    io.clear_fallback_flags(None);
+                }
+                Input::SetEnabled(on)
+            }
+            Input::Removed { dev } => {
+                // Fallback flags are per plug-in: the next plug-in tries flashcp again.
+                if let Some(d) = core.drives.get(&dev) {
+                    io.clear_fallback_flags(Some(&fallback_key(&d.info)));
+                }
+                Input::Removed { dev }
+            }
+            Input::Shutdown => {
+                io.set_marker(false); // from now on new drives go to udisks
+                Input::Shutdown
+            }
+            i => i,
+        };
         let log = format!("{input:?}");
         let actions = core.handle(input);
         if !actions.is_empty() {
@@ -264,6 +302,21 @@ impl Io {
         });
     }
 
+    fn clear_fallback_flags(&self, key: Option<&str>) {
+        let dir = self.env.runtime.join("kernel");
+        match key {
+            Some(k) if !k.is_empty() => {
+                let _ = std::fs::remove_file(dir.join(k));
+            }
+            Some(_) => {}
+            None => {
+                for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+
     fn set_marker(&self, on: bool) {
         let m = self.env.marker();
         if on {
@@ -278,16 +331,14 @@ impl Io {
             Action::Check { dev } => {
                 let bin = self.env.flashcp.clone();
                 self.send_later(move || {
-                    let out = Command::new(&bin)
-                        .args(["mount", "--check", "--json"])
-                        .arg(&dev)
-                        .stderr(Stdio::null())
-                        .output();
-                    let (code, reason) = match out {
-                        Ok(o) => {
-                            let line = String::from_utf8_lossy(&o.stdout).lines().last().unwrap_or("").to_string();
+                    let mut c = Command::new(&bin);
+                    c.args(["mount", "--check", "--json"]).arg(&dev).stdin(Stdio::null()).stderr(Stdio::null());
+                    // A device that stalls must not leave the drive in "checking" forever.
+                    let (code, reason) = match run_with_timeout(c, Duration::from_secs(10)) {
+                        Ok((code, out)) => {
+                            let line = String::from_utf8_lossy(&out).lines().last().unwrap_or("").to_string();
                             let reason = crate::daemon::json::parse_flat(&line).and_then(|m| m.get("reason").cloned());
-                            (o.status.code().unwrap_or(1), reason.filter(|r| r != "null"))
+                            (code.unwrap_or(1), reason.filter(|r| r != "null"))
                         }
                         Err(e) => (1, Some(e.to_string())),
                     };
@@ -330,10 +381,12 @@ impl Io {
             }
             Action::KernelEject { dev, disk } => {
                 let u = self.env.udisksctl.clone();
-                self.send_later(move || {
-                    let ok = run_ok(&u, &["unmount", "-b", &dev, "--no-user-interaction"]).is_ok()
-                        && run_ok(&u, &["power-off", "-b", &disk, "--no-user-interaction"]).is_ok();
-                    Input::PoweredOff { dev, ok }
+                self.send_later(move || match run_ok(&u, &["unmount", "-b", &dev, "--no-user-interaction"]) {
+                    Err(error) => Input::KernelUnmountFailed { dev, error },
+                    Ok(_) => {
+                        let ok = run_ok(&u, &["power-off", "-b", &disk, "--no-user-interaction"]).is_ok();
+                        Input::PoweredOff { dev, ok }
+                    }
                 });
             }
             Action::PowerOff { dev, disk } => {
@@ -411,7 +464,7 @@ impl Io {
         }
         c.arg("--").arg(title).arg(body).stdin(Stdio::null()).stderr(Stdio::null());
         // notify-send returns at once; a desktop without a notification server must not stall us.
-        if let Ok(o) = run_with_timeout(c, Duration::from_secs(3))
+        if let Ok((_, o)) = run_with_timeout(c, Duration::from_secs(3))
             && let Ok(id) = String::from_utf8_lossy(&o).trim().parse::<u32>()
         {
             self.notes.insert(key.into(), id);
@@ -488,14 +541,20 @@ fn run_ok(prog: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-fn run_with_timeout(mut c: Command, t: Duration) -> std::io::Result<Vec<u8>> {
+/// Run with a deadline: (exit code, stdout). Stdout is read on a thread so a chatty child can't
+/// block on a full pipe.
+fn run_with_timeout(mut c: Command, t: Duration) -> std::io::Result<(Option<i32>, Vec<u8>)> {
     let mut child = c.stdout(Stdio::piped()).spawn()?;
+    let mut so = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = so.read_to_end(&mut v);
+        v
+    });
     let deadline = Instant::now() + t;
     loop {
-        if child.try_wait()?.is_some() {
-            let mut v = Vec::new();
-            child.stdout.take().unwrap().read_to_end(&mut v)?;
-            return Ok(v);
+        if let Some(st) = child.try_wait()? {
+            return Ok((st.code(), reader.join().unwrap_or_default()));
         }
         if Instant::now() > deadline {
             let _ = child.kill();
@@ -713,7 +772,11 @@ pub fn to_input(p: &BTreeMap<String, String>) -> Option<Input> {
     let dev = p.get("DEVNAME")?.clone();
     match p.get("ACTION").map(String::as_str) {
         Some("remove") => Some(Input::Removed { dev }),
-        Some("add" | "change") if p.get("FLASHCP_DRIVE_MODE").is_some_and(|v| v == "1") => {
+        // Only the drives the rule took over for this user (the active seat user's daemon).
+        Some("add" | "change")
+            if p.get("FLASHCP_DRIVE_MODE").is_some_and(|v| v == "1")
+                && p.get("FLASHCP_DRIVE_UID").is_some_and(|u| *u == unsafe { libc::getuid() }.to_string()) =>
+        {
             let disk = match (p.get("DEVTYPE").map(String::as_str), p.get("DEVPATH")) {
                 (Some("partition"), Some(path)) => {
                     let parent = Path::new(path).parent()?.file_name()?.to_string_lossy().into_owned();
@@ -757,12 +820,15 @@ mod tests {
 
     #[test]
     fn udev_blocks_to_inputs() {
-        let text = "monitor will print the received events for:\nUDEV - the event which udev sends out\n\n\
+        let uid = unsafe { libc::getuid() };
+        let text = format!(
+            "monitor will print the received events for:\nUDEV - the event which udev sends out\n\n\
             UDEV  [12.3] add      /devices/x/block/sdb/sdb1 (block)\nACTION=add\nDEVPATH=/devices/x/block/sdb/sdb1\n\
             DEVNAME=/dev/sdb1\nDEVTYPE=partition\nID_FS_LABEL=MY_STICK\nID_FS_LABEL_ENC=MY\\x20STICK\n\
-            ID_FS_UUID=1A2B-3C4D\nFLASHCP_DRIVE_MODE=1\n\n\
+            ID_FS_UUID=1A2B-3C4D\nFLASHCP_DRIVE_MODE=1\nFLASHCP_DRIVE_UID={uid}\n\n\
             ACTION=add\nDEVNAME=/dev/sdc1\nDEVTYPE=partition\nDEVPATH=/d/sdc/sdc1\n\n\
-            ACTION=remove\nDEVNAME=/dev/sdb1\n";
+            ACTION=remove\nDEVNAME=/dev/sdb1\n"
+        );
         let (tx, rx) = unbounded();
         read_udev_blocks(BufReader::new(text.as_bytes()), &tx);
         let got: Vec<Input> = rx.try_iter().filter_map(|m| if let Msg::In(i) = m { Some(i) } else { None }).collect();

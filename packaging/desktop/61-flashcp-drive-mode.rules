@@ -3,8 +3,8 @@
 #
 # The decision is made here, while udev processes the event, so it is final before udisks or the
 # daemon hear of the device: there is no window where both drivers could take it.
-#   - flashcp-udev-check (as nobody, sandboxed, <= 1.5 s) prints FLASHCP_DRIVE_MODE=1 and
-#     UDISKS_IGNORE=1 when the volume can be served: udisks never mounts or shows it, the seat
+#   - flashcp-udev-check (as nobody, sandboxed, <= 1.5 s) prints FLASHCP_DRIVE_MODE=1,
+#     FLASHCP_DRIVE_UID=<the seat user> and UDISKS_IGNORE=1 when the volume can be served: udisks never mounts or shows it, the seat
 #     user gets rw on the node (uaccess), and the daemon mounts it at /media/$USER/LABEL.
 #   - It prints UDISKS_AUTO=0 when the daemon handed this drive back to the kernel driver (the
 #     daemon mounts it through udisks itself), FLASHCP_KEEP=1 when the device is busy (keep the
@@ -21,6 +21,7 @@ ENV{DEVTYPE}=="disk", ENV{ID_PART_TABLE_TYPE}=="?*", GOTO="flashcp_drive_mode_en
 TEST=="/etc/flashcp/drive-mode-disabled", GOTO="flashcp_drive_mode_end"
 IMPORT{program}="/usr/libexec/flashcp-udev-check $devnode"
 ENV{FLASHCP_KEEP}=="1", IMPORT{db}="FLASHCP_DRIVE_MODE"
+ENV{FLASHCP_KEEP}=="1", IMPORT{db}="FLASHCP_DRIVE_UID"
 ENV{FLASHCP_KEEP}=="1", ENV{FLASHCP_DRIVE_MODE}=="1", ENV{UDISKS_IGNORE}="1"
 ENV{FLASHCP_DRIVE_MODE}=="1", TAG+="uaccess"
 LABEL="flashcp_drive_mode_end"

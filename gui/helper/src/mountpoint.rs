@@ -213,8 +213,9 @@ pub fn create(env: &Env, user: &str, uid: libc::uid_t, gid: libc::gid_t, name: &
                     .map_err(|e| Refused(format!("cannot set up {}: {e}", path.display())))?;
                 return Ok(path);
             }
-            // Symlink, file, other: not ours to use, try the next name.
-            Err(e) if errno_is(&e, &[libc::ELOOP, libc::ENOTDIR]) => {}
+            // Symlink, file, other, or a live FUSE mount of another drive (root gets EACCES there,
+            // ENOTCONN/EIO if its driver died): not ours to use, try the next name.
+            Err(e) if errno_is(&e, &[libc::ELOOP, libc::ENOTDIR, libc::EACCES, libc::ENOTCONN, libc::EIO]) => {}
             Err(e) => return Err(Refused(format!("cannot open {}: {e}", path.display()))),
         }
     }

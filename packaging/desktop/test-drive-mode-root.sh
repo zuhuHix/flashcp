@@ -25,14 +25,17 @@ sandbox() {
 for fd in 4 5 6 7 8 9; do if { true >&\$fd; } 2>/dev/null; then exit 12; fi; done
 [ "\$(head -c 11 <&3 | tail -c 8)" = "EXFAT   " ] || exit 13
 if [ $landlock = 1 ] && cat /etc/hostname >/dev/null 2>&1; then exit 14; fi
+read -r _ < /proc/self/mountinfo || exit 17   # the check's busy test: own mountinfo and /sys
+ls /sys/class/block >/dev/null || exit 18
 [ "\$(ulimit -f)" = 0 ] || exit 15
 [ "\$1 \$2 \$3 \$4 \$5 \$6" = "mount --check --json --device-fd 3 $loop" ] || exit 16
 exit 0
 EOF
+  printf '#!/bin/sh\necho %s\nexit 0\n' "'{\"event\":\"check\",\"ok\":true,\"busy_unknown\":\"EACCES\"}'" > "$w/unknown"
   printf '#!/bin/sh\nexit 3\n' > "$w/refuse"
   printf '#!/bin/sh\nexit 4\n' > "$w/busy"
   printf '#!/bin/sh\nexec sleep 30\n' > "$w/hang"
-  chmod 755 "$w"/ok "$w"/refuse "$w"/busy "$w"/hang
+  chmod 755 "$w"/ok "$w"/unknown "$w"/refuse "$w"/busy "$w"/hang
   # run <fake> <setup shell commands> -> prints the helper's stdout
   run() {
     unshare -m sh -ec "
@@ -44,6 +47,7 @@ EOF
       touch /usr/bin/flashcp 2>/dev/null || true
       mount --bind '$w/$1' /usr/bin/flashcp
       $2
+      exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-   # like udev: only 0-2 open, so the device lands on fd 3
       ID_FS_UUID=1A2B-3C4D HOME=/root '$helper' '$loop'"
   }
   expect() { # name fake setup want
@@ -54,7 +58,8 @@ EOF
     [ "$got" = "$4" ] || fail "udev-check $1: got '$got', want '$4'"
     [ "$ms" -lt 2500 ] || fail "udev-check $1 took $ms ms"
   }
-  expect served ok "" "FLASHCP_DRIVE_MODE=1 UDISKS_IGNORE=1 "
+  expect served ok "" "FLASHCP_DRIVE_MODE=1 FLASHCP_DRIVE_UID=$uid UDISKS_IGNORE=1 "
+  expect "busy unknown" unknown "" ""
   expect refused refuse "" ""
   expect busy busy "" "FLASHCP_KEEP=1 "
   expect hang hang "" ""
@@ -62,7 +67,7 @@ EOF
   expect "marker is a symlink" ok "rm /run/user/$uid/flashcp/drive-mode-on; ln -s /etc/passwd /run/user/$uid/flashcp/drive-mode-on" ""
   expect "marker owned by root" ok "chown 0 /run/user/$uid/flashcp/drive-mode-on" ""
   expect "fallback flag" ok "touch /run/user/$uid/flashcp/kernel/1A2B-3C4D; chown $uid /run/user/$uid/flashcp/kernel/1A2B-3C4D" "UDISKS_AUTO=0 "
-  expect "fallback flag owned by root" ok "touch /run/user/$uid/flashcp/kernel/1A2B-3C4D" "FLASHCP_DRIVE_MODE=1 UDISKS_IGNORE=1 "
+  expect "fallback flag owned by root" ok "touch /run/user/$uid/flashcp/kernel/1A2B-3C4D" "FLASHCP_DRIVE_MODE=1 FLASHCP_DRIVE_UID=$uid UDISKS_IGNORE=1 "
   expect "no active user" ok "printf 'ACTIVE=c1\n' > /run/systemd/seats/seat0" ""
   # The hung child was SIGKILLed, not left behind.
   sleep 0.5; ! pgrep -u 65534 -f "sleep 30" || fail "the hung check child is still running"
