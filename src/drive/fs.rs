@@ -343,7 +343,8 @@ impl Fs {
     }
     pub fn setattr(&self, ino: Ino, a: &SetAttr) -> R<Attr> {
         let r = self.mutate(|c| c.setattr(ino, a));
-        if r.is_ok() && a.size.is_some() {
+        if r.is_ok() {
+            // any change (size, times, the read-only attribute) gets the idle commit
             self.wrote();
         }
         r
@@ -364,6 +365,12 @@ impl Fs {
     }
     /// Creates (or with `excl == false` opens an existing) file, open once more.
     pub fn create(&self, parent: Ino, name: &std::ffi::OsStr, excl: bool, trunc: bool) -> R<Attr> {
+        self.create_handle(parent, name, excl, trunc, true)
+    }
+
+    /// [`Fs::create`] whose handle has write access only when `write` (O_RDONLY|O_CREAT does
+    /// not): only writable handles count as writers, as in [`Fs::release_handle`].
+    pub fn create_handle(&self, parent: Ino, name: &std::ffi::OsStr, excl: bool, trunc: bool, write: bool) -> R<Attr> {
         let name = super::core::utf16(name)?;
         let a = self.mutate(|c| {
             let i = match c.lookup(parent, &name) {
@@ -384,7 +391,9 @@ impl Fs {
             n.nlookup += 1;
             n.opens += 1;
             c.opened += 1;
-            c.writers += 1;
+            if write {
+                c.writers += 1;
+            }
             c.attr(i)
         })?;
         self.wrote();
@@ -939,11 +948,12 @@ pub(crate) fn execute(dev: &dyn Dev, v: &Vol, plan: &Plan, place: &Place, seq: u
                 eprintln!("data: {} segments, {} runs, cs {cs}, {}", plan.segs.len(), probe.len(), pol.describe());
             }
             let direct = direct_ok && crate::exfat::set_direct(f, true);
-            let w = if direct {
+            let mut w = if direct {
                 crate::exfat::SeqWriter::new(f.clone())
             } else {
                 crate::exfat::SeqWriter::with_align(f.clone(), 1)
             };
+            w.set_inflight(pol.qd); // the profile's depth (1 on USB BOT), as add's data phase
             let mut out = Out::Seq {
                 w: Some(w),
                 pol,

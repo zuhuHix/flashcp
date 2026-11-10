@@ -885,6 +885,20 @@ fn review_regressions() {
     let f = File::options().read(true).write(true).open(&img.path).unwrap();
     let opts = FsOpts { auto_commit: true, idle: std::time::Duration::from_millis(50), readahead: false, ..manual() };
     let fs = open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), opts).unwrap();
+    // a metadata-only change (utimens, chmod) gets the idle commit too
+    let tg = fs.lookup(ROOT, &n("target")).unwrap().ino;
+    let when2 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_400_000_000);
+    fs.setattr(tg, &SetAttr { mtime: Some(when2), mode: Some(0o444), ..Default::default() }).unwrap();
+    let t = std::time::Instant::now();
+    while fs.status().dirty_files > 0 {
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "utimens/chmod stayed pending: {:?}", fs.status());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let probe = open(&img.path);
+    let a = probe.getattr(probe.lookup(ROOT, &n("target")).unwrap().ino).unwrap();
+    assert_eq!((a.mtime, a.read_only), (when2, true));
+    probe.shutdown().unwrap();
+    fs.setattr(tg, &SetAttr { mode: Some(0o644), ..Default::default() }).unwrap();
     let w = fs.create(ROOT, &n("stream"), true, false).unwrap();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (fs2, stop2) = (fs.clone(), stop.clone());

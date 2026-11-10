@@ -18,6 +18,12 @@ use std::time::{Duration, SystemTime};
 
 /// Positive entries and attributes live this long in the kernel. Negative answers are never
 /// cached (the names are case-insensitive: "foo" absent says nothing once "Foo" is created).
+/// Whether open flags give write access: one predicate for create, open and release, so the
+/// driver's count of write handles always balances.
+fn writable(flags: i32) -> bool {
+    flags & libc::O_ACCMODE != libc::O_RDONLY
+}
+
 const TTL: Duration = Duration::from_secs(1);
 
 type Snap = Arc<Vec<(u64, String, bool)>>;
@@ -180,12 +186,12 @@ impl Filesystem for Adapter {
     ) {
         let excl = flags & libc::O_EXCL != 0;
         let trunc = flags & libc::O_TRUNC != 0;
-        let a = tri!(self.fs.create(parent.0, name, excl, trunc), reply);
+        let a = tri!(self.fs.create_handle(parent.0, name, excl, trunc, writable(flags)), reply);
         reply.created(&TTL, &self.fattr(&a), Generation(0), FileHandle(0), FopenFlags::FOPEN_KEEP_CACHE);
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let write = flags.0 & libc::O_ACCMODE != libc::O_RDONLY;
+        let write = writable(flags.0);
         let trunc = flags.0 & libc::O_TRUNC != 0;
         tri!(self.fs.open(ino.0, write, trunc), reply);
         // flashcp is the only writer of the volume: cached pages stay valid across opens.
@@ -239,7 +245,7 @@ impl Filesystem for Adapter {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.fs.release_handle(ino.0, flags.0 & libc::O_ACCMODE != libc::O_RDONLY);
+        self.fs.release_handle(ino.0, writable(flags.0));
         reply.ok();
     }
 
