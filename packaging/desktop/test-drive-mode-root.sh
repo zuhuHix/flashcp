@@ -24,9 +24,10 @@ sandbox() {
 [ -z "\$HOME\$ID_FS_UUID\$PKEXEC_UID" ] || exit 11
 for fd in 4 5 6 7 8 9; do if { true >&\$fd; } 2>/dev/null; then exit 12; fi; done
 [ "\$(head -c 11 <&3 | tail -c 8)" = "EXFAT   " ] || exit 13
-if cat /etc/hostname >/dev/null 2>&1; then exit 14; fi
+# (No ">/dev/null" in here: opening it for writing is itself denied; fd 2 already is /dev/null.)
+if cat /etc/hostname >&2 2>&2; then exit 14; fi
 read -r _ < /proc/self/mountinfo || exit 17   # the check's busy test: own mountinfo and /sys
-ls /sys/class/block >/dev/null || exit 18
+ls /sys/class/block >&2 || exit 18
 [ "\$(ulimit -f)" = 0 ] || exit 15
 [ "\$1 \$2 \$3 \$4 \$5 \$6" = "mount --check --json --device-fd 3 $loop" ] || exit 16
 exit 0
