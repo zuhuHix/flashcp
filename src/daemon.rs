@@ -146,10 +146,12 @@ pub struct DevInfo {
 }
 
 impl DevInfo {
-    /// The name users see: the label, else the serial, else the device name.
+    /// The name users see: the label (control characters and newlines dropped), else the
+    /// serial, else the device name.
     pub fn name(&self) -> String {
         self.label
-            .clone()
+            .as_deref()
+            .map(|l| l.chars().filter(|c| !c.is_control()).collect::<String>())
             .filter(|l| !l.trim().is_empty())
             .or_else(|| self.uuid.clone())
             .unwrap_or_else(|| self.dev.rsplit('/').next().unwrap_or(&self.dev).to_string())
@@ -268,12 +270,15 @@ pub enum Input {
     /// whose texts the user saw (see [`Drive::plug`]).
     Convert {
         dev: String,
-        plug: u64,
+        plug: String,
+        /// The [`drive_identity`] the user was shown.
+        identity: String,
     },
-    /// The answer to the offer made for plug-in `plug`.
+    /// The answer to the offer made for plug-in `plug` of the drive `identity`.
     OfferAnswer {
         dev: String,
-        plug: u64,
+        plug: String,
+        identity: String,
         answer: Answer,
     },
     /// The answer could not be saved (the offer may come back after a restart).
@@ -377,14 +382,15 @@ pub enum Action {
     /// as [`Input::OfferAnswer`] with the same `plug`.
     Offer {
         dev: String,
-        plug: u64,
+        plug: String,
+        identity: String,
         title: String,
         body: String,
     },
     /// Close the offer notification of that plug-in if it is still up.
     CloseOffer {
         dev: String,
-        plug: u64,
+        plug: String,
     },
     /// Persist the answer for this volume (`$XDG_STATE_HOME/flashcp/recluster-offers`).
     Remember {
@@ -419,8 +425,8 @@ impl fmt::Display for Action {
             Action::Rescan { dev } => write!(f, "rescan {dev}"),
             Action::ReclusterCheck { dev } => write!(f, "recluster-check {dev}"),
             Action::Recluster { dev, .. } => write!(f, "recluster {dev}"),
-            Action::Offer { dev, plug, .. } => write!(f, "offer {dev} #{plug}"),
-            Action::CloseOffer { dev, plug } => write!(f, "close-offer {dev} #{plug}"),
+            Action::Offer { dev, .. } => write!(f, "offer {dev}"),
+            Action::CloseOffer { dev, .. } => write!(f, "close-offer {dev}"),
             Action::Remember { volume, answer, .. } => write!(f, "remember {volume} {answer}"),
             Action::Exit => write!(f, "exit"),
         }
@@ -524,10 +530,11 @@ pub struct Drive {
     pub conv_result: Option<(&'static str, String)>,
     /// The notification to show once the driver has mounted it again.
     after_mount: Option<Action>,
-    /// This plug-in's token: new for every `Added`, never reused. Offers, the app's dialog and
-    /// `drive-mode recluster` carry it, so an answer given for one stick never reaches another
-    /// one that got the same device path.
-    pub plug: u64,
+    /// This plug-in's token: 128 random bits from the OS, new for every `Added`, so it is
+    /// unique across daemon restarts too. Offers, the app's dialog and `drive-mode recluster`
+    /// carry it (and the [`drive_identity`] they showed), so an answer given for one stick never
+    /// reaches another one that got the same device path.
+    pub plug: String,
 }
 
 impl Drive {
@@ -595,10 +602,38 @@ pub struct Core {
     pub offers: bool,
     /// Volumes ([`volume_key`]) whose offer was answered: never offered by notification again.
     pub answered: std::collections::BTreeSet<String>,
-    /// The last plug-in token handed out.
-    last_plug: u64,
+    /// Tests only: deterministic tokens `t1`, `t2`, ... instead of random ones.
+    pub test_tokens: Option<u64>,
     /// "Your answer could not be saved" was said once already.
     told_unsaved: bool,
+}
+
+/// 128 random bits from the OS, as 32 hex digits.
+pub fn random_token() -> String {
+    let mut b = [0u8; 16];
+    let mut got = 0;
+    while got < b.len() {
+        let n = unsafe { libc::getrandom(b[got..].as_mut_ptr().cast(), b.len() - got, 0) };
+        if n > 0 {
+            got += n as usize;
+        } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            // No getrandom: the kernel's pool through the device instead.
+            use std::io::Read;
+            std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).expect("random bytes");
+            break;
+        }
+    }
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// What identifies the stick a confirmation was made for: the volume serial and the disk's
+/// hardware serial (empty when absent), as `UUID:SERIAL`. Whitespace and control characters
+/// are replaced, so it is one word on the control socket.
+pub fn drive_identity(info: &DevInfo) -> String {
+    let clean = |s: Option<&str>| -> String {
+        s.unwrap_or("").chars().map(|c| if c.is_whitespace() || c.is_control() { '_' } else { c }).collect()
+    };
+    format!("{}:{}", clean(info.uuid.as_deref()), clean(info.disk_serial.as_deref()))
 }
 
 /// What a conversion request for a stick that is no longer there gets.
@@ -634,7 +669,7 @@ impl Core {
             shutting_down: false,
             offers: true,
             answered: Default::default(),
-            last_plug: 0,
+            test_tokens: None,
             told_unsaved: false,
         }
     }
@@ -658,6 +693,11 @@ impl Core {
             Input::Shutdown => {
                 self.shutting_down = true;
                 for d in self.drives.values_mut() {
+                    // An offer can never be answered once this daemon is gone: take it down.
+                    if d.offering {
+                        d.offering = false;
+                        out.push(Action::CloseOffer { dev: d.info.dev.clone(), plug: d.plug.clone() });
+                    }
                     match d.state {
                         // One SIGTERM per driver: ejecting/unmounting/stopping ones are on their way.
                         State::Starting | State::Mounted if !d.gone => {
@@ -688,8 +728,8 @@ impl Core {
                 }
             }
             Input::ReclusterExit { dev, code } => self.recluster_exit(&dev, code, out),
-            Input::Convert { dev, plug } => {
-                if self.convert_blocker(&dev, plug).is_none() {
+            Input::Convert { dev, plug, identity } => {
+                if self.convert_blocker(&dev, &plug, &identity).is_none() {
                     self.start_convert(&dev, out);
                 }
             }
@@ -707,10 +747,11 @@ impl Core {
                     Urgency::Low,
                 ));
             }
-            Input::OfferAnswer { dev, plug, answer } => {
+            Input::OfferAnswer { dev, plug, identity, answer } => {
                 let Some(d) = self.drives.get_mut(&dev) else { return };
-                // Only the offer of this very plug-in: another stick may have this path now.
-                if !d.offering || d.plug != plug {
+                // Only the offer of this very plug-in of this drive: another stick may have this
+                // path now (also after a daemon restart: tokens are random).
+                if !d.offering || d.plug != plug || drive_identity(&d.info) != identity {
                     return;
                 }
                 d.offering = false;
@@ -722,7 +763,7 @@ impl Core {
                 };
                 self.answered.insert(key.clone());
                 out.push(Action::Remember { dev: dev.clone(), volume: key, answer: word });
-                if answer == Answer::Accept && self.convert_blocker(&dev, plug).is_none() {
+                if answer == Answer::Accept && self.convert_blocker(&dev, &plug, &identity).is_none() {
                     self.start_convert(&dev, out);
                 }
             }
@@ -945,10 +986,15 @@ impl Core {
             conv_message: None,
             conv_result: None,
             after_mount: None,
-            plug: 0,
+            plug: String::new(),
         };
-        self.last_plug += 1;
-        d.plug = self.last_plug;
+        d.plug = match self.test_tokens.as_mut() {
+            Some(n) => {
+                *n += 1;
+                format!("t{n}")
+            }
+            None => random_token(),
+        };
         if let Some(m) = d.info.mounted_at.clone() {
             // Already served by the kernel driver (mounted before the daemon started, or by hand).
             d.mountpoint = Some(m);
@@ -1241,9 +1287,9 @@ impl Core {
     }
 
     /// Why a conversion of plug-in `plug` cannot start now (None: it can).
-    pub fn convert_blocker(&self, dev: &str, plug: u64) -> Option<&'static str> {
+    pub fn convert_blocker(&self, dev: &str, plug: &str, identity: &str) -> Option<&'static str> {
         let Some(d) = self.drives.get(dev) else { return Some(REPLACED) };
-        if d.plug != plug || d.gone {
+        if d.plug.is_empty() || d.plug != plug || drive_identity(&d.info) != identity || d.gone {
             return Some(REPLACED);
         }
         if d.info.uuid.is_none() {
@@ -1268,7 +1314,7 @@ impl Core {
         let Some(d) = self.drives.get_mut(dev) else { return };
         if d.offering {
             d.offering = false;
-            out.push(Action::CloseOffer { dev: dev.into(), plug: d.plug });
+            out.push(Action::CloseOffer { dev: dev.into(), plug: d.plug.clone() });
             if let Some(key) = volume_key(&d.info)
                 && self.answered.insert(key.clone())
             {
@@ -1396,7 +1442,7 @@ impl Core {
         let Some(d) = self.drives.get_mut(dev) else { return };
         if d.offering {
             d.offering = false;
-            out.push(Action::CloseOffer { dev: dev.into(), plug: d.plug });
+            out.push(Action::CloseOffer { dev: dev.into(), plug: d.plug.clone() });
         }
         if d.state == State::Converting(Conv::Running { finish: false }) {
             // recluster gets I/O errors and exits; its exit forgets the drive.
@@ -1501,7 +1547,7 @@ impl Core {
             .values()
             .map(|d| {
                 format!(
-                    r#"{{"device":{},"label":{},"mode":{},"state":{},"mountpoint":{},"dirty_bytes":{},"dirty_files":{},"safe_to_remove":{},"can_convert":{},"cluster":{},"convert_secs":{},"convert_done":{},"convert_total":{},"convert_result":{},"convert_message":{},"plug":{},"volume":{}}}"#,
+                    r#"{{"device":{},"label":{},"mode":{},"state":{},"mountpoint":{},"dirty_bytes":{},"dirty_files":{},"safe_to_remove":{},"can_convert":{},"cluster":{},"convert_secs":{},"convert_done":{},"convert_total":{},"convert_result":{},"convert_message":{},"plug":{},"identity":{},"volume":{}}}"#,
                     json_str(&d.info.dev),
                     json_str(&d.info.name()),
                     json_str(d.mode()),
@@ -1522,7 +1568,8 @@ impl Core {
                     d.conv_total,
                     opt(d.conv_result.as_ref().map(|r| r.0)),
                     opt(d.conv_result.as_ref().map(|r| r.1.as_str())),
-                    d.plug,
+                    json_str(&d.plug),
+                    json_str(&drive_identity(&d.info)),
                     opt(volume_key(&d.info).as_deref()),
                 )
             })
@@ -1652,7 +1699,7 @@ pub fn offer_texts(name: &str, secs: u64) -> (String, String) {
 
 fn offer(d: &Drive) -> Action {
     let (title, body) = offer_texts(&d.info.name(), d.can_convert.map(|(_, s)| s).unwrap_or(1));
-    Action::Offer { dev: d.info.dev.clone(), plug: d.plug, title, body }
+    Action::Offer { dev: d.info.dev.clone(), plug: d.plug.clone(), identity: drive_identity(&d.info), title, body }
 }
 
 /// The end of a conversion: remembered for the app / CLI, and the notification saying so.
@@ -2264,7 +2311,7 @@ mod tests {
         ];
 
         for (name, enabled, steps) in table {
-            let mut core = Core::new(enabled);
+            let mut core = test_core(enabled);
             for (i, (input, want, state)) in steps.into_iter().enumerate() {
                 let dbg = format!("{input:?}");
                 let got: Vec<String> = core.handle(input).iter().map(|a| a.to_string()).collect();
@@ -2293,16 +2340,25 @@ mod tests {
     fn rev(dev: &str, line: &str) -> Input {
         Input::Recluster { dev: dev.into(), ev: ReclusterEvent::parse(line) }
     }
+    /// A core with deterministic plug tokens `t1`, `t2`, ... (the daemon's are random).
+    fn test_core(enabled: bool) -> Core {
+        let mut c = Core::new(enabled);
+        c.test_tokens = Some(0);
+        c
+    }
+    /// The identity of `info(D, ..)`: its volume serial, no disk serial.
+    const ID: &str = "1A2B-3C4D:";
     /// The answer to the offer of the drive now at `dev` (its current plug-in).
     fn answer_for(core: &Core, dev: &str, answer: Answer) -> Input {
-        Input::OfferAnswer { dev: dev.into(), plug: core.drives[dev].plug, answer }
+        let d = &core.drives[dev];
+        Input::OfferAnswer { dev: dev.into(), plug: d.plug.clone(), identity: drive_identity(&d.info), answer }
     }
     fn answer(dev: &str, answer: Answer) -> Input {
-        // Every core in these tests starts at plug-in 1; replugs pass their own number.
-        Input::OfferAnswer { dev: dev.into(), plug: 1, answer }
+        // Every test core starts at plug-in t1; replugs pass their own token.
+        Input::OfferAnswer { dev: dev.into(), plug: "t1".into(), identity: ID.into(), answer }
     }
-    fn convert(dev: &str, plug: u64) -> Input {
-        Input::Convert { dev: dev.into(), plug }
+    fn convert(dev: &str, plug: &str) -> Input {
+        Input::Convert { dev: dev.into(), plug: plug.into(), identity: ID.into() }
     }
 
     type Step = (Input, &'static str, &'static str);
@@ -2345,8 +2401,8 @@ mod tests {
 
     #[test]
     fn offer_accept_convert_remount() {
-        let mut core = Core::new(true);
-        let mut steps = served_big(128 << 10, "offer /dev/sdb1 #1");
+        let mut core = test_core(true);
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
         steps.extend(stop_for_convert(answer(D, Answer::Accept), ACCEPTED));
         steps.extend(vec![
             (rev(D, r#"{"event":"plan","op":"recluster","est_secs":6.2,"switches":2}"#), "", "converting"),
@@ -2376,8 +2432,8 @@ mod tests {
     fn not_now_and_dismissed_are_remembered_no_answer_is_not() {
         for (a, remembered) in [(Answer::NotNow, true), (Answer::Dismissed, true), (Answer::None, false)] {
             let name = format!("{a:?}");
-            let mut core = Core::new(true);
-            let mut steps = served_big(32 << 10, "offer /dev/sdb1 #1");
+            let mut core = test_core(true);
+            let mut steps = served_big(32 << 10, "offer /dev/sdb1");
             steps.push((answer(D, a), if remembered { "remember 1A2B-3C4D::K declined" } else { "" }, "ready"));
             // A second answer (or a stale one) does nothing.
             steps.push((answer(D, Answer::Accept), "", "ready"));
@@ -2385,17 +2441,17 @@ mod tests {
             steps.push((exit_(D, 1), "rmmp /media/u/K", "-"));
             run(&name, &mut core, steps);
             // Plugged in again: asked again only if there was no answer.
-            run(&name, &mut core, served_big(32 << 10, if remembered { "" } else { "offer /dev/sdb1 #2" }));
+            run(&name, &mut core, served_big(32 << 10, if remembered { "" } else { "offer /dev/sdb1" }));
             // The app button works either way (and closes an offer still on screen).
             let want = if remembered {
                 "notify /dev/sdb1:convert; ctl /dev/sdb1 prepare-eject; inhibit on"
             } else {
-                "close-offer /dev/sdb1 #2; remember 1A2B-3C4D::K accepted; notify /dev/sdb1:convert; ctl /dev/sdb1 prepare-eject; inhibit on"
+                "close-offer /dev/sdb1; remember 1A2B-3C4D::K accepted; notify /dev/sdb1:convert; ctl /dev/sdb1 prepare-eject; inhibit on"
             };
-            run(&name, &mut core, vec![(convert(D, 2), want, "converting")]);
+            run(&name, &mut core, vec![(convert(D, "t2"), want, "converting")]);
         }
         // An answer persisted by an earlier daemon.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         core.answered.insert("1A2B-3C4D::K".into());
         run("loaded", &mut core, served_big(128 << 10, ""));
     }
@@ -2403,46 +2459,46 @@ mod tests {
     #[test]
     fn no_offer_unless_it_is_worth_it() {
         // 16 KB: the check says yes, the notification does not ask; the app button can.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         run("16 KB", &mut core, served_big(16 << 10, ""));
-        assert_eq!(core.convert_blocker(D, 1), None);
+        assert_eq!(core.convert_blocker(D, "t1", ID), None);
         // The check says no (or failed): neither.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         run("no", &mut core, serving());
-        assert!(core.convert_blocker(D, 1).is_some());
-        run("no", &mut core, vec![(convert(D, 1), "", "ready")]);
+        assert!(core.convert_blocker(D, "t1", ID).is_some());
+        run("no", &mut core, vec![(convert(D, "t1"), "", "ready")]);
         // The offer turned off.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         core.offers = false;
         run("offers off", &mut core, served_big(128 << 10, ""));
-        assert_eq!(core.convert_blocker(D, 1), None);
+        assert_eq!(core.convert_blocker(D, "t1", ID), None);
         // No volume serial: nothing to remember it by, so no notification.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         let mut steps = served_big(128 << 10, "");
         steps[0].0 = Input::Added(DevInfo { uuid: None, ..info(D, "K") });
         run("no serial", &mut core, steps);
         // Drive mode off: the kernel driver, no check at all.
-        let mut core = Core::new(false);
+        let mut core = test_core(false);
         run("off", &mut core, vec![(added(D), "kernel /dev/sdb1 rw", "mounting")]);
         // A drive being saved / ejected cannot start one.
-        let mut core = Core::new(true);
-        let mut steps = served_big(128 << 10, "offer /dev/sdb1 #1");
+        let mut core = test_core(true);
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
         steps.push((Input::Eject { dev: D.into() }, "ctl /dev/sdb1 prepare-eject", "ejecting"));
         steps.push((answer(D, Answer::Accept), "remember 1A2B-3C4D::K accepted", "ejecting"));
         run("ejecting", &mut core, steps);
-        assert!(core.convert_blocker(D, 1).is_some());
+        assert!(core.convert_blocker(D, "t1", ID).is_some());
         // The CLI/app path refuses a drive that is not ready.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         run("checking", &mut core, vec![(added(D), "check /dev/sdb1", "checking")]);
-        assert_eq!(core.convert_blocker(D, 1), Some("it is not ready (flashcp must have it mounted)"));
-        assert_eq!(core.convert_blocker("/dev/sdz1", 1), Some(REPLACED));
+        assert_eq!(core.convert_blocker(D, "t1", ID), Some("it is not ready (flashcp must have it mounted)"));
+        assert_eq!(core.convert_blocker("/dev/sdz1", "t1", ID), Some(REPLACED));
     }
 
     #[test]
     fn only_a_clean_stop_leads_to_recluster() {
         // The driver dies while flushing: no recluster, the kernel gets it read-only.
-        let mut core = Core::new(true);
-        let mut steps = served_big(128 << 10, "offer /dev/sdb1 #1");
+        let mut core = test_core(true);
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
         steps.push((ev(D, DIRTY), "inhibit on", "saving"));
         steps.push((
             answer(D, Answer::Accept),
@@ -2457,8 +2513,8 @@ mod tests {
         run("crash", &mut core, steps);
         assert_eq!(core.drives[D].conv_result.as_ref().map(|r| r.0), Some("failed"));
         // Exit 0 without a clean `unmounted`: not Clean either.
-        let mut core = Core::new(true);
-        let mut steps = served_big(128 << 10, "offer /dev/sdb1 #1");
+        let mut core = test_core(true);
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
         steps.push((answer(D, Answer::Accept), ACCEPTED, "converting"));
         steps.push((reply(D, "prepare-eject", true), "ctl /dev/sdb1 unmount", "converting"));
         steps.push((ev(D, r#"{"event":"unmounted","clean":false}"#), "", "converting"));
@@ -2469,8 +2525,8 @@ mod tests {
         ));
         run("unclean exit 0", &mut core, steps);
         // The driver refuses to pause (files in use): resumed, nothing changed.
-        let mut core = Core::new(true);
-        let mut steps = served_big(128 << 10, "offer /dev/sdb1 #1");
+        let mut core = test_core(true);
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
         steps.push((answer(D, Answer::Accept), ACCEPTED, "converting"));
         steps.push((
             reply(D, "prepare-eject", false),
@@ -2497,8 +2553,8 @@ mod tests {
             ),
             (1, r#"{"event":"error","message":"read /dev/sdb1: I/O error"}"#, "failed", "Could not make K faster."),
         ] {
-            let mut core = Core::new(true);
-            let mut steps = served_big(128 << 10, "offer /dev/sdb1 #1");
+            let mut core = test_core(true);
+            let mut steps = served_big(128 << 10, "offer /dev/sdb1");
             steps.extend(stop_for_convert(answer(D, Answer::Accept), ACCEPTED));
             steps.push((rev(D, line), "", "converting"));
             steps.push((rexit(D, code), "start /dev/sdb1 /media/u/K; inhibit off", "starting"));
@@ -2509,25 +2565,25 @@ mod tests {
             assert!(r.1.contains(text), "{r:?}");
             assert!(r.1.contains("works as before"), "{r:?}");
             // Still offered by the app button (the check said yes and nothing changed).
-            assert_eq!(core.convert_blocker(D, 1), None);
+            assert_eq!(core.convert_blocker(D, "t1", ID), None);
         }
     }
 
     #[test]
     fn yank_eject_shutdown_and_off_during_a_conversion() {
         let to_running = || {
-            let mut s = served_big(128 << 10, "offer /dev/sdb1 #1");
+            let mut s = served_big(128 << 10, "offer /dev/sdb1");
             s.extend(stop_for_convert(answer(D, Answer::Accept), ACCEPTED));
             s
         };
         // Yanked: a warning; recluster's exit forgets the drive and removes the mountpoint.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         let mut steps = to_running();
         steps.push((Input::Removed { dev: D.into() }, "notify /dev/sdb1:convert; inhibit off", "converting"));
         steps.push((rexit(D, 1), "rmmp /media/u/K", "-"));
         run("yank", &mut core, steps);
         // Eject waits for the end, then powers off instead of remounting.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         let mut steps = to_running();
         steps.push((Input::Eject { dev: D.into() }, "", "converting"));
         steps.push((
@@ -2537,14 +2593,14 @@ mod tests {
         ));
         run("eject", &mut core, steps);
         // An eject during the pause also waits.
-        let mut core = Core::new(true);
-        let mut steps = served_big(128 << 10, "offer /dev/sdb1 #1");
+        let mut core = test_core(true);
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
         steps.push((answer(D, Answer::Accept), ACCEPTED, "converting"));
         steps.push((Input::Eject { dev: D.into() }, "", "converting"));
         run("eject while pausing", &mut core, steps);
         assert!(core.drives[D].eject_after);
         // The daemon is stopped: it waits for recluster, then hands the drive back.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         let mut steps = to_running();
         steps.push((Input::Shutdown, "", "converting"));
         steps.push((
@@ -2554,7 +2610,7 @@ mod tests {
         ));
         run("shutdown", &mut core, steps);
         // Drive mode turned off meanwhile: the kernel driver afterwards.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         let mut steps = to_running();
         steps.push((Input::SetEnabled(false), "", "converting"));
         steps.push((
@@ -2574,7 +2630,7 @@ mod tests {
                 (finish(D), "recluster /dev/sdb1; inhibit on", "converting"),
             ]
         };
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         let mut steps = start();
         steps.push((rexit(D, 0), "notify /dev/sdb1:convert; mkmp /dev/sdb1 K; inhibit off", "starting"));
         steps.push((mp(D), "start /dev/sdb1 /media/u/K", "starting"));
@@ -2582,25 +2638,25 @@ mod tests {
         steps.push((ev(D, MOUNTED), "", "ready"));
         run("finished", &mut core, steps);
         // Refused (e.g. a pending drive-mode commit): mounted as usual, the mount replays it.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         let mut steps = start();
         steps.push((rexit(D, 3), "mkmp /dev/sdb1 K; inhibit off", "starting"));
         run("refused", &mut core, steps);
         // Failed: one attempt, then the kernel read-only with a message; no loop.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         let mut steps = start();
         steps.push((rexit(D, 1), "notify /dev/sdb1:convert; kernel /dev/sdb1 ro; inhibit off", "mounting"));
         steps.push((Input::KernelMounted { dev: D.into(), result: Ok("/media/u/K".into()) }, "", "read_only"));
         run("failed", &mut core, steps);
         assert!(core.drives[D].finish_tried);
         // Yanked meanwhile: forgotten.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         let mut steps = start();
         steps.push((Input::Removed { dev: D.into() }, "inhibit off", "converting"));
         steps.push((rexit(D, 1), "", "-"));
         run("yank", &mut core, steps);
         // Drive mode off before the recluster check answered: the kernel, nothing run.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         let mut steps = start();
         steps.truncate(2);
         steps.push((Input::SetEnabled(false), "", "checking"));
@@ -2610,7 +2666,7 @@ mod tests {
 
     #[test]
     fn kernel_mount_unmounted_by_hand_is_not_listed_as_mounted() {
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         run(
             "unmount by hand",
             &mut core,
@@ -2640,7 +2696,7 @@ mod tests {
             ],
         );
         // A flashcp mount is not affected.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         run("flashcp", &mut core, serving());
         run("flashcp", &mut core, vec![(Input::KernelMountSeen { dev: D.into(), at: None }, "", "ready")]);
     }
@@ -2654,20 +2710,20 @@ mod tests {
             ("same label", DevInfo { uuid: Some("5E6F-7A8B".into()), ..info(D, "K") }),
             ("a clone of A", info(D, "K")),
         ] {
-            let mut core = Core::new(true);
-            let mut steps = served_big(128 << 10, "offer /dev/sdb1 #1");
-            steps.push((Input::Removed { dev: D.into() }, "close-offer /dev/sdb1 #1; stop /dev/sdb1", "ready"));
+            let mut core = test_core(true);
+            let mut steps = served_big(128 << 10, "offer /dev/sdb1");
+            steps.push((Input::Removed { dev: D.into() }, "close-offer /dev/sdb1; stop /dev/sdb1", "ready"));
             steps.push((exit_(D, 1), "rmmp /media/u/K", "-"));
             run(name, &mut core, steps);
             let mut steps = served_big(128 << 10, "");
             steps[0].0 = Input::Added(b.clone());
             steps[2].1 = if b.label.as_deref() == Some("OTHER") { "mkmp /dev/sdb1 OTHER" } else { "mkmp /dev/sdb1 K" };
-            steps[4].1 = "offer /dev/sdb1 #2";
+            steps[4].1 = "offer /dev/sdb1";
             if b.label.as_deref() == Some("OTHER") {
                 steps[3].0 = Input::MountpointReady { dev: D.into(), result: Ok("/media/u/K".into()) };
             }
             run(name, &mut core, steps);
-            assert_eq!(core.drives[D].plug, 2);
+            assert_eq!(core.drives[D].plug, "t2");
             run(
                 name,
                 &mut core,
@@ -2675,12 +2731,16 @@ mod tests {
                     // A's notification answered late, A's dialog, A's CLI confirmation: plug 1.
                     (answer(D, Answer::Accept), "", "ready"),
                     (answer(D, Answer::NotNow), "", "ready"),
-                    (convert(D, 1), "", "ready"),
+                    (convert(D, "t1"), "", "ready"),
                 ],
             );
             assert!(core.answered.is_empty(), "{name}: nothing remembered for B");
-            assert_eq!(core.convert_blocker(D, 1), Some(REPLACED), "{name}");
-            assert_eq!(core.convert_blocker(D, 2), None, "{name}: B's own token works");
+            assert_eq!(core.convert_blocker(D, "t1", ID), Some(REPLACED), "{name}");
+            assert_eq!(core.convert_blocker(D, "t2", &drive_identity(&b)), None, "{name}: B's own token works");
+            // B's token with A's identity (when B is another volume) is not B either.
+            if drive_identity(&b) != ID {
+                assert_eq!(core.convert_blocker(D, "t2", ID), Some(REPLACED), "{name}");
+            }
             // B's own answer is B's.
             let a = answer_for(&core, D, Answer::NotNow);
             let got: Vec<String> = core.handle(a).iter().map(|a| a.to_string()).collect();
@@ -2689,16 +2749,76 @@ mod tests {
         }
     }
 
+    /// An offer (or an app dialog, or a CLI confirmation) made by one daemon run is never
+    /// accepted by the next one, even for the very same stick at the same path: plug tokens
+    /// are random, not a counter that starts over.
+    #[test]
+    fn consent_does_not_survive_a_daemon_restart() {
+        let steps = || {
+            let mut s = served_big(128 << 10, "offer /dev/sdb1");
+            s[0].0 = Input::Added(DevInfo { disk_serial: Some("AA01".into()), ..info(D, "K") });
+            s
+        };
+        let mut first = Core::new(true);
+        run("first run", &mut first, steps());
+        let (old_plug, old_id) = (first.drives[D].plug.clone(), drive_identity(&first.drives[D].info));
+        assert_eq!(old_plug.len(), 32, "128 bits: {old_plug}");
+        assert!(old_plug.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(old_id, "1A2B-3C4D:AA01");
+        // The daemon stops: the offer notification is taken down with it.
+        let got: Vec<String> = first.handle(Input::Shutdown).iter().map(|a| a.to_string()).collect();
+        assert_eq!(got.join("; "), "close-offer /dev/sdb1; stop /dev/sdb1");
+
+        let mut second = Core::new(true);
+        run("second run", &mut second, steps());
+        assert_ne!(second.drives[D].plug, old_plug, "tokens differ across runs");
+        let stale = [
+            Input::OfferAnswer {
+                dev: D.into(),
+                plug: old_plug.clone(),
+                identity: old_id.clone(),
+                answer: Answer::Accept,
+            },
+            Input::OfferAnswer {
+                dev: D.into(),
+                plug: old_plug.clone(),
+                identity: old_id.clone(),
+                answer: Answer::NotNow,
+            },
+            Input::Convert { dev: D.into(), plug: old_plug.clone(), identity: old_id.clone() },
+        ];
+        for input in stale {
+            let dbg = format!("{input:?}");
+            assert!(second.handle(input).is_empty(), "{dbg}");
+            assert_eq!(second.drives[D].state_name(), "ready", "{dbg}");
+        }
+        assert!(second.answered.is_empty(), "nothing remembered");
+        assert_eq!(second.convert_blocker(D, &old_plug, &old_id), Some(REPLACED));
+        // The right token with the wrong identity, and the reverse, are refused too.
+        let plug = second.drives[D].plug.clone();
+        assert_eq!(second.convert_blocker(D, &plug, "1A2B-3C4D:"), Some(REPLACED));
+        assert_eq!(second.convert_blocker(D, &plug, &old_id), None);
+        assert_eq!(second.convert_blocker(D, "", ""), Some(REPLACED));
+    }
+
+    #[test]
+    fn labels_lose_control_characters() {
+        let i = info(D, "K\nX\t<b>");
+        assert_eq!(i.name(), "KX<b>");
+        let (t, b) = offer_texts(&i.name(), 3);
+        assert!(!t.contains('\n') && !b.contains('\n'), "{t} {b}");
+    }
+
     /// The conversion's pause is refused while a shutdown, drive mode off or an eject waits:
     /// each then goes its normal way instead of being dropped.
     #[test]
     fn a_failed_pause_still_carries_out_shutdown_off_and_eject() {
         let pausing = || {
-            let mut s = served_big(128 << 10, "offer /dev/sdb1 #1");
+            let mut s = served_big(128 << 10, "offer /dev/sdb1");
             s.push((answer(D, Answer::Accept), ACCEPTED, "converting"));
             s
         };
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         let mut steps = pausing();
         steps.push((Input::Shutdown, "", "converting"));
         steps.push((
@@ -2710,7 +2830,7 @@ mod tests {
         steps.push((exit_(D, 0), "rmmp /media/u/K; rescan /dev/sdb1; exit", "safe_to_remove"));
         run("shutdown", &mut core, steps);
 
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         let mut steps = pausing();
         steps.push((Input::SetEnabled(false), "", "converting"));
         steps.push((
@@ -2723,7 +2843,7 @@ mod tests {
         run("off", &mut core, steps);
 
         // The eject needed the same pause: it cannot go ahead, and the user is told so.
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         let mut steps = pausing();
         steps.push((Input::Eject { dev: D.into() }, "", "converting"));
         steps.push((
@@ -2743,12 +2863,12 @@ mod tests {
         let two = DevInfo { disk_serial: Some("BB02".into()), ..info(D, "K") };
         assert_eq!(volume_key(&one).as_deref(), Some("1A2B-3C4D:AA01:K"));
         assert_ne!(volume_key(&one), volume_key(&two));
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         core.answered.insert(volume_key(&one).unwrap());
-        let mut steps = served_big(128 << 10, "offer /dev/sdb1 #1");
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
         steps[0].0 = Input::Added(two);
         run("clone", &mut core, steps);
-        let mut core = Core::new(true);
+        let mut core = test_core(true);
         core.answered.insert(volume_key(&one).unwrap());
         let mut steps = served_big(128 << 10, "");
         steps[0].0 = Input::Added(one);
@@ -2759,8 +2879,8 @@ mod tests {
     /// claims it was saved.
     #[test]
     fn an_unsaved_answer_is_said_once() {
-        let mut core = Core::new(true);
-        let mut steps = served_big(128 << 10, "offer /dev/sdb1 #1");
+        let mut core = test_core(true);
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
         steps.push((answer(D, Answer::NotNow), "remember 1A2B-3C4D::K declined", "ready"));
         steps.push((Input::RememberFailed { dev: D.into() }, "notify /dev/sdb1:offer", "ready"));
         steps.push((Input::RememberFailed { dev: D.into() }, "", "ready"));

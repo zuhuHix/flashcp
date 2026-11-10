@@ -49,10 +49,13 @@ pub struct DriveModeDrive {
     pub convert_result: Option<String>,
     #[serde(default, alias = "convert_message")]
     pub convert_message: Option<String>,
-    /// This plug-in's token: "Make faster" sends it back, so a dialog opened for one stick is
-    /// never applied to another one that got the same device path.
+    /// This plug-in's random token and the drive's identity: "Make faster" sends both back,
+    /// so a dialog opened for one stick is never applied to another one that got the same
+    /// device path (also across a restart of the drive service).
     #[serde(default)]
-    pub plug: u64,
+    pub plug: String,
+    #[serde(default)]
+    pub identity: String,
 }
 
 /// The daemon and setting state for the window.
@@ -235,14 +238,31 @@ pub async fn drive_mode_eject(device: String) -> Result<(), String> {
 /// "Make faster": the daemon pauses the drive, converts it and mounts it again. Returns the
 /// result text; a refusal or failure comes back as the error (the drive works as before).
 #[tauri::command]
-pub async fn drive_mode_recluster(device: String, plug: u64) -> Result<String, String> {
-    validate_device(&device)?;
+pub async fn drive_mode_recluster(device: String, plug: String, identity: String) -> Result<String, String> {
+    let args = recluster_args(&device, &plug, &identity)?;
     blocking(move || {
-        let plug = plug.to_string();
-        let args = ["drive-mode", "recluster", device.as_str(), "--yes", "--plug", plug.as_str(), "--json"];
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         parse_recluster(&run(&program(), &args, RECLUSTER_TIMEOUT)?)
     })
     .await
+}
+
+/// The CLI arguments of "Make faster": the dialog's device, plug token and drive identity,
+/// each checked to be one plain word (the daemon compares the last two with the drive).
+pub fn recluster_args(device: &str, plug: &str, identity: &str) -> Result<Vec<String>, String> {
+    validate_device(device)?;
+    let token = plug.len() >= 2 && plug.len() <= 64 && plug.chars().all(|c| c.is_ascii_alphanumeric());
+    let id = !identity.is_empty()
+        && identity.len() <= 256
+        && !identity.starts_with('-')
+        && identity.chars().all(|c| c.is_ascii_graphic());
+    if !token || !id {
+        return Err("This drive changed; look at it again before making it faster".to_string());
+    }
+    Ok(["drive-mode", "recluster", device, "--yes", "--plug", plug, "--identity", identity, "--json"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect())
 }
 
 #[cfg(test)]
@@ -268,10 +288,16 @@ mod tests {
             DriveModeSet { enabled: false, running: true }
         );
         assert!(parse_ok(r#"{"ok":true}"#).is_ok());
-        let conv = r#"{"ok":true,"running":true,"enabled":true,"offers":true,"drives":[{"device":"/dev/sdb1","label":"K","mode":"flashcp","state":"converting","mountpoint":"/media/u/K","dirty_bytes":0,"dirty_files":0,"safe_to_remove":false,"can_convert":true,"cluster":131072,"convert_secs":7,"convert_done":5,"convert_total":10,"convert_result":null,"convert_message":null,"plug":4,"volume":"1A2B-3C4D::K"}]}"#;
+        let conv = r#"{"ok":true,"running":true,"enabled":true,"offers":true,"drives":[{"device":"/dev/sdb1","label":"K","mode":"flashcp","state":"converting","mountpoint":"/media/u/K","dirty_bytes":0,"dirty_files":0,"safe_to_remove":false,"can_convert":true,"cluster":131072,"convert_secs":7,"convert_done":5,"convert_total":10,"convert_result":null,"convert_message":null,"plug":"0f3a9c","identity":"1A2B-3C4D:AA01","volume":"1A2B-3C4D:AA01:K"}]}"#;
         let d = &parse_status(conv).unwrap().drives[0];
         assert!(d.can_convert && d.convert_secs == 7 && d.convert_done == 5 && d.convert_total == 10);
-        assert_eq!(d.plug, 4);
+        assert_eq!((d.plug.as_str(), d.identity.as_str()), ("0f3a9c", "1A2B-3C4D:AA01"));
+        let a = recluster_args("/dev/sdb1", "0f3a9c", "1A2B-3C4D:AA01").unwrap();
+        assert_eq!(a[4..8], ["--plug", "0f3a9c", "--identity", "1A2B-3C4D:AA01"]);
+        for (plug, id) in [("", "1A2B-3C4D:"), ("0f3a", ""), ("0f 3a", "x"), ("0f3a", "--yes"), ("0f3a", "a b")] {
+            assert!(recluster_args("/dev/sdb1", plug, id).is_err(), "{plug:?} {id:?}");
+        }
+        assert!(recluster_args("/tmp/x", "0f3a", "1A2B-3C4D:").is_err());
         assert_eq!(d.convert_result, None);
         assert_eq!(
             parse_recluster(

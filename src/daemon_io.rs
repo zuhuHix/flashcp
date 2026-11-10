@@ -199,6 +199,20 @@ pub fn read_answered(path: &Path) -> std::collections::BTreeSet<String> {
     s.lines().filter_map(|l| l.split_once('\t')).map(|(k, _)| k.to_string()).collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: make [`remember`] fail at this step ("write" or "rename").
+    static FAIL_AT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+fn fail_here(_step: &'static str) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_AT.with(|f| f.get()) == Some(_step) {
+        return Err(std::io::Error::other(format!("injected failure at {_step}")));
+    }
+    Ok(())
+}
+
 /// Add one answer: the whole file rewritten to a new temp file (0600, never through a
 /// symlink), fsynced, renamed over the old one, the directory fsynced.
 fn remember(path: &Path, volume: &str, answer: &str) -> std::io::Result<()> {
@@ -221,8 +235,10 @@ fn remember(path: &Path, volume: &str, answer: &str) -> std::io::Result<()> {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)?;
+        fail_here("write")?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
+        fail_here("rename")?;
         std::fs::rename(&tmp, path)?;
         std::fs::File::open(dir)?.sync_all()
     })();
@@ -286,6 +302,7 @@ pub fn run(env: Env) -> Result<()> {
         drivers: HashMap::new(),
         notes: HashMap::new(),
         offers: Arc::default(),
+        markup: None,
         inhibitor: None,
     };
     let mut core = Core::new(enabled);
@@ -353,6 +370,10 @@ pub fn run(env: Env) -> Result<()> {
     eprintln!("flashcp drived: running (drive mode {})", if enabled { "on" } else { "off" });
 
     main_loop(&mut core, &mut io, &rx);
+    // Offers still on screen can never be answered by a later daemon: close them.
+    for id in io.offers.lock().unwrap().values() {
+        let _ = notifications(&env.gdbus, "CloseNotification", &[&id.to_string()]);
+    }
     io.set_marker(false);
     let _ = std::fs::remove_file(&sock);
     anyhow::ensure!(!MONITOR_DIED.load(Ordering::Relaxed), "udevadm monitor ended");
@@ -374,11 +395,13 @@ fn main_loop(core: &mut Core, io: &mut Io, rx: &Receiver<Msg>) {
                         refresh_kernel_mounts(core);
                         (core.status_json().replacen("{\"ok\":true", "{\"ok\":true,\"running\":true", 1), None)
                     }
-                    // `recluster DEV PLUG`: PLUG is the `plug` of the status the user was shown.
+                    // `recluster DEV PLUG IDENTITY`: the `plug` and `identity` of the status the
+                    // user was shown; both must match the drive at DEV now.
                     (Some("recluster"), Some(dev)) => {
-                        let plug = words.next().and_then(|p| p.parse::<u64>().ok()).unwrap_or(0);
-                        match core.convert_blocker(dev, plug) {
-                            None => ("{\"ok\":true}".into(), Some(Input::Convert { dev: dev.into(), plug })),
+                        let plug = words.next().unwrap_or("").to_string();
+                        let identity = words.next().unwrap_or("").to_string();
+                        match core.convert_blocker(dev, &plug, &identity) {
+                            None => ("{\"ok\":true}".into(), Some(Input::Convert { dev: dev.into(), plug, identity })),
                             Some(why) => (format!("{{\"ok\":false,\"error\":{}}}", crate::events::json_str(why)), None),
                         }
                     }
@@ -453,7 +476,9 @@ struct Io {
     /// Notification ids by key, to replace a notification instead of stacking a new one.
     notes: HashMap<String, u32>,
     /// The offer notifications on screen, by device and plug-in: their D-Bus id.
-    offers: Arc<Mutex<HashMap<(String, u64), u32>>>,
+    offers: Arc<Mutex<HashMap<(String, String), u32>>>,
+    /// Whether the notification server renders markup in bodies (None: not asked yet).
+    markup: Option<bool>,
     inhibitor: Option<Child>,
 }
 
@@ -598,14 +623,15 @@ impl Io {
                 });
             }
             Action::Recluster { dev, serial } => self.recluster(dev, serial),
-            Action::Offer { dev, plug, title, body } => {
+            Action::Offer { dev, plug, identity, title, body } => {
                 let (gdbus, offers, tx) = (self.env.gdbus.clone(), self.offers.clone(), self.tx.clone());
+                let body = self.body_text(&body);
                 std::thread::spawn(move || {
-                    // The answer carries the plug-in it was asked for: the core drops it if
-                    // another stick has this path by then.
-                    let answer = offer(&gdbus, &offers, (&dev, plug), &title, &body);
-                    offers.lock().unwrap().remove(&(dev.clone(), plug));
-                    let _ = tx.send(Msg::In(Input::OfferAnswer { dev, plug, answer }));
+                    // The answer carries the plug-in and drive it was asked for: the core drops
+                    // it if another stick has this path by then.
+                    let answer = offer(&gdbus, &offers, (&dev, &plug), &title, &body);
+                    offers.lock().unwrap().remove(&(dev.clone(), plug.clone()));
+                    let _ = tx.send(Msg::In(Input::OfferAnswer { dev, plug, identity, answer }));
                 });
             }
             Action::CloseOffer { dev, plug } => {
@@ -693,6 +719,16 @@ impl Io {
         });
     }
 
+    /// Every notification body goes through here. The spec makes the summary plain text and
+    /// the body markup on servers with the "body-markup" capability, so a label like
+    /// `<a href=...>` could otherwise turn into a link or hide text: the body is escaped there
+    /// (and when the server cannot be asked); a server that says it has no markup gets it as is.
+    fn body_text(&mut self, body: &str) -> String {
+        let gdbus = self.env.gdbus.clone();
+        let markup = *self.markup.get_or_insert_with(|| body_is_markup(notifications(&gdbus, "GetCapabilities", &[])));
+        if markup { escape_markup(body) } else { body.to_string() }
+    }
+
     fn notify(&mut self, key: &str, title: &str, body: &str, urgency: Urgency) {
         let u = match urgency {
             Urgency::Low => "low",
@@ -704,6 +740,7 @@ impl Io {
         if let Some(id) = self.notes.get(key) {
             c.arg(format!("--replace-id={id}"));
         }
+        let body = self.body_text(body);
         c.arg("--").arg(title).arg(body).stdin(Stdio::null()).stderr(Stdio::null());
         // notify-send returns at once; a desktop without a notification server must not stall us.
         if let Ok((_, o)) = run_with_timeout(c, Duration::from_secs(3))
@@ -939,6 +976,32 @@ fn kernel_mountpoint(dev: &str) -> Option<String> {
     entries.into_iter().find(|m| m.source == dev && !m.fstype.starts_with("fuse")).map(|m| m.target)
 }
 
+/// From the server's `GetCapabilities` reply: does it read bodies as markup? Unknown (no
+/// answer, nothing readable) counts as yes: escaped text is only uglier, unescaped markup can
+/// mislead.
+fn body_is_markup(caps: Result<String, String>) -> bool {
+    match caps {
+        Ok(c) if c.contains("'body'") || c.contains("'actions'") => c.contains("'body-markup'"),
+        _ => true,
+    }
+}
+
+/// The five characters notification-body markup gives a meaning to.
+pub fn escape_markup(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '"' => o.push_str("&quot;"),
+            '\'' => o.push_str("&#39;"),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
 /// A GVariant text-format string literal (for `gdbus call` arguments).
 fn gv_str(s: &str) -> String {
     let mut o = String::from("'");
@@ -980,7 +1043,13 @@ fn notifications(gdbus: &str, method: &str, args: &[&str]) -> Result<String, Str
 
 /// Show the offer with Accept / Not now and wait for the answer. No "actions" capability, no
 /// server, no gdbus: [`Answer::None`] (nothing is shown, nothing remembered).
-fn offer(gdbus: &str, ids: &Mutex<HashMap<(String, u64), u32>>, key: (&str, u64), title: &str, body: &str) -> Answer {
+fn offer(
+    gdbus: &str,
+    ids: &Mutex<HashMap<(String, String), u32>>,
+    key: (&str, &str),
+    title: &str,
+    body: &str,
+) -> Answer {
     match notifications(gdbus, "GetCapabilities", &[]) {
         Ok(caps) if caps.contains("'actions'") => {}
         _ => return Answer::None,
@@ -1024,7 +1093,7 @@ fn offer(gdbus: &str, ids: &Mutex<HashMap<(String, u64), u32>>, key: (&str, u64)
         let _ = monitor.wait();
         return Answer::None;
     };
-    ids.lock().unwrap().insert((key.0.into(), key.1), id);
+    ids.lock().unwrap().insert((key.0.into(), key.1.into()), id);
     let mut answer = Answer::None;
     for line in lines.map_while(Result::ok) {
         let mine = line.contains(&format!("(uint32 {id},"));
@@ -1187,6 +1256,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn notification_bodies_escape_markup() {
+        assert_eq!(escape_markup("<b>KINGSTON</b>"), "&lt;b&gt;KINGSTON&lt;/b&gt;");
+        assert_eq!(
+            escape_markup(r#"<a href="https://x.example">K</a>"#),
+            "&lt;a href=&quot;https://x.example&quot;&gt;K&lt;/a&gt;"
+        );
+        assert_eq!(escape_markup("Tom & Jerry's"), "Tom &amp; Jerry&#39;s");
+        assert_eq!(escape_markup("Don't unplug it."), "Don&#39;t unplug it.");
+        // Escaped only where the server reads markup (or cannot be asked).
+        assert!(body_is_markup(Ok("(['actions', 'body', 'body-markup'],)".into())));
+        assert!(!body_is_markup(Ok("(['actions', 'body'],)".into())));
+        assert!(body_is_markup(Err("no server".into())));
+        assert!(body_is_markup(Ok("garbage".into())));
+    }
+
+    #[test]
     fn gvariant_strings_and_config_keys() {
         assert_eq!(gv_str("Don't unplug it\\now\n"), r"'Don\'t unplug it\\now\n'");
         // Not under tempfile_dir(): the other test removes that whole directory when it ends.
@@ -1227,6 +1312,19 @@ mod tests {
         remember(&st, "5E6F-0000:X:L", "accepted").unwrap();
         assert_eq!(std::fs::read_to_string(&st).unwrap(), "1A2B-3C4D::K\tdeclined\n5E6F-0000:X:L\taccepted\n");
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 2, "no temp file left behind");
+        // A write or a rename that fails: the previous file stays as it was, no temp file left.
+        for step in ["write", "rename"] {
+            FAIL_AT.with(|f| f.set(Some(step)));
+            let r = remember(&st, "9999-9999::Z", "declined");
+            FAIL_AT.with(|f| f.set(None));
+            assert!(r.is_err(), "{step}");
+            assert_eq!(
+                std::fs::read_to_string(&st).unwrap(),
+                "1A2B-3C4D::K\tdeclined\n5E6F-0000:X:L\taccepted\n",
+                "{step}: the previous answers are intact"
+            );
+            assert_eq!(std::fs::read_dir(&d).unwrap().count(), 2, "{step}: a temp file was left behind");
+        }
         // The state directory cannot be created (a file is in the way): an error, not a claim.
         std::fs::write(d.join("blocked"), "").unwrap();
         assert!(remember(&d.join("blocked/recluster-offers"), "k", "declined").is_err());

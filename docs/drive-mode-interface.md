@@ -290,7 +290,12 @@ A reason the integration does not know means "do not offer".
    the device itself, with the same rights and claim as `flashcp mount` (the uaccess ACL; no
    helper), with `--expect-serial <ID_FS_UUID>`: it reads the boot sector through that claimed
    fd and refuses (`wrong-volume`, exit 3, nothing written) unless it carries the serial of the
-   stick the user was asked about. Then `flashcp mount` again on the same mountpoint, and a notification once it is
+   stick the user was asked about. Before each phase that writes (the relocation, switch 1, the
+   new metadata, switch 2, an owed backup sector) it reads the boot sector again through the fd
+   (O_DIRECT on a block device, past the page cache) and stops with `wrong-volume` if it is not
+   the one the plan was built on (or the last switch wrote): a medium changed behind the fd (a
+   card in a reader) gets nothing further. The backup sector of a switch follows its main
+   sector without a read in between, so as not to widen the crash window. Then `flashcp mount` again on the same mountpoint, and a notification once it is
    mounted: done, refused (exit 3, "nothing was written; it works as before") or failed (exit 1,
    the volume is the old or the new one, complete). `prepare-eject` refused: `resume`, nothing
    changed, a notification.
@@ -300,11 +305,18 @@ A reason the integration does not know means "do not offer".
    yank: a notification ("plug it in here again before using it on Windows"); the next plug-in
    runs step 1 again.
 
-**Consent belongs to one plug-in.** Every `Added` gets a new `plug` number (never reused while
-the daemon runs). The offer notification, the app's dialog and `drive-mode recluster` carry the
-`plug` of the drive they showed; the daemon accepts an answer or a request only while the drive
-at that path is still that plug-in, else `That drive was replaced. Nothing was changed.` An
-`ActionInvoked` counts only for the notification id created for that plug-in.
+**Consent belongs to one plug-in of one drive.** Every `Added` gets a `plug` token of 128 random
+bits from the OS (so a token from an earlier daemon run never matches). The offer notification,
+the app's dialog and `drive-mode recluster` carry the `plug` and the `identity` (volume serial
+and disk hardware serial, `UUID:SERIAL`) of the drive they showed; the daemon accepts an answer
+or a request only while the drive at that path is still that plug-in with that identity, else
+`That drive was replaced. Nothing was changed.` An `ActionInvoked` counts only for the
+notification id created for that plug-in. Offers still on screen when the daemon stops are
+closed.
+
+Notification bodies are escaped (`& < > " '`) where the server reads them as markup (its
+capabilities list `body-markup`, or it cannot be asked); summaries (titles) are plain text by
+the spec and are sent as they are. Labels lose their control characters and newlines.
 
 The answers: `$XDG_STATE_HOME/flashcp/recluster-offers` (default `~/.local/state/...`), one
 `<UUID>:<disk serial>:<label>\t<accepted|declined>` line per volume (`volume_key`; the disk
@@ -349,14 +361,14 @@ actions `accept` ("Accept") and `notnow` ("Not now"), expire timeout 0; the answ
 | `status` | `{"ok":true,"running":true,"enabled":B,"offers":B,"drives":[DRIVE,...]}` |
 | `enable` / `disable` | `{"ok":true,"enabled":B}` |
 | `eject DEV` | `{"ok":true}`, or `{"ok":false,"error":"no such drive"}` |
-| `recluster DEV PLUG` | `{"ok":true}` (the conversion started), or `{"ok":false,"error":"..."}`: `That drive was replaced. Nothing was changed.` (no drive at DEV, or not plug-in PLUG), `flashcp cannot tell this drive apart from others (it has no volume serial)`, `drive mode is off`, `it is being converted already`, `it is not ready (flashcp must have it mounted)`, `it would not get faster (...)` |
+| `recluster DEV PLUG IDENTITY` | `{"ok":true}` (the conversion started), or `{"ok":false,"error":"..."}`: `That drive was replaced. Nothing was changed.` (no drive at DEV, or not plug-in PLUG, or not IDENTITY), `flashcp cannot tell this drive apart from others (it has no volume serial)`, `drive mode is off`, `it is being converted already`, `it is not ready (flashcp must have it mounted)`, `it would not get faster (...)` |
 | `offers on` / `offers off` | `{"ok":true,"offers":B}` (the CLI writes the config first) |
 
 `DRIVE`: `{"device":S,"label":S,"mode":"flashcp"|"kernel"|"none","state":S,"mountpoint":S|null,
 "dirty_bytes":N,"dirty_files":N,"safe_to_remove":B,"can_convert":B,"cluster":N,"convert_secs":N,
 "convert_done":N,"convert_total":N,"convert_result":"done"|"refused"|"failed"|null,
-"convert_message":S|null,"plug":N,"volume":S|null}`. `plug` is this plug-in's number, `volume`
-its `volume_key`. `state` is one of `checking`, `busy`, `starting`, `ready`, `saving`,
+"convert_message":S|null,"plug":S,"identity":S,"volume":S|null}`. `plug` is this plug-in's
+random token (32 hex digits), `identity` the drive's `UUID:SERIAL`, `volume` its `volume_key`. `state` is one of `checking`, `busy`, `starting`, `ready`, `saving`,
 `ejecting`, `stopping`, `mounting`, `kernel`, `read_only`, `unmounted` (a kernel mount someone
 unmounted by hand), `converting`, `safe_to_remove`, `stopped`, `failed`. `cluster` and
 `convert_secs` come from `recluster --check` (0 when it said no); while converting,
@@ -364,9 +376,10 @@ unmounted by hand), `converting`, `safe_to_remove`, `stopped`, `failed`. `cluste
 `convert_result`/`convert_message` describe the last conversion of this plug-in (the message is
 the notification's title and body).
 
-`flashcp drive-mode recluster DEV [--yes] [--plug N] [--json]` asks first (on a terminal;
-without one it needs `--yes`), sends `recluster DEV PLUG` with the `plug` of the status whose
-texts it printed (`--plug N`: only if that is still N; the app passes the one its dialog showed), prints progress while `state` is `converting`, and once the
+`flashcp drive-mode recluster DEV [--yes] [--plug TOKEN --identity ID] [--json]` asks first (on
+a terminal; without one it needs `--yes`), sends `recluster DEV PLUG IDENTITY` with the values of
+the status whose texts it printed (`--plug`/`--identity`: only if they are still those; the app
+passes the ones its dialog showed), prints progress while `state` is `converting`, and once the
 drive is back prints the message and exits 0 (done), 3 (refused, or it could not start) or 1
 (failed). With `--json` the last line is `{"ok":B,"result":R,"message":S}` (plus `"error":S` when
 not done).

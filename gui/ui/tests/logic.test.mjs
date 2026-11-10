@@ -1241,6 +1241,16 @@ describe("USB drive mode", () => {
     assert.equal(driveModeNote({ running: false }, false), "Turning off…");
     assert.equal(driveModeNote({ running: true }, true), "Turning on…");
   });
+  test("drive labels reach the page as text only (no innerHTML anywhere in the UI)", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    for (const f of ["../main.js", "../logic.js"]) {
+      const src = readFileSync(fileURLToPath(new URL(f, import.meta.url)), "utf8");
+      assert.doesNotMatch(src, /innerHTML|outerHTML|insertAdjacentHTML|document\.write/, f);
+    }
+    const t = makeFasterTexts(d({ label: '<a href="x">K</a> & <b>', convertSecs: 3 }));
+    assert.equal(t.title, 'Make <a href="x">K</a> & <b> faster for small files?', "plain text; textContent shows it as is");
+  });
   test("Make faster: when it shows, its words, its progress", () => {
     assert.equal(canMakeFaster(d({ canConvert: true })), true);
     assert.equal(canMakeFaster(d({ canConvert: true, state: "saving" })), true);

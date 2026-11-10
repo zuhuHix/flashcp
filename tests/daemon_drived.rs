@@ -73,30 +73,48 @@ impl Rig {
         script(&dir.join("bin/notify-send"), &format!("printf '%s|' \"$@\" >> {}; echo >> {0}; echo 7", log("notify")));
         let fifo = dir.join("events");
         assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
-        let flashcp = if real() {
-            PathBuf::from(env!("CARGO_BIN_EXE_flashcp"))
-        } else {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/daemon_fixtures/fake-mount")
-        };
-        let daemon = Command::new(env!("CARGO_BIN_EXE_flashcp"))
-            .arg("drived")
-            .envs(rig_env(&dir))
-            .env("FLASHCP_DRIVED_FLASHCP", flashcp)
-            .env("FLASHCP_DRIVED_EVENTS", &fifo)
-            .env("FLASHCP_DRIVED_MEDIA", dir.join("media"))
-            .env("FLASHCP_DRIVED_UDISKSCTL", dir.join("bin/udisksctl"))
-            .env("FLASHCP_DRIVED_GDBUS", dir.join("bin/gdbus"))
-            .env("FLASHCP_DRIVED_NOTIFY", dir.join("bin/notify-send"))
-            .env("FLASHCP_DRIVED_NO_LOGIN1", "1")
-            .stderr(File::create(dir.join("daemon.log")).unwrap())
-            .spawn()
-            .unwrap();
-        let events = OpenOptions::new().write(true).open(&fifo).unwrap();
+        let (daemon, events) = spawn_daemon(&dir);
         let r = Rig { dir, daemon, events };
         r.wait("the daemon's socket", || r.dir.join("run/flashcp/drived.sock").exists());
         r
     }
 
+    /// Stop the daemon (SIGTERM, a clean exit) and start a new one on the same directories.
+    fn restart(&mut self) {
+        unsafe { libc_kill(self.daemon.id() as i32, 15) };
+        let st = self.daemon.wait().unwrap();
+        assert!(st.success(), "daemon exit {st:?}\n{}", self.log("daemon"));
+        (self.daemon, self.events) = spawn_daemon(&self.dir);
+        self.wait("the new daemon's socket", || UnixStream::connect(self.dir.join("run/flashcp/drived.sock")).is_ok());
+    }
+}
+
+fn spawn_daemon(dir: &Path) -> (Child, File) {
+    let fifo = dir.join("events");
+    let flashcp = if real() {
+        PathBuf::from(env!("CARGO_BIN_EXE_flashcp"))
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/daemon_fixtures/fake-mount")
+    };
+    let log = OpenOptions::new().create(true).append(true).open(dir.join("daemon.log")).unwrap();
+    let daemon = Command::new(env!("CARGO_BIN_EXE_flashcp"))
+        .arg("drived")
+        .envs(rig_env(dir))
+        .env("FLASHCP_DRIVED_FLASHCP", flashcp)
+        .env("FLASHCP_DRIVED_EVENTS", &fifo)
+        .env("FLASHCP_DRIVED_MEDIA", dir.join("media"))
+        .env("FLASHCP_DRIVED_UDISKSCTL", dir.join("bin/udisksctl"))
+        .env("FLASHCP_DRIVED_GDBUS", dir.join("bin/gdbus"))
+        .env("FLASHCP_DRIVED_NOTIFY", dir.join("bin/notify-send"))
+        .env("FLASHCP_DRIVED_NO_LOGIN1", "1")
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let events = OpenOptions::new().write(true).open(&fifo).unwrap();
+    (daemon, events)
+}
+
+impl Rig {
     fn log(&self, name: &str) -> String {
         fs::read_to_string(self.dir.join(format!("{name}.log"))).unwrap_or_default()
     }
@@ -531,9 +549,15 @@ fn daemon_request(r: &Rig, line: &str) -> String {
     l
 }
 
+/// A string field of the (one drive's) status.
+fn field_of(status: &str, key: &str) -> String {
+    let pat = format!("\"{key}\":\"");
+    let rest = &status[status.find(&pat).unwrap_or_else(|| panic!("no {key} in {status}")) + pat.len()..];
+    rest[..rest.find('"').unwrap()].to_string()
+}
+
 fn plug_of(status: &str) -> String {
-    let rest = &status[status.find("\"plug\":").expect("a plug field") + 7..];
-    rest[..rest.find([',', '}']).unwrap()].to_string()
+    field_of(status, "plug")
 }
 
 /// Stick A is unplugged and stick B arrives at the same path: a confirmation made for A (the
@@ -546,6 +570,7 @@ fn a_confirmation_for_a_replaced_stick_is_refused() {
     let dev = r.announce(&img);
     r.wait("A ready", r.state_is("ready"));
     let a_plug = plug_of(&r.status());
+    let a_id = field_of(&r.status(), "identity");
     r.unplug(&dev);
     r.wait("A forgotten", || !r.status().contains(&dev));
     // B: another stick (a new volume serial), the same device path.
@@ -556,13 +581,13 @@ fn a_confirmation_for_a_replaced_stick_is_refused() {
     assert_ne!(plug_of(&r.status()), a_plug);
     let before = fs::read(&img).unwrap();
 
-    let reply = daemon_request(&r, &format!("recluster {dev} {a_plug}"));
+    let reply = daemon_request(&r, &format!("recluster {dev} {a_plug} {a_id}"));
     assert!(
         reply.contains("\"ok\":false") && reply.contains("That drive was replaced. Nothing was changed."),
         "{reply}"
     );
     let o = Command::new(env!("CARGO_BIN_EXE_flashcp"))
-        .args(["drive-mode", "recluster", &dev, "--yes", "--json", "--plug", &a_plug])
+        .args(["drive-mode", "recluster", &dev, "--yes", "--json", "--plug", &a_plug, "--identity", &a_id])
         .envs(rig_env(&r.dir))
         .output()
         .unwrap();
@@ -597,5 +622,40 @@ fn recluster_refuses_a_volume_with_another_serial() {
     assert!(text.contains("\"result\":\"refused\"") && text.contains("not the volume that was checked"), "{text}");
     assert_eq!(fs::read(&img).unwrap(), before, "nothing was written");
     r.wait("mounted again", r.state_is("ready"));
+    r.stop();
+}
+
+/// A dialog left open (or a CLI confirmation made) across a restart of the drive service, for
+/// the very same stick at the same path: refused by the new daemon, nothing written or saved.
+#[test]
+fn a_confirmation_from_before_a_daemon_restart_is_refused() {
+    let mut r = Rig::new("restart");
+    r.cli(&["drive-mode", "offer", "off"]);
+    let img = r.big_cluster_image("r");
+    let dev = r.announce(&img);
+    r.wait("ready", r.state_is("ready"));
+    let (old_plug, id) = (plug_of(&r.status()), field_of(&r.status(), "identity"));
+    assert_eq!(old_plug.len(), 32, "{old_plug}");
+    r.restart();
+    r.announce(&img);
+    r.wait("ready again", r.state_is("ready"));
+    assert_eq!(field_of(&r.status(), "identity"), id, "the same stick");
+    assert_ne!(plug_of(&r.status()), old_plug);
+    let before = fs::read(&img).unwrap();
+    let reply = daemon_request(&r, &format!("recluster {dev} {old_plug} {id}"));
+    assert!(reply.contains("That drive was replaced. Nothing was changed."), "{reply}");
+    // What the app's "Make faster" runs, with the token its dialog still holds.
+    let o = Command::new(env!("CARGO_BIN_EXE_flashcp"))
+        .args(["drive-mode", "recluster", &dev, "--yes", "--json", "--plug", &old_plug, "--identity", &id])
+        .envs(rig_env(&r.dir))
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(o.status.code(), Some(3), "{text}");
+    assert!(text.contains("That drive was replaced. Nothing was changed."), "{text}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(r.status().contains("\"state\":\"ready\""));
+    assert_eq!(fs::read(&img).unwrap(), before, "written to");
+    assert!(!r.dir.join("state/flashcp/recluster-offers").exists());
     r.stop();
 }

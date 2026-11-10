@@ -132,7 +132,7 @@ function demoUsbDrives() {
     {
       device: "/dev/sdb1", label: "KINGSTON", mode: fast ? "flashcp" : "kernel", state: fast ? "saving" : "kernel",
       mountpoint: "/media/demo/KINGSTON", dirtyBytes: fast ? 12_000_000 : 0, dirtyFiles: fast ? 3 : 0, safeToRemove: !fast,
-      canConvert: fast && !demoUsb.converted, convertSecs: 7, plug: 1,
+      canConvert: fast && !demoUsb.converted, convertSecs: 7, plug: "demo1", identity: "1A2B-3C4D:",
       ...(demoUsb.converting ? { state: "converting", dirtyBytes: 0, dirtyFiles: 0, convertDone: 60, convertTotal: 137 } : {}),
     },
     {
@@ -1346,7 +1346,7 @@ function wireDragDrop() {
 // from this window; result: the last conversion's text.
 let usb = {
   status: null, pending: null, error: "", ejecting: new Set(),
-  confirming: null, confirmingPlug: null, converting: null, result: "",
+  confirming: null, confirmingPlug: null, confirmingIdentity: null, converting: null, result: "",
 };
 let usbSig = null;
 let usbTimer = null;
@@ -1411,7 +1411,10 @@ async function ejectUsb(device) {
 
 // The dialog is for one plug-in of one drive: its device path and its plug token.
 function openFaster(drive) {
-  usb = { ...usb, confirming: drive.device, confirmingPlug: drive.plug, result: "", error: "" };
+  usb = {
+    ...usb, confirming: drive.device, confirmingPlug: drive.plug, confirmingIdentity: drive.identity,
+    result: "", error: "",
+  };
   renderUsb();
   els["usb-faster-yes"].focus();
 }
@@ -1424,13 +1427,14 @@ function closeFaster() {
 async function confirmFaster() {
   const device = usb.confirming;
   const plug = usb.confirmingPlug;
+  const identity = usb.confirmingIdentity;
   if (!device) return;
   usb = { ...usb, confirming: null, converting: device, result: "", error: "" };
   renderUsb();
   refreshUsbNow();
   try {
     // The daemon refuses if another drive has this path by now ("That drive was replaced").
-    const text = await call("drive_mode_recluster", { device, plug });
+    const text = await call("drive_mode_recluster", { device, plug, identity });
     usb = { ...usb, result: text };
   } catch (err) {
     usb = { ...usb, error: messageOf(err) };
@@ -1507,7 +1511,9 @@ function renderUsb() {
   }
   // The confirm dialog, while its drive is still there and can still be converted.
   // A different plug-in at the same path (unplugged and another stick plugged in) closes it.
-  const target = drives.find((d) => d.device === usb.confirming && d.plug === usb.confirmingPlug);
+  const target = drives.find(
+    (d) => d.device === usb.confirming && d.plug === usb.confirmingPlug && d.identity === usb.confirmingIdentity,
+  );
   const open = Boolean(target && canMakeFaster(target));
   els["usb-faster"].hidden = !open;
   if (open) {

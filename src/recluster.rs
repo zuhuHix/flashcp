@@ -133,6 +133,28 @@ pub struct ReclusterOpts {
     pub expect_serial: Option<u32>,
 }
 
+/// Sector 0 as the medium holds it now: on a block device read with O_DIRECT through the same
+/// open file (a reopen of `/proc/self/fd/N`), so a changed medium is not hidden by the page cache.
+fn fresh_sector0(f: &File) -> Result<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    if f.metadata()?.file_type().is_block_device()
+        && let Ok(d) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(format!("/proc/self/fd/{}", f.as_raw_fd()))
+    {
+        // 4096 bytes, aligned: valid for 512- and 4096-byte logical blocks.
+        let mut b = crate::util::AlignedBuf::new(4096);
+        if d.read_exact_at(b.as_mut(), 0).is_ok() {
+            return Ok(b.as_ref()[..SECTOR as usize].to_vec());
+        }
+    }
+    let mut b = vec![0u8; SECTOR as usize];
+    f.read_exact_at(&mut b, 0)?;
+    Ok(b)
+}
+
 /// The volume serial of a boot sector (what udev shows as `ID_FS_UUID`, `XXXX-XXXX`).
 pub fn boot_serial(boot: &[u8]) -> u32 {
     u32::from_le_bytes([boot[100], boot[101], boot[102], boot[103]])
@@ -1728,6 +1750,8 @@ struct Run<'a> {
     dev: &'a dyn Dev,
     fat: FatMode,
     guard: &'a dyn Fn() -> Result<()>,
+    /// The main boot sector the medium must hold now (what the last switch wrote).
+    expected: &'a std::cell::RefCell<Vec<u8>>,
     sink: &'a mut dyn FnMut(&Event),
     done: u64,
     total: u64,
@@ -1756,6 +1780,7 @@ impl Run<'_> {
         (self.guard)()?;
         let sink = &mut *self.sink;
         switch(self.f, self.dev, view, name, &mut || sink(&Event::Switched { step: name, cluster: view.cs }))?;
+        *self.expected.borrow_mut() = view.sector0.to_vec();
         self.done += 2 * SECTOR;
         Ok(n)
     }
@@ -1792,6 +1817,30 @@ pub(crate) fn run_on(
             ));
         }
     }
+    // Planning takes a while, and the fd stays the same while the medium behind it may not (a
+    // card in a reader): before every phase that writes, the main boot sector read again
+    // through the fd (bypassing the page cache on a block device) must be the one this run
+    // planned from, or the one its last switch wrote.
+    let expected = std::cell::RefCell::new(boot[..SECTOR as usize].to_vec());
+    let medium = || -> Result<()> {
+        let now = fresh_sector0(f).context("read the boot sector again")?;
+        let same = {
+            let want = expected.borrow();
+            (0..SECTOR as usize).all(|i| now[i] == want[i] || matches!(i, 106 | 107 | 112))
+        };
+        if !same || o.expect_serial.is_some_and(|s| boot_serial(&now) != s) {
+            return Err(refused(
+                "wrong-volume",
+                "the medium changed while recluster ran (its boot sector is not the one this run planned \
+                 from); nothing further was written",
+            ));
+        }
+        Ok(())
+    };
+    let guard = &|| -> Result<()> {
+        guard()?;
+        medium()
+    };
     let pending = backup_state(&boot)? == Backup::SwitchPending;
     let mut t = open_tree(f, dev_len).map_err(invalid)?;
     // The backup boot sector an interrupted switch still owes. The main region has just passed
@@ -1884,8 +1933,18 @@ pub(crate) fn run_on(
         }
 
         // ── write ──
-        let mut run =
-            Run { f, dev_len, dev, fat: o.fat, guard, sink, done: 0, total: sum.written, last: Instant::now() };
+        let mut run = Run {
+            f,
+            dev_len,
+            dev,
+            fat: o.fat,
+            guard,
+            expected: &expected,
+            sink,
+            done: 0,
+            total: sum.written,
+            last: Instant::now(),
+        };
         if let Some(v1) = step1 {
             // Step 2 stays as planned: the check before the switch has just shown that the medium
             // holds exactly step 1's plan, which step 2 was planned from (and tuned for: sectors 1

@@ -513,6 +513,79 @@ fn crash_at_every_device_op_leaves_the_old_or_the_new_volume() {
     }
 }
 
+/// The medium behind the claimed fd changes (a card swapped in a reader) after the check and
+/// planning: before each phase that writes (relocation, switch 1, the new metadata, switch 2)
+/// the boot sector is read again, and a change stops the run with `wrong-volume` before it
+/// writes anything more.
+#[test]
+fn a_medium_change_before_any_writing_phase_stops_the_run() {
+    use std::cell::{Cell, RefCell};
+    let (old, new) = (8192u32, 512u32);
+    let img = volume("recl-medium", 32, old, 1, 90, 9 << 20);
+    let template = img.dir.join("template.img");
+    std::fs::copy(&img.path, &template).unwrap();
+    let serial = boot_serial(&std::fs::read(&img.path).unwrap()[..512]);
+    let o = ReclusterOpts { expect_serial: Some(serial), ..opts(Some(new), FatMode::Prefix) };
+    let len = std::fs::metadata(&img.path).unwrap().len();
+    // Count the phases of an undisturbed run (two switches here).
+    let calls = Cell::new(0);
+    {
+        let f = rw(&img.path);
+        let plain = FileDev::new(Arc::new(rw(&img.path)));
+        let s = run_on(
+            &f,
+            len,
+            &plain,
+            &o,
+            &COST,
+            &|| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(s.changed);
+    }
+    assert_eq!(calls.get(), 4, "relocation, switch 1, new metadata, switch 2");
+    for at in 1..=4 {
+        std::fs::copy(&template, &img.path).unwrap();
+        let f = rw(&img.path);
+        let plain = FileDev::new(Arc::new(rw(&img.path)));
+        let (n, seen) = (Cell::new(0), RefCell::new(None));
+        let hook = || -> Result<()> {
+            n.set(n.get() + 1);
+            if n.get() == at {
+                // Another medium: its serial differs (the rest of sector 0 may well be equal).
+                let other = rw(&img.path);
+                let mut b = [0u8; 4];
+                other.read_exact_at(&mut b, 100).unwrap();
+                b[0] ^= 0x5a;
+                other.write_all_at(&b, 100).unwrap();
+                *seen.borrow_mut() = Some(sum(&img.path));
+            }
+            Ok(())
+        };
+        let r = run_on(&f, len, &plain, &o, &COST, &hook, &mut |_| {});
+        assert_eq!(reason(r), "wrong-volume", "change before phase {at}");
+        assert_eq!(Some(sum(&img.path)), *seen.borrow(), "phase {at}: written after the change");
+    }
+    // Without --expect-serial the boot sector still has to stay what the run planned from.
+    std::fs::copy(&template, &img.path).unwrap();
+    let f = rw(&img.path);
+    let plain = FileDev::new(Arc::new(rw(&img.path)));
+    let n = Cell::new(0);
+    let hook = || -> Result<()> {
+        n.set(n.get() + 1);
+        if n.get() == 2 {
+            rw(&img.path).write_all_at(&[0x77], 92).unwrap(); // the cluster count, low byte
+        }
+        Ok(())
+    };
+    let r = run_on(&f, len, &plain, &opts(Some(new), FatMode::Prefix), &COST, &hook, &mut |_| {});
+    assert_eq!(reason(r), "wrong-volume");
+}
+
 /// Device offsets in the root directory: of its end-of-directory marker, and of a live entry set.
 fn root_of(p: &Path) -> (u64, u64) {
     let f = File::open(p).unwrap();
