@@ -302,15 +302,12 @@ impl Filesystem for Adapter {
                 let (_, name, _) = &snap[(i - 2) as usize];
                 // The entry may be gone since the snapshot. Each one added counts as a lookup
                 // for the kernel (which sends the matching forget).
-                match self.fs.lookup(ino.0, OsStr::new(name)) {
-                    Ok(a) => {
-                        let fa = self.fattr(&a);
-                        if reply.add(fa.ino, i + 1, name, &TTL, &fa, Generation(0)) {
-                            self.fs.forget(a.ino, 1);
-                            break;
-                        }
+                if let Ok(a) = self.fs.lookup(ino.0, OsStr::new(name)) {
+                    let fa = self.fattr(&a);
+                    if reply.add(fa.ino, i + 1, name, &TTL, &fa, Generation(0)) {
+                        self.fs.forget(a.ino, 1);
+                        break;
                     }
-                    Err(_) => {}
                 }
             }
             i += 1;
