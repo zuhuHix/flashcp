@@ -17,14 +17,13 @@ sandbox() {
   local uid=4242
   # A fake /usr/bin/flashcp that exits 0 only if the sandbox holds (bind-mounted in a private
   # mount namespace, together with a fake seat0 and the user's runtime dir).
-  local landlock=0; [ -e /sys/kernel/security/landlock ] && landlock=1
   cat > "$w/ok" <<EOF
 #!/bin/sh
 [ "\$(id -u)" = 65534 ] && [ "\$(id -g)" = 65534 ] && [ -z "\$(id -G | tr -d ' 65534')" ] || exit 10
 [ -z "\$HOME\$ID_FS_UUID\$PKEXEC_UID" ] || exit 11
 for fd in 4 5 6 7 8 9; do if { true >&\$fd; } 2>/dev/null; then exit 12; fi; done
 [ "\$(head -c 11 <&3 | tail -c 8)" = "EXFAT   " ] || exit 13
-if [ $landlock = 1 ] && cat /etc/hostname >/dev/null 2>&1; then exit 14; fi
+if cat /etc/hostname >/dev/null 2>&1; then exit 14; fi
 read -r _ < /proc/self/mountinfo || exit 17   # the check's busy test: own mountinfo and /sys
 ls /sys/class/block >/dev/null || exit 18
 [ "\$(ulimit -f)" = 0 ] || exit 15
@@ -32,12 +31,23 @@ ls /sys/class/block >/dev/null || exit 18
 exit 0
 EOF
   printf '#!/bin/sh\necho %s\nexit 0\n' "'{\"event\":\"check\",\"ok\":true,\"busy_unknown\":\"EACCES\"}'" > "$w/unknown"
+  # Network: a listener on the host's loopback must be unreachable from the check.
+  cat > "$w/net" <<'EOF'
+#!/usr/bin/python3 -I
+import socket, sys
+try:
+    socket.create_connection(("127.0.0.1", 8765), 1)
+except OSError:
+    sys.exit(0)
+sys.exit(19)
+EOF
   printf '#!/bin/sh\nexit 3\n' > "$w/refuse"
   printf '#!/bin/sh\nexit 4\n' > "$w/busy"
   printf '#!/bin/sh\nexec sleep 30\n' > "$w/hang"
-  chmod 755 "$w"/ok "$w"/unknown "$w"/refuse "$w"/busy "$w"/hang
+  chmod 755 "$w"/ok "$w"/net "$w"/unknown "$w"/refuse "$w"/busy "$w"/hang
   # run <fake> <setup shell commands> -> prints the helper's stdout
   run() {
+    local ll=""; [ -n "${NO_LL:-}" ] && ll="FLASHCP_UDEV_CHECK_NO_LANDLOCK=1"
     unshare -m sh -ec "
       mount -t tmpfs none /run/systemd 2>/dev/null || { mkdir -p /run/systemd && mount -t tmpfs none /run/systemd; }
       mkdir -p /run/systemd/seats; printf 'ACTIVE=c9\nACTIVE_UID=$uid\n' > /run/systemd/seats/seat0
@@ -48,7 +58,7 @@ EOF
       mount --bind '$w/$1' /usr/bin/flashcp
       $2
       exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-   # like udev: only 0-2 open, so the device lands on fd 3
-      ID_FS_UUID=1A2B-3C4D HOME=/root '$helper' '$loop'"
+      ID_FS_UUID=1A2B-3C4D HOME=/root $ll '$helper' '$loop'"
   }
   expect() { # name fake setup want
     local t0 got; t0=$(date +%s%N)
@@ -60,6 +70,12 @@ EOF
   }
   expect served ok "" "FLASHCP_DRIVE_MODE=1 FLASHCP_DRIVE_UID=$uid UDISKS_IGNORE=1 "
   expect "busy unknown" unknown "" ""
+  python3 -c 'import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", 8765)); s.listen(); time.sleep(60)' &
+  local listener=$!; sleep 0.5
+  python3 -c 'import socket; socket.create_connection(("127.0.0.1", 8765), 1)' || fail "listener not up"
+  expect "no network" net "" "FLASHCP_DRIVE_MODE=1 FLASHCP_DRIVE_UID=$uid UDISKS_IGNORE=1 "
+  kill "$listener"
+  NO_LL=1 expect "no Landlock: fail closed" ok "" ""
   expect refused refuse "" ""
   expect busy busy "" "FLASHCP_KEEP=1 "
   expect hang hang "" ""

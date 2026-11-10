@@ -360,10 +360,13 @@ helper itself parses nothing from the device; `flashcp mount --check` does, in a
 - The child gets only the device opened **read-only** (as fd 3) and `/dev/null` as 0–2;
   everything else is closed (`close_range`). It runs as `nobody:nogroup` with no supplementary
   groups, `PR_SET_NO_NEW_PRIVS`, `RLIMIT_CPU` 2 s, `RLIMIT_AS` 256 MB, `RLIMIT_NOFILE` 16,
-  `RLIMIT_FSIZE` 0, no core dumps, no TCP (Landlock ABI 4+), an empty environment, and `/usr/bin/flashcp` executed by
-  absolute path. If the kernel has Landlock, the child can only read and execute below `/usr`
+  `RLIMIT_FSIZE` 0, no core dumps, in its own (empty) network and IPC namespaces (made while
+  still root), an empty environment, and `/usr/bin/flashcp` executed by
+  absolute path. Landlock is required (fail closed): the child can only read and execute below `/usr`
   and `/lib*`, read `/etc/ld.so.cache`, and read `/sys` and its own `mountinfo` (the check's
-  busy test: holders, partitions, mounts); nothing else on the filesystem. Its stdout (at most
+  busy test: holders, partitions, mounts); nothing else on the filesystem. If the kernel has
+  no Landlock, or any of these steps fails, the check does not run and the drive is left to
+  udisks. Its stdout (at most
   4 KB) comes back through a pipe: a check that could not do its busy test (`busy_unknown`) is
   not a takeover.
 - So a parser bug gives the attacker code execution as `nobody` with a read-only fd of their

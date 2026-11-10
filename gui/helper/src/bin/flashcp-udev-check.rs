@@ -5,7 +5,8 @@
 //! device to udisks and the kernel driver. Any error, oddity or timeout also prints nothing.
 //!
 //! The volume is parsed only by the child, as nobody, with no new privileges, tight rlimits, an
-//! empty environment, only the read-only device fd, and (best effort) Landlock. The parent never
+//! empty environment, only the read-only device fd, in new network and IPC namespaces, under
+//! Landlock (required: without it, or if any layer fails, the check does not run). The parent never
 //! waits more than 1.5 s and never waits for a child it killed. See SECURITY-NOTES.md.
 use std::ffi::CString;
 use std::fs;
@@ -91,6 +92,8 @@ fn check(dev: &str) -> Option<(i32, String)> {
     if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return None;
     }
+    // Test hook: pretend the kernel has no Landlock. It can only make the helper refuse.
+    let no_landlock = std::env::var_os("FLASHCP_UDEV_CHECK_NO_LANDLOCK").is_some();
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return None;
@@ -99,7 +102,8 @@ fn check(dev: &str) -> Option<(i32, String)> {
         unsafe {
             // Only 0, 2 (/dev/null), 1 (the pipe) and 3 (the device) survive the exec.
             // (Allocating after fork is fine: this process is single-threaded.)
-            let ll = landlock_ruleset();
+            // Fail closed: no Landlock, no check (the drive is left to udisks).
+            let Some(ll) = landlock_ruleset().filter(|_| !no_landlock) else { libc::_exit(127) };
             if null < 0 || libc::dup2(null, 0) < 0 || libc::dup2(pipe[1], 1) < 0 || libc::dup2(null, 2) < 0 {
                 libc::_exit(127);
             }
@@ -121,6 +125,10 @@ fn check(dev: &str) -> Option<(i32, String)> {
                     libc::_exit(127);
                 }
             }
+            // No network and no SysV IPC, whatever the Landlock ABI (needs root: before the drop).
+            if libc::getuid() == 0 && libc::unshare(libc::CLONE_NEWNET | libc::CLONE_NEWIPC) != 0 {
+                libc::_exit(127);
+            }
             if libc::getuid() == 0
                 && (libc::setgroups(0, std::ptr::null()) != 0 || libc::setgid(NOBODY) != 0 || libc::setuid(NOBODY) != 0)
             {
@@ -129,8 +137,8 @@ fn check(dev: &str) -> Option<(i32, String)> {
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 libc::_exit(127);
             }
-            if let Some(rs) = ll {
-                libc::syscall(libc::SYS_landlock_restrict_self, rs, 0u32);
+            if libc::syscall(libc::SYS_landlock_restrict_self, ll, 0u32) != 0 {
+                libc::_exit(127);
             }
             if libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) != 0 {
                 libc::_exit(127);
@@ -171,7 +179,7 @@ fn check(dev: &str) -> Option<(i32, String)> {
 /// A Landlock ruleset (built in the child) that allows only reading and executing below /usr and
 /// /lib* and reading /etc/ld.so.cache (exec of a dynamically linked /usr/bin/flashcp), reading
 /// /sys and the child's own mountinfo (the check's busy test). None if the kernel has no
-/// Landlock: the other layers still apply.
+/// Landlock, which makes the caller refuse to run the check.
 fn landlock_ruleset() -> Option<libc::c_long> {
     #[repr(C)]
     struct Attr {
