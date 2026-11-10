@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "gui/**"
+      - "src/daemon*.rs"
       - "packaging/desktop/**"
       - ".github/workflows/gui.yml"
       - ".github/actions/gui-deb/**"
@@ -12,6 +13,7 @@ on:
     branches: [main]
     paths:
       - "gui/**"
+      - "src/daemon*.rs"
       - "packaging/desktop/**"
       - ".github/workflows/gui.yml"
       - ".github/actions/gui-deb/**"
@@ -106,6 +108,25 @@ jobs:
             echo "::warning::flashcp-dolphin.desktop does not pass desktop-file-validate (expected for KDE service menus)"
           desktop-file-validate packaging/desktop/flashcp-dolphin-pull.desktop || \
             echo "::warning::flashcp-dolphin-pull.desktop does not pass desktop-file-validate (expected for KDE service menus)"
+      - name: Validate the drive-mode udev rule, user service and maintainer scripts
+        run: |
+          set -eux
+          udevadm verify packaging/desktop/61-flashcp-drive-mode.rules
+          systemd-analyze --user verify packaging/desktop/flashcp-drived.service || \
+            systemd-analyze --user verify packaging/desktop/flashcp-drived.service 2>&1 | grep -q "/usr/bin/flashcp"
+          grep -qx 'enable flashcp-drived.service' packaging/desktop/80-flashcp-drived.preset
+          for f in packaging/desktop/deb-*.sh packaging/desktop/test-drive-mode-root.sh; do bash -n "$f"; done
+          xmllint --noout packaging/desktop/io.github.zuhuhix.flashcp.mountpoint.policy
+          # The mountpoint helper is allow_active only.
+          grep -A4 '<defaults>' packaging/desktop/io.github.zuhuhix.flashcp.mountpoint.policy | grep -q '<allow_any>no</allow_any>'
+          grep -A4 '<defaults>' packaging/desktop/io.github.zuhuhix.flashcp.mountpoint.policy | grep -q '<allow_inactive>no</allow_inactive>'
+      - name: Drive-mode udev helper sandbox (as root in this VM)
+        working-directory: gui
+        run: |
+          set -eux
+          sudo apt-get install -y exfatprogs
+          cargo build --locked -p flashcp-helper --bin flashcp-udev-check
+          sudo env CI=true ../packaging/desktop/test-drive-mode-root.sh sandbox target/debug/flashcp-udev-check
       - name: Validate Nautilus extension and polkit policy
         run: |
           set -eux
@@ -141,6 +162,12 @@ jobs:
         id: gui
         with:
           toolchain: 1.99.1
+      - name: Install, system off/on, uninstall (drive mode rollback, as root in this VM)
+        run: |
+          set -eux
+          sudo apt-get update && sudo apt-get install -y exfatprogs
+          cargo build --release --locked
+          sudo env CI=true packaging/desktop/test-drive-mode-root.sh package "${{ steps.gui.outputs.deb }}" target/release/flashcp
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: flashcp-gui-deb

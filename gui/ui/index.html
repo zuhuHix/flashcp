@@ -37,6 +37,26 @@
       </div>
     </section>
 
+    <section class="card" id="usb" aria-labelledby="usb-heading">
+      <h2 id="usb-heading">USB drives</h2>
+      <label class="switch" for="usb-switch">
+        <input id="usb-switch" type="checkbox" role="switch" checked>
+        <span class="switch-track" aria-hidden="true"></span>
+        <span class="switch-text">Speed up USB drives</span>
+      </label>
+      <p id="usb-explain" class="hint">
+        Copies to and from USB exFAT drives go through flashcp in every app. Turn off to use the
+        normal driver.
+      </p>
+      <p id="usb-note" class="hint" role="status" aria-live="polite"></p>
+      <p id="usb-service" class="notice warn" hidden>
+        <span id="usb-service-text">The drive service isn't running.</span>
+        Start it with <code id="usb-service-cmd" class="code"></code>
+      </p>
+      <p id="usb-error" class="trust-error" role="alert" hidden></p>
+      <ul id="usb-drives" class="usb-list" aria-label="USB drives"></ul>
+    </section>
+
     <section id="optimize" class="card panel" tabindex="-1" aria-labelledby="optimize-title" hidden>
       <p id="optimize-title" class="stage">Optimize this stick</p>
       <p id="optimize-status" class="hint" role="status">

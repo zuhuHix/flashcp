@@ -2,6 +2,10 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import {
+  driveModeBadge,
+  drivePendingText,
+  driveModeButtons,
+  driveModeNote,
   formatBytes,
   formatSpeed,
   formatDuration,
@@ -1193,5 +1197,44 @@ describe("optimize tip and dismissal", () => {
     assert.deepEqual(addDismissed(list, "A"), ["A"]);
     assert.deepEqual(addDismissed(list, "B"), ["A", "B"]);
     assert.deepEqual(list, ["A"]);
+  });
+});
+
+describe("USB drive mode", () => {
+  const d = (over) => ({
+    device: "/dev/sdb1",
+    label: "KINGSTON",
+    mode: "flashcp",
+    state: "ready",
+    mountpoint: "/media/u/KINGSTON",
+    dirtyBytes: 0,
+    dirtyFiles: 0,
+    safeToRemove: false,
+    ...over,
+  });
+  test("badge, pending text and buttons per drive; note per service state", () => {
+    const rows = [
+      [d(), "Fast (flashcp)", "good", "", true, false, false],
+      [d({ state: "saving", dirtyBytes: 12_000_000 }), "Fast (flashcp)", "good", "Saving 12.0 MB…", true, false, false],
+      [d({ state: "safe_to_remove", safeToRemove: true }), "Fast (flashcp)", "good", "", true, false, true],
+      [d({ safeToRemove: true, dirtyBytes: 5 }), "Fast (flashcp)", "good", "Saving 5 B…", true, false, false],
+      [d({ mode: "kernel", state: "kernel" }), "Normal driver", "neutral", "", true, false, false],
+      [d({ mode: "kernel", state: "read_only" }), "Read-only", "warn", "", true, false, false],
+      [d({ mode: "none", state: "busy" }), "In use", "neutral", "", false, false, false],
+      [d({ state: "ejecting" }), "Ejecting…", "neutral", "", true, true, false],
+      [d({ mode: "none", state: "failed" }), "Failed", "bad", "", false, false, false],
+      [d({ mode: "none", state: "ready" }), "Not in use", "neutral", "", false, false, false],
+    ];
+    for (const [drive, text, tone, pending, eject, ejectDisabled, safe] of rows) {
+      const label = `${drive.mode}/${drive.state}`;
+      assert.deepEqual(driveModeBadge(drive), { text, tone }, label);
+      assert.equal(drivePendingText(drive), pending, label);
+      assert.deepEqual(driveModeButtons(drive), { eject, ejectDisabled, safe }, label);
+    }
+    assert.equal(driveModeNote({ running: false }, null), "The drive service isn't running");
+    assert.equal(driveModeNote({ running: true }, null), "");
+    assert.equal(driveModeNote(null, null), "");
+    assert.equal(driveModeNote({ running: false }, false), "Turning off…");
+    assert.equal(driveModeNote({ running: true }, true), "Turning on…");
   });
 });

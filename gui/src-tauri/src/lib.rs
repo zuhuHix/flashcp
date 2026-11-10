@@ -1,5 +1,6 @@
 //! flashcp desktop app: Tauri shell, IPC commands, tray, udisks watcher and notifications.
 
+mod drivemode;
 mod drives;
 mod events;
 mod job;
@@ -27,7 +28,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{App, AppHandle, Emitter, Manager, State, WindowEvent};
 
@@ -482,17 +483,49 @@ fn notify_drive(app: &AppHandle, drive: &Drive) {
     });
 }
 
+/// Shows the real drive-mode setting on the tray check item (the CLI may take a moment).
+fn sync_fast_item(item: &CheckMenuItem<tauri::Wry>) {
+    let item = item.clone();
+    thread::spawn(move || {
+        if let Ok(status) = tauri::async_runtime::block_on(drivemode::drive_mode_status()) {
+            let _ = item.set_checked(status.enabled);
+        }
+    });
+}
+
+/// The tray check item was clicked: apply its new state, and revert it if that fails.
+fn toggle_fast(app: &AppHandle, item: &CheckMenuItem<tauri::Wry>) {
+    let wanted = item.is_checked().unwrap_or(true);
+    let (app, item) = (app.clone(), item.clone());
+    thread::spawn(move || {
+        match tauri::async_runtime::block_on(drivemode::drive_mode_set(wanted)) {
+            Ok(done) => {
+                let _ = item.set_checked(done.enabled);
+            }
+            Err(_) => {
+                let _ = item.set_checked(!wanted);
+            }
+        }
+        let _ = app.emit("drive-mode-changed", ());
+    });
+}
+
 fn setup_tray(app: &App) -> Result<(), Box<dyn Error>> {
     let open = MenuItem::with_id(app, "open", "Open flashcp", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &quit])?;
+    let fast = CheckMenuItem::with_id(app, "fast", "Speed up USB drives", true, true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &fast, &quit])?;
+    sync_fast_item(&fast);
+    let fast_item = fast.clone();
     let mut builder = TrayIconBuilder::with_id("flashcp-tray")
         .tooltip("flashcp")
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| match event.id.as_ref() {
+        .on_menu_event(move |app, event| match event.id.as_ref() {
             "open" => show_main(app),
             "quit" => app.exit(0),
+            // The menu has already flipped the check mark; make the setting match, or flip it back.
+            "fast" => toggle_fast(app, &fast_item),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -572,7 +605,10 @@ pub fn run() {
             take_pending_pull,
             optimize_plan,
             start_optimize,
-            optimize_pending
+            optimize_pending,
+            drivemode::drive_mode_status,
+            drivemode::drive_mode_set,
+            drivemode::drive_mode_eject
         ])
         .setup(setup_app)
         .run(tauri::generate_context!())

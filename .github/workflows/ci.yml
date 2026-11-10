@@ -39,6 +39,15 @@ jobs:
         env:
           FLASHCP_REQUIRE_FSCK: "1"
         run: cargo test --locked
+      - name: Drive daemon against the real flashcp mount over FUSE
+        run: |
+          set -eux
+          sudo apt-get install -y fuse3
+          if ./target/debug/flashcp mount --help >/dev/null 2>&1; then
+            FLASHCP_DRIVE_TESTS_REAL=1 cargo test --locked --test daemon_drived -- --test-threads=1
+          else
+            echo "::warning::flashcp mount is not in this build yet (drive core PR); ran the stand-in driver only"
+          fi
 
   fuse:
     name: drive mode (FUSE)

@@ -43,7 +43,7 @@
     ],
     "linux": {
       "deb": {
-        "depends": ["flashcp", "pkexec | policykit-1", "udisks2", "xdg-utils"],
+        "depends": ["flashcp", "pkexec | policykit-1", "udisks2", "xdg-utils", "fuse3"],
         "recommends": ["libnotify-bin", "python3-nautilus"],
         "section": "utils",
         "desktopTemplate": "../../packaging/desktop/flashcp-gui.desktop",
@@ -59,8 +59,17 @@
           "/usr/share/kio/servicemenus/flashcp.desktop": "../../packaging/desktop/flashcp-dolphin.desktop",
           "/usr/share/kio/servicemenus/flashcp-pull.desktop": "../../packaging/desktop/flashcp-dolphin-pull.desktop",
           "/usr/share/icons/hicolor/scalable/apps/flashcp-gui.svg": "../../packaging/desktop/flashcp-gui.svg",
-          "/usr/share/doc/flashcp-gui/SECURITY-NOTES.md": "../../packaging/desktop/SECURITY-NOTES.md"
-        }
+          "/usr/share/doc/flashcp-gui/SECURITY-NOTES.md": "../../packaging/desktop/SECURITY-NOTES.md",
+          "/usr/libexec/flashcp-mountpoint": "../target/release/flashcp-mountpoint",
+          "/usr/libexec/flashcp-udev-check": "../target/release/flashcp-udev-check",
+          "/usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.mountpoint.policy": "../../packaging/desktop/io.github.zuhuhix.flashcp.mountpoint.policy",
+          "/usr/lib/udev/rules.d/61-flashcp-drive-mode.rules": "../../packaging/desktop/61-flashcp-drive-mode.rules",
+          "/usr/lib/systemd/user/flashcp-drived.service": "../../packaging/desktop/flashcp-drived.service",
+          "/usr/lib/systemd/user-preset/80-flashcp-drived.preset": "../../packaging/desktop/80-flashcp-drived.preset"
+        },
+        "postInstallScript": "../../packaging/desktop/deb-postinst.sh",
+        "preRemoveScript": "../../packaging/desktop/deb-prerm.sh",
+        "postRemoveScript": "../../packaging/desktop/deb-postrm.sh"
       }
     }
   }

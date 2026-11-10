@@ -1,0 +1,17 @@
+[Unit]
+Description=flashcp drive mode: serve USB exFAT drives through flashcp
+Documentation=https://github.com/zuhuHix/flashcp/blob/main/packaging/desktop/README.md
+ConditionUser=!@system
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/flashcp drived
+Restart=on-failure
+RestartSec=2
+# SIGTERM goes to the daemon only: it flushes and unmounts every drive (each driver gets exactly
+# one SIGTERM from it), then exits. Whatever is left after the timeout is killed.
+KillMode=mixed
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target

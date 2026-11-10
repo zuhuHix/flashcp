@@ -1,5 +1,10 @@
 // DOM and Tauri wiring for the flashcp GUI. All decisions live in logic.js.
 import {
+  driveModeBadge,
+  drivePendingText,
+  driveModeButtons,
+  driveModeNote,
+  DRIVE_SERVICE_HINT,
   formatBytes,
   formatDuration,
   progressFraction,
@@ -115,6 +120,24 @@ const DEMO_TREE = {
 };
 const DEMO_DOWNLOADS = "/home/demo/Downloads";
 
+// ?usb=stopped (preview only): the drive service is not running.
+const demoUsb = { enabled: true, running: new URLSearchParams(window.location.search).get("usb") !== "stopped", ejected: new Set() };
+function demoUsbDrives() {
+  if (!demoUsb.running) return [];
+  const fast = demoUsb.enabled;
+  const rows = [
+    {
+      device: "/dev/sdb1", label: "KINGSTON", mode: fast ? "flashcp" : "kernel", state: fast ? "saving" : "kernel",
+      mountpoint: "/media/demo/KINGSTON", dirtyBytes: fast ? 12_000_000 : 0, dirtyFiles: fast ? 3 : 0, safeToRemove: !fast,
+    },
+    {
+      device: "/dev/sdc1", label: "BACKUP", mode: "kernel", state: "kernel",
+      mountpoint: "/media/demo/BACKUP", dirtyBytes: 0, dirtyFiles: 0, safeToRemove: true,
+    },
+  ];
+  return rows.filter((r) => !demoUsb.ejected.has(r.device));
+}
+
 let demoSettings = { autostart: false, notifyOnPlug: true };
 // ?pull=conflict: the first demo pull ends with the "already exist" error.
 const demoParams = new URLSearchParams(window.location.search);
@@ -175,6 +198,7 @@ const ids = [
   "optimize-confirm", "optimize-cancel", "progress-note",
   "recovery", "recovery-message", "recovery-text", "recovery-warning", "recovery-resume",
   "recovery-dismiss", "optimize-tip", "tip-open", "tip-dismiss",
+  "usb-switch", "usb-note", "usb-service", "usb-service-cmd", "usb-error", "usb-drives",
 ];
 const els = Object.fromEntries(ids.map((id) => [id, document.getElementById(id)]));
 
@@ -212,6 +236,16 @@ async function demoInvoke(cmd, args) {
   switch (cmd) {
     case "list_drives":
       return DEMO_DRIVES.map((d) => ({ ...d }));
+    case "drive_mode_status":
+      return { running: demoUsb.running, enabled: demoUsb.enabled, drives: demoUsbDrives() };
+    case "drive_mode_set":
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      demoUsb.enabled = !!args.enabled;
+      return { enabled: demoUsb.enabled, running: demoUsb.running };
+    case "drive_mode_eject":
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      demoUsb.ejected.add(args.device);
+      return null;
     case "get_settings":
       return { ...demoSettings };
     case "set_settings":
@@ -1292,6 +1326,144 @@ function wireDragDrop() {
   });
 }
 
+// ---- USB drive mode -------------------------------------------------------
+
+// Kept apart from `state`: it is polled on its own and never affects the copy form.
+let usb = { status: null, pending: null, error: "", ejecting: new Set() };
+let usbSig = null;
+let usbTimer = null;
+let usbSeq = 0;
+
+async function pollUsb() {
+  const seq = ++usbSeq;
+  try {
+    const status = await call("drive_mode_status");
+    if (seq === usbSeq) usb = { ...usb, status, error: "" };
+  } catch (err) {
+    if (seq === usbSeq) usb = { ...usb, error: messageOf(err) };
+  }
+  renderUsb();
+}
+
+function scheduleUsb() {
+  clearTimeout(usbTimer);
+  usbTimer = null;
+  if (document.hidden) return;
+  usbTimer = setTimeout(async () => {
+    await pollUsb();
+    scheduleUsb();
+  }, 1000);
+}
+
+function refreshUsbNow() {
+  clearTimeout(usbTimer);
+  pollUsb().then(scheduleUsb);
+}
+
+async function toggleUsb() {
+  const enabled = els["usb-switch"].checked;
+  usb = { ...usb, pending: enabled, error: "" };
+  usbSeq++; // answers requested before the switch are stale
+  renderUsb();
+  try {
+    const done = await call("drive_mode_set", { enabled });
+    usb = { ...usb, status: { ...(usb.status || { drives: [] }), enabled: done.enabled, running: done.running } };
+  } catch (err) {
+    usb = { ...usb, error: `Could not turn ${enabled ? "on" : "off"}: ${messageOf(err)}` };
+  }
+  usb = { ...usb, pending: null };
+  renderUsb();
+  refreshUsbNow();
+}
+
+async function ejectUsb(device) {
+  usb = { ...usb, error: "", ejecting: new Set(usb.ejecting).add(device) };
+  renderUsb();
+  try {
+    await call("drive_mode_eject", { device });
+  } catch (err) {
+    usb = { ...usb, error: `Could not eject ${device}: ${messageOf(err)}` };
+  }
+  const ejecting = new Set(usb.ejecting);
+  ejecting.delete(device);
+  usb = { ...usb, ejecting };
+  renderUsb();
+  refreshUsbNow();
+}
+
+function usbRow(drive) {
+  const badge = driveModeBadge(drive);
+  const buttons = driveModeButtons(drive);
+  const li = document.createElement("li");
+  li.className = "usb-row";
+  const name = document.createElement("span");
+  name.className = "usb-name";
+  name.textContent = drive.label || drive.device;
+  const tag = document.createElement("span");
+  tag.className = `badge ${badge.tone}`;
+  tag.textContent = badge.text;
+  li.append(name, tag);
+  const pending = drivePendingText(drive);
+  if (pending) {
+    const p = document.createElement("span");
+    p.className = "hint";
+    p.textContent = pending;
+    li.append(p);
+  }
+  if (buttons.safe) {
+    const safe = document.createElement("span");
+    safe.className = "usb-safe";
+    safe.textContent = "Safe to remove";
+    li.append(safe);
+  }
+  if (buttons.eject) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = usb.ejecting.has(drive.device) ? "Ejecting…" : "Eject";
+    b.disabled = buttons.ejectDisabled || usb.ejecting.has(drive.device);
+    b.setAttribute("aria-label", `Eject ${drive.label || drive.device}`);
+    b.addEventListener("click", () => ejectUsb(drive.device));
+    li.append(b);
+  }
+  return li;
+}
+
+function renderUsb() {
+  const status = usb.status;
+  const busy = usb.pending !== null;
+  // While the switch is changing it shows the wanted state; otherwise the daemon's setting.
+  els["usb-switch"].checked = busy ? usb.pending : status ? status.enabled : true;
+  els["usb-switch"].disabled = busy;
+  const note = driveModeNote(status, usb.pending);
+  const stopped = !busy && status !== null && status.running === false;
+  els["usb-note"].textContent = stopped ? "" : note;
+  els["usb-service"].hidden = !stopped;
+  els["usb-service-cmd"].textContent = DRIVE_SERVICE_HINT;
+  els["usb-error"].hidden = !usb.error;
+  els["usb-error"].textContent = usb.error;
+  const drives = status && status.running ? status.drives : [];
+  const sig = JSON.stringify([drives, [...usb.ejecting]]);
+  if (sig !== usbSig) {
+    usbSig = sig;
+    els["usb-drives"].replaceChildren(...drives.map(usbRow));
+  }
+}
+
+function startUsb() {
+  els["usb-switch"].addEventListener("change", toggleUsb);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      clearTimeout(usbTimer);
+      usbTimer = null;
+    } else {
+      refreshUsbNow();
+    }
+  });
+  if (hasTauri) tauri.event.listen("drive-mode-changed", refreshUsbNow);
+  renderUsb();
+  refreshUsbNow();
+}
+
 async function listenToBackend() {
   if (!hasTauri) return;
   await tauri.event.listen("job", (e) => onJob(e.payload));
@@ -1310,6 +1482,7 @@ async function init() {
   render();
 
   await listenToBackend();
+  startUsb();
   await refreshDrives();
 
   try {

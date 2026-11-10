@@ -13,6 +13,7 @@ pub mod device;
 pub mod exec;
 pub mod identity;
 pub mod json;
+pub mod mountpoint;
 pub mod mounts;
 pub mod trust;
 pub mod weak;

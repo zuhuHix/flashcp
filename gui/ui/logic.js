@@ -1205,3 +1205,64 @@ export function closeOptimize(state) {
 export function beginOptimize(state, driveId) {
   return { ...beginJob(state, "optimize", 1), optimize: null, optimizeDriveId: driveId };
 }
+
+// ---- USB drive mode (the flashcp drived daemon) -------------------------
+
+/**
+ * @typedef {Object} DriveModeDrive
+ * @property {string} device
+ * @property {string} label
+ * @property {"flashcp"|"kernel"|"none"|string} mode
+ * @property {string} state
+ * @property {string|null} mountpoint
+ * @property {number} dirtyBytes
+ * @property {number} dirtyFiles
+ * @property {boolean} safeToRemove
+ */
+
+const DRIVE_STATE_BADGES = {
+  checking: "Checking…",
+  busy: "In use",
+  starting: "Starting…",
+  ejecting: "Ejecting…",
+  stopping: "Stopping…",
+  mounting: "Mounting…",
+  read_only: "Read-only",
+  stopped: "Stopped",
+  failed: "Failed",
+};
+
+/** Badge text and tone ("good", "neutral", "warn", "bad") for one drive row. */
+export function driveModeBadge(drive) {
+  const special = DRIVE_STATE_BADGES[drive.state];
+  if (special) {
+    const tone = drive.state === "failed" ? "bad" : drive.state === "read_only" ? "warn" : "neutral";
+    return { text: special, tone };
+  }
+  if (drive.mode === "flashcp") return { text: "Fast (flashcp)", tone: "good" };
+  if (drive.mode === "kernel" || drive.state === "kernel") return { text: "Normal driver", tone: "neutral" };
+  return { text: "Not in use", tone: "neutral" };
+}
+
+/** "Saving 12 MB…" while data is still waiting to be written; "" otherwise. */
+export function drivePendingText(drive) {
+  return drive.dirtyBytes > 0 ? `Saving ${formatBytes(drive.dirtyBytes)}…` : "";
+}
+
+/** Which controls a drive row shows. Eject only for drives flashcp or the kernel serves. */
+export function driveModeButtons(drive) {
+  const served = drive.mode === "flashcp" || drive.mode === "kernel";
+  const leaving = drive.state === "ejecting" || drive.state === "stopping";
+  return { eject: served, ejectDisabled: leaving, safe: drive.safeToRemove === true && !(drive.dirtyBytes > 0) };
+}
+
+/** The line under the switch: the service note, what the switch is doing, or "". */
+export function driveModeNote(status, pendingEnabled) {
+  if (pendingEnabled === true) return "Turning on…";
+  if (pendingEnabled === false) return "Turning off…";
+  if (status && status.running === false) return "The drive service isn't running";
+  return "";
+}
+
+/** The command that starts the drive service, shown when it isn't running. */
+export const DRIVE_SERVICE_HINT = "systemctl --user start flashcp-drived";

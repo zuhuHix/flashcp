@@ -1,0 +1,26 @@
+# flashcp drive mode: USB exFAT drives are served by `flashcp mount` (FUSE) instead of the kernel
+# exfat driver, for the logged-in seat user whose flashcp-drived service is running and on.
+#
+# The decision is made here, while udev processes the event, so it is final before udisks or the
+# daemon hear of the device: there is no window where both drivers could take it.
+#   - flashcp-udev-check (as nobody, sandboxed, <= 1.5 s) prints FLASHCP_DRIVE_MODE=1 and
+#     UDISKS_IGNORE=1 when the volume can be served: udisks never mounts or shows it, the seat
+#     user gets rw on the node (uaccess), and the daemon mounts it at /media/$USER/LABEL.
+#   - It prints UDISKS_AUTO=0 when the daemon handed this drive back to the kernel driver (the
+#     daemon mounts it through udisks itself), FLASHCP_KEEP=1 when the device is busy (keep the
+#     previous decision), and nothing otherwise: udisks and the desktop handle it as always.
+# Off for every user: `sudo flashcp drive-mode off --system` (creates the file tested below).
+ACTION=="remove", GOTO="flashcp_drive_mode_end"
+SUBSYSTEM!="block", GOTO="flashcp_drive_mode_end"
+ENV{ID_BUS}!="usb", GOTO="flashcp_drive_mode_end"
+ENV{ID_FS_TYPE}!="exfat", GOTO="flashcp_drive_mode_end"
+ENV{ID_FS_USAGE}!="filesystem", GOTO="flashcp_drive_mode_end"
+ENV{DEVTYPE}!="partition", ENV{DEVTYPE}!="disk", GOTO="flashcp_drive_mode_end"
+# A whole disk only when it has no partition table (an exFAT "superfloppy").
+ENV{DEVTYPE}=="disk", ENV{ID_PART_TABLE_TYPE}=="?*", GOTO="flashcp_drive_mode_end"
+TEST=="/etc/flashcp/drive-mode-disabled", GOTO="flashcp_drive_mode_end"
+IMPORT{program}="/usr/libexec/flashcp-udev-check $devnode"
+ENV{FLASHCP_KEEP}=="1", IMPORT{db}="FLASHCP_DRIVE_MODE"
+ENV{FLASHCP_KEEP}=="1", ENV{FLASHCP_DRIVE_MODE}=="1", ENV{UDISKS_IGNORE}="1"
+ENV{FLASHCP_DRIVE_MODE}=="1", TAG+="uaccess"
+LABEL="flashcp_drive_mode_end"
