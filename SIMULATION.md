@@ -260,11 +260,11 @@ The blind errors are large, in both directions:
 
 - **Writes are predicted too fast (≈ −55 %).** The probe's 82.7 MB/s at 8 MB is a burst rate: `build` sustains ≈24 MB/s.
 - **Reads are predicted too slow (+57–89 %).** The generic BOT preset's jump and stream costs are USB 2 guesses.
-- **Small writes do not fit the model at all.** 4K *sequential* writes are slower (1.2 MB/s) than 4K *random* ones (254 IOPS ≈ 1.0 MB/s, versus 3.4 ms for a sequential 4K). That points to a sub-page (read-modify-write) penalty that the model does not have.
+- **Small writes do not fit the model at all.** A sequential 4K write takes ≈3.4 ms (1.2 MB/s), about 3× as long as a whole sequential 64K write (≈1.14 ms at 57.5 MB/s). The model's `cmd + len / bw` cannot express a write that costs more than one 16 times its size. Random 4K writes take ≈3.9 ms each (254 IOPS ≈ 1.0 MB/s), only ~15 % slower than sequential 4K, so on this stick the cost comes from the small size, not from the jump. The probe does not show the cause; a read-modify-write of a larger flash page is one possibility.
 
 **Calibrated** on its own 15 points (10 families), the Kingston reaches a median abs error of 12.5 % fitted, but **46 % held out** point-wise and **54 % by family**. Both of its rankings are right (flashcp layout pull < kernel layout pull; fill < skip on 128 KB clusters, which is the decision add's probe made on the stick).
 
-The honest conclusion: **on a USB 3 BOT stick, the model ranks strategies correctly, but its absolute times are not trustworthy, blind or calibrated.** It needs two terms it lacks: a sustained vs burst write rate (SLC-cache-like), and a small-write penalty below the flash page size. A sustained-write probe (≥ 1 GB) and a 16K/32K write size sweep would pin them.
+The honest conclusion: **on a USB 3 BOT stick, the model ranks strategies correctly, but its absolute times are not trustworthy, blind or calibrated.** It needs two terms it lacks: a sustained vs burst write rate (SLC-cache-like), and a size-dependent cost for small writes, below some size between 4K and 64K. A sustained-write probe (≥ 1 GB) and an 8K/16K/32K write-size sweep would pin them.
 
 Side finding: add's in-situ probe estimated "fill 2 s" for the whole add, from 3 × 4 MB units, but the add took 93 s. The probe's choice was right; its time extrapolation was 45× off.
 
