@@ -839,6 +839,48 @@ fn review_regressions() {
     fsck(&img2.path);
     same!(snapshot(&open(&img2.path)), want, "after deletes and moves");
     assert_eq!(want.get("/target").cloned().flatten().as_deref(), Some(&b"kept"[..]));
+    // 2b: prepare-eject vs a write already admitted (held at the gate by a barrier): eject
+    //     waits for it, so "safe" includes it; afterwards writes and write-opens get EROFS
+    let img3 = image("regress-eject", 32, 4096);
+    let fs = open(&img3.path);
+    let held = fs.create(ROOT, &n("held"), true, false).unwrap();
+    fs.flush().unwrap();
+    let (inside, release) = (Arc::new(std::sync::Barrier::new(2)), Arc::new(std::sync::Barrier::new(2)));
+    let (i2, r2) = (inside.clone(), release.clone());
+    fs.set_hook(Some(Arc::new(move || {
+        if std::thread::current().name() == Some("held-writer") {
+            i2.wait();
+            r2.wait();
+        }
+    })));
+    let fw = fs.clone();
+    let writer = std::thread::Builder::new()
+        .name("held-writer".into())
+        .spawn(move || fw.write(held.ino, 0, b"acknowledged"))
+        .unwrap();
+    inside.wait(); // the write is admitted and waiting
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (fe, d2) = (fs.clone(), done.clone());
+    let ejector = std::thread::spawn(move || {
+        let r = fe.prepare_eject();
+        d2.store(true, std::sync::atomic::Ordering::SeqCst);
+        r
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!done.load(std::sync::atomic::Ordering::SeqCst), "prepare-eject finished while a write was in flight");
+    release.wait();
+    assert_eq!(writer.join().unwrap(), Ok(12));
+    ejector.join().unwrap().unwrap();
+    fs.set_hook(None);
+    assert_eq!(fs.write(held.ino, 0, b"late"), Err(libc::EROFS));
+    assert_eq!(fs.open(held.ino, true, false), Err(libc::EROFS));
+    assert_eq!(fs.open(held.ino, false, false), Ok(()));
+    // "safe" meant durable: a fresh mount of the device as it is now has the write
+    let again = open(&img3.path);
+    assert_eq!(again.read(again.lookup(ROOT, &n("held")).unwrap().ino, 0, 64).unwrap(), b"acknowledged");
+    again.shutdown().unwrap();
+    fs.resume();
+    fs.shutdown().unwrap();
     // 3: flush returns while another thread keeps writing
     let f = File::options().read(true).write(true).open(&img.path).unwrap();
     let opts = FsOpts { auto_commit: true, idle: std::time::Duration::from_millis(50), readahead: false, ..manual() };

@@ -73,6 +73,12 @@ struct Shared {
     /// Held (shared) by readers of committed data while they read outside the core lock;
     /// a commit's planning takes it exclusively, so clusters it reuses have no reader left.
     gate: std::sync::RwLock<()>,
+    /// The admission gate of mutations (see [`Fs::mutate`]) and the eject state it guards.
+    admit: std::sync::RwLock<()>,
+    ejecting: std::sync::atomic::AtomicBool,
+    /// Test hook: runs inside every mutation, after admission.
+    #[cfg(test)]
+    hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     ra: Option<Arc<super::readahead::Ra>>,
     /// Device handle for reads outside the core lock.
     rdev: std::fs::File,
@@ -165,7 +171,6 @@ struct Ctl {
     stop: bool,
     reason: &'static str,
     fatal: Option<String>,
-    ejecting: bool,
 }
 
 #[derive(Clone)]
@@ -274,6 +279,10 @@ impl Fs {
         };
         let sh = Arc::new(Shared {
             gate: std::sync::RwLock::new(()),
+            admit: std::sync::RwLock::new(()),
+            ejecting: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            hook: Mutex::new(None),
             ra,
             rdev,
             track: Mutex::new(Track::default()),
@@ -374,7 +383,17 @@ impl Fs {
         Ok(a)
     }
     pub fn open(&self, ino: Ino, write: bool, trunc: bool) -> R<()> {
-        let mut c = self.core();
+        if write || trunc {
+            return self.mutate(|c| Self::open_in(c, ino, write, trunc)).inspect(|_| {
+                if trunc {
+                    self.wrote();
+                }
+            });
+        }
+        Self::open_in(&mut self.core(), ino, false, false)
+    }
+
+    fn open_in(c: &mut Core, ino: Ino, write: bool, trunc: bool) -> R<()> {
         let n = c.ino(ino)?;
         if write && n.is_dir {
             return Err(libc::EISDIR);
@@ -392,10 +411,6 @@ impl Fs {
         }
         c.ino_mut(ino)?.opens += 1;
         c.opened += 1;
-        drop(c);
-        if trunc {
-            self.wrote();
-        }
         Ok(())
     }
     pub fn release(&self, ino: Ino) {
@@ -519,9 +534,16 @@ impl Fs {
         (c.vol.cc * c.vol.cs, c.vol.cs, crate::volume::le32(&c.vol.sector0, 100))
     }
 
+    /// Every mutation runs inside the admission gate (shared side), from its `ejecting` check
+    /// to its end, so `prepare-eject` (exclusive side) never reports safe while one is pending.
     fn mutate<T>(&self, f: impl FnOnce(&mut Core) -> R<T>) -> R<T> {
-        if self.sh.st.lock().unwrap().ejecting {
+        let _admitted = self.sh.admit.read().unwrap_or_else(|e| e.into_inner());
+        if self.sh.ejecting.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(libc::EROFS);
+        }
+        #[cfg(test)]
+        if let Some(h) = self.sh.hook.lock().unwrap().clone() {
+            h();
         }
         let mut c = self.core();
         f(&mut c)
@@ -577,11 +599,12 @@ impl Fs {
     pub fn status(&self) -> Status {
         let c = self.core();
         let st = self.sh.st.lock().unwrap();
+        let ejecting = self.sh.ejecting.load(std::sync::atomic::Ordering::SeqCst);
         let open = c.opened;
         Status {
-            state: if st.fatal.is_some() || c.read_only.is_some() && !st.ejecting {
+            state: if st.fatal.is_some() || c.read_only.is_some() && !ejecting {
                 "read_only"
-            } else if st.ejecting {
+            } else if ejecting {
                 "ejecting"
             } else if st.committing {
                 "committing"
@@ -630,7 +653,12 @@ impl Fs {
     /// Flush, refuse new writes (EROFS), flush again: then nothing is pending.
     pub fn prepare_eject(&self) -> Result<()> {
         self.flush_why("eject")?;
-        self.sh.st.lock().unwrap().ejecting = true;
+        {
+            // no mutation is in flight once the gate is held exclusively; later ones see
+            // `ejecting` and fail with EROFS
+            let _all = self.sh.admit.write().unwrap_or_else(|e| e.into_inner());
+            self.sh.ejecting.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         self.flush_why("eject")?;
         let c = self.core();
         ensure!(c.dirty.is_empty() && c.stager.staged == 0, "changes are still pending");
@@ -638,7 +666,7 @@ impl Fs {
     }
 
     pub fn resume(&self) {
-        self.sh.st.lock().unwrap().ejecting = false;
+        self.sh.ejecting.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Final commit and stop of the commit thread.
@@ -662,6 +690,12 @@ impl Fs {
     #[cfg(test)]
     pub(crate) fn journal_place(&self) -> Option<Place> {
         self.core().journal.clone()
+    }
+
+    /// Test hook: `f` runs inside every mutation, after admission (to hold one there).
+    #[cfg(test)]
+    pub(crate) fn set_hook(&self, f: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.sh.hook.lock().unwrap() = f;
     }
 
     /// Commits completed so far.

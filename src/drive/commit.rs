@@ -491,8 +491,9 @@ fn subset(c: &Core, mut all: Vec<Ino>, n: usize) -> Vec<Ino> {
             by_name.entry((x.parent, super::set::key(&x.name, &c.vol.upc))).or_default().push(i);
             if let Some(d) = x.disk {
                 // its committed name too (a rename away from it)
-                if let Some(dd) = c.inodes.get(&d.dir).and_then(|p| p.dd.as_ref()) {
-                    let f = super::set::decode(&dd.data[d.off..d.off + d.len]);
+                if let Some(dd) = c.inodes.get(&d.dir).and_then(|p| p.dd.as_ref())
+                    && let Ok(f) = super::set::decode(&dd.data[d.off..d.off + d.len])
+                {
                     by_name.entry((d.dir, super::set::key(&f.name, &c.vol.upc))).or_default().push(i);
                 }
             }
@@ -520,11 +521,10 @@ fn subset(c: &Core, mut all: Vec<Ino>, n: usize) -> Vec<Ino> {
             }
             if let Some(d) = x.disk
                 && let Some(dd) = c.inodes.get(&d.dir).and_then(|p| p.dd.as_ref())
+                && let Ok(f) = super::set::decode(&dd.data[d.off..d.off + d.len])
+                && let Some(v) = by_name.get(&(d.dir, super::set::key(&f.name, &c.vol.upc)))
             {
-                let f = super::set::decode(&dd.data[d.off..d.off + d.len]);
-                if let Some(v) = by_name.get(&(d.dir, super::set::key(&f.name, &c.vol.upc))) {
-                    stack.extend(v.iter().copied());
-                }
+                stack.extend(v.iter().copied());
             }
             // a new directory needs its parent committed with or before it
             if x.linked && x.disk.is_none() {

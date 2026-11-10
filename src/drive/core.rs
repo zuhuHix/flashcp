@@ -303,7 +303,9 @@ impl Core {
             if dir == ROOT && super::djournal::is_journal(&ch) {
                 continue;
             }
-            let f = set::decode(&dd.data[ch.set_off..ch.set_off + ch.set_len]);
+            let Ok(f) = set::decode(&dd.data[ch.set_off..ch.set_off + ch.set_len]) else {
+                continue; // cannot happen for a set parse_dir accepted
+            };
             let ino = self.next_ino;
             self.next_ino += 1;
             let k = set::key(&ch.name, &self.vol.upc);
@@ -565,14 +567,16 @@ impl Core {
         }
         let new_size = n.size.max(end);
         let need = new_size.div_ceil(self.vol.cs);
+        let before = n.need;
         self.set_need(i, need)?;
         self.seq += 1;
         let seq = self.seq;
         let n = self.inodes.get_mut(&i).unwrap();
-        self.stager.write(&mut n.ov, off, data, seq).map_err(|e| {
+        if let Err(e) = self.stager.write(&mut n.ov, off, data, seq) {
             eprintln!("flashcp mount: staging: {e}");
-            libc::EIO
-        })?;
+            let _ = self.set_need(i, before);
+            return Err(libc::EIO);
+        }
         n.size = new_size;
         n.mtime = now();
         n.data_dirty = true;

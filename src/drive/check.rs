@@ -66,14 +66,15 @@ pub fn check(dev: &File, len: u64) -> CheckReport {
         let mut v = Vol::open_boot(f, len, true, false)?;
         // bound the root before reading it
         let root = le32(&v.sector0, 96);
-        let cl = v.chain(root, "root directory", u64::MAX).ok();
-        match cl {
-            Some(c) if c.len() as u64 * v.cs <= MAX_ROOT => {}
-            Some(_) => anyhow::bail!("root directory larger than 1 MB"),
-            None => {
-                // too long, a loop or out of range: let the full parse say which (bounded)
-                v.chain(root, "root directory", MAX_ROOT / v.cs)?;
+        // at most one cluster past the bound is walked: longer (or a loop) is "too big"
+        let limit = MAX_ROOT / v.cs + 1;
+        match v.chain(root, "root directory", limit) {
+            Ok(c) if c.len() as u64 * v.cs <= MAX_ROOT => {}
+            Ok(_) => anyhow::bail!("root directory larger than 1 MB"),
+            Err(e) if format!("{e:#}").contains("too long") => {
+                anyhow::bail!("root directory larger than 1 MB (or its chain loops)")
             }
+            Err(e) => return Err(e),
         }
         let dirty = v.flags & FLAG_DIRTY != 0;
         let mut pending = false;
@@ -200,11 +201,36 @@ mod tests {
         let iters: u64 = std::env::var("FLASHCP_FUZZ_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
         let mut rng = crate::util::Rng(0xC0FFEE);
         let path = img.dir.join("fuzz.img");
-        for it in 0..iters {
-            let mut b = pristine.clone();
-            // mutate: the boot sector, the FAT head, the root directory
-            let regions = [(0usize, 512usize), (fat, 64), (root, cs.min(4096)), (11 * 512, 512)];
-            for _ in 0..1 + rng.next() % 8 {
+        // the journal's entry set in the root (mutated too: --check and recovery decode it raw)
+        let jname: Vec<u16> = crate::drive::djournal::NAME.encode_utf16().collect();
+        let jset = (0..cs.min(4096) / 32).map(|k| root + 32 * k).find(|&o| {
+            pristine[o] == 0x85 && pristine[o + 35] as usize == jname.len() && {
+                let f = crate::drive::set::decode(&pristine[o..o + 128]);
+                f.is_ok_and(|f| f.name == jname)
+            }
+        });
+        let jset = jset.expect("the journal's entry is in the root's first cluster");
+        let fix_set = |b: &mut [u8], o: usize| {
+            let c = crate::exfat::checksum16(&b[o..o + 128], true);
+            b[o + 2..o + 4].copy_from_slice(&c.to_le_bytes());
+        };
+        // deterministic hostile cases first: a root chain that loops onto itself; the journal's
+        // entry with a NameLength past its entries (checksum fixed)
+        let mut fixed: Vec<Vec<u8>> = Vec::new();
+        let rc = le32(s0, 96) as usize;
+        let mut b = pristine.clone();
+        b[fat + 4 * rc..fat + 4 * rc + 4].copy_from_slice(&(rc as u32).to_le_bytes());
+        fixed.push(b);
+        let mut b = pristine.clone();
+        b[jset + 35] = 255;
+        fix_set(&mut b, jset);
+        fixed.push(b);
+        let n_fixed = fixed.len() as u64;
+        for it in 0..iters + n_fixed {
+            let mut b = if it < n_fixed { fixed[it as usize].clone() } else { pristine.clone() };
+            // mutate: the boot sector, the FAT head, the root directory, the journal's entry
+            let regions = [(0usize, 512usize), (fat, 64), (root, cs.min(4096)), (11 * 512, 512), (jset, 128)];
+            for _ in 0..if it < n_fixed { 0 } else { 1 + rng.next() % 8 } {
                 let (a, l) = regions[(rng.next() % regions.len() as u64) as usize];
                 let at = a + (rng.next() % l as u64) as usize;
                 match rng.next() % 3 {
@@ -215,6 +241,9 @@ mod tests {
                         b[at] = v;
                     }
                 }
+            }
+            if it >= n_fixed && it % 2 == 0 {
+                fix_set(&mut b, jset); // so mutated entries get past the checksum
             }
             if it % 3 == 0 {
                 // keep the boot checksum valid so mutations reach the parser past it
@@ -252,5 +281,32 @@ mod tests {
                 }
             }
         }
+        // a forged ACTIVE journal: right serial and geometry, hashes recomputed, `pre` equal
+        // to the device's bytes, but its write lands in a file's data: recovery refuses and
+        // writes nothing
+        std::fs::write(&path, &pristine).unwrap();
+        let rw = File::options().read(true).write(true).open(&path).unwrap();
+        let len = rw.metadata().unwrap().len();
+        let mut v = Vol::open(rw.try_clone().unwrap(), len, true, false).unwrap();
+        let upc = v.upc.clone();
+        let key = |n: &str| crate::volume::upcase(&n.encode_utf16().collect::<Vec<_>>(), &upc);
+        let dir = v.dirs[0].children[&key("dir")].clone();
+        let d = v.read_child(0, "", &dir).unwrap();
+        let f = d.children[&key("file number 3.txt")].clone();
+        let at = v.cluster_off(f.first);
+        let pre = v.read_at(at, 16).unwrap();
+        let post: Vec<u8> = pre.iter().map(|b| b ^ 0x5A).collect();
+        let w = crate::drive::commit::JW { phase: crate::drive::commit::P_LINK, off: at, pre: pre.clone(), post };
+        let place = crate::drive::djournal::find(&v.dirs[0].children.values().cloned().collect::<Vec<_>>()).unwrap();
+        let body = crate::drive::djournal::encode_body(&v, &[w], &[]).unwrap();
+        let dev = crate::drive::dev::FileDev::new(std::sync::Arc::new(rw.try_clone().unwrap()));
+        crate::drive::djournal::write_active(&dev, &v, &place, 7, &body).unwrap();
+        let e = crate::drive::tests::open_with(&path, std::sync::Arc::new(dev), crate::drive::tests::manual())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(e.downcast_ref::<crate::drive::djournal::Refused>().is_some(), "{e:#}");
+        assert!(format!("{e:#}").contains("not a commit's write"), "{e:#}");
+        assert_eq!(v.read_at(at, 16).unwrap(), pre, "recovery wrote the forged bytes");
+        v.dev.sync_all().unwrap();
     }
 }

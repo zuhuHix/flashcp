@@ -122,11 +122,22 @@ pub(crate) struct Stager {
     pub(crate) spilled: u64,
     spill: Option<(Arc<File>, u64)>,
     dir: Option<std::path::PathBuf>,
+    /// Test hook: spill writes fail.
+    #[cfg(test)]
+    pub(crate) fail_spill: bool,
 }
 
 impl Stager {
     pub(crate) fn new(ram_cap: u64, dir: Option<std::path::PathBuf>) -> Stager {
-        Stager { ram_cap, staged: 0, spilled: 0, spill: None, dir }
+        Stager {
+            ram_cap,
+            staged: 0,
+            spilled: 0,
+            spill: None,
+            dir,
+            #[cfg(test)]
+            fail_spill: false,
+        }
     }
 
     fn spill_file(&mut self) -> io::Result<&mut (Arc<File>, u64)> {
@@ -158,37 +169,53 @@ impl Stager {
             return Ok(());
         }
         let n = data.len() as u64;
-        let (gone, gone_spill) = ov.punch(off, off + n);
-        self.staged -= gone;
-        self.spilled -= gone_spill;
-        // Append to the last RAM store of this file when nothing else holds it.
-        if let Some((&o, p)) = ov.0.range_mut(..off).next_back()
+        // Append to the last RAM store of this file when nothing else holds it (cannot fail;
+        // the piece ends at `off`, so nothing it holds is replaced).
+        if let Some((&o, p)) = ov.0.range(..off).next_back()
             && o + p.len == off
-            && let Some(Store::Mem(v)) = Arc::get_mut(&mut p.store)
-            && v.len() as u64 == p.at + p.len
-            && v.len() + data.len() <= APPEND_MAX
+            && matches!(&*p.store, Store::Mem(v) if v.len() as u64 == p.at + p.len && v.len() + data.len() <= APPEND_MAX)
+            && Arc::strong_count(&p.store) == 1
             && self.staged < self.ram_cap
         {
-            v.extend_from_slice(data);
-            p.len += n;
-            p.seq = seq;
-            self.staged += n;
-            return Ok(());
+            let (gone, gone_spill) = ov.punch(off, off + n);
+            self.staged -= gone;
+            self.spilled -= gone_spill;
+            let p = ov.0.get_mut(&o).unwrap();
+            if let Some(Store::Mem(v)) = Arc::get_mut(&mut p.store) {
+                v.extend_from_slice(data);
+                p.len += n;
+                p.seq = seq;
+                self.staged += n;
+                return Ok(());
+            }
+            unreachable!("the store was checked to be unshared");
         }
+        // The new bytes are stored first: if that fails (spill file), the overlay still holds
+        // every byte it held, and the write reports the error.
         let store = if self.staged - self.spilled < self.ram_cap {
             let mut v = Vec::with_capacity(data.len()); // appends grow it
             v.extend_from_slice(data);
             Store::Mem(v)
         } else {
+            #[cfg(test)]
+            if self.fail_spill {
+                return Err(io::Error::other("injected spill failure"));
+            }
             let (f, end) = self.spill_file()?;
             f.write_all_at(data, *end)?;
             let s = Store::Spill { file: f.clone(), off: *end };
             *end += n;
-            self.spilled += n;
             s
         };
+        let spilled = matches!(store, Store::Spill { .. });
+        let (gone, gone_spill) = ov.punch(off, off + n);
+        self.staged -= gone;
+        self.spilled -= gone_spill;
         ov.0.insert(off, Piece { store: Arc::new(store), at: 0, len: n, seq });
         self.staged += n;
+        if spilled {
+            self.spilled += n;
+        }
         Ok(())
     }
 
@@ -253,6 +280,18 @@ mod tests {
         st.released(r);
         assert_eq!(ov.bytes(), 2);
         assert_eq!(st.staged, 2);
+    }
+
+    /// A write that fails to stage (the spill file) leaves every acknowledged byte in place.
+    #[test]
+    fn failed_spill_keeps_the_overlay() {
+        let mut st = Stager::new(8, None);
+        let mut ov = Overlay::default();
+        st.write(&mut ov, 0, &[5; 8], 1).unwrap(); // RAM, at the cap
+        st.fail_spill = true;
+        assert!(st.write(&mut ov, 2, &[6; 4], 2).is_err());
+        assert_eq!(content(&ov, 8), vec![Some(5); 8]);
+        assert_eq!((st.staged, st.spilled), (8, 0));
     }
 
     #[test]
