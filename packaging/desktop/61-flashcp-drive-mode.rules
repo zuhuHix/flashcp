@@ -3,7 +3,7 @@
 #
 # The decision is made here, while udev processes the event, so it is final before udisks or the
 # daemon hear of the device: there is no window where both drivers could take it.
-#   - flashcp-udev-check (as nobody, sandboxed, <= 1.5 s) prints FLASHCP_DRIVE_MODE=1,
+#   - flashcp-udev-check (the check sandboxed in a transient systemd service, <= 1.5 s) prints FLASHCP_DRIVE_MODE=1,
 #     FLASHCP_DRIVE_UID=<the seat user> and UDISKS_IGNORE=1 when the volume can be served: udisks never mounts or shows it, the seat
 #     user gets rw on the node (uaccess), and the daemon mounts it at /media/$USER/LABEL.
 #   - It prints UDISKS_AUTO=0 when the daemon handed this drive back to the kernel driver (the

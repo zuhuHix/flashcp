@@ -355,28 +355,33 @@ device (`UDISKS_IGNORE=1`) and whether the seat user gets the `uaccess` ACL
 
 **Threat model.** The input is a hostile USB stick: an arbitrary exFAT image built to crash,
 hang or exploit the parser, possibly also stalling I/O (a device that never answers). The
-helper itself parses nothing from the device; `flashcp mount --check` does, in a child:
+helper itself parses nothing from the device; `flashcp mount --check` does, in a transient
+systemd service that PID 1 starts for it (`systemd-run --wait --pipe`):
 
-- The child gets only the device opened **read-only** (as fd 3) and `/dev/null` as 0–2;
-  everything else is closed (`close_range`). It runs as `nobody:nogroup` with no supplementary
-  groups, `PR_SET_NO_NEW_PRIVS`, `RLIMIT_CPU` 2 s, `RLIMIT_AS` 256 MB, `RLIMIT_NOFILE` 16,
-  `RLIMIT_FSIZE` 0, no core dumps, in its own (empty) network and IPC namespaces (made while
-  still root), an empty environment, and `/usr/bin/flashcp` executed by
-  absolute path. Landlock is required (fail closed): the child can only read and execute below `/usr`
-  and `/lib*`, read `/etc/ld.so.cache`, and read `/sys` and its own `mountinfo` (the check's
-  busy test: holders, partitions, mounts); nothing else on the filesystem. If the kernel has
-  no Landlock, or any of these steps fails, the check does not run and the drive is left to
-  udisks. Its stdout (at most
-  4 KB) comes back through a pipe: a check that could not do its busy test (`busy_unknown`) is
-  not a takeover.
-- So a parser bug gives the attacker code execution as `nobody` with a read-only fd of their
-  own stick, no writable files, no network-relevant privilege beyond what `nobody` has, and two
-  seconds of CPU. The worst outcome of a wrong answer is cosmetic or a fallback: "serve it" means
-  the user's own FUSE driver opens it (and its own checks run again), "don't" means udisks does.
-- **udev is never stalled:** the parent waits at most 1.5 s for the child's exit, then
-  SIGKILLs it and does not wait for it (a child stuck in D state on a bad device cannot hold the
-  udev worker). No answer, a crash, a timeout, or any oddity prints nothing: the device is left
-  to udisks exactly as without flashcp.
+- Why PID 1: everything udev runs inherits `systemd-udevd.service`'s seccomp filter, which
+  denies Landlock, mount, pivot_root and seccomp (`SystemCallErrorNumber=EPERM`), so no
+  filesystem sandbox can be built inside the helper. The service is built by systemd instead,
+  and any part of it failing fails the unit, which means no takeover.
+- The service (`SANDBOX` in the source) runs as a fresh `DynamicUser` with no capabilities and
+  `NoNewPrivileges`. It has a private network (`PrivateNetwork`, `RestrictAddressFamilies=none`,
+  `IPAddressDeny=any`), private IPC, devices and /tmp, a read-only system (`ProtectSystem=strict`),
+  no /home, and empty tmpfs over /etc (only `ld.so.cache` bound in), /var, /run, /srv, /opt, /mnt,
+  /media and /root. It also gets the kernel/cgroup/clock/hostname protections, a
+  `@system-service` seccomp filter minus `@privileged @resources @mount`, no W^X memory, no
+  realtime, no SUID, no new namespaces, `MemoryMax=256M`, `RuntimeMaxSec=2`, `LimitCPU=2`,
+  `LimitFSIZE=0`, `LimitNOFILE=16` and no core dumps.
+- Its only input is the device, opened **read-only** by the helper and passed as stdin (fd 0);
+  the environment is empty. It can read the system's binaries and libraries, `/sys` and its
+  own `/proc` (the check's busy test: holders, partitions, mounts), nothing else.
+- So a parser bug gives the attacker code execution as a throwaway uid with a read-only fd of
+  their own stick, no writable files, no network, and two seconds. The worst outcome of a wrong
+  answer is cosmetic or a fallback: "serve it" means the user's own FUSE driver opens it (and
+  its own checks run again), "don't" means udisks does.
+- **udev is never stalled:** the helper waits at most 1.5 s for `systemd-run`, then SIGKILLs it
+  and does not wait for it; the service itself is ended by `RuntimeMaxSec`. No answer, a
+  failure, a timeout, or any oddity prints nothing: the device is left to udisks exactly as
+  without flashcp. Its stdout (at most 4 KB) comes back through a pipe: a check that could not
+  do its busy test (`busy_unknown`) is not a takeover.
 
 **The active user.** The helper reads `ACTIVE_UID` of `/run/systemd/seats/seat0` (logind's
 state file; no D-Bus). uid 0 or none: nothing. It then looks under `/run/user/<uid>/flashcp/`
