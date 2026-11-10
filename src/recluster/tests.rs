@@ -400,6 +400,7 @@ fn model_random_trees_on_random_geometries() {
         };
         // (Not on the multi-GB ones: they are never too full, and hashing them takes seconds.)
         let image_before = if mb <= 256 { sum(&img.path) } else { 0 };
+        let boot_before = read_boot(&File::open(&img.path).unwrap()).unwrap();
         let mut events = Vec::new();
         match run_seen(&img.path, &opts(new, fat), None, &mut |e| events.push(e.clone())) {
             Ok(s) => {
@@ -431,6 +432,11 @@ fn model_random_trees_on_random_geometries() {
         assert_eq!(cs, new.map_or(DEFAULT_CLUSTER, |c| c as u64), "{what}");
         same(&after, &before, &what);
         assert!(boot_regions_agree(&img.path), "{what}");
+        // Of the boot sector, only the geometry fields and boot code below 440 may differ: the
+        // bytes where a partition table would be decide whether Windows shows a superfloppy.
+        let boot_after = read_boot(&File::open(&img.path).unwrap()).unwrap();
+        assert!(boot_after[..80] == boot_before[..80] && boot_after[440..512] == boot_before[440..512], "{what}");
+        assert_eq!(boot_after[512..12 * 512], boot_before[512..12 * 512], "{what}: sectors 1 to 11 were written");
         // Again: nothing to do. And the driver serves the same tree and can write to it.
         assert!(!run(&img.path, &opts(new, fat), None).unwrap().changed, "{what}");
         let fs = open(&img.path);

@@ -11,7 +11,8 @@
 //! Every byte this command writes goes to clusters that are FREE in the volume as it is at that
 //! moment, except one 512-byte sector: main boot sector 0. Writing that sector is the switch.
 //! Four bytes of its boot code area (ignored by every driver; `optimize` keeps its job id
-//! there) are chosen so that the new sector has the SAME boot checksum as the old one
+//! there; they lie below offset 440, clear of where a partition table would be, which matters
+//! on a stick without one) are chosen so that the new sector has the SAME boot checksum as the old one
 //! ([`neutral`]). The checksum sector (11) is therefore never written, and the switch is one
 //! sector, which a device writes whole or not at all (the model the crash tests of `sync` and
 //! drive mode use, [`crate::drive::dev::CrashDev`]). Before the switch the old volume is
@@ -99,6 +100,8 @@ const ROOT_SLACK: u64 = 2048;
 /// named switch (`relocated` | `reclustered`) is on the medium, before its backup copy: the
 /// window a crash can leave, for the cross-OS checks.
 const STOP_ENV: &str = "FLASHCP_TEST_RECLUSTER_STOP";
+/// The boot code bytes a switch may tune lie below this offset of sector 0 (see [`neutral`]).
+const NEUTRAL_TOP: usize = 439;
 /// More files and directories than this are refused (the plan keeps them all in memory).
 const MAX_OBJECTS: usize = 8 << 20;
 /// ... and more directory bytes, or more file fragments, than these.
@@ -1339,8 +1342,10 @@ fn fat_bytes_for(cc: u64) -> u64 {
 /// a meet-in-the-middle search over 2 × 65536 states finds them. Several positions are tried
 /// (a given one has a solution for most targets, not all). False: no position worked.
 fn neutral(region: &mut [u8], target: u32) -> bool {
-    // Behind the job id `optimize` keeps at 120.., before the 0x55AA signature at 510.
-    for base in (478..=485).chain((160..478).rev()) {
+    // Behind the job id `optimize` keeps at 120.., and below 440: where an MBR has its disk
+    // signature and partition table (440..510), a volume without a partition table must keep
+    // what it has, or Windows takes four stray bytes for partition entries and shows no volume.
+    for base in (160..=NEUTRAL_TOP - 24).rev() {
         let q = [base, base + 8, base + 16, base + 24];
         if let Some(v) = solve(region, q, target) {
             for (p, b) in q.into_iter().zip(v) {

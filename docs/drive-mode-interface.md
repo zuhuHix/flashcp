@@ -230,7 +230,8 @@ offer or resume it as the product decides.
 It cannot be undone cheaply (bigger clusters again mean moving every file: `optimize`). The
 label, the serial number (`UUID`), every file's name, attributes and timestamps stay. Four
 bytes of the boot code area of the boot sector change (that is what makes the switch one
-sector); nothing reads them unless a BIOS boots from the stick's exFAT boot code. Drive mode's
+sector; they lie below offset 440, clear of where a partition table would be); nothing reads
+them unless a BIOS boots from the stick's exFAT boot code. Drive mode's
 idle journal file is not carried over; `flashcp mount` creates a new one at its first commit.
 
 ### Reasons (`--check` and `refused`)
