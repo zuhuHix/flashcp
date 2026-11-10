@@ -27,4 +27,5 @@ pub use events::{Event, Op};
 pub use exfat::{BuildOpts, BuildStats, FatMode, TargetSpec, build, build_to};
 pub use pull::{PullOpts, PullStats, pull, pull_from};
 pub use sync::{SyncOpts, SyncStats, sync, sync_to};
+pub mod drive;
 pub mod sim;
