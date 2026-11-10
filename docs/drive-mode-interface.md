@@ -34,7 +34,10 @@ flashcp mount --check <DEVICE> [--json] [--device-fd N]
 
 Reads at most the boot region, the up-case table, the allocation bitmap's location, the root
 directory and the journal locations (no full walk; ≤ ~200 ms on a USB stick). It never writes:
-a pending journal is reported (`pending_journal`), not replayed; the real mount replays it. It prints one JSON line with `--json` (else a sentence) and exits with the code
+a pending journal is reported (`pending_journal`), not replayed; the real mount replays it.
+The busy test comes FIRST: a device that is mounted (by the kernel or anything else), has a
+mounted sibling partition, or cannot be claimed with `O_EXCL` exits **4**, never 3, whatever
+its filesystem, so the daemon never mounts a volume twice. It prints one JSON line with `--json` (else a sentence) and exits with the code
 below. `0` means "flashcp would serve this volume".
 
 ## Exit codes (both modes)
@@ -51,7 +54,9 @@ below. `0` means "flashcp would serve this volume".
 
 ### The `refused` reasons (exit 3)
 
-`{"event":"refused","reason":R,"message":"...","device":"/dev/sdb1"}` with `R` one of:
+`{"event":"refused","reason":R,"message":"...","device":"/dev/sdb1","label":L|null,"serial":S|null}` with `R` one of
+(`label`/`serial` are those of an exFAT boot region that could be read, the serial as 8 hex
+digits = the `UUID` udev shows as `XXXX-XXXX`; null otherwise):
 
 | reason | when |
 |---|---|
@@ -62,6 +67,16 @@ below. `0` means "flashcp would serve this volume".
 | `too_small` | smaller than the driver's minimum (1 MiB) |
 
 A reason the integration does not know must be treated as `invalid` (fall back).
+
+### What the daemon does with each code (agreed with the integration, 2026-11-10)
+
+| code | daemon behaviour |
+|---:|---|
+| 3, or an unknown `refused` reason | kernel mount, read-write |
+| 4 | someone else has it mounted: leave it alone. Otherwise retry 3× (after 1, 3, 10 s), then notify only. Never a kernel mount. |
+| 5 | kernel mount read-write, and log it |
+| 6 | kernel mount READ-ONLY plus a persistent "run fsck.exfat" notification. Never read-write. |
+| 1 (while mounted) | one restart of `flashcp mount` (which recovers from the journal), then kernel mount + notify |
 
 ## JSON events (stdout, `--json`)
 
@@ -76,8 +91,10 @@ One object per line, flushed after each. Human-readable messages go to stderr re
 {"event":"committed","bytes":N,"files":N,"secs":F}   everything up to here is durable on the medium
 {"event":"error","message":"...","fatal":B}          fatal=true: the mount is going away (exit 1)
 {"event":"unmounted","clean":B}                      last line; clean=false only after a forced exit
-{"event":"refused","reason":R,"message":"..."}       (exit 3), see above; also printed by --check
-{"event":"check","ok":B,"reason":R|null,"label":"...","serial":"...","pending_journal":B}  --check only
+{"event":"refused","reason":R,"message":"...","device":"...","label":L|null,"serial":S|null}
+                                                   (exit 3), see above; also printed by --check
+{"event":"busy","message":"...","device":"..."}    (exit 4)
+{"event":"check","ok":B,"reason":R|null,"label":L|null,"serial":S|null,"pending_journal":B}  --check only
 ```
 
 `dirty_bytes` counts bytes that were written by applications and are not yet on the medium
