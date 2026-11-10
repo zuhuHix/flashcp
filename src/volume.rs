@@ -582,6 +582,8 @@ impl Vol {
     /// adjacent clusters merged. Bounded by the length, like [`Vol::object_clusters`].
     pub(crate) fn runs(&mut self, first: u32, no_fat_chain: bool, len: u64, what: &str) -> Result<Vec<(u64, u64)>> {
         let n = len.div_ceil(self.cs);
+        // A crafted DataLength must not make the walk below loop (and grow) past the heap.
+        ensure!(n <= self.cc, "{what}: DataLength {len} is larger than the volume's cluster heap; run fsck.exfat");
         if n == 0 {
             return Ok(Vec::new());
         }

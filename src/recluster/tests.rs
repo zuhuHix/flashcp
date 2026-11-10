@@ -493,6 +493,9 @@ fn crash_at_every_device_op_leaves_the_old_or_the_new_volume() {
             }
             if !boot_regions_agree(&img.path) {
                 owed += 1;
+                // A run that is then refused still completes the backup it owes.
+                assert_eq!(reason(run(&img.path, &opts(Some(1 << 20), FatMode::Prefix), None)), "bad-cluster-size");
+                assert!(boot_regions_agree(&img.path), "{what}: a refused run left the backup boot sector owed");
             }
             // The next run finishes (or starts over), and nothing is left to do after it.
             let s = run(&img.path, &o, None).unwrap_or_else(|e| panic!("{what}: the second run failed: {e:#}"));
@@ -535,17 +538,18 @@ fn leak(p: &Path, every_other: bool) {
 #[test]
 fn every_refusal_has_its_reason_and_writes_nothing() {
     type Craft = fn(&Path);
-    let cases: Vec<(&str, u32, Option<u32>, Craft)> = vec![
-        ("dirty", 32768, None, |p| rw(p).write_all_at(&[2], 106).unwrap()),
-        ("not-exfat", 32768, None, |p| rw(p).write_all_at(b"NTFS    ", 3).unwrap()),
-        ("unsupported-sector-size", 32768, None, |p| rw(p).write_all_at(&[12], 108).unwrap()),
+    // (reason, whether --check sees it too, old cluster, --cluster, how the volume is spoiled)
+    let cases: Vec<(&str, bool, u32, Option<u32>, Craft)> = vec![
+        ("dirty", true, 32768, None, |p| rw(p).write_all_at(&[2], 106).unwrap()),
+        ("not-exfat", true, 32768, None, |p| rw(p).write_all_at(b"NTFS    ", 3).unwrap()),
+        ("unsupported-sector-size", true, 32768, None, |p| rw(p).write_all_at(&[12], 108).unwrap()),
         // a file's name entry no longer matches its set checksum
-        ("invalid-volume", 32768, None, |p| rw(p).write_all_at(b"!", root_of(p).1 + 70).unwrap()),
-        ("backup-boot-mismatch", 32768, None, |p| rw(p).write_all_at(b"x", 13 * 512 + 100).unwrap()),
-        ("bad-cluster-size", 32768, Some(3000), |_| {}),
-        ("bad-cluster-size", 32768, Some(65536), |_| {}),
+        ("invalid-volume", true, 32768, None, |p| rw(p).write_all_at(b"!", root_of(p).1 + 70).unwrap()),
+        ("backup-boot-mismatch", true, 32768, None, |p| rw(p).write_all_at(b"x", 13 * 512 + 100).unwrap()),
+        ("bad-cluster-size", true, 32768, Some(3000), |_| {}),
+        ("bad-cluster-size", true, 32768, Some(65536), |_| {}),
         // sync's journal file is in the root: an interrupted sync
-        ("pending-sync", 32768, None, |p| {
+        ("pending-sync", true, 32768, None, |p| {
             let upc = crate::exfat::upcase_map();
             let n = crate::exfat::Node {
                 name: crate::volume::SYNC_JOURNAL_NAME.encode_utf16().collect(),
@@ -562,7 +566,7 @@ fn every_refusal_has_its_reason_and_writes_nothing() {
             rw(p).write_all_at(&crate::exfat::finish_set(set, 0, 0), root_of(p).0).unwrap()
         }),
         // drive mode's journal says a commit is in flight
-        ("pending-commit", 32768, None, |p| {
+        ("pending-commit", true, 32768, None, |p| {
             let fs = open(p);
             let place = fs.journal_place().expect("the first commit creates the journal");
             fs.shutdown().unwrap();
@@ -572,26 +576,56 @@ fn every_refusal_has_its_reason_and_writes_nothing() {
             crate::drive::djournal::write_active(&dev, &v, &place, 99, b"a commit that never finished").unwrap();
         }),
         // a benign entry flashcp does not know, with clusters of its own
-        ("unsupported-entry", 32768, None, |p| {
+        ("unsupported-entry", false, 32768, None, |p| {
             let mut e = [0u8; 32];
             (e[0], e[4], e[20]) = (0xA5, 1, 9);
             rw(p).write_all_at(&e, root_of(p).0).unwrap()
         }),
-        ("no-space", 32768, None, |p| leak(p, false)),
+        ("no-space", true, 32768, None, |p| leak(p, false)),
+        // a cluster marked bad: its mark must not turn into free space
+        ("bad-clusters", true, 32768, None, |p| {
+            let f = rw(p);
+            let v = Vol::open(f.try_clone().unwrap(), f.metadata().unwrap().len(), false, true).unwrap();
+            let c = free_extents(&v.bitmap, v.cc).last().map(|e| e.0 + e.1 / 2).unwrap();
+            f.write_all_at(&BAD.to_le_bytes(), v.fat_off + c * 4).unwrap();
+            drop(v);
+            set_bits(p, &[c], true);
+        }),
+        // a FAT chain that loops, under a DataLength far beyond the volume: refused, not walked
+        // (--check does not walk files)
+        ("invalid-volume", false, 32768, None, |p| {
+            let f = rw(p);
+            let v = Vol::open(f.try_clone().unwrap(), f.metadata().unwrap().len(), false, false).unwrap();
+            let root = &v.dirs[0];
+            let ch = root.children.values().find(|c| !c.is_dir && c.len > 2 * v.cs).expect("a file of 3+ clusters");
+            f.write_all_at(&(ch.first + 1).to_le_bytes(), v.fat_off + ch.first as u64 * 4).unwrap();
+            f.write_all_at(&ch.first.to_le_bytes(), v.fat_off + (ch.first as u64 + 1) * 4).unwrap();
+            let mut set = root.data[ch.set_off..ch.set_off + ch.set_len].to_vec();
+            set[33] &= !2;
+            set[56..64].copy_from_slice(&(1u64 << 45).to_le_bytes());
+            let sum = checksum16(&set, true);
+            set[2..4].copy_from_slice(&sum.to_le_bytes());
+            f.write_all_at(&set, v.cluster_off(root.clusters[0]) + ch.set_off as u64).unwrap();
+        }),
+        // a benign primary whose SECONDARY owns clusters
+        ("unsupported-entry", false, 32768, None, |p| {
+            let mut e = [0u8; 64];
+            (e[0], e[1], e[32], e[33], e[52]) = (0xA5, 1, 0xE5, 1, 9);
+            rw(p).write_all_at(&e, root_of(p).0).unwrap()
+        }),
         // The bitmap of this volume takes two clusters, and no two free ones are adjacent.
-        ("no-contiguous-space", 4096, Some(512), |p| leak(p, true)),
+        ("no-contiguous-space", true, 4096, Some(512), |p| leak(p, true)),
     ];
-    for (k, (want, old, new, craft)) in cases.into_iter().enumerate() {
+    for (k, (want, check_sees, old, new, craft)) in cases.into_iter().enumerate() {
         let img = volume(&format!("recl-refuse-{k}"), if old == 4096 { 160 } else { 24 }, old, 11, 30, 2 << 20);
         craft(&img.path);
         let before = sum(&img.path);
         assert_eq!(reason(run(&img.path, &opts(new, FatMode::Prefix), None)), want, "case {k}");
         assert_eq!(sum(&img.path), before, "{want}: the refusal wrote something");
         // --check gives the same reason (an explicit --cluster is not its business).
-        if new.is_none() {
+        if new.is_none() && check_sees {
             let c = check(&TargetSpec::Path(img.path.clone())).unwrap();
-            // (It reads no entry but the root's system ones, so it cannot see a vendor entry.)
-            assert!(want == "unsupported-entry" || (!c.benefit && c.reason == want), "{want}: check says {c:?}");
+            assert!(!c.benefit && c.reason == want, "{want}: check says {c:?}");
             assert_eq!(sum(&img.path), before, "{want}: --check wrote something");
         }
     }

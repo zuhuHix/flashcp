@@ -180,8 +180,12 @@ directory and the allocation bitmap, no other directory (well under a second on 
 Exit **0**: `benefit` is true (`reason` is `"ok"`): the clusters are 16 KB or bigger and there
 is room to convert. Offer it once per stick (key the "asked" state by the volume serial plus
 the device identity): **"Make this stick faster (about N seconds)"**, N = `est_secs` rounded up,
-with **Accept** and **Not now**. `est_secs` and `write_bytes` are upper estimates from the
-device's cached profile (the directories are not read); the plan of the real run is exact. Do
+with **Accept** and **Not now**. `est_secs` and `write_bytes` are estimates from the device's
+cached profile and the bitmap (no directory is read, no file is walked). They hold for the
+usual stick; they can be far too low when a big FAT-chained file starts in the first ~0.1 % of
+the volume (it moves whole, from its first cluster). The real run's `plan` line is exact: show
+its `est_secs` once it arrives (and stop with SIGTERM before the first `switched` if it is
+much more than offered: nothing is changed before then). Do
 not promise a speed-up factor: what changes is that small files need smaller writes.
 Exit **3**: do not offer; `reason` says why (table below). Exit 1: an error (unreadable
 device); do not offer.
@@ -218,7 +222,9 @@ again with `flashcp mount`. One JSON object per line on stdout:
   size; `"relocated"` (only when `switches` is 2) is the intermediate one: still the old
   cluster size, the room for the new FAT is free.
 - `done` with `"changed":false`: the clusters already had the wanted size.
-- Exit 0 = done, 3 = refused (a `refused` line, nothing written), 1 = error, 2 = usage.
+- Exit 0 = done, 3 = refused (a `refused` line, nothing written, except that an interrupted
+  run's backup boot sector is always completed first: its message then says so), 1 = error,
+  2 = usage.
 
 **If it is interrupted** (yanked, power loss, killed): the volume is the old one or the new
 one, complete and fsck-clean, never a mix: every write goes to free space until one 512-byte
@@ -249,6 +255,7 @@ idle journal file is not carried over; `flashcp mount` creates a new one at its 
 | `backup-boot-mismatch` | the backup boot region differs from the main one in a way a recluster does not leave | nothing (`fsck.exfat` territory) |
 | `no-space`, `no-contiguous-space` | too little free space behind the first ~0.1 % of the volume, or it is too fragmented | nothing; may be worth asking again when files were deleted |
 | `geometry`, `too-many-clusters`, `too-many-files`, `checksum` | the volume cannot be described with clusters that small (or is too large to plan in memory) | nothing |
+| `bad-clusters` | clusters are marked bad in the FAT; a recluster would lose the marks | nothing |
 | `bad-cluster-size` | `--cluster` is not a power of two below the current size | bug in the caller |
 
 A reason the integration does not know means "do not offer".

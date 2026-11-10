@@ -31,7 +31,8 @@
 //!    a new bitmap and, if needed, the up-case table too. FAT entries are written only for
 //!    clusters that are free or belong to a NoFatChain file in the current volume (both are
 //!    ignored there). Sync. The result is parsed through the boot sector about to be written
-//!    with the validating parser every command uses, and compared with the plan. Then the
+//!    with the validating parser every command uses, and compared with the plan; moved file data
+//!    and every directory written are read back and compared byte for byte. Then the
 //!    switch: sector 0 with the new root directory cluster.
 //! 2. **recluster**: the new FAT, bitmap, up-case table and every directory (re-numbered:
 //!    new cluster = (old − zone) × ratio; NoFatChain where an object is one run, a FAT chain
@@ -52,13 +53,17 @@
 //! medium until something writes to the new one. The rule that closes this window: every run
 //! of `recluster` (and `--check`, which reports it as `"finish":true`) looks for exactly this
 //! state (sectors 13..=23 equal 1..=11, sector 12 differs from sector 0, both regions
-//! checksum-valid) and completes the backup write once the main volume has passed validation.
+//! checksum-valid) and completes the backup write once the main volume has passed validation,
+//! before anything else (also when it then refuses). Both boot sector writes go through an
+//! O_DIRECT handle on a block device, so each reaches the device as one sector, not as the
+//! page cache's 4 KiB block.
 //!
 //! # Refusals
 //!
 //! Decided before the first write, each with a reason code ([`Refused`]): a dirty or invalid
 //! volume, an interrupted `flashcp sync` or drive-mode commit, a sector size other than 512,
-//! entries that own clusters this command does not know how to re-address, a backup boot region
+//! entries that own clusters this command does not know how to re-address, clusters marked bad
+//! (their marks would be lost), a backup boot region
 //! that does not match the main one, a geometry that cannot be expressed, and too little free
 //! space. Kept: every file's bytes and position, names, attributes, all timestamps, benign
 //! entries (volume GUID, vendor extensions), the label and the serial number. Not carried
@@ -408,6 +413,7 @@ fn claim(refd: &mut [u8], bitmap: &[u8], runs: &[(u64, u64)], what: &dyn Fn() ->
 /// against each other like `add` does, plus what only this command cares about (entries that
 /// own clusters it cannot re-address, journals of interrupted flashcp runs).
 fn load(v: &mut Vol) -> Result<Tree> {
+    journal_sane(v)?;
     crate::drive::djournal::hide_from(v).map_err(|e| refused("pending-commit", format!("{e:#}")))?;
     let root = v.dirs.pop().ok_or_else(|| anyhow!("no root directory"))?;
     if root.children.values().any(crate::volume::is_sync_journal) {
@@ -517,9 +523,10 @@ fn load(v: &mut Vol) -> Result<Tree> {
                         queue.push_back((t.dirs.len() - 1, Some(((*ch).clone(), d.path.clone()))));
                         (runs, t.dirs.len() as u32 - 1)
                     } else {
+                        let runs = v.runs(ch.first, ch.no_fat_chain, ch.len, &what())?;
                         t.files += 1;
                         t.data_bytes += ch.len;
-                        (v.runs(ch.first, ch.no_fat_chain, ch.len, &what())?, u32::MAX)
+                        (runs, u32::MAX)
                     };
                     claim(&mut refd, &t.bitmap, &runs, &what)?;
                     pieces += runs.len();
@@ -537,7 +544,10 @@ fn load(v: &mut Vol) -> Result<Tree> {
                 }
                 // A benign primary the parser skipped (volume GUID, …), kept as it is.
                 _ => {
-                    if matches!(ty, 0xA1 | 0xA2) || (set[4] & 1 != 0 && le32(set, 20) != 0) {
+                    // (A primary's AllocationPossible is in its flags at 4, a secondary's at 1.)
+                    let owns = |e: &[u8], flags: usize| e[flags] & 1 != 0 && le32(e, 20) != 0;
+                    let secondaries = set.as_chunks::<32>().0.iter().skip(1);
+                    if matches!(ty, 0xA1 | 0xA2) || owns(set, 4) || secondaries.clone().any(|e| owns(e, 1)) {
                         return Err(refused(
                             "unsupported-entry",
                             format!(
@@ -561,7 +571,49 @@ fn load(v: &mut Vol) -> Result<Tree> {
         t.dirs[di].content = content;
     }
     ensure!(t.bitmap_at != usize::MAX && t.upcase_at != usize::MAX, "the root directory lost its system entries");
+    // Allocated, referenced by nothing: leaked (dropped by the rewrite, as fsck.exfat would),
+    // or marked bad (FAT entry 0xFFFFFFF7), which must never become free space.
+    for (i, (&b, &r)) in t.bitmap.iter().zip(&refd).enumerate() {
+        let mut m = b & !r;
+        while m != 0 {
+            let c = 2 + i as u64 * 8 + m.trailing_zeros() as u64;
+            m &= m - 1;
+            if c < t.cc + 2 && v.fat(c as u32)? == BAD {
+                return Err(refused(
+                    "bad-clusters",
+                    format!(
+                        "the volume has clusters marked bad (cluster {c} and maybe more); recluster would lose \
+                         those marks"
+                    ),
+                ));
+            }
+        }
+    }
     Ok(t)
+}
+
+/// The FAT entry of a cluster marked bad.
+const BAD: u32 = 0xFFFF_FFF7;
+
+/// Drive mode's journal file, if the root has one, must point into the heap before its header
+/// is read.
+fn journal_sane(v: &Vol) -> Result<()> {
+    let bad = v
+        .dirs
+        .first()
+        .into_iter()
+        .flat_map(|r| r.children.values())
+        .find(|c| crate::drive::djournal::is_journal(c) && !(v.valid(c.first) && contiguous_ok(v, c.first, c.len)));
+    match bad {
+        Some(_) => {
+            Err(refused("invalid-volume", "drive mode's journal file lies outside the cluster heap; run fsck.exfat"))
+        }
+        None => Ok(()),
+    }
+}
+
+fn contiguous_ok(v: &Vol, first: u32, len: u64) -> bool {
+    crate::volume::contiguous_run(first, len.div_ceil(v.cs).max(1), v.cc).is_ok()
 }
 
 // ───────────────────────── the new geometry ─────────────────────────
@@ -1478,7 +1530,34 @@ fn open_tree(f: &File, dev_len: u64) -> Result<Tree> {
 /// first), and compares it with the plan: geometry, bitmap bit for bit, every directory entry
 /// for entry, every allocation. Returns the tree as the view holds it.
 fn verify(f: &File, dev_len: u64, t: &Tree, view: &View) -> Result<Tree> {
+    let sources: Vec<(u64, u64)> = view.copies.iter().map(|c| (c.src, c.src + c.len)).collect();
     drop_cache(f, &view.allowed);
+    drop_cache(f, &sources);
+    // The file data copied out of the way must be what it was copied from (the original is
+    // still there: it is overwritten only after this switch, by the next step).
+    let (mut a, mut b) = (vec![0u8; MAX_REQ as usize], vec![0u8; MAX_REQ as usize]);
+    for c in &view.copies {
+        let mut done = 0;
+        while done < c.len {
+            let n = (c.len - done).min(MAX_REQ) as usize;
+            f.read_exact_at(&mut a[..n], c.src + done).context("read back the moved data")?;
+            f.read_exact_at(&mut b[..n], c.dst + done).context("read back the moved data")?;
+            ensure!(a[..n] == b[..n], "file data moved to byte {} did not arrive intact; nothing was switched", c.dst);
+            done += n as u64;
+        }
+    }
+    // Every directory written, byte for byte (also the zeros after its last entry).
+    for di in (0..t.dirs.len()).filter(|&d| view.emit[d]) {
+        let want = view.dir_bytes(t, di)?;
+        let mut got = vec![0u8; want.len()];
+        let mut at = 0;
+        for &(s, n) in &view.dirs[di].runs {
+            let len = (n * view.cs) as usize;
+            f.read_exact_at(&mut got[at..at + len], view.off(s)).context("read back a directory")?;
+            at += len;
+        }
+        ensure!(got == want, "a directory written did not arrive intact; nothing was switched");
+    }
     let mut region = read_boot(f)?;
     region.truncate(12 * SECTOR as usize);
     region[..SECTOR as usize].copy_from_slice(&view.sector0);
@@ -1673,117 +1752,127 @@ pub(crate) fn run_on(
     precheck(&boot)?;
     let pending = backup_state(&boot)? == Backup::SwitchPending;
     let mut t = open_tree(f, dev_len).map_err(invalid)?;
-    let (old_cs, free_before) = (t.cs, free_bytes(&t.bitmap, t.cc, t.cs));
-    let stats = |changed: bool, cluster: u64, written: u64, free_after: u64, finished_switch: bool| Stats {
-        changed,
-        old_cluster: old_cs,
-        cluster,
-        written,
-        secs: t0.elapsed().as_secs_f64(),
-        free_before,
-        free_after,
-        finished_switch,
-    };
-    // The backup boot sector an interrupted switch still owes. The main region has just
-    // passed validation, so the backup follows it.
-    let finish_backup = || -> Result<()> {
+    // The backup boot sector an interrupted switch still owes. The main region has just passed
+    // validation, so the backup follows it, whatever this run decides next (also a refusal: a
+    // backup that describes a previous volume must not stay behind).
+    let finish = pending && !o.dry_run;
+    if finish {
         guard()?;
         dev.write_at(&boot[..SECTOR as usize], 12 * SECTOR).context("write the backup boot sector")?;
-        dev.sync().context("sync")
-    };
-    let Some(g) = target_geometry(t.vol_bytes, t.heap, t.cs, t.cc, o.cluster)? else {
-        let finish = pending && !o.dry_run;
-        if finish {
-            finish_backup()?;
-        }
-        let s = stats(false, old_cs, if finish { SECTOR } else { 0 }, free_before, finish);
-        sink(&Event::Done(s.clone()));
-        return Ok(s);
-    };
-    let l = layout(&t, &g)?;
-    let relocate = find_bit(&t.bitmap, 2, l.kz, true).is_some();
-
-    // ── both steps are planned (and every refusal decided) before the first write ──
-    let mut sum = Totals::default();
-    let mut step1 = None;
-    let mut step2;
-    if relocate {
-        let mut v1 = plan_relocate(&t, l.kz, cost)?;
-        tune(f, &mut v1)?;
-        count_writes(&t, &v1, o.fat, &mut sum)?;
-        step2 = plan_switch(&t, &g, &l, |oi| &v1.files[oi].runs)?;
-        step1 = Some(v1);
-    } else {
-        step2 = plan_switch(&t, &g, &l, |oi| &t.objs[oi].runs)?;
+        dev.sync().context("sync")?;
     }
-    tune(f, &mut step2)?;
-    count_writes(&t, &step2, o.fat, &mut sum)?;
-    let free_after = free_bytes(&step2.bitmap_bytes(&t)?, g.cc, g.cs);
-    let est_secs = 0.3
-        + sum.written as f64 / cost.bps
-        + sum.requests as f64 * cost.skip_s
-        + sum.read as f64 / cost.read_bps
-        + sum.syncs as f64 * 0.02;
-    let move_bytes = step1.as_ref().map_or(0, |v| v.copies.iter().map(|c| c.len).sum());
-    let detail = format!(
-        "plan: clusters {} → {} │ {} files, {} dirs, {} of data stay where they are{} │ will write {} (new FAT, \
-         bitmap, directories), about {:.0} s │ free space {} → {} │ small files will need smaller writes",
-        kb(old_cs),
-        kb(g.cs),
-        t.files,
-        t.dirs.len() - 1,
-        human_bytes(t.data_bytes as f64),
+    // What follows, in a closure: a refusal after that backup write must say it happened.
+    let mut rest = || -> Result<Stats> {
+        let (old_cs, free_before) = (t.cs, free_bytes(&t.bitmap, t.cc, t.cs));
+        let stats = |changed: bool, cluster: u64, written: u64, free_after: u64, finished_switch: bool| Stats {
+            changed,
+            old_cluster: old_cs,
+            cluster,
+            written,
+            secs: t0.elapsed().as_secs_f64(),
+            free_before,
+            free_after,
+            finished_switch,
+        };
+        let Some(g) = target_geometry(t.vol_bytes, t.heap, t.cs, t.cc, o.cluster)? else {
+            let s = stats(false, old_cs, if finish { SECTOR } else { 0 }, free_before, finish);
+            sink(&Event::Done(s.clone()));
+            return Ok(s);
+        };
+        let l = layout(&t, &g)?;
+        let relocate = find_bit(&t.bitmap, 2, l.kz, true).is_some();
+
+        // ── both steps are planned (and every refusal decided) before the first write ──
+        let mut sum = Totals::default();
+        let mut step1 = None;
+        let mut step2;
         if relocate {
-            format!(", except {} that make room for the new FAT", human_bytes(move_bytes as f64))
+            let mut v1 = plan_relocate(&t, l.kz, cost)?;
+            tune(f, &mut v1)?;
+            count_writes(&t, &v1, o.fat, &mut sum)?;
+            step2 = plan_switch(&t, &g, &l, |oi| &v1.files[oi].runs)?;
+            step1 = Some(v1);
         } else {
-            String::new()
-        },
-        human_bytes(sum.written as f64),
-        est_secs.ceil(),
-        human_bytes(free_before as f64),
-        human_bytes(free_after as f64),
-    );
-    sink(&Event::Plan(Plan {
-        old_cluster: old_cs,
-        cluster: g.cs,
-        files: t.files,
-        dirs: t.dirs.len() as u64 - 1,
-        data_bytes: t.data_bytes,
-        write_bytes: sum.written,
-        move_bytes,
-        est_secs,
-        free_before,
-        free_after,
-        fragmented: t.objs.iter().filter(|o| !o.is_dir && o.runs.len() > 1).count() as u64,
-        relocate,
-        detail,
-    }));
-    if o.dry_run {
-        return Ok(stats(false, g.cs, 0, free_after, false));
-    }
-
-    // ── write ──
-    if pending {
-        finish_backup()?;
-    }
-    let mut run = Run { f, dev_len, dev, fat: o.fat, guard, sink, done: 0, total: sum.written, last: Instant::now() };
-    if let Some(v1) = step1 {
-        t = run.step(&t, &v1, "relocated")?;
-        // Step 2, planned again from what is on the medium now.
-        step2 = plan_switch(&t, &g, &l, |oi| &t.objs[oi].runs)?;
+            step2 = plan_switch(&t, &g, &l, |oi| &t.objs[oi].runs)?;
+        }
         tune(f, &mut step2)?;
-    }
-    ensure!(find_bit(&t.bitmap, 2, l.kz, true).is_none(), "internal error: the zone is not free; nothing was switched");
-    run.step(&t, &step2, "reclustered")?;
-    let written = run.done + if pending { SECTOR } else { 0 };
-    (run.sink)(&Event::Progress { bytes_done: run.total.max(run.done), bytes_total: run.total.max(run.done) });
-    // What every other command sees from now on.
-    drop_cache(f, &[]);
-    let after = Vol::open(f.try_clone().context("dup the device handle")?, dev_len, false, true)
-        .context("the volume after the switch")?;
-    let s = stats(true, after.cs, written, after.free_clusters() * after.cs, pending);
-    (run.sink)(&Event::Done(s.clone()));
-    Ok(s)
+        count_writes(&t, &step2, o.fat, &mut sum)?;
+        let free_after = free_bytes(&step2.bitmap_bytes(&t)?, g.cc, g.cs);
+        let est_secs = 0.3
+            + sum.written as f64 / cost.bps
+            + sum.requests as f64 * cost.skip_s
+            + sum.read as f64 / cost.read_bps
+            + sum.syncs as f64 * 0.02;
+        let move_bytes = step1.as_ref().map_or(0, |v| v.copies.iter().map(|c| c.len).sum());
+        let detail = format!(
+            "plan: clusters {} → {} │ {} files, {} dirs, {} of data stay where they are{} │ will write {} (new FAT, \
+             bitmap, directories), about {:.0} s │ free space {} → {} │ small files will need smaller writes",
+            kb(old_cs),
+            kb(g.cs),
+            t.files,
+            t.dirs.len() - 1,
+            human_bytes(t.data_bytes as f64),
+            if relocate {
+                format!(", except {} that make room for the new FAT", human_bytes(move_bytes as f64))
+            } else {
+                String::new()
+            },
+            human_bytes(sum.written as f64),
+            est_secs.ceil(),
+            human_bytes(free_before as f64),
+            human_bytes(free_after as f64),
+        );
+        sink(&Event::Plan(Plan {
+            old_cluster: old_cs,
+            cluster: g.cs,
+            files: t.files,
+            dirs: t.dirs.len() as u64 - 1,
+            data_bytes: t.data_bytes,
+            write_bytes: sum.written,
+            move_bytes,
+            est_secs,
+            free_before,
+            free_after,
+            fragmented: t.objs.iter().filter(|o| !o.is_dir && o.runs.len() > 1).count() as u64,
+            relocate,
+            detail,
+        }));
+        if o.dry_run {
+            return Ok(stats(false, g.cs, 0, free_after, false));
+        }
+
+        // ── write ──
+        let mut run =
+            Run { f, dev_len, dev, fat: o.fat, guard, sink, done: 0, total: sum.written, last: Instant::now() };
+        if let Some(v1) = step1 {
+            // Step 2 stays as planned: the check before the switch has just shown that the medium
+            // holds exactly step 1's plan, which step 2 was planned from (and tuned for: sectors 1
+            // to 11 do not change).
+            t = run.step(&t, &v1, "relocated")?;
+        }
+        ensure!(
+            find_bit(&t.bitmap, 2, l.kz, true).is_none(),
+            "internal error: the zone is not free; nothing was switched"
+        );
+        run.step(&t, &step2, "reclustered")?;
+        let written = run.done + if finish { SECTOR } else { 0 };
+        (run.sink)(&Event::Progress { bytes_done: run.total.max(run.done), bytes_total: run.total.max(run.done) });
+        // What every other command sees from now on.
+        drop_cache(f, &[]);
+        let after = Vol::open(f.try_clone().context("dup the device handle")?, dev_len, false, true)
+            .context("the volume after the switch")?;
+        let s = stats(true, after.cs, written, after.free_clusters() * after.cs, finish);
+        (run.sink)(&Event::Done(s.clone()));
+        Ok(s)
+    };
+    rest().map_err(|e| match e.downcast::<Refused>() {
+        Ok(r) if finish => refused(
+            r.reason,
+            format!("{} (only the backup boot sector of an interrupted recluster was completed)", r.message),
+        ),
+        Ok(r) => anyhow::Error::new(r),
+        Err(e) => e,
+    })
 }
 
 fn free_bytes(bitmap: &[u8], cc: u64, cs: u64) -> u64 {
@@ -1813,8 +1902,62 @@ pub fn recluster(target: &TargetSpec, o: &ReclusterOpts, sink: &mut dyn FnMut(&E
             None => Ok(()),
         }
     };
-    let dev = FileDev::new(file.clone());
+    let dev = BootDirect::new(FileDev::new(file.clone()), &file, !image);
     run_on(&file, tgt.bytes, &dev, o, &cost, &guard, sink)
+}
+
+/// The device for a run: buffered I/O, except that the one-sector boot sector writes go
+/// through an O_DIRECT handle on a block device. Through the page cache they would reach the
+/// device as a whole 4 KiB cache block (LBAs 0..8, or 8..16 for the backup, which holds main
+/// sectors 8..11 too); this way each is the 512-byte write the crash argument counts on.
+struct BootDirect {
+    inner: FileDev,
+    direct: Option<File>,
+}
+
+impl BootDirect {
+    fn new(inner: FileDev, f: &File, block: bool) -> BootDirect {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let direct = block
+            .then(|| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(format!("/proc/self/fd/{}", f.as_raw_fd()))
+                    .ok()
+            })
+            .flatten();
+        BootDirect { inner, direct }
+    }
+}
+
+impl Dev for BootDirect {
+    fn read_at(&self, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+        self.inner.read_at(buf, off)
+    }
+    fn write_at(&self, buf: &[u8], off: u64) -> std::io::Result<()> {
+        if let Some(d) = &self.direct
+            && buf.len() == SECTOR as usize
+            && (off == 0 || off == 12 * SECTOR)
+        {
+            let mut b = crate::util::AlignedBuf::new(SECTOR as usize);
+            b.as_mut().copy_from_slice(buf);
+            let r = crate::sim::trace::serial(crate::sim::trace::Op::Write, off, SECTOR, || {
+                d.write_all_at(b.as_ref(), off)
+            });
+            // EINVAL: a device whose logical blocks are bigger than 512 bytes. Nothing was written.
+            match r {
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+                r => return r,
+            }
+        }
+        self.inner.write_at(buf, off)
+    }
+    fn sync(&self) -> std::io::Result<()> {
+        self.inner.sync()
+    }
 }
 
 // ───────────────────────── --check ─────────────────────────
@@ -1908,9 +2051,23 @@ fn check_on(f: &File, len: u64, cost: &Cost, c: &mut Check) -> Result<()> {
     let mut v = Vol::open(f.try_clone().context("dup the device handle")?, len, false, true)?;
     (c.cluster, c.new_cluster) = (v.cs, v.cs);
     c.free = v.free_clusters() * v.cs;
+    journal_sane(&v)?;
     crate::drive::djournal::hide_from(&mut v).map_err(|e| refused("pending-commit", format!("{e:#}")))?;
     if v.dirs[0].children.values().any(crate::volume::is_sync_journal) {
         return Err(refused("pending-sync", format!("the volume holds the journal of {}", crate::volume::SYNC_HINT)));
+    }
+    // Clusters marked bad: the FAT read in one go (it is small at the cluster sizes worth an
+    // offer: 4 MB on 128 GB at 128 KB). An allocated cluster whose entry says bad.
+    let fat_len = (v.cc + 2) * 4;
+    if fat_len <= 64 << 20 && v.cs >= OFFER_MIN_CLUSTER {
+        let fat = v.read_at(v.fat_off, fat_len)?;
+        let bad = (2..v.cc + 2).find(|&cl| bit(&v.bitmap, cl) && le32(&fat, (cl * 4) as usize) == BAD);
+        if let Some(cl) = bad {
+            return Err(refused(
+                "bad-clusters",
+                format!("the volume has clusters marked bad (cluster {cl}); recluster would lose those marks"),
+            ));
+        }
     }
     if v.cs < OFFER_MIN_CLUSTER {
         return Err(refused(
