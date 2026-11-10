@@ -136,7 +136,7 @@ of `fsck.exfat -n` is printed but does not fail the build.
 
 On Windows and macOS the same `win_check.ps1` and `mac_check.sh` run on these volumes unchanged
 (`recl-superfloppy` and `control-mkfs-superfloppy` get the superfloppy flag). The five normal
-volumes gate. `recl-crash-window` is report-only (`continue-on-error`): it is an interrupted state, and the
+volumes gate. `recl-crash-window` is report-only (its check step is `continue-on-error`, so the job stays green and raises a warning): it is an interrupted state, and the
 question it answers is what each OS says about it, not whether flashcp may leave it.
 
 ### The recluster steps in `ci.yml`
