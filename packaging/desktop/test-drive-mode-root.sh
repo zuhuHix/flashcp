@@ -99,8 +99,11 @@ EOF
 package() {
   local deb=$1 cli=$2
   install -m 0755 "$cli" /usr/bin/flashcp
-  apt-get install -y --no-install-recommends udisks2 fuse3 >/dev/null
-  dpkg -i --ignore-depends=flashcp "$deb" || apt-get install -f -y
+  # Everything the GUI package depends on except the CLI package (installed by hand above).
+  local deps; deps=$(dpkg-deb -f "$deb" Depends | tr ',' '\n' | sed 's/^ *//; s/ *$//; s/ |.*//; s/ (.*//' | grep -vx flashcp)
+  # shellcheck disable=SC2086
+  apt-get install -y --no-install-recommends $deps >/dev/null
+  dpkg -i --ignore-depends=flashcp "$deb"
   for f in /usr/lib/udev/rules.d/61-flashcp-drive-mode.rules /usr/libexec/flashcp-udev-check \
            /usr/libexec/flashcp-mountpoint /usr/lib/systemd/user/flashcp-drived.service \
            /usr/lib/systemd/user-preset/80-flashcp-drived.preset; do
