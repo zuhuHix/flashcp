@@ -153,7 +153,7 @@ What you can do about it:
   4 KB-cluster stick, against 259–371 s onto a default-format one.
 - **`flashcp optimize`** converts a stick that already holds files. It copies them to this
   computer, verifies the copy, rebuilds the stick and verifies again.
-- **Make faster** (in the next release, [#26](https://github.com/zuhuHix/flashcp/pull/26)):
+- **Make faster** (new in 0.4.0, [#26](https://github.com/zuhuHix/flashcp/pull/26)):
   smaller clusters in place, in seconds, without moving your files. Drive mode offers it once per
   stick; see [below](#make-a-normally-formatted-stick-fast).
 
@@ -163,7 +163,7 @@ file onto a 4 KB-cluster stick in 86.0 s, against 107.7 s onto a default-format 
 ### Make a normally formatted stick fast
 
 > [!NOTE]
-> In the next release (merged, not released yet).
+> New in **0.4.0**.
 
 When drive mode serves a stick that was formatted the usual way (clusters of 32 KB or more),
 flashcp offers once to give it small clusters in place: a few seconds, nothing erased, the files
@@ -231,12 +231,12 @@ flashcp removes per-file overhead. Where there is little of it, there is little 
 
 flashcp runs on Linux (x86_64 and aarch64). The release binaries are static, so they work on any distribution.
 `fsck.exfat` from `exfatprogs` is recommended for checking volumes. The current release is
-**0.3.1**; drive mode arrived in 0.3.0.
+**0.4.0**; drive mode arrived in 0.3.0, the in-place cluster change in 0.4.0.
 
 **Prebuilt binary**
 
 ```sh
-VERSION=0.3.1
+VERSION=0.4.0
 ARCH=$(uname -m)   # x86_64 or aarch64
 curl -LO "https://github.com/zuhuHix/flashcp/releases/download/v$VERSION/flashcp-$VERSION-$ARCH-unknown-linux-musl.tar.gz"
 tar -xzf "flashcp-$VERSION-$ARCH-unknown-linux-musl.tar.gz"
@@ -249,7 +249,7 @@ Checksums are in `SHA256SUMS` on the [release page](https://github.com/zuhuHix/f
 **Debian / Ubuntu (.deb)**
 
 ```sh
-VERSION=0.3.1
+VERSION=0.4.0
 ARCH=$(dpkg --print-architecture)   # amd64 or arm64
 curl -LO "https://github.com/zuhuHix/flashcp/releases/download/v$VERSION/flashcp_${VERSION}_$ARCH.deb"
 sudo apt install "./flashcp_${VERSION}_$ARCH.deb"
@@ -276,7 +276,7 @@ Download both packages from the [release page](https://github.com/zuhuHix/flashc
 install them together:
 
 ```sh
-VERSION=0.3.1
+VERSION=0.4.0
 BASE="https://github.com/zuhuHix/flashcp/releases/download/v$VERSION"
 curl -LO "$BASE/flashcp_${VERSION}_amd64.deb" -LO "$BASE/flashcp-gui_${VERSION}_amd64.deb"
 sudo apt install "./flashcp_${VERSION}_amd64.deb" "./flashcp-gui_${VERSION}_amd64.deb"
@@ -460,7 +460,7 @@ and only then deletes the copy.
 On the USB 2.0 stick with 20k small files, `optimize` took 81–103 s once; afterwards, pulling the
 files back took 16.0 s instead of 28.9 s and adding 20k more took 36.5 s instead of 84.1 s.
 
-**Smaller clusters without moving the files: `recluster`** (in the next release)
+**Smaller clusters without moving the files: `recluster`** (new in 0.4.0)
 
 ```sh
 sudo flashcp recluster /dev/sdX1 --dry-run    # see the plan
@@ -913,8 +913,8 @@ flashcp mount --check <device|image>                   # would drive mode serve 
 flashcp drive-mode status [--json]                     # drive mode on/off, and how each USB drive is served
 flashcp drive-mode on|off [--system]                   # "Speed up USB drives" (--system: every user, root)
 flashcp drive-mode eject <device>                      # save everything, unmount, power off
-flashcp drive-mode recluster <device> [--yes]          # make a served drive faster (next release)
-flashcp drive-mode offer on|off                        # the "Make … faster?" notification (next release)
+flashcp drive-mode recluster <device> [--yes]          # make a served drive faster (0.4.0)
+flashcp drive-mode offer on|off                        # the "Make … faster?" notification (0.4.0)
 flashcp --version
 ```
 
@@ -983,7 +983,7 @@ The same operations are available as a Rust library: `flashcp::build`, `flashcp:
 
 ## Roadmap
 
-**In the next release** (merged, not released yet)
+**Shipped in 0.4.0**
 - [x] **Smaller clusters in place:** give a default-format stick 4 KB clusters without moving
   file data ([#26](https://github.com/zuhuHix/flashcp/pull/26)), offered once per stick by drive
   mode and the app's **Make faster** button ([Make a normally formatted stick fast](#make-a-normally-formatted-stick-fast)).
