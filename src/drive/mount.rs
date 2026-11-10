@@ -372,7 +372,7 @@ pub fn run_mount(a: MountArgs) -> i32 {
     let mut opts = FsOpts {
         idle: Duration::from_millis(a.idle_ms),
         close_linger: Duration::from_millis(a.close_ms),
-        part_off: target.part_off,
+        part_off_bytes: crate::exfat::device_offset(&target),
         ..FsOpts::default()
     };
     if let Some(mb) = a.max_dirty_mb {
@@ -593,4 +593,21 @@ fn claim_fd(fd: i32) -> Result<crate::exfat::Target> {
     anyhow::ensure!(md.len() > 0, "image file is empty");
     let flags = crate::exfat::FlagGuard::new(&file)?;
     Ok(crate::exfat::Target { bytes: md.len(), file, part_off: 0, direct: false, _flags: flags })
+}
+
+#[cfg(test)]
+mod tests {
+    /// A target's partition offset is in sectors; the driver's option (and the write probe)
+    /// take bytes: the mount converts at the boundary.
+    #[test]
+    fn partition_offset_reaches_the_driver_in_bytes() {
+        let p = std::env::temp_dir().join(format!("fcp-partoff-{}", std::process::id()));
+        let file = std::fs::File::create(&p).unwrap();
+        let _flags = crate::exfat::FlagGuard::new(&file).unwrap();
+        let t = crate::exfat::Target { file, bytes: 1 << 30, part_off: 2048, direct: false, _flags };
+        assert_eq!(crate::exfat::device_offset(&t), 1 << 20);
+        let opts = super::super::FsOpts { part_off_bytes: crate::exfat::device_offset(&t), ..Default::default() };
+        assert_eq!(opts.part_off_bytes, 2048 * 512);
+        let _ = std::fs::remove_file(&p);
+    }
 }

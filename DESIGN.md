@@ -45,7 +45,8 @@ read-write exFAT implementation with crash ordering for every operation.
   parent per created file (5.04 → 4.02 FUSE requests per created file). The driver makes the
   checks the kernel made against the modes it reports (0644/0755, 0444/0555 with the
   read-only attribute), and only the mounting user reaches the mount (no `allow_other`):
-  - a read-only file refuses opens for writing and truncation by path;
+  - a read-only file refuses opens for writing and any truncation (O_TRUNC with any access
+    mode, truncate, and ftruncate through a handle opened before the attribute was set);
   - a read-only directory refuses create, mkdir, unlink, rmdir and renames out of or into it;
   - `access(2)` refuses W_OK on read-only objects and X_OK on files;
   - chown to another owner gets EPERM.
@@ -117,6 +118,12 @@ Data layout:
   device's measured cost per request. A gap may be filled only where it is our own slack or
   clusters the pre-commit bitmap calls free. The data goes through `add`'s O_DIRECT sequential
   writer on a separate file description, so the metadata handle stays buffered.
+- The policy comes from `add`'s in-situ write probe when the device has no cached choice for
+  this pattern. The probe writes test patterns into the very clusters the pending commit is
+  about to fill: clusters free in the pre-commit bitmap, which nothing on the volume
+  references. A kill or yank mid-probe leaves only garbage in free space and the committed
+  volume untouched, just as a crash during the data step does. The probe runs only when skip
+  and fill would plan different writes.
 
 Entry sets:
 

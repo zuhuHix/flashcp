@@ -165,7 +165,7 @@ impl Filesystem for Adapter {
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        fh: Option<FileHandle>,
+        _fh: Option<FileHandle>,
         crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -176,14 +176,8 @@ impl Filesystem for Adapter {
         if uid.is_some_and(|u| u != self.uid) || gid.is_some_and(|g| g != self.gid) {
             return reply.error(err(libc::EPERM));
         }
-        let sa = SetAttr {
-            size,
-            mtime: mtime.map(when),
-            atime: atime.map(when),
-            crtime,
-            mode: mode.map(|m| m & 0o222),
-            handle: fh.is_some(),
-        };
+        let sa =
+            SetAttr { size, mtime: mtime.map(when), atime: atime.map(when), crtime, mode: mode.map(|m| m & 0o222) };
         let a = if sa.size.is_none()
             && sa.mtime.is_none()
             && sa.atime.is_none()

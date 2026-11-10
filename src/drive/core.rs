@@ -99,8 +99,6 @@ pub struct SetAttr {
     pub crtime: Option<SystemTime>,
     /// chmod: only the write bits matter (none set = read-only attribute).
     pub mode: Option<u32>,
-    /// Through an open handle (ftruncate), not a path.
-    pub handle: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -627,9 +625,8 @@ impl Core {
 
     pub(crate) fn setattr(&mut self, i: Ino, a: &SetAttr) -> R<Attr> {
         if let Some(s) = a.size {
-            // truncate by path of a read-only file: refused (mode 0444); through a handle opened
-            // for writing before it became read-only, allowed (as POSIX)
-            if !a.handle && self.ino(i)?.attrs & ATTR_RO != 0 {
+            // the read-only attribute forbids any truncation, by path or through a handle
+            if self.ino(i)?.attrs & ATTR_RO != 0 {
                 return Err(libc::EACCES);
             }
             self.truncate(i, s)?;

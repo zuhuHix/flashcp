@@ -581,6 +581,21 @@ fn permission_checks_without_default_permissions() {
     let c = std::ffi::CString::new(f.clone().into_os_string().into_encoded_bytes()).unwrap();
     assert_eq!(unsafe { libc::truncate(c.as_ptr(), 0) }, -1);
     assert_eq!(std::io::Error::last_os_error().raw_os_error(), eacces);
+    // 2b. O_RDONLY|O_TRUNC, O_CREAT|O_TRUNC on the existing file, and ftruncate through a handle
+    //     opened for writing before the attribute was set: no truncation in any of them
+    let raw = |flags: i32| unsafe { libc::open(c.as_ptr(), flags, 0o644) };
+    assert_eq!(raw(libc::O_RDONLY | libc::O_TRUNC), -1);
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), eacces);
+    assert_eq!(raw(libc::O_RDONLY | libc::O_CREAT | libc::O_TRUNC), -1);
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), eacces);
+    let g = m.mnt.join("held-open.txt");
+    let held = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&g).unwrap();
+    std::io::Write::write_all(&mut &held, b"keep me").unwrap();
+    std::fs::set_permissions(&g, std::fs::Permissions::from_mode(0o444)).unwrap();
+    assert_eq!(errno(held.set_len(0)), eacces);
+    drop(held);
+    assert_eq!(std::fs::read(&g).unwrap(), b"keep me");
+    assert_eq!(std::fs::read(&f).unwrap(), b"read only");
     // 3. create and 4. mkdir in a read-only directory
     assert_eq!(errno(std::fs::write(rd.join("new"), b"n")), eacces);
     assert_eq!(errno(std::fs::create_dir(rd.join("newdir"))), eacces);

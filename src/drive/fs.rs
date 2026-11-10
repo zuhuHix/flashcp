@@ -30,8 +30,9 @@ pub struct FsOpts {
     pub readahead: bool,
     /// Readahead cache, bytes.
     pub ra_cap: u64,
-    /// The volume's offset on its disk (bytes): the write probe aligns its windows to it.
-    pub part_off: u64,
+    /// The volume's offset on its disk, in BYTES (a `Target`'s `part_off` is in sectors:
+    /// convert with `exfat::device_offset`): the write probe aligns its windows to it.
+    pub part_off_bytes: u64,
 }
 
 impl Default for FsOpts {
@@ -45,7 +46,7 @@ impl Default for FsOpts {
             spill_dir: None,
             readahead: true,
             ra_cap: 64 << 20,
-            part_off: 0,
+            part_off_bytes: 0,
         }
     }
 }
@@ -404,7 +405,8 @@ impl Fs {
                     if c.ino(i)?.is_dir {
                         return Err(libc::EISDIR);
                     }
-                    if write && c.ino(i)?.attrs & super::set::ATTR_RO != 0 {
+                    // read-only attribute: no write access, and no O_TRUNC whatever the access mode
+                    if (write || trunc) && c.ino(i)?.attrs & super::set::ATTR_RO != 0 {
                         return Err(libc::EACCES);
                     }
                     if trunc {
@@ -452,6 +454,10 @@ impl Fs {
             }
         }
         if trunc {
+            // O_RDONLY|O_TRUNC too: the read-only attribute forbids any truncation
+            if n.attrs & super::set::ATTR_RO != 0 {
+                return Err(libc::EACCES);
+            }
             c.truncate(ino, 0)?;
         }
         c.ino_mut(ino)?.opens += 1;
@@ -941,7 +947,7 @@ impl Fs {
         self.note(Note::Committing { bytes: plan.bytes, files: plan.files, reason: why });
         // The executor reads the volume through its own handle on the same file.
         let vol_view = { self.core().vol.view()? };
-        execute(&*self.sh.dev, &vol_view, &plan, &place, seq, self.sh.opts.part_off)?;
+        execute(&*self.sh.dev, &vol_view, &plan, &place, seq, self.sh.opts.part_off_bytes)?;
         let (bytes, files) = (plan.bytes, plan.files);
         let mut c = self.core();
         if let Some(ra) = &self.sh.ra {
