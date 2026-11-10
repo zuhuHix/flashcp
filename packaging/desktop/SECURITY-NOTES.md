@@ -347,7 +347,7 @@ stand-in for udisks' ACL: members of the user's primary group (usually private) 
 ## Drive mode: flashcp-udev-check
 
 `61-flashcp-drive-mode.rules` runs `/usr/libexec/flashcp-udev-check $devnode` (as root, from
-udev's `IMPORT{program}`) for `SUBSYSTEM=block`, `ID_BUS=usb`, `ID_FS_TYPE=exfat`,
+udev's `IMPORT{program}`) for `SUBSYSTEM=block`, `ID_USB_DRIVER=usb-storage|uas` (USB mass storage, including UAS SSDs, which udev reports as `ID_BUS=scsi`), `ID_FS_TYPE=exfat`,
 `ID_FS_USAGE=filesystem` and `DEVTYPE=partition` (or a whole disk without a partition table),
 unless `/etc/flashcp/drive-mode-disabled` exists. Its output decides whether udisks may see the
 device (`UDISKS_IGNORE=1`) and whether the seat user gets the `uaccess` ACL

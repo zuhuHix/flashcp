@@ -14,7 +14,10 @@
 # Off for every user: `sudo flashcp drive-mode off --system` (creates the file tested below).
 ACTION=="remove", GOTO="flashcp_drive_mode_end"
 SUBSYSTEM!="block", GOTO="flashcp_drive_mode_end"
-ENV{ID_BUS}!="usb", GOTO="flashcp_drive_mode_end"
+# The USB transport, not ID_BUS: udev reports UAS disks (most USB SSDs) as ID_BUS=scsi.
+# ID_USB_DRIVER is set only by the usb_id builtin, i.e. only for devices behind a USB interface:
+# SATA, NVMe, SAS, iSCSI, virtio and other SCSI disks never have it (test_drive_mode_rule.py).
+ENV{ID_USB_DRIVER}!="usb-storage|uas", GOTO="flashcp_drive_mode_end"
 ENV{ID_FS_TYPE}!="exfat", GOTO="flashcp_drive_mode_end"
 ENV{ID_FS_USAGE}!="filesystem", GOTO="flashcp_drive_mode_end"
 ENV{DEVTYPE}!="partition", ENV{DEVTYPE}!="disk", GOTO="flashcp_drive_mode_end"
