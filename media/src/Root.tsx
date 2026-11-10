@@ -7,6 +7,7 @@ import {CopyVsBuild} from './CopyVsBuild';
 import {BENCH_PAGES, BenchPageId} from './data/benchmarks';
 import {DRIVE_MODE_FRAMES, DriveMode} from './DriveMode';
 import {PullSweep} from './PullSweep';
+import {RECLUSTER_FRAMES, Recluster} from './Recluster';
 import {Theme} from './shared';
 import {SHOWREEL_FRAMES, Showreel} from './Showreel';
 import {SYNC_FRAMES, SyncOnlyChanged} from './SyncOnlyChanged';
@@ -20,6 +21,7 @@ const THEMES: Theme[] = ['light', 'dark'];
 const SCENES: {id: string; component: React.FC<{theme: Theme}>; frames: number; height?: number}[] = [
   {id: 'DriveMode', component: DriveMode, frames: DRIVE_MODE_FRAMES},
   {id: 'ClusterSlack', component: ClusterSlack, frames: CLUSTER_SLACK_FRAMES},
+  {id: 'Recluster', component: Recluster, frames: RECLUSTER_FRAMES},
   {id: 'SyncOnlyChanged', component: SyncOnlyChanged, frames: SYNC_FRAMES},
   {id: 'CopyVsBuild', component: CopyVsBuild, frames: 330},
   {id: 'VolumeLayout', component: VolumeLayout, frames: 240},

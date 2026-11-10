@@ -22,6 +22,7 @@ MAX_GIF_BYTES=3000000
 declare -A NAME=(
   [DriveMode]=drive-mode
   [ClusterSlack]=cluster-slack
+  [Recluster]=recluster
   [SyncOnlyChanged]=sync-only-changed
   [BenchmarkChart-usb3]=benchmark-usb3
   [BenchmarkChart-ssd]=benchmark-ssd
@@ -32,10 +33,10 @@ declare -A NAME=(
   [PullSweep]=pull-sweep
   [TwoDrives]=two-drives
 )
-ALL=(DriveMode ClusterSlack SyncOnlyChanged BenchmarkChart-usb3 BenchmarkChart-ssd BenchmarkChart-usb2
+ALL=(DriveMode ClusterSlack Recluster SyncOnlyChanged BenchmarkChart-usb3 BenchmarkChart-ssd BenchmarkChart-usb2
   CopyVsBuild VolumeLayout AddNoErase PullSweep TwoDrives)
 # scenes the Pages site plays as video (sharper and smaller than a GIF)
-SITE_VIDEO=" DriveMode ClusterSlack SyncOnlyChanged "
+SITE_VIDEO=" DriveMode ClusterSlack Recluster SyncOnlyChanged "
 
 SCENES=()
 REEL=1

@@ -9,6 +9,8 @@
 //         128 KB clusters: mkfs 0.08 | mount 0.38 | cp + unmount 288.26 | all 288.72 s
 //   [#18] PR 18 (Kingston, morning session), [#22] PR 22 (drive mode core), [#9] PR 9 (SanDisk),
 //         [#7] PR 7 and [#6] PR 6 (MSI SSD and SanDisk build / add / pull).
+//   [#26] PR 26 (in-place re-cluster), hardware table: the same Kingston, 2026-11-10 19:23-19:32,
+//         SINGLE runs, fsck clean after every step, the trees identical (diff -r) afterwards.
 // A number that is not in one of these does not belong in an animation.
 
 export type Bar = {
@@ -213,4 +215,18 @@ export const SYNC = {
   /** every modification time touched, so sync rewrote every file */
   full: {label: 'every file rewritten', seconds: 8.89, written: '224 MB'},
   footnote: 'Kingston DataTraveler 3.0 (USB 3) · 20,000 files, 169 MB · 4 KB clusters · single runs',
+};
+
+// In-place re-cluster. [#26] The stick was formatted by mkfs.exfat (128 KB clusters) and held
+// `small` (20,000 files) copied by the kernel driver. Then, in this order:
+//   flashcp add of 20,000 more files, 128 KB clusters:  97.96 s (the plan: 234.6 MB to write)
+//   flashcp recluster 128 KB -> 4 KB, 40,000 files:      6.35 s, 137.3 MB written, 126.7 MB of it
+//                                                       file data moved out of the new FAT's way
+//   flashcp add of 20,000 more files, 4 KB clusters:     5.48 s, 211.0 MB written
+// The speed-up the scene shows is computed from the two add times: 97.96 / 5.48 = 17.9.
+export const RECLUSTER = {
+  before: {clusterKb: 128, seconds: 97.96},
+  recluster: {seconds: 6.35, writtenMb: 137.3, movedMb: 126.7},
+  after: {clusterKb: 4, seconds: 5.48, writtenMb: 211.0},
+  footnote: 'Kingston DataTraveler 3.0 · 20,000 small files · single runs',
 };
