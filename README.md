@@ -34,8 +34,8 @@ flashcp runs on Linux, and there are two ways to use it:
 - **[Drive mode](#drive-mode): nothing to open.** With the desktop package installed, eligible USB
   exFAT drives are served by flashcp's own driver, so a copy from any app (the file manager, a
   browser download, `cp`, `rsync`) goes through it. A drive that is busy or fails the clean-volume
-  check falls back to the kernel driver. Drive mode is in the next release (0.3.0).
-- **Commands**, in the current release (0.2.0), for whole jobs on an unmounted drive:
+  check falls back to the kernel driver. New in 0.3.0.
+- **Commands** for whole jobs on an unmounted drive:
   - **`flashcp build`** writes a whole new exFAT drive in one stream. **It erases the drive.**
   - **`flashcp add`** adds a folder to a drive that already has files, without erasing anything.
   - **`flashcp pull`** copies files off a drive, reading it front to back in physical order.
@@ -62,9 +62,8 @@ CI, see [Compatibility](#compatibility)). There's a command-line tool and a
 ## Drive mode
 
 > [!NOTE]
-> Drive mode is merged and ships in the next release, **0.3.0**. The current release (0.2.0)
-> does not have it. To use it today, build both packages from `main`
-> ([packaging/desktop/README.md](packaging/desktop/README.md)).
+> Drive mode is new in **0.3.0** and comes with the desktop package: [install](#install) both
+> packages and it is on. Releases before 0.3.0 do not have it.
 
 **What it is.** Once the [desktop package](#desktop-app) is installed, eligible USB exFAT drives
 are served by flashcp's own exFAT driver (`flashcp mount`, a userspace FUSE driver) instead of the
@@ -184,12 +183,12 @@ flashcp removes per-file overhead. Where there is little of it, there is little 
 
 flashcp runs on Linux (x86_64 and aarch64). The release binaries are static, so they work on any distribution.
 `fsck.exfat` from `exfatprogs` is recommended for checking volumes. The current release is
-**0.2.0**; drive mode arrives with 0.3.0.
+**0.3.0**, the first with drive mode.
 
 **Prebuilt binary**
 
 ```sh
-VERSION=0.2.0
+VERSION=0.3.0
 ARCH=$(uname -m)   # x86_64 or aarch64
 curl -LO "https://github.com/zuhuHix/flashcp/releases/download/v$VERSION/flashcp-$VERSION-$ARCH-unknown-linux-musl.tar.gz"
 tar -xzf "flashcp-$VERSION-$ARCH-unknown-linux-musl.tar.gz"
@@ -202,7 +201,7 @@ Checksums are in `SHA256SUMS` on the [release page](https://github.com/zuhuHix/f
 **Debian / Ubuntu (.deb)**
 
 ```sh
-VERSION=0.2.0
+VERSION=0.3.0
 ARCH=$(dpkg --print-architecture)   # amd64 or arm64
 curl -LO "https://github.com/zuhuHix/flashcp/releases/download/v$VERSION/flashcp_${VERSION}_$ARCH.deb"
 sudo apt install "./flashcp_${VERSION}_$ARCH.deb"
@@ -229,7 +228,7 @@ Download both packages from the [release page](https://github.com/zuhuHix/flashc
 install them together:
 
 ```sh
-VERSION=0.2.0
+VERSION=0.3.0
 BASE="https://github.com/zuhuHix/flashcp/releases/download/v$VERSION"
 curl -LO "$BASE/flashcp_${VERSION}_amd64.deb" -LO "$BASE/flashcp-gui_${VERSION}_amd64.deb"
 sudo apt install "./flashcp_${VERSION}_amd64.deb" "./flashcp-gui_${VERSION}_amd64.deb"
@@ -882,7 +881,7 @@ The same operations are available as a Rust library: `flashcp::build`, `flashcp:
   itself doesn't run there yet (see [Roadmap](#roadmap)).
 - **exFAT only.** `build` creates exFAT; `add` and `pull` read exFAT. FAT32 and NTFS drives aren't supported.
 - **`build` erases the target.** Use `add` to keep what's on the drive.
-- **Drive mode** is not in a release yet (0.3.0 is next) and needs the desktop package (systemd,
+- **Drive mode** needs 0.3.0 or later and the desktop package (systemd,
   udisks2, FUSE 3). `cp` returns about 2× later than with the kernel driver (see
   [the caveat](#drive-mode-flashcp-mount-vs-the-kernel-exfat-driver)). `sync` does not wait for it:
   only Eject and a program's own `fsync` do. It doesn't support symlinks, hard links, xattrs or
@@ -918,7 +917,7 @@ The same operations are available as a Rust library: `flashcp::build`, `flashcp:
 - [ ] **One-click jobs:** repeatable copy jobs you start with one click.
 - [ ] **Windows and macOS versions** of flashcp. [Supporters](#support) get them first.
 
-**Coming in 0.3.0 (merged, not released yet):** [drive mode](#drive-mode). `flashcp mount`, a
+**Shipped in 0.3.0:** [drive mode](#drive-mode). `flashcp mount`, a
 crash-safe read-write exFAT driver in userspace with write-behind
 ([#22](https://github.com/zuhuHix/flashcp/pull/22)), saving when files are closed
 ([#24](https://github.com/zuhuHix/flashcp/pull/24)), a round of commit and read-ahead fixes
