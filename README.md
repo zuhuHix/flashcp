@@ -38,9 +38,42 @@ What you get is an ordinary exFAT drive with ordinary files on it. Windows, macO
 and write it like any other (checked in CI, see [Compatibility](#compatibility)). flashcp itself
 runs on Linux. There's a command-line tool and a [desktop tray app](#desktop-app).
 
+## Drive mode
+
+**What it is.** Once the [desktop package](#desktop-app) is installed, every USB exFAT drive is
+served by flashcp's own exFAT driver (`flashcp mount`, a userspace FUSE driver) instead of the
+kernel's, so copies from any app (the file manager, `cp`, `rsync`) go through flashcp.
+Linux only.
+
+**What you see.** The drive appears as usual at `/media/<user>/<LABEL>`.
+Eject shows "Saving N MB to LABEL…" and then "LABEL can be removed". If you pull the drive out
+while data is still being saved, a warning names what may be missing, and the next plug-in
+repairs the drive from its journal. Drives that aren't clean exFAT, or that are busy, fall back
+to the normal kernel driver, exactly as without flashcp.
+
+**What it measured.** On a Kingston DataTraveler 3.0 USB 3 stick, a durable copy of 20k small
+files took 73.8 s against 315 s with the kernel driver (kernel: 1 run), and reading them back
+8.29 s against 10.81 s. One cost: `cp` itself *returns* about 2× later than with the kernel
+driver, while the data is on the drive sooner. See [Drive mode benchmarks](#drive-mode-flashcp-mount-vs-the-kernel-exfat-driver).
+
+**How to turn it off.** The **Speed up USB drives** switch in the app or the tray menu, or
+`flashcp drive-mode off` (per user; current drives are saved and remounted by the kernel driver).
+For every user: `sudo flashcp drive-mode off --system`. Uninstalling the desktop package restores
+normal automount.
+
+**The safety model.**
+- Every metadata write goes through a crash-safe journal on the drive (`/.flashcp-drive-journal`).
+- After a crash or a yank, the drive holds the old tree or the new one, never a mix. A crash
+  test at every device write checks this, and so did crash tests on the real drives.
+- The plug-in check that reads an unknown drive runs sandboxed in a transient systemd unit: a
+  throwaway user, no network, no access to your files, and the device opened read-only.
+
+Details: [packaging/desktop/README.md](packaging/desktop/README.md#drive-mode-speed-up-usb-drives-on-by-default),
+[DESIGN.md](DESIGN.md), [SECURITY-NOTES.md](packaging/desktop/SECURITY-NOTES.md#drive-mode-flashcp-udev-check).
+
 ## Contents
 
-[Install](#install) · [Desktop app](#desktop-app) · [Quick start](#quick-start) ·
+[Drive mode](#drive-mode) · [Install](#install) · [Desktop app](#desktop-app) · [Quick start](#quick-start) ·
 [Benchmarks](#benchmarks) · [Compatibility](#compatibility) · [How it works](#how-it-works) ·
 [The journey](#the-journey) · [Command reference](#command-reference) · [Honest limits](#honest-limits) ·
 [Roadmap](#roadmap) · [Support](#support) · [Contributing](#contributing)
@@ -95,7 +128,10 @@ On Linux Mint, Ubuntu and Debian you can install a small tray app alongside the 
 sudo apt install ./flashcp_*.deb ./flashcp-gui_*.deb
 ```
 
-It starts at login and shows a notification when you plug in a USB exFAT drive. It has two modes:
+It starts at login and shows a notification when you plug in a USB exFAT drive. It also turns on
+[drive mode](#drive-mode): its **USB drives** section shows each drive's mode, what is still being
+saved and **Safe to remove**, next to the **Speed up USB drives** switch (also in the tray menu).
+For explicit fast copies it has two modes:
 
 - **Copy to USB.** Pick files or drop them on the window, and flashcp adds them to the drive in one
   sequential pass. The app unmounts the drive, writes, remounts it and opens it in your file manager.
@@ -369,6 +405,33 @@ speed, and every scattered file needs its own read either way. A stick written b
 has every file contiguous, and `pull` is 2× faster there; `optimize` turns a kernel-filled stick into
 one. Treat single numbers on cheap sticks as rough: they are noisy.
 
+### Drive mode: `flashcp mount` vs the kernel exfat driver
+
+From [#22](https://github.com/zuhuHix/flashcp/pull/22). The small dataset (20k files / 169 MB),
+a fresh filesystem each run, median of 3 unless marked. Kernel = the udisks mount of the kernel exfat
+driver. **Durable** = `cp` until the data is on the drive and it is unmounted (kernel: `cp` + `sync -f` +
+unmount; flashcp: `cp` + unmount + the final commit). **cp returns** = when `cp` itself exits.
+**Read back** = a cold `cp -r` of what each one wrote, byte-checked. `fsck.exfat` was clean after
+every flashcp run.
+
+| Drive | | kernel exfat | flashcp mount | |
+|---|---|---:|---:|---:|
+| Kingston DataTraveler 3.0 (USB 3, BOT) | small, durable | 315.1 s (1 run) | **73.8 s** | 4.3× faster |
+| | small, `cp` returns | 0.61 s (1 run) | 1.22 s | 2.0× slower |
+| | small, read back | 10.81 s | **8.29 s** | 1.30× faster |
+| | 20k empty files in one dir, durable | 24.8 s | **0.83 s** | 30× faster |
+| MSI DATAMAG 20Gbps (USB SSD, UAS) | small, durable | 1.80 s | **1.26 s** | 1.43× faster |
+| | small, `cp` returns | 0.53 s | 1.01 s | 1.9× slower |
+| | small, read back | 4.85 s | **2.84 s** | 1.71× faster |
+| | 20k empty files in one dir, durable | 22.9 s | **0.49 s** | 47× faster |
+
+**The honest caveat:** `cp` returns about 2× later with drive mode, while the data is on the drive
+sooner. The kernel lets `cp` return once the data is in RAM; through FUSE every file costs about
+four round trips to the driver (~40 µs per file here). That is the FUSE protocol itself, and the
+durable time, the one that matters for "safe to remove", is better on both drives. Crash tests on
+both drives (SIGKILL and aborts between commit phases) remounted to the old or the new tree with
+`fsck.exfat` clean.
+
 ### Simulating a drive: `flashcp sim`
 
 Tuning on a real USB 2 stick takes minutes per run, and runs vary a lot. flashcp can record the exact
@@ -563,6 +626,11 @@ flashcp bench <src> <mounted-dir> --runs 3             # the early copy methods,
 flashcp copy  <src> <dst> [--writers N] [--verify]     # pipelined, ordered loose-file copy (experiment)
 flashcp pack  <src> <out.tar> --compress auto|zstd|none  # one tar stream (experiment)
 flashcp sim   run|sweep|calibrate|profiles               # trace-driven drive simulator (SIMULATION.md)
+flashcp mount <device|image> <mountpoint>              # drive mode's FUSE exFAT driver, read-write
+flashcp mount --check <device|image>                   # would drive mode serve it? 0 = yes, 3 = no, 4 = busy
+flashcp drive-mode status [--json]                     # drive mode on/off, and how each USB drive is served
+flashcp drive-mode on|off [--system]                   # "Speed up USB drives" (--system: every user, root)
+flashcp drive-mode eject <device>                      # save everything, unmount, power off
 flashcp --version
 ```
 
@@ -572,6 +640,9 @@ flashcp --version
 - `sync`: `--yes-many` (confirm more than 1000 deletions), `--fast-moves` (trust a sampled
   fingerprint for moves instead of a full comparison; risky), `--readers <n>`.
 - `pull`: with `--delete-extraneous`, `--yes-many` confirms more than 1000 deletions.
+- `mount`: `--json` (events as JSON lines), `--control <socket>` (status, flush, prepare-eject,
+  resume, unmount). You normally don't run it yourself: `flashcp drived`, the per-user service the
+  desktop package enables, does. The contract is [docs/drive-mode-interface.md](docs/drive-mode-interface.md).
 - `build`, `add`, `sync`, `pull` and `info` take `--target-fd N` instead of a path, to use an already-open
   block device (for example from a privileged helper; that's how the desktop app works).
 
@@ -597,6 +668,9 @@ The same operations are available as a Rust library: `flashcp::build`, `flashcp:
   itself doesn't run there yet (see [Roadmap](#roadmap)).
 - **exFAT only.** `build` creates exFAT; `add` and `pull` read exFAT. FAT32 and NTFS drives aren't supported.
 - **`build` erases the target.** Use `add` to keep what's on the drive.
+- **Drive mode** needs the desktop package (systemd, udisks2, FUSE 3). `cp` returns about 2× later
+  than with the kernel driver (see [the caveat](#drive-mode-flashcp-mount-vs-the-kernel-exfat-driver)).
+  It doesn't support symlinks, hard links, xattrs or ownership. Data still being saved when the drive is yanked is lost, as with the kernel's page cache.
 - **The drive must be unmounted** for `build` and `add` (the desktop app unmounts and remounts for you).
   `pull` works on a mounted drive but warns, because it can't see writes the kernel hasn't flushed.
 - **`add` is cautious.** It refuses TexFAT, two FATs, dirty or media-failure volumes, and volumes it
@@ -618,11 +692,14 @@ The same operations are available as a Rust library: `flashcp::build`, `flashcp:
 ## Roadmap
 
 **Planned**
-- [ ] **Drive mode** *(in progress for v0.3.0)*: a native FUSE mount, so every app's copies to the
-  drive get faster automatically, not just flashcp's.
 - [ ] **Write-behind and one-click jobs:** copies that finish in the background, and repeatable
   copy jobs you start with one click.
 - [ ] **Windows and macOS versions** of flashcp. [Supporters](#support) get them first.
+
+**New in 0.3.0:** [drive mode](#drive-mode). `flashcp mount`, a crash-safe read-write exFAT
+driver in userspace ([#22](https://github.com/zuhuHix/flashcp/pull/22)), and the always-on
+integration: the udev takeover, `flashcp drived`, the eject guard, the **Speed up USB drives**
+switch and `flashcp drive-mode` ([#20](https://github.com/zuhuHix/flashcp/pull/20)).
 
 **Shipped in 0.2.0:** `flashcp sync` and `pull --update` / `--delete-extraneous`
 ([#14](https://github.com/zuhuHix/flashcp/pull/14)), the desktop app's **Optimize this stick**

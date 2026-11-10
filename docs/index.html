@@ -24,6 +24,7 @@
     <a class="brand" href="#top">flashcp</a>
     <nav aria-label="Page sections">
       <ul class="nav-list">
+        <li><a href="#drive-mode">Drive mode</a></li>
         <li><a href="#benchmarks">Benchmarks</a></li>
         <li><a href="#drives">Drives</a></li>
         <li><a href="#writes">Writes</a></li>
@@ -64,6 +65,9 @@
           <pre class="command"><code>flashcp sync ./photos /dev/sdX1 --to photos</code></pre>
           <p class="cmd-label">Make a stick that was filled file by file fast (files kept)</p>
           <pre class="command"><code>flashcp optimize /dev/sdX1 --yes</code></pre>
+          <p class="cmd-label">Drive mode (desktop package): check it, or turn it off</p>
+          <pre class="command"><code>flashcp drive-mode status
+flashcp drive-mode off</code></pre>
         </div>
 
         <p class="safety" role="note">
@@ -75,6 +79,34 @@
         <video src="flashcp.mp4" autoplay muted loop playsinline aria-label="Showreel of flashcp: build, add and pull on a fast USB SSD and on a cheap USB 2.0 stick"></video>
         <p class="media-fallback" id="video-fallback" hidden>The showreel is not available yet. The commands next to it are the whole interface.</p>
       </figure>
+    </div>
+  </section>
+
+  <!-- 1b. Drive mode -->
+  <section class="section section-alt" id="drive-mode" aria-labelledby="drive-mode-title">
+    <div class="container">
+      <h2 id="drive-mode-title">Drive mode</h2>
+      <p class="lede">New in 0.3.0, Linux only. Once the desktop package is installed, every USB exFAT drive is served by flashcp's own exFAT driver (<code>flashcp mount</code>, in userspace over FUSE), so copies from any app go through flashcp.</p>
+      <ul class="plain-list">
+        <li><strong>What you see.</strong> The drive appears as usual at <code>/media/&lt;user&gt;/&lt;LABEL&gt;</code>. Eject shows &ldquo;Saving&hellip;&rdquo; and then &ldquo;can be removed&rdquo;. Pulling it out mid-save gives a warning, and the next plug-in repairs it from the journal. Drives that aren't clean exFAT, or that are busy, fall back to the normal kernel driver.</li>
+        <li><strong>Turning it off.</strong> The <em>Speed up USB drives</em> switch in the app or the tray, <code>flashcp drive-mode off</code>, or for every user <code>sudo flashcp drive-mode off --system</code>.</li>
+        <li><strong>Safety.</strong> Every metadata write goes through a crash-safe journal on the drive, so after a crash the drive holds the old tree or the new one. The plug-in check runs sandboxed in a transient systemd unit with no network and no access to your files.</li>
+      </ul>
+      <div class="table-wrap">
+        <table class="results">
+          <caption>20k small files (169&nbsp;MB), kernel exfat driver vs <code>flashcp mount</code>. Durable = until the data is on the drive and it is unmounted. Medians of 3 unless marked.</caption>
+          <thead><tr><th scope="col">Drive</th><th scope="col"></th><th scope="col" class="num">kernel</th><th scope="col" class="num">flashcp</th></tr></thead>
+          <tbody>
+            <tr><th scope="row" rowspan="3">Kingston DataTraveler 3.0 (USB 3, BOT)</th><td>durable copy</td><td class="num">315.1&nbsp;s (1 run)</td><td class="num"><strong>73.8&nbsp;s</strong></td></tr>
+            <tr><td><code>cp</code> returns</td><td class="num">0.61&nbsp;s (1 run)</td><td class="num">1.22&nbsp;s</td></tr>
+            <tr><td>read back</td><td class="num">10.81&nbsp;s</td><td class="num"><strong>8.29&nbsp;s</strong></td></tr>
+            <tr><th scope="row" rowspan="3">MSI DATAMAG 20Gbps (USB SSD, UAS)</th><td>durable copy</td><td class="num">1.80&nbsp;s</td><td class="num"><strong>1.26&nbsp;s</strong></td></tr>
+            <tr><td><code>cp</code> returns</td><td class="num">0.53&nbsp;s</td><td class="num">1.01&nbsp;s</td></tr>
+            <tr><td>read back</td><td class="num">4.85&nbsp;s</td><td class="num"><strong>2.84&nbsp;s</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="note"><strong>Honest caveat:</strong> <code>cp</code> returns about 2&times; later than with the kernel driver, while the data is on the drive sooner. Through FUSE every file costs a few round trips to the driver. Details in the <a href="https://github.com/zuhuHix/flashcp#drive-mode">README</a> and <a href="https://github.com/zuhuHix/flashcp/pull/22">#22</a>.</p>
     </div>
   </section>
 
@@ -294,6 +326,7 @@
       <h2 id="desktop-title">Desktop app</h2>
       <p class="lede">A Linux tray app for copying to and from USB drives without a terminal.</p>
       <ul class="plain-list">
+        <li><strong>Drive mode.</strong> A <em>USB drives</em> section shows each drive's mode, what is still being saved and <em>Safe to remove</em>, next to the <em>Speed up USB drives</em> switch (also in the tray). See <a href="#drive-mode">Drive mode</a>.</li>
         <li><strong>Linux tray app, as a .deb.</strong> It starts at login. It has two modes, Copy to USB and Copy from USB, and the app unmounts and remounts the drive for you.</li>
         <li><strong>File manager entries.</strong> Right-click in Nemo, Nautilus or Dolphin for <em>Fast copy to USB (flashcp)</em> or <em>Fast copy from USB (flashcp)</em>. Normal file-manager copies are not intercepted.</li>
         <li><strong>Optimize this stick.</strong> The app shows the plan (time estimate, space needed on this computer, what is kept), copies the stick to <code>~/.cache/flashcp/optimize</code>, verifies it, rebuilds the stick, verifies again and deletes the copy. An interrupted run offers <em>Resume optimize</em>.</li>
@@ -316,6 +349,7 @@
         <li><strong>Optimize needs local disk space</strong> for a full copy of the stick (never tmpfs or other volatile storage). If an optimize is interrupted, Windows may offer to format the stick: decline, and run the same optimize again on Linux.</li>
         <li><strong>Sync trusts size and modification time</strong> unless you pass <code>--checksum</code>. Its speed is measured on image files only so far.</li>
         <li><strong>Simulator accuracy varies by drive.</strong> <code>flashcp sim</code> held-out error by workload family: SanDisk 7.1&nbsp;%, MSI 14.9&nbsp;%, Kingston 53.5&nbsp;% (the model lacks a sustained write rate). Real drives remain the judge; see <a href="https://github.com/zuhuHix/flashcp/blob/main/SIMULATION.md">SIMULATION.md</a>.</li>
+        <li><strong>Drive mode needs the desktop package.</strong> <code>cp</code> returns about 2&times; later than with the kernel driver. No symlinks, hard links, xattrs or ownership. Data still being saved when a drive is yanked is lost, as with the kernel's page cache.</li>
         <li><strong>Unmount first.</strong> The device must be unmounted for build and add. The desktop app handles that.</li>
       </ul>
     </div>
@@ -329,7 +363,7 @@
       <ul class="roadmap">
         <li><span class="tag tag-shipped">Shipped</span> <code>flashcp optimize</code> (rewrites a stick into the fast layout, files kept: copy, verify, rebuild, verify; resumable), automatic cluster size, a per-device speed profile, the device-aware add gap policy, and the first copy onto an empty stick running as a build.</li>
         <li><span class="tag tag-shipped">Shipped</span> <code>flashcp sync</code> and <code>pull --update</code> / <code>--delete-extraneous</code> (only what changed, with a crash-safe journal), the desktop app's Optimize button, <code>flashcp --version</code>, and the trace-driven simulator <code>flashcp sim</code>.</li>
-        <li><span class="tag tag-explore">In progress</span> Drive mode for v0.3.0: a native FUSE mount, so every app's copies get faster.</li>
+        <li><span class="tag tag-shipped">Shipped</span> Drive mode (0.3.0): <code>flashcp mount</code>, a crash-safe exFAT driver in userspace, plus the always-on integration (udev takeover, <code>flashcp drived</code>, the eject guard, the <em>Speed up USB drives</em> switch, <code>flashcp drive-mode</code>).</li>
         <li><span class="tag">Planned</span> Write-behind and one-click jobs.</li>
         <li><span class="tag">Planned</span> Windows and macOS versions. Buy Me a Coffee supporters get them first.</li>
       </ul>
