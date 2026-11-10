@@ -170,6 +170,14 @@ impl Rig {
     }
 }
 
+impl Drop for Rig {
+    /// A failed test must not leave its daemon behind (it holds the test harness's pipes).
+    fn drop(&mut self) {
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
+    }
+}
+
 unsafe extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
@@ -228,7 +236,7 @@ fn refused_volume_gets_the_kernel_driver() {
 }
 
 /// The driver crashes: restarted once (recovery), the second crash falls back to the kernel
-/// driver with a notification.
+/// driver READ-ONLY (it did not end cleanly) with notifications.
 #[test]
 fn crash_restart_once_then_kernel() {
     let mut r = Rig::new("crash");
@@ -240,9 +248,10 @@ fn crash_restart_once_then_kernel() {
         r.log("daemon").matches("-> start ").count() >= 2 && r.status().contains("\"state\":\"ready\"")
     });
     r.kill_driver(&mp);
-    r.wait("kernel mode", r.state_is("kernel"));
+    r.wait("kernel mode, read-only", r.state_is("read_only"));
     assert!(r.log("notify").contains("fast mode stopped"), "{}", r.log("notify"));
-    assert!(r.log("udisksctl").contains(&format!("mount -b {dev}")));
+    assert!(r.log("notify").contains("couldn't finish saving"), "{}", r.log("notify"));
+    assert!(r.log("udisksctl").contains(&format!("mount -b {dev} --no-user-interaction -o ro")));
     r.stop();
 }
 

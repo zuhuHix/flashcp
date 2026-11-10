@@ -805,6 +805,7 @@ pub fn to_input(p: &BTreeMap<String, String>) -> Option<Input> {
                 disk,
                 label: label.filter(|l| !l.is_empty()),
                 uuid: p.get("ID_FS_UUID").cloned().filter(|u| !u.is_empty()),
+                recover: p.get("FLASHCP_RECOVER").is_some_and(|v| v == "1"),
             }))
         }
         _ => None,

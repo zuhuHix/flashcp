@@ -1,6 +1,7 @@
 //! `flashcp-udev-check DEVNODE`: run from the drive-mode udev rule (IMPORT{program}) as root.
 //! Prints udev properties on stdout: `FLASHCP_DRIVE_MODE=1` + `UDISKS_IGNORE=1` when the active
-//! seat user's drive daemon is on and `flashcp mount --check` accepts the volume; `FLASHCP_KEEP=1`
+//! seat user's drive daemon is on and `flashcp mount --check` accepts the volume, or (plus
+//! `FLASHCP_RECOVER=1`) whenever the volume has an interrupted flashcp commit; `FLASHCP_KEEP=1`
 //! when the check says busy (keep the previous decision); nothing otherwise, which leaves the
 //! device to udisks and the kernel driver. Any error, oddity or timeout also prints nothing.
 //!
@@ -31,17 +32,25 @@ fn decide(args: &[String]) -> Option<String> {
     }
     let uid = active_uid(&fs::read_to_string("/run/systemd/seats/seat0").ok()?)?;
     let uuid = std::env::var("ID_FS_UUID").ok().filter(|u| valid_key(u));
-    if !daemon_wants(uid, uuid.as_deref(), dev.rsplit('/').next()?)? {
+    let wants = daemon_wants(uid, uuid.as_deref(), dev.rsplit('/').next()?);
+    if wants == Some(false) {
         // The daemon gave this drive to the kernel driver: visible to udisks, it mounts it itself.
         return Some("UDISKS_AUTO=0\n".into());
     }
     let (code, out) = check(dev)?;
+    // Sandbox setup failures exit 121..=130 (step order in `check`); stderr goes to udev's log.
+    if std::env::var_os("FLASHCP_UDEV_CHECK_DEBUG").is_some() {
+        eprintln!("flashcp-udev-check: {dev}: check exit {code}: {}", out.trim());
+    }
+    let takeover = format!("FLASHCP_DRIVE_MODE=1\nFLASHCP_DRIVE_UID={uid}\nUDISKS_IGNORE=1\n");
     match code {
-        // busy_unknown: the check could not see the holders/mounts, so it is no takeover.
-        0 if !out.contains("busy_unknown") => {
-            Some(format!("FLASHCP_DRIVE_MODE=1\nFLASHCP_DRIVE_UID={uid}\nUDISKS_IGNORE=1\n"))
-        }
         4 => Some("FLASHCP_KEEP=1\n".into()),
+        // busy_unknown: the check could not see the holders/mounts, so it is no takeover.
+        0 if out.contains("busy_unknown") => None,
+        // An interrupted flashcp commit: flashcp's recovery first, even with drive mode off (the
+        // daemon mounts it once, then hands it over); never the kernel driver before that.
+        0 if out.contains("\"pending_journal\":true") => Some(format!("{takeover}FLASHCP_RECOVER=1\n")),
+        0 if wants == Some(true) => Some(takeover),
         _ => None,
     }
 }
@@ -56,18 +65,22 @@ fn valid_key(s: &str) -> bool {
     !s.is_empty() && s.len() <= 36 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// lstat only (never follows), everything must be owned by `uid`. None: the daemon is off (no
-/// "on" marker); Some(false): a per-drive kernel-fallback flag (by UUID or device name) exists.
+/// lstat only (never follows), everything must be owned by `uid`. Some(false): a per-drive
+/// kernel-fallback flag (by UUID or device name) exists; Some(true): the daemon is on (its
+/// "on" marker exists); None: neither.
 fn daemon_wants(uid: u32, uuid: Option<&str>, devname: &str) -> Option<bool> {
     let base = format!("/run/user/{uid}/flashcp");
     let owned = |p: &str, dir: bool| {
         fs::symlink_metadata(p).is_ok_and(|m| m.uid() == uid && if dir { m.is_dir() } else { m.is_file() })
     };
-    if !owned(&base, true) || !owned(&format!("{base}/drive-mode-on"), false) {
+    if !owned(&base, true) {
         return None;
     }
     let flag = |k: &str| owned(&format!("{base}/kernel/{k}"), false);
-    Some(!(uuid.is_some_and(flag) || (valid_key(devname) && flag(devname))))
+    if uuid.is_some_and(flag) || (valid_key(devname) && flag(devname)) {
+        return Some(false);
+    }
+    owned(&format!("{base}/drive-mode-on"), false).then_some(true)
 }
 
 /// Runs the check in a sandboxed child; returns its exit code and (up to 4 KB of) its stdout, or
@@ -103,15 +116,15 @@ fn check(dev: &str) -> Option<(i32, String)> {
             // Only 0, 2 (/dev/null), 1 (the pipe) and 3 (the device) survive the exec.
             // (Allocating after fork is fine: this process is single-threaded.)
             // Fail closed: no Landlock, no check (the drive is left to udisks).
-            let Some(ll) = landlock_ruleset().filter(|_| !no_landlock) else { libc::_exit(127) };
+            let Some(ll) = landlock_ruleset().filter(|_| !no_landlock) else { libc::_exit(121) };
             if null < 0 || libc::dup2(null, 0) < 0 || libc::dup2(pipe[1], 1) < 0 || libc::dup2(null, 2) < 0 {
-                libc::_exit(127);
+                libc::_exit(122);
             }
             // udev starts us with only 0-2 open, so the device usually IS fd 3: dup2 would then be a
             // no-op that keeps O_CLOEXEC, and exec would close it.
             let moved = if fd == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd, 3) };
             if moved < 0 {
-                libc::_exit(127);
+                libc::_exit(123);
             }
             for (res, v) in [
                 (libc::RLIMIT_CPU, 2),
@@ -122,29 +135,29 @@ fn check(dev: &str) -> Option<(i32, String)> {
             ] {
                 let r = libc::rlimit { rlim_cur: v, rlim_max: v };
                 if libc::setrlimit(res, &r) != 0 {
-                    libc::_exit(127);
+                    libc::_exit(124);
                 }
             }
             // No network and no SysV IPC, whatever the Landlock ABI (needs root: before the drop).
             if libc::getuid() == 0 && libc::unshare(libc::CLONE_NEWNET | libc::CLONE_NEWIPC) != 0 {
-                libc::_exit(127);
+                libc::_exit(125);
             }
             if libc::getuid() == 0
                 && (libc::setgroups(0, std::ptr::null()) != 0 || libc::setgid(NOBODY) != 0 || libc::setuid(NOBODY) != 0)
             {
-                libc::_exit(127);
+                libc::_exit(126);
             }
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 libc::_exit(127);
             }
             if libc::syscall(libc::SYS_landlock_restrict_self, ll, 0u32) != 0 {
-                libc::_exit(127);
+                libc::_exit(128);
             }
             if libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32) != 0 {
-                libc::_exit(127);
+                libc::_exit(129);
             }
             libc::execve(bin.as_ptr(), argp.as_ptr(), envp.as_ptr());
-            libc::_exit(127);
+            libc::_exit(130);
         }
     }
     unsafe { libc::close(pipe[1]) };

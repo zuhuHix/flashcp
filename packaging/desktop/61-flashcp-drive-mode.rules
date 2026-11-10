@@ -9,6 +9,8 @@
 #   - It prints UDISKS_AUTO=0 when the daemon handed this drive back to the kernel driver (the
 #     daemon mounts it through udisks itself), FLASHCP_KEEP=1 when the device is busy (keep the
 #     previous decision), and nothing otherwise: udisks and the desktop handle it as always.
+# A volume with an interrupted flashcp commit (pending journal) is always given to flashcp first
+# (FLASHCP_RECOVER=1), so the kernel driver never mounts it before the journal is replayed.
 # Off for every user: `sudo flashcp drive-mode off --system` (creates the file tested below).
 ACTION=="remove", GOTO="flashcp_drive_mode_end"
 SUBSYSTEM!="block", GOTO="flashcp_drive_mode_end"
@@ -22,6 +24,7 @@ TEST=="/etc/flashcp/drive-mode-disabled", GOTO="flashcp_drive_mode_end"
 IMPORT{program}="/usr/libexec/flashcp-udev-check $devnode"
 ENV{FLASHCP_KEEP}=="1", IMPORT{db}="FLASHCP_DRIVE_MODE"
 ENV{FLASHCP_KEEP}=="1", IMPORT{db}="FLASHCP_DRIVE_UID"
+ENV{FLASHCP_KEEP}=="1", IMPORT{db}="FLASHCP_RECOVER"
 ENV{FLASHCP_KEEP}=="1", ENV{FLASHCP_DRIVE_MODE}=="1", ENV{UDISKS_IGNORE}="1"
 ENV{FLASHCP_DRIVE_MODE}=="1", TAG+="uaccess"
 LABEL="flashcp_drive_mode_end"
