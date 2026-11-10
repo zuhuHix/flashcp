@@ -258,9 +258,17 @@ pub(crate) fn apply(dev: &dyn Dev, writes: &[JW], mut on_phase: impl FnMut(&str)
             dev.write_at(&w.post, w.off).with_context(|| format!("write metadata at {}", w.off))?;
         }
         dev.sync().context("sync")?;
+        // test hook: die right after this phase (a crash with the journal active)
+        if std::env::var(ABORT_AFTER_ENV).is_ok_and(|v| v == *name) {
+            eprintln!("{ABORT_AFTER_ENV}: aborting after phase {name}");
+            std::process::abort();
+        }
     }
     Ok(())
 }
+
+/// Test hook (hardware crash tests): abort the process after the named metadata phase.
+pub(crate) const ABORT_AFTER_ENV: &str = "FLASHCP_TEST_ABORT_AFTER";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Recovered {

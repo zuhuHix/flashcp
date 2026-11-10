@@ -104,7 +104,8 @@ those "before" bytes come from the in-memory mirrors, so planning needs no reads
 The body also carries the volume's serial and geometry, and samples (offset, length, xxh3) of
 the data step's runs (only those no later metadata write lands on).
 
-The journal file is created once, by the first commit on a volume:
+The journal file is created once, when a writable volume without one is mounted (not in the
+first commit, which would hold the lock through three syncs):
 - Its IDLE header goes into free contiguous clusters (sync).
 - Its bitmap bits (sync).
 - Its entry set, inside one sector of the root, padded with deleted entries (sync).
@@ -149,9 +150,11 @@ Committed data is read outside the core lock, under a reader gate that commit pl
 exclusively. When a plan reuses freed clusters, no reader that saw the old mapping is still
 reading them. A read goes to the readahead cache first:
 
-- **Bulk copy of a directory.** When the second file of a directory is read from offset 0, the
-  directory's remaining committed files (up to 2 MB each, 1 GB in all) are queued in directory
-  order.
+- **Bulk copy of a directory.** When the second file of a directory is read from offset 0,
+  or any first file while a bulk copy was seen in the last 2 s, the directory's remaining
+  committed files (up to 2 MB each, 1 GB in all) are queued in directory order, together with
+  the next sibling directory's files. That way the device never idles while `cp -r` opens the
+  next directory.
 - **Big files.** A sequential reader keeps 16 MB queued ahead of it.
 
 The queued extents are coalesced with `pull`'s read planner, using the gap from the device's

@@ -176,7 +176,7 @@ impl Stager {
             return Ok(());
         }
         let store = if self.staged - self.spilled < self.ram_cap {
-            let mut v = Vec::with_capacity(data.len().clamp(64 << 10, APPEND_MAX));
+            let mut v = Vec::with_capacity(data.len()); // appends grow it
             v.extend_from_slice(data);
             Store::Mem(v)
         } else {
