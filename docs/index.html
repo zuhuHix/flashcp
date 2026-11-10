@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>flashcp: fast small-file copies to and from USB drives</title>
-  <meta name="description" content="flashcp makes copying many small files to and from USB drives faster while the drive stays a normal exFAT drive. Measured on a Kingston DataTraveler 3.0 USB 3 stick with 4 KB clusters: 20,000 small files safe to remove after 5.3 s, against 74 s with the Linux kernel driver on the same format (single runs). Big files gain little. Results vary by drive.">
+  <meta name="description" content="flashcp makes copying many small files to and from USB drives faster while the drive stays a normal exFAT drive. Measured on a Kingston DataTraveler 3.0 USB 3 stick with 4 KB clusters: 20,000 small files safe to remove after 5.3 s, against 50 to 74 s with the Linux kernel driver on the same format (single runs). Big files gain little. Results vary by drive.">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
   <script>
@@ -47,7 +47,7 @@
       <div class="hero-text">
         <p class="eyebrow">Rust CLI &middot; exFAT &middot; GPL-3.0-or-later</p>
         <h1>flashcp</h1>
-        <p class="pitch">Copying thousands of small files to a USB stick is slow. flashcp makes it fast, and the drive stays a normal exFAT drive. On a Kingston DataTraveler 3.0 USB 3 stick with 4&nbsp;KB clusters, 20,000 small files (169&nbsp;MB) were safe to remove after 5.3&nbsp;s through flashcp's driver, against 74&nbsp;s with the Linux kernel driver on the same stick and format (single runs). On a stick formatted the usual way the same copy took 94&nbsp;s against 259&ndash;371&nbsp;s. Big files gain little, and results vary by drive. <a href="#benchmarks">See the benchmarks</a>.</p>
+        <p class="pitch">Copying thousands of small files to a USB stick is slow. flashcp makes it fast, and the drive stays a normal exFAT drive. On a Kingston DataTraveler 3.0 USB 3 stick with 4&nbsp;KB clusters, 20,000 small files (169&nbsp;MB) were safe to remove after 5.3&nbsp;s through flashcp's driver. With the Linux kernel driver on the same stick and format, copying and unmounting took 50&nbsp;s in one run and about 72&nbsp;s in another: roughly 10&times; longer (single runs). On a stick formatted the usual way the same copy took 94&nbsp;s against 259&ndash;371&nbsp;s. Big files gain little, and results vary by drive. <a href="#benchmarks">See the benchmarks</a>.</p>
 
         <div class="cta-row">
           <a class="btn btn-primary" href="https://github.com/zuhuHix/flashcp">GitHub repo</a>
@@ -87,9 +87,9 @@ flashcp drive-mode off</code></pre>
   <section class="section section-alt" id="drive-mode" aria-labelledby="drive-mode-title">
     <div class="container">
       <h2 id="drive-mode-title">Drive mode</h2>
-      <p class="lede">In the next release (0.3.0; merged, not released yet), Linux only. Once the desktop package is installed, every USB exFAT drive is served by flashcp's own exFAT driver (<code>flashcp mount</code>, in userspace over FUSE), so copies from any app go through flashcp. There is nothing to open.</p>
+      <p class="lede">In the next release (0.3.0; merged, not released yet), Linux only. Once the desktop package is installed, eligible USB exFAT drives are served by flashcp's own exFAT driver (<code>flashcp mount</code>, in userspace over FUSE), so copies from any app go through flashcp. A drive that is busy or fails the clean-volume check falls back to the kernel driver. There is nothing to open.</p>
       <figure class="media">
-        <video data-light="media/drive-mode-light.mp4" data-dark="media/drive-mode-dark.mp4" muted loop playsinline preload="metadata" aria-label="Drive mode. A USB stick is plugged in and flashcp's driver takes it over. A file manager, a browser and a terminal drop files; they land in the driver's staging area at once (the apps are done after 0.9 s) and stream to the stick in one ordered run. Eject shows Saving, then KINGSTON can be removed after 5.3 s. The kernel driver, on the same stick and format, needs 74.0 s for the same copy: 13.9 times longer. Kingston DataTraveler 3.0, 20,000 files, 169 MB, 4 KB clusters, single runs."></video>
+        <video data-light="media/drive-mode-light.mp4" data-dark="media/drive-mode-dark.mp4" muted loop playsinline preload="metadata" aria-label="Drive mode. A USB stick is plugged in and flashcp's driver takes it over. A file manager, a browser and a terminal drop files; they land in the driver's staging area at once and stream to the stick in one ordered run. The three apps are an illustration: the 0.9 s shown is the measured return of one cp -r of all 20,000 files. Eject shows Saving, then KINGSTON can be removed after 5.3 s. The kernel driver, on the same stick and format, needed 50 to 74 s for the same copy in two runs: about 9 to 14 times longer. Kingston DataTraveler 3.0, 20,000 files, 169 MB, 4 KB clusters, single runs."></video>
       </figure>
       <ul class="plain-list">
         <li><strong>What you see.</strong> The drive appears as usual at <code>/media/&lt;user&gt;/&lt;LABEL&gt;</code>. Eject shows &ldquo;Saving N&nbsp;MB to LABEL&hellip;&rdquo; and then &ldquo;LABEL can be removed&rdquo;. Pulling it out mid-save gives a warning, and the next plug-in repairs it from the journal. Drives that aren't clean exFAT, or that are busy, fall back to the normal kernel driver.</li>
@@ -99,11 +99,11 @@ flashcp drive-mode off</code></pre>
       </ul>
       <div class="table-wrap">
         <table class="results">
-          <caption>20k small files (169&nbsp;MB), kernel exfat driver vs <code>flashcp mount</code>. Durable = until the data is on the drive and it is unmounted. Medians of 3 unless marked. The Kingston's kernel range is how the copy ends: unmount only (259&nbsp;s) to <code>sync</code> + unmount (371&nbsp;s).</caption>
+          <caption>20k small files (169&nbsp;MB), kernel exfat driver vs <code>flashcp mount</code>. Durable = until the data is on the drive and it is unmounted. Medians of 3 unless marked. On 4&nbsp;KB clusters the kernel's copy + unmount took 50.3&nbsp;s in one run and about 72&nbsp;s in another, so drive mode was about 9&ndash;14&times; sooner. On 128&nbsp;KB clusters the kernel figures are whole runs (formatting and mounting are under 1&nbsp;s of them, measured 0.46&nbsp;s): 259&ndash;289&nbsp;s ending with an unmount (2.8&ndash;3.1&times;) and up to 371&nbsp;s with a final <code>sync</code> (4.0&times;). In the animation, 0.9&nbsp;s is the measured return of one <code>cp -r</code>; the three apps are an illustration.</caption>
           <thead><tr><th scope="col">Drive</th><th scope="col"></th><th scope="col" class="num">kernel</th><th scope="col" class="num">flashcp</th></tr></thead>
           <tbody>
-            <tr><th scope="row" rowspan="5">Kingston DataTraveler 3.0 (USB 3, BOT)</th><td>durable copy, 4&nbsp;KB clusters (1 run each)</td><td class="num">74.0&nbsp;s</td><td class="num"><strong>5.31&nbsp;s</strong></td></tr>
-            <tr><td>durable copy, default 128&nbsp;KB clusters (1 run each)</td><td class="num">259&ndash;371&nbsp;s</td><td class="num"><strong>93.8&nbsp;s</strong></td></tr>
+            <tr><th scope="row" rowspan="5">Kingston DataTraveler 3.0 (USB 3, BOT)</th><td>durable copy, 4&nbsp;KB clusters (single runs)</td><td class="num">50&ndash;72&nbsp;s</td><td class="num"><strong>5.31&nbsp;s</strong></td></tr>
+            <tr><td>durable copy, default 128&nbsp;KB clusters (single runs)</td><td class="num">259&ndash;371&nbsp;s</td><td class="num"><strong>93.8&nbsp;s</strong></td></tr>
             <tr><td>the same, earlier session</td><td class="num">315.1&nbsp;s (1 run)</td><td class="num"><strong>73.8&nbsp;s</strong></td></tr>
             <tr><td><code>cp</code> returns (128&nbsp;KB, earlier session)</td><td class="num">0.61&nbsp;s (1 run)</td><td class="num">1.22&nbsp;s</td></tr>
             <tr><td>read back (128&nbsp;KB, earlier session)</td><td class="num">10.81&nbsp;s</td><td class="num"><strong>8.29&nbsp;s</strong></td></tr>
@@ -127,7 +127,7 @@ flashcp drive-mode off</code></pre>
       </figure>
       <ul class="plain-list">
         <li><strong>What it costs.</strong> For the 20,000-file test set (169&nbsp;MB) the Kingston stick had to write 2.6&nbsp;GB on 128&nbsp;KB clusters and 211&nbsp;MB on 4&nbsp;KB clusters. Same stick, same files, same driver (drive mode, single runs): 93.8&nbsp;s against 5.31&nbsp;s.</li>
-        <li><strong>What helps.</strong> <code>flashcp build</code> picks the cluster size for your data, and <code>flashcp optimize</code> converts a stick that already holds files. The kernel driver gains too: it copied these files in 74&nbsp;s onto a 4&nbsp;KB-cluster stick, against 259&ndash;371&nbsp;s onto a default-format one.</li>
+        <li><strong>What helps.</strong> <code>flashcp build</code> picks the cluster size for your data, and <code>flashcp optimize</code> converts a stick that already holds files. The kernel driver gains too: it copied these files in 52&ndash;74&nbsp;s onto a 4&nbsp;KB-cluster stick, against 259&ndash;371&nbsp;s onto a default-format one.</li>
         <li><strong>Coming next.</strong> Changing the cluster size in place, without moving file data (<a href="https://github.com/zuhuHix/flashcp/pull/26">#26</a>, not merged yet).</li>
         <li><strong>Big files don't suffer.</strong> On the USB 2.0 stick the kernel copied one 512&nbsp;MB file onto a 4&nbsp;KB-cluster stick in 86.0&nbsp;s, against 107.7&nbsp;s onto a default-format one.</li>
       </ul>
@@ -136,7 +136,7 @@ flashcp drive-mode off</code></pre>
         <li><strong>Photos, music and video (about 5&nbsp;MB and up):</strong> about 1.0&ndash;1.3&times; on the sticks. That is an estimate from byte counts and the drives' measured rates, not a timed run; the one timed case, a 512&nbsp;MB file on the USB 2.0 stick, took 87.5&nbsp;s with <code>flashcp build</code> and 86.0&nbsp;s with the kernel driver on the same 4&nbsp;KB format.</li>
         <li><strong>Reading a stick another system filled:</strong> on par with <code>cp</code> on the USB 2.0 stick (29.52&nbsp;s against 30.86&nbsp;s), 1.4&times; on the USB 3 stick.</li>
         <li><strong>A fast SSD in drive mode:</strong> 1.26&nbsp;s against 1.80&nbsp;s. The big SSD gains are in build, add and pull.</li>
-        <li><strong>A default-format stick</strong> stays slow for small files until it has small clusters: drive mode was 2.8&ndash;4.0&times; sooner there, not 13.9&times;.</li>
+        <li><strong>A default-format stick</strong> stays slow for small files until it has small clusters: drive mode was 2.8&ndash;4.0&times; sooner there, not 9&ndash;14&times;.</li>
       </ul>
     </div>
   </section>

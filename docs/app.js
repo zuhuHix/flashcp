@@ -127,8 +127,8 @@
       build: {
         // Afternoon session, single runs. build of `many` has no baseline (not run, ≈25 min), so it is not shown.
         small: { cases: [
-          { sub: 'Like for like: 4 KB clusters on both sides (mkfs.exfat -c 4K + cp + unmount) · single runs; the build took 2.72 s in the afternoon and 9.02 s in the morning', base: 74.0, baseLabel: '74.0 s', flash: 2.72, flashLabel: '2.72–9.02 s', xLabel: '8–27×' },
-          { sub: 'If you just format and copy: the kernel on the default 128 KB clusters (259 s ending with unmount, 371 s with sync + unmount), flashcp build on 4 KB', base: 258.8, baseLabel: '259–371 s (128 KB)', flash: 2.72, flashLabel: '2.72–9.02 s (4 KB)', xLabel: NO_X }
+          { sub: 'Like for like: 4 KB clusters on both sides, formatting included (mkfs.exfat -c 4K + mount + cp + unmount took 52.2 s and 74.0 s) · single runs; the build took 2.72 s in the afternoon and 9.02 s in the morning', base: 52.2, baseLabel: '52.2–74.0 s', flash: 2.72, flashLabel: '2.72–9.02 s', xLabel: '6–27×' },
+          { sub: 'If you just format and copy: the kernel on the default 128 KB clusters (259–289 s ending with unmount, 371 s with sync + unmount), flashcp build on 4 KB', base: 258.8, baseLabel: '259–371 s (128 KB)', flash: 2.72, flashLabel: '2.72–9.02 s (4 KB)', xLabel: NO_X }
         ] }
       },
       add: {
@@ -138,8 +138,8 @@
       },
       mode: {
         small: { cases: [
-          { sub: 'Copy until safe to remove, 4 KB clusters on both sides · single runs', base: 74.0, baseLabel: '74.0 s', flash: 5.31, flashLabel: '5.31 s', xLabel: '13.9×' },
-          { sub: 'Copy until safe to remove, default 128 KB clusters on both sides · single runs; the kernel took 259 s ending with unmount and 371 s with sync + unmount', base: 258.8, baseLabel: '259–371 s', flash: 93.8, flashLabel: '93.8 s', xLabel: '2.8–4.0×' }
+          { sub: 'Copy until safe to remove, 4 KB clusters on both sides · single runs; the kernel’s copy + unmount took 50.3 s in one run and about 72 s in another (74.0 s with ≈2 s of formatting and mounting)', base: 50.3, baseLabel: '50.3–72 s', flash: 5.31, flashLabel: '5.31 s', xLabel: '9–14×' },
+          { sub: 'Copy until safe to remove, default 128 KB clusters on both sides · single runs; the kernel figures are whole runs (formatting and mounting are 0.46 s of them): 259 s and 289 s ending with unmount (2.8–3.1×), 371 s with sync + unmount (4.0×)', base: 258.8, baseLabel: '259–371 s', flash: 93.8, flashLabel: '93.8 s', xLabel: '2.8–4.0×' }
         ] }
       },
       pull: {

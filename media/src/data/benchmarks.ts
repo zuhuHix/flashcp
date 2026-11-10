@@ -4,6 +4,9 @@
 // Sources:
 //   [K]   Kingston DataTraveler 3.0 128 GB (USB 3, usb-storage/BOT), 2026-11-10 16:33-17:07,
 //         dataset `small` (20,000 files / 169 MB), SINGLE runs, fsck clean after every write.
+//   [K2]  the same stick at 18:09, kernel driver only, ending with unmount, phases timed:
+//         4 KB clusters:   mkfs 1.53 | mount 0.38 | cp + unmount 50.28 | all 52.20 s
+//         128 KB clusters: mkfs 0.08 | mount 0.38 | cp + unmount 288.26 | all 288.72 s
 //   [#18] PR 18 (Kingston, morning session), [#22] PR 22 (drive mode core), [#9] PR 9 (SanDisk),
 //         [#7] PR 7 and [#6] PR 6 (MSI SSD and SanDisk build / add / pull).
 // A number that is not in one of these does not belong in an animation.
@@ -42,8 +45,11 @@ export type BenchPage = {
 export const DATASET = {files: 20000, mb: 169};
 
 export const BENCH_PAGES = {
-  // [K] unless marked. 74.0 / 5.31 = 13.9; 74.0 / 9.02 = 8.2 and 74.0 / 2.72 = 27.2;
-  // 258.8 / 93.8 = 2.8 and 370.7 / 93.8 = 4.0.
+  // [K] and [K2]. The kernel copied onto a 4 KB stick twice: 73.98 s in all at 16:5x (about 2 s
+  // of it mkfs + mount) and 50.28 s for cp + unmount at 18:09 (52.20 s in all).
+  // Drive mode (cp + unmount + commit, no formatting): 50.28 / 5.31 = 9.5 and 73.98 / 5.31 = 13.9.
+  // Build (formats too, so against the kernel totals): 52.20 / 9.02 = 5.8 and 73.98 / 2.72 = 27.2.
+  // 128 KB: 258.8 / 93.8 = 2.8, 288.7 / 93.8 = 3.1 (both unmount only), 370.7 / 93.8 = 4.0 (sync).
   usb3: {
     title: 'USB 3 stick · Kingston DataTraveler 3.0 · 20,000 small files',
     baseLegend: 'Linux kernel driver (mkfs + cp)',
@@ -54,30 +60,31 @@ export const BENCH_PAGES = {
       {
         name: 'drive mode copy',
         sub: '4 KB-cluster stick',
-        base: {value: 74.0, label: '74.0'},
+        base: {value: 50.3, max: 74.0, label: '50–74'},
         flash: {value: 5.31, label: '5.31'},
-        pill: '13.9×',
+        pill: '9–14×',
       },
       {
         name: 'build',
         sub: 'blank stick, 4 KB both',
-        base: {value: 74.0, label: '74.0'},
+        base: {value: 52.2, max: 74.0, label: '52–74'},
         // 2.72 s [K]; 9.02 s [#18]: the stick has a fast phase, so small builds vary
         flash: {value: 2.72, max: 9.02, label: '2.72–9.02'},
-        pill: '8–27×',
+        pill: '6–27×',
       },
       {
         name: 'drive mode copy',
         sub: 'default 128 KB clusters',
-        // umount only 258.8 s, sync -f + umount 315.5 s, sync + umount 370.7 s
+        // whole runs (mkfs + mount are 0.46 s of them): unmount only 258.8 s [K] and 288.7 s [K2],
+        // sync -f + unmount 315.5 s, sync + unmount 370.7 s
         base: {value: 258.8, max: 370.7, label: '259–371'},
         flash: {value: 93.8, label: '93.8'},
         pill: '2.8–4.0×',
       },
     ],
     notes: [
-      'single runs · the kernel range is how the copy ends: unmount only (259 s) to sync + unmount (371 s)',
-      'small builds vary with the stick’s state (it has a fast first phase), so they are a range',
+      'single runs · 128 KB kernel copies: 259–289 s ending with unmount, up to 371 s with a final sync',
+      '4 KB kernel copies: 50–74 s over two runs · small builds vary with the stick’s state',
     ],
   },
   // [#6] [#7] medians of 3; drive mode row [#22] (durable copy, medians of 3).
@@ -169,17 +176,20 @@ export const BENCH_PAGES = {
 
 export type BenchPageId = keyof typeof BENCH_PAGES;
 
-// Drive mode hero: one copy of `small` onto the Kingston with 4 KB clusters. [K]
+// Drive mode hero: one copy of `small` onto the Kingston with 4 KB clusters. [K] [K2]
 export const DRIVE_MODE = {
   label: 'KINGSTON',
-  /** `cp -r` returned after 0.93 s */
+  /** one `cp -r` of the 20,000 files returned after 0.93 s */
   appDoneS: 0.93,
   /** cp + unmount + the final commit: the stick can be removed */
   durableS: 5.31,
-  /** kernel exfat driver on the same 4 KB format: mkfs + mount + cp + unmount */
-  kernelS: 74.0,
-  /** 74.0 / 5.31 */
-  speedup: '13.9×',
+  /** kernel exfat driver, same 4 KB format, cp + unmount: the faster of its two runs.
+   *  The strip is drawn at this pace. */
+  kernelS: 50.28,
+  /** both kernel runs: 50.28 s, and 73.98 s that includes about 2 s of mkfs + mount */
+  kernelLabel: '50–74',
+  /** 50.28 / 5.31 = 9.5 to 73.98 / 5.31 = 13.9 */
+  speedup: '9–14×',
   footnote: 'Kingston DataTraveler 3.0 (USB 3) · 20,000 files, 169 MB · 4 KB clusters · single runs',
 };
 

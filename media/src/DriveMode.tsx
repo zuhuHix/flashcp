@@ -8,11 +8,12 @@ import {EASE_IO, EASE_OUT, FONT, MONO, Palette, PALETTES, Theme, fmt, pop, ramp,
 //
 // A stick is plugged in and flashcp's driver takes it over. Three apps drop files; they land in
 // the driver's staging lane at once and leave for the stick as one ordered stream. Eject shows
-// the real notification ("Saving N MB to LABEL…", then "LABEL can be removed"). Below, the kernel
-// driver does the same copy on the same stick with one metadata round trip per file.
+// the real notification texts (src/daemon.rs). Below, the kernel driver does the same copy on the
+// same stick with one metadata round trip per file. The three apps are an illustration: the
+// measured copy was one `cp -r`, and appDoneS is when it returned.
 //
 // Both clocks run on ONE time scale: frame COPY_T0 is 0 s and frame DONE is DRIVE_MODE.durableS,
-// so the kernel strip is exactly as far as kernelS allows when flashcp is done.
+// so the kernel strip is exactly as far as kernelS (its faster run) allows when flashcp is done.
 const W = 1200;
 const H = 600;
 export const DRIVE_MODE_FRAMES = 390;
@@ -48,7 +49,7 @@ const SLOT_PY = 40;
 const PIPE_Y = 222;
 const STICK = {x: 860, y: 150, w: 280, h: 150};
 const BAR = {x: 880, y: 202, w: 240, h: 40, cells: 24};
-const TOAST_BOX = {x: 740, y: 24, w: 400, h: 80};
+const TOAST_BOX = {x: 740, y: 22, w: 400, h: 108};
 
 // ---- files: 24 tiles, 8 per app, launched one per frame so all three apps feed the lane at once ----
 const N = 24;
@@ -237,7 +238,7 @@ export const DriveMode: React.FC<{theme: Theme}> = ({theme}) => {
             </g>
           ))}
           <text x={APP_X} y={368} fontSize={22} fill={P.muted} opacity={ramp(f, APP_DONE, APP_DONE + 8) * keep}>
-            {'the apps are done after '}
+            {'a cp -r of all 20,000 files returns after '}
             <tspan fontWeight={700} fill={P.text}>{`${fmt(DRIVE_MODE.appDoneS)} s`}</tspan>
           </text>
 
@@ -358,20 +359,20 @@ export const DriveMode: React.FC<{theme: Theme}> = ({theme}) => {
             <rect x={TOAST_BOX.x} y={TOAST_BOX.y} width={TOAST_BOX.w} height={TOAST_BOX.h} rx={14} fill={P.panel} stroke={done ? P.teal : P.border} strokeWidth={2.5} />
             {/* saving: a turning arc; done: a tick */}
             <g opacity={1 - doneP}>
-              <circle cx={TOAST_BOX.x + 30} cy={TOAST_BOX.y + 40} r={12} fill="none" stroke={P.grid} strokeWidth={4} />
+              <circle cx={TOAST_BOX.x + 28} cy={TOAST_BOX.y + 54} r={12} fill="none" stroke={P.grid} strokeWidth={4} />
               <path
-                d={`M${TOAST_BOX.x + 30} ${TOAST_BOX.y + 28} a12 12 0 0 1 12 12`}
+                d={`M${TOAST_BOX.x + 28} ${TOAST_BOX.y + 42} a12 12 0 0 1 12 12`}
                 fill="none"
                 stroke={P.teal}
                 strokeWidth={4}
                 strokeLinecap="round"
-                transform={`rotate(${(f - TOAST) * 14} ${TOAST_BOX.x + 30} ${TOAST_BOX.y + 40})`}
+                transform={`rotate(${(f - TOAST) * 14} ${TOAST_BOX.x + 28} ${TOAST_BOX.y + 54})`}
               />
             </g>
-            <g opacity={doneP} transform={scaleAt(TOAST_BOX.x + 30, TOAST_BOX.y + 40, pop(f, DONE, fps))}>
-              <circle cx={TOAST_BOX.x + 30} cy={TOAST_BOX.y + 40} r={14} fill={P.teal} />
+            <g opacity={doneP} transform={scaleAt(TOAST_BOX.x + 28, TOAST_BOX.y + 54, pop(f, DONE, fps))}>
+              <circle cx={TOAST_BOX.x + 28} cy={TOAST_BOX.y + 54} r={14} fill={P.teal} />
               <path
-                d={`M${TOAST_BOX.x + 23} ${TOAST_BOX.y + 40} l5 6 l9 -11`}
+                d={`M${TOAST_BOX.x + 21} ${TOAST_BOX.y + 54} l5 6 l9 -11`}
                 fill="none"
                 stroke={P.pillText}
                 strokeWidth={3.5}
@@ -380,18 +381,22 @@ export const DriveMode: React.FC<{theme: Theme}> = ({theme}) => {
               />
             </g>
             <g opacity={1 - doneP}>
-              <text x={TOAST_BOX.x + 56} y={TOAST_BOX.y + 34} fontSize={22} fontWeight={700} fill={P.text} style={{fontVariantNumeric: 'tabular-nums'}}>
+              <text x={TOAST_BOX.x + 52} y={TOAST_BOX.y + 34} fontSize={22} fontWeight={700} fill={P.text} style={{fontVariantNumeric: 'tabular-nums'}}>
                 {`Saving ${pendingMb} MB to ${DRIVE_MODE.label}…`}
               </text>
-              <text x={TOAST_BOX.x + 56} y={TOAST_BOX.y + 64} fontSize={22} fill={P.muted}>
-                Don’t remove the drive yet
+              {/* the notification's real body text, on two lines */}
+              <text x={TOAST_BOX.x + 52} y={TOAST_BOX.y + 63} fontSize={22} fill={P.muted}>
+                Don't remove the drive yet: you'll
+              </text>
+              <text x={TOAST_BOX.x + 52} y={TOAST_BOX.y + 90} fontSize={22} fill={P.muted}>
+                be told when it can be removed.
               </text>
             </g>
             <g opacity={doneP}>
-              <text x={TOAST_BOX.x + 56} y={TOAST_BOX.y + 34} fontSize={22} fontWeight={700} fill={P.text}>
+              <text x={TOAST_BOX.x + 52} y={TOAST_BOX.y + 46} fontSize={22} fontWeight={700} fill={P.text}>
                 {`${DRIVE_MODE.label} can be removed`}
               </text>
-              <text x={TOAST_BOX.x + 56} y={TOAST_BOX.y + 64} fontSize={22} fill={P.muted}>
+              <text x={TOAST_BOX.x + 52} y={TOAST_BOX.y + 76} fontSize={22} fill={P.muted}>
                 Everything was saved.
               </text>
             </g>
@@ -458,7 +463,7 @@ export const DriveMode: React.FC<{theme: Theme}> = ({theme}) => {
               {`${fmt(realS)} s`}
             </text>
             <text x={950} y={512} fontSize={22} fill={P.muted} opacity={kernelDone}>
-              {`of ${fmt(DRIVE_MODE.kernelS)} s`}
+              {`of ${DRIVE_MODE.kernelLabel} s`}
             </text>
           </g>
 
