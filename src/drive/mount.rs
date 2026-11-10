@@ -24,6 +24,7 @@ pub struct MountArgs {
     pub control: Option<PathBuf>,
     pub device_fd: Option<i32>,
     pub idle_ms: u64,
+    pub close_ms: u64,
     pub max_dirty_mb: Option<u64>,
     pub threads: usize,
 }
@@ -367,7 +368,11 @@ pub fn run_mount(a: MountArgs) -> i32 {
         }
     };
     // 2. the driver
-    let mut opts = FsOpts { idle: Duration::from_millis(a.idle_ms), ..FsOpts::default() };
+    let mut opts = FsOpts {
+        idle: Duration::from_millis(a.idle_ms),
+        close_linger: Duration::from_millis(a.close_ms),
+        ..FsOpts::default()
+    };
     if let Some(mb) = a.max_dirty_mb {
         opts.max_dirty = mb.max(1) << 20;
     }

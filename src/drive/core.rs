@@ -140,6 +140,8 @@ pub(crate) struct Core {
     pub(crate) commits: u64,
     /// Open handles (sum of `Inode::opens`).
     pub(crate) opened: u64,
+    /// Open handles with write access.
+    pub(crate) writers: u64,
     /// Every change up to this `seq` is durable (a full commit planned at it finished).
     pub(crate) durable_seq: u64,
 }
@@ -280,6 +282,7 @@ impl Core {
             journal: None,
             commits: 0,
             opened: 0,
+            writers: 0,
             durable_seq: 0,
         };
         c.inodes.insert(ROOT, root);

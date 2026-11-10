@@ -296,6 +296,10 @@ enum Cmd {
         /// Commit this long after the last write
         #[arg(long, default_value_t = 1000, value_name = "MS")]
         idle_ms: u64,
+        /// Commit this long after the last file open for writing is closed (0: off). `sync` and
+        /// `syncfs` never reach a FUSE driver, so this bounds what is pending after a copy
+        #[arg(long, default_value_t = 150, value_name = "MS")]
+        close_ms: u64,
         /// Writers block once this many MB are pending (default 256)
         #[arg(long, value_name = "MB")]
         max_dirty_mb: Option<u64>,
@@ -365,7 +369,18 @@ fn main() {
     }
     // `flashcp sim` replays traces and never touches a device: it is not traced itself (its
     // recordings run flashcp in child processes, each with its own trace file).
-    if let Cmd::Mount { device, mountpoint, check, json, control, device_fd, idle_ms, max_dirty_mb, threads } = cli.cmd
+    if let Cmd::Mount {
+        device,
+        mountpoint,
+        check,
+        json,
+        control,
+        device_fd,
+        idle_ms,
+        close_ms,
+        max_dirty_mb,
+        threads,
+    } = cli.cmd
     {
         // No trace, no environment: --check runs in a sandbox that allows almost nothing.
         let code = if check {
@@ -378,6 +393,7 @@ fn main() {
                 control,
                 device_fd,
                 idle_ms,
+                close_ms,
                 max_dirty_mb,
                 threads,
             })
