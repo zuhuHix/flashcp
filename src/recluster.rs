@@ -110,7 +110,8 @@ const SYNC_EVERY: u64 = 32 << 20;
 const ROOT_SLACK: u64 = 2048;
 /// Test hook: stop (with an error, as if killed) right after the main boot sector of the
 /// named switch (`relocated` | `reclustered`) is on the medium, before its backup copy: the
-/// window a crash can leave, for the cross-OS checks.
+/// window a crash can leave, for the cross-OS checks. Only with the `test-hooks` feature.
+#[cfg(feature = "test-hooks")]
 const STOP_ENV: &str = "FLASHCP_TEST_RECLUSTER_STOP";
 /// The boot code bytes a switch may tune lie below this offset of sector 0 (see [`neutral`]).
 const NEUTRAL_TOP: usize = 439;
@@ -1663,9 +1664,12 @@ fn switch(f: &File, dev: &dyn Dev, view: &View, name: &str, on_main: &mut dyn Fn
     dev.write_at(&view.sector0, 0).context("write the main boot sector")?;
     dev.sync().context("sync")?;
     on_main();
+    #[cfg(feature = "test-hooks")]
     if std::env::var(STOP_ENV).as_deref() == Ok(name) {
         bail!("stopped by {STOP_ENV} after the main boot sector of the {name} switch");
     }
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = name;
     dev.write_at(&view.sector0, 12 * SECTOR).context("write the backup boot sector")?;
     dev.sync().context("sync")
 }

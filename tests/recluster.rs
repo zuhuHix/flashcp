@@ -108,3 +108,31 @@ fn check_dry_run_run_and_refusal_speak_the_contract() {
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("Refused: "), "{out:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The stop hook of the crash-window CI volume exists only in a `test-hooks` build: in any
+/// other, the variable is ignored and both boot sectors are written.
+#[test]
+fn the_stop_hook_is_not_in_a_normal_build() {
+    if cfg!(feature = "test-hooks") {
+        return;
+    }
+    let dir = common::test_dir("recluster_hook");
+    let (src, img) = (dir.join("src"), dir.join("vol.img"));
+    make_tricky_tree(&src);
+    make_image(&img, 64 * MB);
+    assert_success(&common::run_build(&src, &img, &["--cluster", "32768"]), "flashcp build");
+    for step in ["relocated", "reclustered"] {
+        let out = flashcp()
+            .arg("recluster")
+            .arg(&img)
+            .args(["--cluster", if step == "relocated" { "8192" } else { "4096" }])
+            .env("FLASHCP_TEST_RECLUSTER_STOP", step)
+            .output()
+            .unwrap();
+        assert_success(&out, "flashcp recluster with the stop variable set");
+        let b = std::fs::read(&img).unwrap();
+        assert_eq!(b[..512], b[12 * 512..13 * 512], "{step}: the backup boot sector was not written");
+    }
+    fsck_clean(&img);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -125,7 +125,8 @@ boot sector is then zeroed, or given one wrong byte (so its checksum no longer f
 whether an OS mounts a volume whose main boot region is right and whose backup is invalid
 (Windows: no; it also refuses `recl-crash-window`, whose backup is valid but older).
 
-`recl-crash-window` runs the recluster with `FLASHCP_TEST_RECLUSTER_STOP=reclustered`. The command
+`recl-crash-window` runs the recluster with `FLASHCP_TEST_RECLUSTER_STOP=reclustered` (a hook that exists only in a
+`--features test-hooks` build, which `xos.yml` makes; release builds ignore the variable). The command
 stops with exit 1 (the build requires exactly that, and the hook's message in the output) after
 writing the main boot sector of the final switch and before the backup boot sector. The main boot
 region is the new volume, the backup is the previous one, and both are valid. The build then
