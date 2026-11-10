@@ -109,6 +109,7 @@ The device is modelled as follows:
 |---|---|
 | `sandisk-cruzer-usb2` | **Fitted.** Writes from the probe (4K 1.64 ms, 8M 6.5 MB/s → `wr.cmd` 1.05 ms, `wr.bw` 6.88 MB/s; reproduces 64K 6.2 and 1M 6.45 MB/s). `ftl.open_cost` 19.2 ms from random 4K QD1 at 48 IOPS. `rd.bw` 13.8 MB/s from the cached read probe. `max_req` 120 KB from sysfs. Read jump/stream costs, `wr.qpen`, `ftl.merge`/`copy_bw` and GC were tuned on the end-to-end scenarios below (so calibration does **not** start from them, see below). |
 | `msi-datamag-uas` | **Fitted to the probe:** 4K QD1 97 MB/s and 8M 999 MB/s → `cmd` 18 µs, `ser` 20 µs, `bw` 1.02 GB/s. 32 lanes. Reads assumed equal to writes, and `ser`, `max_req` 1 MiB and `flush` are GUESSES. End-to-end MSI runs are 0.3–2.3 s and mostly host time. |
+| `kingston-dt3-usb3` | **Probe-only:** the cache entry flashcp wrote for the stick (`flashcp probe` writes, pull's read micro-probe) on the generic BOT preset. The held-out test below shows that its absolute times are off by about 50 %. |
 | `usb2-cheap`, `usb3-midrange`, `nvme-usb` | **GUESSES** at typical drives of their class, for what-if comparisons only. Nothing of these classes was measured. |
 
 `--profile` also accepts a model file (`flashcp-simmodel 1`, `key=value`, as printed by `flashcp sim profiles NAME`) or a devprofile cache file. The latter turns any device flashcp has measured (`flashcp probe`, add's write probe, pull's read probe) into a model, with the unmeasured parameters taken from its transport's generic preset.
@@ -189,6 +190,16 @@ The family number is the honest one for "a workload the model has not seen".
 | median abs error | 3.9 % | 12.8 % | **9.0 %** |
 | rankings | 3/3 | 3/3 | **3/3** |
 
+**Re-run 2026-11-10** (all three drives, every trace re-recorded, 6 min 44 s):
+
+| drive | held out, point-wise | held out, by family | rankings |
+|---|---:|---:|---:|
+| SanDisk | 4.2 % | 7.1 % | 11/11 |
+| MSI | 15.8 % | 14.9 % | **2/3** |
+| Kingston | 46.0 % | 53.5 % | 2/2 |
+
+The MSI `mixed` pair flipped. Its real gap is 8 % (1.68 vs 1.82 s), inside the host-time noise of re-recording a host-bound drive, so MSI rankings closer than ~10 % are not reliable.
+
 Almost every MSI scenario is a family of its own, so the family CV is close to leave-one-out. With only 3 ranking pairs, the MSI validation is weak: treat MSI predictions as rough. MSI runs are host-bound, and their numbers move by a few points between recordings: an earlier recording gave 11.6 % held out.
 
 | scenario | real s | range | held-out s | error | family held-out s | error | flag |
@@ -219,6 +230,43 @@ Almost every MSI scenario is a family of its own, so the family CV is close to l
 - **512 B-cluster pull (+21 %), 4K writes and 1 MB reads in the probe:** these are small effects of request alignment that the model does not have.
 - **Kernel-layout pulls held out as a family (SanDisk, +18–19 %):** with the whole kernel-layout family withheld, nothing constrains the forward-jump cost, and the prior's generic value is too high. Point-wise they are within 6 %.
 - **MSI** is host-bound. Its error depends on how closely the recording machine matches the measuring one, and on recording one at a time. The fit absorbs part of the difference into `host_scale` (≈0.5). The outliers are the `mixed` pulls (±27–29 %), `msi-add-empty128k` and the 4K probe.
+
+## Held-out test on a third drive: Kingston DataTraveler 3.0 (2026-11-10)
+
+This is a drive the model had never seen: 128 GB, USB 3.0 5 Gbps, usb-storage (BOT), max request 1 MB, partition at sector 134400.
+
+**Probe.** `flashcp probe` ran on a fresh exFAT on the stick:
+
+- seq writes: 4K 1.2 / 64K 57.5 / 1M 55.3 / 8M 82.7 MB/s;
+- random 4K QD1: 254 IOPS;
+- flush: 1.88 ms.
+
+`flashcp probe` does not measure reads, so an O_DIRECT `dd` read probe was added (4K 26.6 / 1M 235 MB/s).
+
+**Blind prediction.** The probe-only profile (generic BOT preset plus these numbers, the path `--profile <devprofile>` takes) predicted the runs **before** any end-to-end run. The hardware runs below are medians of 3, except where a single run is noted. All builds and adds passed `fsck.exfat -n`, and the pulls of the kernel layout, flashcp `small` and flashcp `many` matched byte for byte.
+
+| op | normal (kernel, timed incl. mount/sync/umount) | flashcp | × | blind sim | blind error |
+|---|---:|---:|---:|---:|---:|
+| build small (vs mkfs + cp) | 304 s (1 run) | 9.02 s | 34× | 3.85 s | −57 % |
+| build many | not run (≈25 min) | 22.3 s | – | 10.4 s | −53 % |
+| pull small, kernel layout (vs cp) | 11.3 s | 7.96 s | 1.4× | 14.6 s | +84 % |
+| pull small, flashcp layout (vs cp) | 7.2 s | 1.15 s | 6.2× | 2.17 s | +89 % |
+| pull many, flashcp layout (vs cp) | 38.6 s | 3.60 s | 10.7× | 5.66 s | +57 % |
+| add small onto a kernel-filled stick (vs mount + cp) | 527 s (1 run) | 93.3 s (1 run) | 5.7× | 389 s* | +317 % |
+
+\* The blind recording assumed add's probe would choose skip-all. On the stick it chose **fill**: 93.3 s, against 144.3 s with skip forced (both 1 run). The blind skip prediction (389 s) is +169 % against the measured skip.
+
+The blind errors are large, in both directions:
+
+- **Writes are predicted too fast (≈ −55 %).** The probe's 82.7 MB/s at 8 MB is a burst rate: `build` sustains ≈24 MB/s.
+- **Reads are predicted too slow (+57–89 %).** The generic BOT preset's jump and stream costs are USB 2 guesses.
+- **Small writes do not fit the model at all.** 4K *sequential* writes are slower (1.2 MB/s) than 4K *random* ones (254 IOPS ≈ 1.0 MB/s, versus 3.4 ms for a sequential 4K). That points to a sub-page (read-modify-write) penalty that the model does not have.
+
+**Calibrated** on its own 15 points (10 families), the Kingston reaches a median abs error of 12.5 % fitted, but **46 % held out** point-wise and **54 % by family**. Both of its rankings are right (flashcp layout pull < kernel layout pull; fill < skip on 128 KB clusters, which is the decision add's probe made on the stick).
+
+The honest conclusion: **on a USB 3 BOT stick, the model ranks strategies correctly, but its absolute times are not trustworthy, blind or calibrated.** It needs two terms it lacks: a sustained vs burst write rate (SLC-cache-like), and a small-write penalty below the flash page size. A sustained-write probe (≥ 1 GB) and a 16K/32K write size sweep would pin them.
+
+Side finding: add's in-situ probe estimated "fill 2 s" for the whole add, from 3 × 4 MB units, but the add took 93 s. The probe's choice was right; its time extrapolation was 45× off.
 
 ## Sweeps that reproduce known decisions
 

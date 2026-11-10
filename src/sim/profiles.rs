@@ -11,7 +11,8 @@ use crate::sim::model::{DirCost, Model, Transport};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
-const NAMES: &[&str] = &["sandisk-cruzer-usb2", "msi-datamag-uas", "usb2-cheap", "usb3-midrange", "nvme-usb"];
+const NAMES: &[&str] =
+    &["sandisk-cruzer-usb2", "msi-datamag-uas", "kingston-dt3-usb3", "usb2-cheap", "usb3-midrange", "nvme-usb"];
 
 pub fn builtin_names() -> &'static [&'static str] {
     NAMES
@@ -22,6 +23,7 @@ pub fn builtin(name: &str) -> Option<Model> {
     Some(match name {
         "sandisk-cruzer-usb2" | "sandisk" => sandisk(),
         "msi-datamag-uas" | "msi" => msi(),
+        "kingston-dt3-usb3" | "kingston" => kingston(),
         "usb2-cheap" => usb2_cheap(),
         "usb3-midrange" => usb3_midrange(),
         "nvme-usb" => nvme_usb(),
@@ -314,7 +316,15 @@ pub fn resolve(spec: &str) -> Result<Model> {
     if let Ok(d) = parsed {
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "device".into());
         let has_name = text.lines().any(|l| l.trim_start().starts_with("sim.name="));
-        let mut m = from_devprofile(&d.profile, if has_name { &d.name } else { &stem });
+        return Ok(from_sim_device(&d, if has_name { &d.name } else { &stem }));
+    }
+    bail!("{}: neither a flashcp-simmodel nor a flashcp-devprofile file", path.display())
+}
+
+/// A model from a sim-device file: [`from_devprofile`] plus its `sim.max_sectors_kb`.
+pub fn from_sim_device(d: &crate::sim::device::SimDevice, name: &str) -> Model {
+    {
+        let mut m = from_devprofile(&d.profile, name);
         if let Some(kb) = d.max_sectors_kb.filter(|&k| k >= 1) {
             let old = m.max_req;
             m.max_req = kb as u64 * 1024;
@@ -327,9 +337,20 @@ pub fn resolve(spec: &str) -> Result<Model> {
                 m.wr.bw = if inv > 0.0 { 1.0 / inv } else { bps };
             }
         }
-        return Ok(m);
+        m
     }
-    bail!("{}: neither a flashcp-simmodel nor a flashcp-devprofile file", path.display())
+}
+
+/// Kingston DataTraveler 3.0 128 GB, USB 3.0 5 Gbps, usb-storage (BOT), max request 1 MB.
+/// PROBE-ONLY: built from what flashcp cached for the stick (`flashcp probe`'s writes, pull's
+/// read micro-probe; `devices/kingston.dev`) on the generic BOT preset, exactly the model a
+/// user gets from `--profile ~/.cache/flashcp/devices/<key>`. It was used for the blind
+/// prediction before any end-to-end run; the end-to-end runs are in scenarios.txt, and
+/// `flashcp sim calibrate --drive kingston` fits it (see SIMULATION.md).
+pub fn kingston() -> Model {
+    let d = crate::sim::device::SimDevice::parse(include_str!("devices/kingston.dev"))
+        .expect("the shipped kingston.dev is valid");
+    from_sim_device(&d, "kingston-dt3-usb3")
 }
 
 #[cfg(test)]

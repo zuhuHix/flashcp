@@ -87,3 +87,29 @@ pair faster=sd-build-small-512  slower=sd-build-small
 pair faster=msi-pull-flashcp    slower=msi-pull-kernel
 pair faster=msi-pull-many-flashcp slower=msi-pull-many-kernel
 pair faster=msi-pull-mixed-flashcp slower=msi-pull-mixed-kernel
+
+# ── Kingston DataTraveler 3.0 128 GB, USB 3.0 5 Gbps, usb-storage (BOT), max request 1024 KB ──
+# Measured 2026-11-10 (flashcp at 54b5b50), medians of 3 unless the range is missing (1 run).
+# The kernel baselines (not simulated) were: mkfs + mount + cp -r small + sync + umount 304 s;
+# mount + cp -r small into a stick holding small 527 s; mount + cp -r + sync + umount reading
+# small from the kernel layout 11.3 s, from the flashcp layout 7.2 s, many from the flashcp
+# layout 38.6 s. mkfs default: 128 KB clusters.
+id=kg-build-small        drive=kingston op=build data=small layout=blank              real=9.02  lo=7.40 hi=9.06 src=hw-2026-11-10
+id=kg-build-many         drive=kingston op=build data=many  layout=blank              real=22.27 lo=18.25 hi=23.70 src=hw-2026-11-10
+id=kg-pull-kernel        drive=kingston op=pull  data=small layout=kernel128k:small   real=7.96  lo=7.89 hi=9.30 src=hw-2026-11-10
+id=kg-pull-flashcp       drive=kingston op=pull  data=small layout=flashcp:small      real=1.15  lo=1.14 hi=1.23 src=hw-2026-11-10
+id=kg-pull-many-flashcp  drive=kingston op=pull  data=many  layout=flashcp:many       real=3.60  lo=3.58 hi=3.64 src=hw-2026-11-10
+id=kg-add-128k-fill      drive=kingston op=add   data=small layout=kernel128k:small args=--to,B env=FLASHCP_TEST_GAP_POLICY=fill:1 real=93.3 src=hw-2026-11-10
+id=kg-add-128k-skip1     drive=kingston op=add   data=small layout=kernel128k:small args=--to,D env=FLASHCP_TEST_GAP_POLICY=skip:1 real=144.3 src=hw-2026-11-10
+# flashcp probe on the stick (seq write 4K 1.2 / 64K 57.5 / 1M 55.3 / 8M 82.7 MB/s, random 4K
+# QD1 254 IOPS, flush 1.88 ms) and an O_DIRECT dd read probe (4K 26.6 / 1M 235 MB/s).
+id=kg-micro-seqw4k       drive=kingston op=micro kind=seqw bs=4096    qd=1 bytes=67108864  real=55.92 src=probe
+id=kg-micro-seqw64k      drive=kingston op=micro kind=seqw bs=65536   qd=1 bytes=67108864  real=1.167 src=probe
+id=kg-micro-seqw1m       drive=kingston op=micro kind=seqw bs=1048576 qd=1 bytes=67108864  real=1.214 src=probe
+id=kg-micro-seqw8m       drive=kingston op=micro kind=seqw bs=8388608 qd=1 bytes=67108864  real=0.811 src=probe
+id=kg-micro-randw4k      drive=kingston op=micro kind=randw bs=4096   qd=1 bytes=2097152   real=2.016 src=probe
+id=kg-micro-flush        drive=kingston op=micro kind=flush bs=4096   qd=1 bytes=409600    real=0.188 src=probe
+id=kg-micro-seqr4k       drive=kingston op=micro kind=seqr bs=4096    qd=1 bytes=16384000  real=0.616 src=dd
+id=kg-micro-seqr1m       drive=kingston op=micro kind=seqr bs=1048576 qd=1 bytes=268435456 real=1.142 src=dd
+pair faster=kg-pull-flashcp     slower=kg-pull-kernel
+pair faster=kg-add-128k-fill    slower=kg-add-128k-skip1
