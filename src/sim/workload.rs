@@ -26,7 +26,7 @@ use std::time::{Instant, UNIX_EPOCH};
 
 const SCENARIOS_TXT: &str = include_str!("scenarios.txt");
 const DATASETS: &[&str] = &["small", "smallB", "many", "mixed", "file512m"];
-const DRIVES: &[&str] = &["sandisk", "msi"];
+const DRIVES: &[&str] = &["sandisk", "msi", "kingston"];
 const OPS: &[&str] = &["build", "add", "pull", "micro"];
 const MICRO_KINDS: &[&str] = &["seqw", "randw", "flush", "seqr"];
 
@@ -142,6 +142,7 @@ pub fn device_file_text(drive: &str) -> Option<&'static str> {
     match drive {
         "sandisk" => Some(include_str!("devices/sandisk.dev")),
         "msi" => Some(include_str!("devices/msi.dev")),
+        "kingston" => Some(include_str!("devices/kingston.dev")),
         _ => None,
     }
 }
@@ -151,6 +152,7 @@ pub fn drive_model_name(drive: &str) -> &str {
     match drive {
         "sandisk" => "sandisk-cruzer-usb2",
         "msi" => "msi-datamag-uas",
+        "kingston" => "kingston-dt3-usb3",
         other => other,
     }
 }
@@ -702,7 +704,7 @@ mod tests {
     fn builtin_file_parses_and_is_consistent() {
         let (scs, pairs) = builtin_scenarios();
         assert!(scs.len() > 40, "{} scenarios", scs.len());
-        assert_eq!(pairs.len(), 14);
+        assert_eq!(pairs.len(), 16);
         let pull = scs.iter().find(|s| s.id == "sd-pull-flashcp").unwrap();
         assert_eq!((pull.drive.as_str(), pull.op.as_str(), pull.layout.as_str()), ("sandisk", "pull", "flashcp:small"));
         assert_eq!(pull.real, Some(16.0));
@@ -719,7 +721,7 @@ mod tests {
             assert!(device_file_text(&s.drive).is_some(), "{}", s.id);
             parse_layout(&s.layout).unwrap_or_else(|e| panic!("{}: {e:#}", s.id));
         }
-        for d in ["sandisk", "msi"] {
+        for d in ["sandisk", "msi", "kingston"] {
             let dev = SimDevice::parse(device_file_text(d).unwrap()).unwrap();
             assert_eq!(dev.name, drive_model_name(d));
             assert!(dev.size_bytes.is_some());

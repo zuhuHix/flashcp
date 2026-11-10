@@ -80,7 +80,7 @@ pub struct SweepArgs {
     #[arg(long)]
     pub jobs: Option<usize>,
     /// Drive to record on (default: the profile's drive; other profiles record as sandisk)
-    #[arg(long, value_parser = ["sandisk", "msi"])]
+    #[arg(long, value_parser = ["sandisk", "msi", "kingston"])]
     pub record_as: Option<String>,
     /// Print JSON instead of a table
     #[arg(long)]
@@ -90,7 +90,7 @@ pub struct SweepArgs {
 #[derive(Args, Debug)]
 pub struct CalibrateArgs {
     /// Drive to calibrate
-    #[arg(long, default_value = "all", value_parser = ["sandisk", "msi", "all"])]
+    #[arg(long, default_value = "all", value_parser = ["sandisk", "msi", "kingston", "all"])]
     pub drive: String,
     /// Scenario file (default: the built-in scenarios.txt)
     #[arg(long, value_name = "FILE")]
@@ -143,7 +143,7 @@ pub struct Settings {
 pub type Combo = Vec<(String, String)>;
 
 const DATASETS: &[&str] = &["small", "smallB", "many", "mixed", "file512m"];
-const DRIVES: &[&str] = &["sandisk", "msi"];
+const DRIVES: &[&str] = &["sandisk", "msi", "kingston"];
 
 fn require_seeds(seeds: usize) -> Result<()> {
     if seeds == 0 {
@@ -164,6 +164,7 @@ fn record_drive<'a>(profile: &str, record_as: Option<&'a str>) -> &'a str {
     }
     match profile {
         "msi-datamag-uas" | "msi" => "msi",
+        "kingston-dt3-usb3" | "kingston" => "kingston",
         _ => "sandisk",
     }
 }
@@ -415,7 +416,7 @@ pub fn sweep_scenarios(
     let default = match op {
         "build" => "blank".to_string(),
         "pull" => format!("flashcp:{workload}"),
-        "add" => if drive == "msi" { "kernel128k:small" } else { "kernel32k:small" }.to_string(),
+        "add" => if drive == "sandisk" { "kernel32k:small" } else { "kernel128k:small" }.to_string(),
         _ => bail!("unknown op `{op}` (build | add | pull)"),
     };
     let layout = layout.map(str::to_string).unwrap_or(default);
@@ -722,7 +723,8 @@ fn calibrate_cmd(a: &CalibrateArgs) -> Result<()> {
     let to_record: Vec<Scenario> = measured.iter().filter(|s| s.op != "micro").cloned().collect();
     // Host-bound drives (msi) are recorded one at a time (their host time is what they
     // measure, and parallel recordings would inflate it); the rest in parallel.
-    let host_bound = |s: &Scenario| s.drive == "msi";
+    // (On the USB 3 Kingston, pulls take ~1 s and are partly host time too.)
+    let host_bound = |s: &Scenario| s.drive != "sandisk";
     let (serial, par): (Vec<usize>, Vec<usize>) = (0..to_record.len()).partition(|&i| host_bound(&to_record[i]));
     eprintln!(
         "[sim] recording {} scenarios ({} in parallel, {jobs} jobs; {} one at a time)",

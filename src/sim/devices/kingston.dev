@@ -1,0 +1,21 @@
+flashcp-devprofile 1
+# What flashcp's profile cache and sysfs say about the Kingston DataTraveler 3.0 128 GB
+# (USB 3.0 5 Gbps, usb-storage/BOT, max request 1024 KB), used to RECORD traces on an image as
+# if the stick were the target (FLASHCP_SIM_DEVICE). Exactly the cache entry flashcp wrote on
+# 2026-11-10: `flashcp probe` (82.7 MB/s at 8 MB, 3.34 ms per extra write request) and pull's
+# read micro-probe (0.136 ms per extra request at 167 MB/s, hence gap 20 KB).
+seq_write_bps=82736726.62838015
+write_skip_s=0.00334362049683517
+write_qd=1
+seq_read_bps=167250619.04960522
+read_cmd_s=0.00013614508627450984
+transport=usb-storage
+sim.name=kingston-dt3-usb3
+sim.max_sectors_kb=1024
+sim.logical_block=512
+sim.removable=1
+# add's in-situ probe chose fill with 1 in flight on 128 KB clusters (cached as c128k-m16k).
+sim.probe_choice=fill:1
+# Measured: /sys/block/sdb/sdb1/start and size (242086656 sectors).
+sim.part_start_sectors=134400
+sim.size_bytes=123948367872
