@@ -412,12 +412,12 @@ pub fn run_mount(a: MountArgs) -> i32 {
         let _ = fs.shutdown();
         return 1;
     }
-    if let Some(p) = &a.control {
-        if let Err(e) = serve_control(p, fs.clone(), tx.clone()) {
-            emit(fail_json(&format!("control socket: {e:#}")));
-            let _ = fs.shutdown();
-            return 1;
-        }
+    if let Some(p) = &a.control
+        && let Err(e) = serve_control(p, fs.clone(), tx.clone())
+    {
+        emit(fail_json(&format!("control socket: {e:#}")));
+        let _ = fs.shutdown();
+        return 1;
     }
     // 4. FUSE
     let cfg = super::fuse::Adapter::config(a.threads);
@@ -514,7 +514,6 @@ pub fn run_mount(a: MountArgs) -> i32 {
                 }
             }
             Ok(Msg::Unmount) | Ok(Msg::Fatal) => {
-                if matches!(rx.try_recv(), Err(_)) {}
                 if started.is_none() {
                     started = Some((Instant::now(), true));
                     start(true, ended.clone(), fs.clone(), dirty.clone(), tx.clone());

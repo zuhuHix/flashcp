@@ -40,6 +40,23 @@ jobs:
           FLASHCP_REQUIRE_FSCK: "1"
         run: cargo test --locked
 
+  fuse:
+    name: drive mode (FUSE)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install exfatprogs, fuse3, rsync
+        run: sudo apt-get update && sudo apt-get install -y exfatprogs fuse3 rsync
+      - name: Let the runner user open /dev/fuse
+        run: sudo chmod 666 /dev/fuse
+      - name: cargo test --test drive_fuse
+        env:
+          FLASHCP_REQUIRE_FUSE: "1"
+          FLASHCP_REQUIRE_FSCK: "1"
+        run: cargo test --locked --test drive_fuse -- --nocapture --test-threads=1
+
   image:
     name: build image, fsck, mount, diff
     runs-on: ubuntu-latest
