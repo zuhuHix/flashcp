@@ -63,7 +63,8 @@ CI, see [Compatibility](#compatibility)). There's a command-line tool and a
 
 > [!NOTE]
 > Drive mode is new in **0.3.0** and comes with the desktop package: [install](#install) both
-> packages and it is on. Releases before 0.3.0 do not have it.
+> packages and it is on. Releases before 0.3.0 do not have it. An upgrade to 0.3.0 from an
+> older version left it off; 0.3.1 turns it on ([#29](https://github.com/zuhuHix/flashcp/pull/29)).
 
 **What it is.** Once the [desktop package](#desktop-app) is installed, eligible USB exFAT drives
 are served by flashcp's own exFAT driver (`flashcp mount`, a userspace FUSE driver) instead of the
@@ -183,12 +184,12 @@ flashcp removes per-file overhead. Where there is little of it, there is little 
 
 flashcp runs on Linux (x86_64 and aarch64). The release binaries are static, so they work on any distribution.
 `fsck.exfat` from `exfatprogs` is recommended for checking volumes. The current release is
-**0.3.0**, the first with drive mode.
+**0.3.1**; drive mode arrived in 0.3.0.
 
 **Prebuilt binary**
 
 ```sh
-VERSION=0.3.0
+VERSION=0.3.1
 ARCH=$(uname -m)   # x86_64 or aarch64
 curl -LO "https://github.com/zuhuHix/flashcp/releases/download/v$VERSION/flashcp-$VERSION-$ARCH-unknown-linux-musl.tar.gz"
 tar -xzf "flashcp-$VERSION-$ARCH-unknown-linux-musl.tar.gz"
@@ -201,7 +202,7 @@ Checksums are in `SHA256SUMS` on the [release page](https://github.com/zuhuHix/f
 **Debian / Ubuntu (.deb)**
 
 ```sh
-VERSION=0.3.0
+VERSION=0.3.1
 ARCH=$(dpkg --print-architecture)   # amd64 or arm64
 curl -LO "https://github.com/zuhuHix/flashcp/releases/download/v$VERSION/flashcp_${VERSION}_$ARCH.deb"
 sudo apt install "./flashcp_${VERSION}_$ARCH.deb"
@@ -228,7 +229,7 @@ Download both packages from the [release page](https://github.com/zuhuHix/flashc
 install them together:
 
 ```sh
-VERSION=0.3.0
+VERSION=0.3.1
 BASE="https://github.com/zuhuHix/flashcp/releases/download/v$VERSION"
 curl -LO "$BASE/flashcp_${VERSION}_amd64.deb" -LO "$BASE/flashcp-gui_${VERSION}_amd64.deb"
 sudo apt install "./flashcp_${VERSION}_amd64.deb" "./flashcp-gui_${VERSION}_amd64.deb"
