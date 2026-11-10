@@ -1151,7 +1151,8 @@ mod tests {
     #[test]
     fn gvariant_strings_and_config_keys() {
         assert_eq!(gv_str("Don't unplug it\\now\n"), r"'Don\'t unplug it\\now\n'");
-        let d = tempfile_dir().join("keys");
+        // Not under tempfile_dir(): the other test removes that whole directory when it ends.
+        let d = std::env::temp_dir().join(format!("flashcp-drived-keys-{}", std::process::id()));
         let c = d.join("drive-mode.conf");
         assert!(read_offers(&c));
         write_enabled(&c, false).unwrap();
