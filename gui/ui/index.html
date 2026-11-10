@@ -55,6 +55,16 @@
       </p>
       <p id="usb-error" class="trust-error" role="alert" hidden></p>
       <ul id="usb-drives" class="usb-list" aria-label="USB drives"></ul>
+      <div id="usb-faster" class="usb-confirm" role="dialog" aria-labelledby="usb-faster-title" hidden>
+        <p id="usb-faster-title" class="usb-confirm-title"></p>
+        <p id="usb-faster-body" class="hint"></p>
+        <p id="usb-faster-windows" class="hint"></p>
+        <div class="button-row">
+          <button id="usb-faster-yes" class="accent" type="button">Make it faster</button>
+          <button id="usb-faster-cancel" type="button">Cancel</button>
+        </div>
+      </div>
+      <p id="usb-result" class="hint" role="status" aria-live="polite" hidden></p>
     </section>
 
     <section id="optimize" class="card panel" tabindex="-1" aria-labelledby="optimize-title" hidden>

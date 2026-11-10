@@ -25,7 +25,7 @@ fn rw(p: &Path) -> File {
 }
 
 fn opts(cluster: Option<u32>, fat: FatMode) -> ReclusterOpts {
-    ReclusterOpts { cluster, fat, dry_run: false }
+    ReclusterOpts { cluster, fat, dry_run: false, expect_serial: None, expect_hw: None }
 }
 
 /// `recluster` of the image at `p` through `dev` (the plain file when None).
@@ -511,6 +511,209 @@ fn crash_at_every_device_op_leaves_the_old_or_the_new_volume() {
         // Both switches were crossed, and both left their backup write to a second run.
         assert!(olds > 0 && news > 0 && owed >= 2, "old {olds}, new {news}, backup owed {owed}");
     }
+}
+
+/// The medium behind the claimed fd changes (a card swapped in a reader) after the check and
+/// planning: before each phase that writes (relocation, switch 1, the new metadata, switch 2)
+/// the boot sector is read again, and a change stops the run with `wrong-volume` before it
+/// writes anything more.
+#[test]
+fn a_medium_change_before_any_writing_phase_stops_the_run() {
+    use std::cell::{Cell, RefCell};
+    let (old, new) = (8192u32, 512u32);
+    let img = volume("recl-medium", 32, old, 1, 90, 9 << 20);
+    let template = img.dir.join("template.img");
+    std::fs::copy(&img.path, &template).unwrap();
+    let serial = boot_serial(&std::fs::read(&img.path).unwrap()[..512]);
+    let o = ReclusterOpts { expect_serial: Some(serial), ..opts(Some(new), FatMode::Prefix) };
+    let len = std::fs::metadata(&img.path).unwrap().len();
+    // Count the phases of an undisturbed run (two switches here).
+    let calls = Cell::new(0);
+    {
+        let f = rw(&img.path);
+        let plain = FileDev::new(Arc::new(rw(&img.path)));
+        let s = run_on(
+            &f,
+            len,
+            &plain,
+            &o,
+            &COST,
+            &|| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(s.changed);
+    }
+    assert_eq!(calls.get(), 4, "relocation, switch 1, new metadata, switch 2");
+    for at in 1..=4 {
+        std::fs::copy(&template, &img.path).unwrap();
+        let f = rw(&img.path);
+        let plain = FileDev::new(Arc::new(rw(&img.path)));
+        let (n, seen) = (Cell::new(0), RefCell::new(None));
+        let hook = || -> Result<()> {
+            n.set(n.get() + 1);
+            if n.get() == at {
+                // Another medium: its serial differs (the rest of sector 0 may well be equal).
+                let other = rw(&img.path);
+                let mut b = [0u8; 4];
+                other.read_exact_at(&mut b, 100).unwrap();
+                b[0] ^= 0x5a;
+                other.write_all_at(&b, 100).unwrap();
+                *seen.borrow_mut() = Some(sum(&img.path));
+            }
+            Ok(())
+        };
+        let r = run_on(&f, len, &plain, &o, &COST, &hook, &mut |_| {});
+        assert_eq!(reason(r), "wrong-volume", "change before phase {at}");
+        assert_eq!(Some(sum(&img.path)), *seen.borrow(), "phase {at}: written after the change");
+    }
+    // Without --expect-serial the boot sector still has to stay what the run planned from.
+    std::fs::copy(&template, &img.path).unwrap();
+    let f = rw(&img.path);
+    let plain = FileDev::new(Arc::new(rw(&img.path)));
+    let n = Cell::new(0);
+    let hook = || -> Result<()> {
+        n.set(n.get() + 1);
+        if n.get() == 2 {
+            rw(&img.path).write_all_at(&[0x77], 92).unwrap(); // the cluster count, low byte
+        }
+        Ok(())
+    };
+    let r = run_on(&f, len, &plain, &opts(Some(new), FatMode::Prefix), &COST, &hook, &mut |_| {});
+    assert_eq!(reason(r), "wrong-volume");
+}
+
+/// The claimed device is a clone of the stick the user was asked about (same volume serial,
+/// another hardware serial), or its hardware serial cannot be read: refused before any write.
+#[test]
+fn another_physical_drive_behind_the_fd_is_refused() {
+    let img = volume("recl-hw", 32, 8192, 2, 40, 4 << 20);
+    let before = sum(&img.path);
+    let serial = boot_serial(&std::fs::read(&img.path).unwrap()[..512]);
+    let o = ReclusterOpts {
+        expect_serial: Some(serial),
+        expect_hw: Some("ORIGINAL01".into()),
+        ..opts(Some(512), FatMode::Prefix)
+    };
+    for live in [Some("CLONE02".to_string()), None] {
+        HW_SERIAL.with(|h| *h.borrow_mut() = Some(live.clone()));
+        let r = run(&img.path, &o, None);
+        HW_SERIAL.with(|h| *h.borrow_mut() = None);
+        assert_eq!(reason(r), "wrong-volume", "{live:?}");
+        assert_eq!(sum(&img.path), before, "{live:?}: written to");
+    }
+    HW_SERIAL.with(|h| *h.borrow_mut() = Some(Some("ORIGINAL01".into())));
+    let r = run(&img.path, &o, None);
+    HW_SERIAL.with(|h| *h.borrow_mut() = None);
+    assert!(r.unwrap().changed, "the right drive is converted");
+}
+
+/// The medium changes between a switch's main and backup boot-sector writes: the backup is not
+/// written onto the replacement, and a rerun on the original drive completes the switch.
+#[test]
+fn a_medium_change_between_the_two_boot_writes_writes_no_backup() {
+    let (old, new) = (8192u32, 512u32);
+    let img = volume("recl-backup-swap", 32, old, 1, 90, 9 << 20);
+    let template = img.dir.join("template.img");
+    std::fs::copy(&img.path, &template).unwrap();
+    let (_, before) = digest(&img.path);
+    let o = opts(Some(new), FatMode::Prefix);
+    let len = std::fs::metadata(&img.path).unwrap().len();
+    for step in ["relocated", "reclustered"] {
+        std::fs::copy(&template, &img.path).unwrap();
+        let f = rw(&img.path);
+        let plain = FileDev::new(Arc::new(rw(&img.path)));
+        let (switched, seen) = (std::cell::RefCell::new(None), std::cell::RefCell::new(None));
+        let mut sink = |e: &Event| {
+            if let Event::Switched { step: s, .. } = e
+                && *s == step
+            {
+                // Another medium now: sector 0 is not the one just written.
+                let dev = rw(&img.path);
+                let mut b = vec![0u8; 512];
+                dev.read_exact_at(&mut b, 0).unwrap();
+                *switched.borrow_mut() = Some(b.clone());
+                b[100] ^= 0x5a;
+                dev.write_all_at(&b, 0).unwrap();
+                *seen.borrow_mut() = Some(sum(&img.path));
+            }
+        };
+        let r = run_on(&f, len, &plain, &o, &COST, &|| Ok(()), &mut sink);
+        assert_eq!(reason(r), "wrong-volume", "{step}");
+        assert_eq!(Some(sum(&img.path)), *seen.borrow(), "{step}: written to the replacement");
+        // The original drive comes back: its main sector is the switched one, the backup owed.
+        rw(&img.path).write_all_at(switched.borrow().as_ref().unwrap(), 0).unwrap();
+        assert!(!boot_regions_agree(&img.path), "{step}: the backup is owed");
+        let s = run(&img.path, &o, None).unwrap_or_else(|e| panic!("{step}: the rerun failed: {e:#}"));
+        assert_eq!(s.cluster, new as u64, "{step}");
+        assert!(boot_regions_agree(&img.path), "{step}: the rerun completed the backup");
+        fsck(&img.path);
+        let (_, now) = digest(&img.path);
+        same(&now, &before, step);
+    }
+}
+
+/// On a block device the boot sector must be read past the page cache; when that read cannot
+/// be done there is no cached fallback: nothing is written.
+#[test]
+fn no_write_without_a_direct_read_of_the_boot_sector() {
+    let img = volume("recl-direct", 32, 8192, 3, 40, 4 << 20);
+    let before = sum(&img.path);
+    DIRECT_READ_FAILS.with(|c| c.set(true));
+    let r = run(&img.path, &opts(Some(512), FatMode::Prefix), None);
+    DIRECT_READ_FAILS.with(|c| c.set(false));
+    assert_eq!(reason(r), "wrong-volume");
+    assert_eq!(sum(&img.path), before, "written without a direct read");
+}
+
+/// The hardware serial comes from the first USB parent of the block device in sysfs.
+#[test]
+fn hardware_serial_from_sysfs() {
+    let d = std::env::temp_dir().join(format!("fcp-sysfs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let usb = d.join("devices/pci0/usb2/2-1");
+    let part = usb.join("2-1:1.0/host6/target6:0:0/6:0:0:0/block/sdb/sdb1");
+    std::fs::create_dir_all(&part).unwrap();
+    std::fs::write(usb.join("idVendor"), "0951\n").unwrap();
+    std::fs::write(usb.join("serial"), "E0D55EA5 74B5\n").unwrap();
+    std::fs::create_dir_all(d.join("dev/block")).unwrap();
+    std::os::unix::fs::symlink(&part, d.join("dev/block/8:17")).unwrap();
+    assert_eq!(hw_serial_in(&d, libc::makedev(8, 17)).as_deref(), Some("E0D55EA5_74B5"));
+    assert_eq!(hw_serial_in(&d, libc::makedev(8, 33)), None, "no such device");
+    std::fs::remove_file(usb.join("serial")).unwrap();
+    assert_eq!(hw_serial_in(&d, libc::makedev(8, 17)), None, "no serial");
+    // Behind a hub, under a root hub, both with serials: the stick's own, and with none of its
+    // own never the hub's or the controller's.
+    let root = d.join("devices/pci0/usb4");
+    let hub = root.join("4-1");
+    let stick = hub.join("4-1.2");
+    let part = stick.join("4-1.2:1.0/host7/target7:0:0/7:0:0:0/block/sdc/sdc1");
+    std::fs::create_dir_all(&part).unwrap();
+    for (dir, vendor, serial) in
+        [(&root, "1d6b", "0000:00:14.0"), (&hub, "05e3", "HUB0001"), (&stick, "0951", "C87F54C6")]
+    {
+        std::fs::write(dir.join("idVendor"), format!("{vendor}\n")).unwrap();
+        std::fs::write(dir.join("serial"), format!("{serial}\n")).unwrap();
+    }
+    std::os::unix::fs::symlink(&part, d.join("dev/block/8:33")).unwrap();
+    assert_eq!(hw_serial_in(&d, libc::makedev(8, 33)).as_deref(), Some("C87F54C6"));
+    std::fs::remove_file(stick.join("serial")).unwrap();
+    assert_eq!(hw_serial_in(&d, libc::makedev(8, 33)), None, "a hub's serial was taken");
+    std::fs::remove_dir_all(&hub).unwrap();
+    std::fs::create_dir_all(part.to_string_lossy().replace("/4-1/4-1.2", "/4-1.2")).unwrap();
+    let direct = root.join("4-1.2");
+    std::fs::write(direct.join("idVendor"), "0951\n").unwrap();
+    std::fs::remove_file(d.join("dev/block/8:33")).unwrap();
+    std::os::unix::fs::symlink(
+        direct.join("4-1.2:1.0/host7/target7:0:0/7:0:0:0/block/sdc/sdc1"),
+        d.join("dev/block/8:33"),
+    )
+    .unwrap();
+    assert_eq!(hw_serial_in(&d, libc::makedev(8, 33)), None, "the root hub's serial was taken");
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// Device offsets in the root directory: of its end-of-directory marker, and of a live entry set.

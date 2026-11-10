@@ -26,6 +26,10 @@ if "--check" in args:
 mp, sock_path = args[2], args[args.index("--control") + 1]
 starts = int(open(dev + ".starts").read()) + 1 if os.path.exists(dev + ".starts") else 1
 open(dev + ".starts", "w").write(str(starts))
+# The previous start ended cleanly (an unmount): nothing to replay.
+was_clean = os.path.exists(dev + ".clean")
+if was_clean:
+    os.unlink(dev + ".clean")
 st = {"dirty": 0, "files": 0, "eject": False}
 lock = threading.Lock()
 done = threading.Event()
@@ -42,6 +46,7 @@ def commit(reason):
 def finish(*_):
     commit("unmount")
     out(event="unmounted", clean=True)
+    open(dev + ".clean", "w").close()
     done.set()
 
 def serve(conn):
@@ -75,7 +80,7 @@ srv = socket.socket(socket.AF_UNIX); srv.bind(sock_path); srv.listen(4)
 threading.Thread(target=lambda: [threading.Thread(target=serve, args=(srv.accept()[0],), daemon=True).start() for _ in iter(int, 1)], daemon=True).start()
 signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=finish).start())
 out(event="mounted", proto=1, device=dev, mountpoint=mp, label="STICK", serial="1a2b3c4d", size=1 << 26,
-    free=1 << 25, cluster=4096, pid=os.getpid(), recovered="replayed" if starts > 1 else None)
+    free=1 << 25, cluster=4096, pid=os.getpid(), recovered="replayed" if starts > 1 and not was_clean else None)
 if mode == "crash":
     time.sleep(0.2); os.kill(os.getpid(), signal.SIGKILL)
 done.wait()

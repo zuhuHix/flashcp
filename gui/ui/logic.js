@@ -1218,6 +1218,12 @@ export function beginOptimize(state, driveId) {
  * @property {number} dirtyBytes
  * @property {number} dirtyFiles
  * @property {boolean} safeToRemove
+ * @property {boolean} [canConvert] "Make faster" can run (the drive would gain from it)
+ * @property {number} [convertSecs] about how many seconds it takes
+ * @property {number} [convertDone] bytes written so far while converting
+ * @property {number} [convertTotal]
+ * @property {string|null} [convertResult] "done", "refused" or "failed"
+ * @property {string|null} [convertMessage]
  */
 
 const DRIVE_STATE_BADGES = {
@@ -1228,6 +1234,8 @@ const DRIVE_STATE_BADGES = {
   stopping: "Stopping…",
   mounting: "Mounting…",
   read_only: "Read-only",
+  converting: "Making faster…",
+  unmounted: "Not mounted",
   stopped: "Stopped",
   failed: "Failed",
 };
@@ -1252,8 +1260,48 @@ export function drivePendingText(drive) {
 /** Which controls a drive row shows. Eject only for drives flashcp or the kernel serves. */
 export function driveModeButtons(drive) {
   const served = drive.mode === "flashcp" || drive.mode === "kernel";
-  const leaving = drive.state === "ejecting" || drive.state === "stopping";
+  const leaving = drive.state === "ejecting" || drive.state === "stopping" || drive.state === "converting";
   return { eject: served, ejectDisabled: leaving, safe: drive.safeToRemove === true && !(drive.dirtyBytes > 0) };
+}
+
+/** "7 seconds", "a minute and a half", "4 minutes" (as the drive service says it). */
+export function secondsText(secs) {
+  const s = Math.max(0, Math.ceil(Number(secs) || 0));
+  if (s <= 1) return "a second";
+  if (s < 90) return `${s} seconds`;
+  if (s < 120) return "a minute and a half";
+  return `${Math.ceil(s / 60)} minutes`;
+}
+
+/** Whether a drive row offers "Make faster": flashcp serves it, it is idle, and it would gain. */
+export function canMakeFaster(drive) {
+  return drive.canConvert === true && drive.mode === "flashcp" && (drive.state === "ready" || drive.state === "saving");
+}
+
+/** The windows note of a conversion, in one sentence. */
+export const FASTER_WINDOWS_NOTE =
+  "If it loses power in the second it switches over, Windows may show it as unformatted until you plug it in here again; your files stay safe.";
+
+/** The confirm dialog: the same words as the notification. No jargon. */
+export function makeFasterTexts(drive) {
+  const name = drive.label || drive.device;
+  return {
+    title: `Make ${name} faster for small files?`,
+    body:
+      `flashcp can change how ${name} stores files so that small files copy much faster. Nothing is ` +
+      `erased. It takes about ${secondsText(drive.convertSecs)} and you must not unplug it meanwhile.`,
+    windows: FASTER_WINDOWS_NOTE,
+    confirm: "Make it faster",
+  };
+}
+
+/** "Making KINGSTON faster… don't unplug it (42 %)" while it runs; "" otherwise. */
+export function makeFasterProgress(drive) {
+  if (drive.state !== "converting") return "";
+  const name = drive.label || drive.device;
+  const total = Number(drive.convertTotal) || 0;
+  const pct = total > 0 ? ` (${Math.min(100, Math.floor(((Number(drive.convertDone) || 0) * 100) / total))} %)` : "";
+  return `Making ${name} faster… don't unplug it${pct}`;
 }
 
 /** The line under the switch: the service note, what the switch is doing, or "". */

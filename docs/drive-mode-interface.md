@@ -157,8 +157,9 @@ A stick formatted the usual way has big clusters (32 KB at 8 GB, 128 KB at 128 G
 small file takes a whole one and commits write mostly padding. `flashcp recluster` gives the
 volume 4 KB clusters in place: it rewrites only the metadata (boot sector, FAT, bitmap,
 directories); file data stays where it is, except what lies in the first ~0.1 % of the volume,
-where the bigger FAT has to go. This section is the SUGGESTED contract for the daemon and the
-GUI (the command exists; nothing calls it yet). It is never run without a click.
+where the bigger FAT has to go. This section is the contract the daemon (`flashcp drived`) and
+the GUI build on; [What the daemon does](#what-the-daemon-does-with-it) below is how they use it.
+It is never run without a click.
 
 ```text
 flashcp recluster --check <DEVICE> [--json] [--target-fd N]
@@ -262,5 +263,137 @@ idle journal file is not carried over; `flashcp mount` creates a new one at its 
 | `geometry`, `too-many-clusters`, `too-many-files`, `checksum` | the volume cannot be described with clusters that small (or is too large to plan in memory) | nothing |
 | `bad-clusters` | clusters are marked bad in the FAT; a recluster would lose the marks | nothing |
 | `bad-cluster-size` | `--cluster` is not a power of two below the current size | bug in the caller |
+| `wrong-volume` | (run only) `--expect-serial` / `--expect-hw` was given and the claimed device holds another volume or is another drive; or the medium changed during the run, or its boot sector could not be read past the cache | the stick was swapped: say so; nothing (further) was written |
 
 A reason the integration does not know means "do not offer".
+
+### What the daemon does with it
+
+(In the next release.) After `flashcp mount --check` said 0, and only with drive mode on:
+
+1. `flashcp recluster --check --json DEV` (10 s timeout; a failure or no `check` line = "no").
+   - `"finish":true`, first time for this plug-in: `flashcp recluster --json DEV` BEFORE
+     mounting, without asking. Exit 0: one notification ("KINGSTON was repaired"), then
+     `flashcp mount`. Exit 3: mounted as usual (a pending drive-mode commit is replayed by the
+     mount). Anything else: one notification, kernel mount READ-ONLY. One attempt per plug-in, so
+     the two checks cannot loop.
+   - Otherwise `benefit` (exit 0) is kept as `can_convert`, and the drive is mounted.
+2. Once flashcp has it mounted, the offer notification goes out when: `can_convert`, clusters
+   ≥ **32 KB** (`OFFER_MIN_CLUSTER`: every stick of 256 MB and up formatted the usual way; a
+   16 KB stick, which `--check` also accepts, gets only the app button), the volume has a
+   serial, its key has no answer yet, and the offer is on. Once per plug-in at most.
+3. Accept (the notification, the app's **Make faster**, `flashcp drive-mode recluster DEV`):
+   `prepare-eject` (writes refused from now on, everything committed) → `unmount` → the driver's
+   exit goes through the same handover choke point as an eject: only **Clean** (exit 0 after a
+   clean `unmounted` with nothing pending) goes on to `flashcp recluster --json DEV`; anything
+   else is the usual unclean path (kernel read-only, "couldn't finish saving"). recluster opens
+   the device itself, with the same rights and claim as `flashcp mount` (the uaccess ACL; no
+   helper), with `--expect-serial <ID_FS_UUID>`: it reads the boot sector through that claimed
+   fd and refuses (`wrong-volume`, exit 3, nothing written) unless it carries the serial of the
+   stick the user was asked about. Before each phase that writes (the relocation, switch 1, the
+   new metadata, switch 2, an owed backup sector) it reads the boot sector again through the fd
+   (O_DIRECT on a block device, past the page cache) and stops with `wrong-volume` if it is not
+   the one the plan was built on (or the last switch wrote): a medium changed behind the fd (a
+   card in a reader) gets nothing further. Between a switch's main and backup boot-sector
+   writes it reads sector 0 once more and writes the backup only if it is the sector just
+   written; otherwise it stops (`wrong-volume`) and the original drive is left in the normal
+   "backup owed" state the next run completes. On a block device these reads are O_DIRECT;
+   if that cannot be done the run stops, it never trusts a cached copy. With `--expect-hw
+   SERIAL` (the daemon passes the disk's hardware serial when it has one) the claimed device's
+   hardware serial, from sysfs through the fd (`rdev` → `/sys/dev/block/MAJ:MIN` → the USB
+   parent's `serial`), must be that one before the first write; a clone has the same volume
+   serial, not that. Then `flashcp mount` again on the same mountpoint, and a notification once it is
+   mounted: done, refused (exit 3, "nothing was written; it works as before") or failed (exit 1,
+   the volume is the old or the new one, complete). `prepare-eject` refused: `resume`, nothing
+   changed, a notification.
+4. While it runs (`"state":"converting"`): writes fail (EROFS), Eject waits and then powers off
+   instead of remounting, the sleep/shutdown delay inhibitor is held, a daemon stop waits for
+   recluster and then hands the drive back, drive mode off hands it to the kernel afterwards. A
+   yank: a notification ("plug it in here again before using it on Windows"); the next plug-in
+   runs step 1 again.
+
+**Consent belongs to one plug-in of one drive.** Every `Added` gets a `plug` token of 128 random
+bits from the OS (so a token from an earlier daemon run never matches). The offer notification,
+the app's dialog and `drive-mode recluster` carry the `plug` and the `identity` (volume serial
+and disk hardware serial, `UUID:SERIAL`) of the drive they showed; the daemon accepts an answer
+or a request only while the drive at that path is still that plug-in with that identity, else
+`That drive was replaced. Nothing was changed.` When an answer or a request is accepted, the
+identity of what is at the path NOW is read from the device itself (its volume serial, past
+the page cache) and from sysfs (its hardware serial) and must be that identity too, so a swap
+udev has not reported yet is refused as well. An `ActionInvoked` counts only for the
+notification id created for that plug-in. Offers still on screen when the daemon stops are
+closed, also one whose `Notify` was still on its way. When the OS gives no random bytes for a
+token, that drive is served as usual but never offered or converted.
+
+Notification bodies are escaped (`& < > " '`) where the server reads them as markup (its
+capabilities list `body-markup`, or it cannot be asked); summaries (titles) are plain text by
+the spec and are sent as they are. Labels lose their control characters and newlines.
+
+The answers: `$XDG_STATE_HOME/flashcp/recluster-offers` (default `~/.local/state/...`), one
+`<key>\t<accepted|declined>` line per volume. The key (`volume_key`) is `<UUID>:<hardware
+serial>:` when the disk has a hardware serial (the USB device's `serial` in sysfs, what udev's
+`ID_SERIAL_SHORT` is made from): renaming the stick keeps it, two cloned sticks differ. Without a
+hardware serial it is `<UUID>::<label>`: then two sticks cloned from one image (same volume
+serial and label) count as one, and a renamed stick is asked again. Both forms survive a
+conversion. Keys written by an earlier build of this branch (`UUID:SERIAL:LABEL`) are read as
+`UUID:SERIAL:`. The file is rewritten whole (temp file, mode 0600, fsync,
+rename; a symlink there is replaced, never followed). If it cannot be written the user is told
+once ("flashcp could not save your answer" / "It may ask about KINGSTON again."); the answer
+holds until the daemon restarts. Accept → `accepted`; Not now, dismissed or expired → `declined`; never
+offered again by notification. No answer (the server has no "actions" capability, no server,
+the drive was unplugged first) → nothing is written, it is offered again on the next plug-in.
+The global off switch is `offer_faster=false` in `$XDG_CONFIG_HOME/flashcp/drive-mode.conf`
+(`flashcp drive-mode offer on|off`).
+
+The notification is sent through `org.freedesktop.Notifications` with `gdbus`:
+`GetCapabilities` must list `actions`; `gdbus monitor` is started first, then `Notify` with
+actions `accept` ("Accept") and `notnow` ("Not now"), expire timeout 0; the answer is the
+`ActionInvoked` (then `CloseNotification`) or `NotificationClosed` (reason 1 or 2 = declined,
+3 = closed by the daemon = no answer) for that id. Texts (KINGSTON = the label, N from `est_secs`):
+
+| when | title | body |
+|---|---|---|
+| offer | Make KINGSTON faster for small files? | flashcp can change how KINGSTON stores files so that small files copy much faster. Nothing is erased. It takes about N seconds and you must not unplug it meanwhile. |
+| running | Making KINGSTON faster… | Don't unplug it. This takes about N seconds. |
+| done | KINGSTON is ready | Small files now copy to it much faster. |
+| refused | KINGSTON was not changed | There is not enough free space on it. Delete some files and try again. (or: flashcp found something it does not change safely (MESSAGE).) Nothing was written; it works as before. |
+| failed | Could not make KINGSTON faster | MESSAGE. Your files are safe and it works as before. |
+| pause refused | KINGSTON was not changed | It is in use (ERROR). Nothing was changed. Close the files on it and try again. |
+| yanked | KINGSTON was unplugged while it was being changed | Your files are safe. Plug it in here again before using it on Windows: flashcp checks it and finishes the change if needed. |
+| finished on plug-in | KINGSTON was repaired | A change to make it faster had been interrupted; it is now complete. Nothing was lost. |
+| answer not saved (once) | flashcp could not save your answer | It may ask about KINGSTON again. |
+| finish failed | KINGSTON is read-only for now | flashcp could not complete an earlier change to it (MESSAGE). Your files are there: copy them off, or plug it in again to retry. |
+
+## The daemon's control socket (`flashcp drived`)
+
+`$XDG_RUNTIME_DIR/flashcp/drived.sock` (mode 0600), one request per line, one JSON line back.
+`flashcp drive-mode ...` is its client; the app runs that CLI with `--json`.
+
+| request | reply |
+|---|---|
+| `status` | `{"ok":true,"running":true,"enabled":B,"offers":B,"drives":[DRIVE,...]}` |
+| `enable` / `disable` | `{"ok":true,"enabled":B}` |
+| `eject DEV` | `{"ok":true}`, or `{"ok":false,"error":"no such drive"}` |
+| `recluster DEV PLUG IDENTITY` | `{"ok":true}` (the conversion started), or `{"ok":false,"error":"..."}`: `That drive was replaced. Nothing was changed.` (no drive at DEV, or not plug-in PLUG, or not IDENTITY), `flashcp cannot tell this drive apart from others (it has no volume serial)`, `drive mode is off`, `it is being converted already`, `it is not ready (flashcp must have it mounted)`, `it would not get faster (...)` |
+| `offers on` / `offers off` | `{"ok":true,"offers":B}` (the CLI writes the config first) |
+
+`DRIVE`: `{"device":S,"label":S,"mode":"flashcp"|"kernel"|"none","state":S,"mountpoint":S|null,
+"dirty_bytes":N,"dirty_files":N,"safe_to_remove":B,"can_convert":B,"cluster":N,"convert_secs":N,
+"convert_done":N,"convert_total":N,"convert_result":"done"|"refused"|"failed"|null,
+"convert_message":S|null,"plug":S,"identity":S,"volume":S|null}`. `plug` is this plug-in's
+random token (32 hex digits, empty if none could be made), `identity` the drive's
+`UUID:SERIAL`, `volume` its `volume_key`. `state` is one of `checking`, `busy`, `starting`, `ready`, `saving`,
+`ejecting`, `stopping`, `mounting`, `kernel`, `read_only`, `unmounted` (a kernel mount someone
+unmounted by hand), `converting`, `safe_to_remove`, `stopped`, `failed`. `cluster` and
+`convert_secs` come from `recluster --check` (0 when it said no); while converting,
+`convert_secs` is the plan's estimate and `convert_done`/`convert_total` the progress bytes.
+`convert_result`/`convert_message` describe the last conversion of this plug-in (the message is
+the notification's title and body).
+
+`flashcp drive-mode recluster DEV [--yes] [--plug TOKEN --identity ID] [--json]` asks first (on
+a terminal; without one it needs `--yes`), sends `recluster DEV PLUG IDENTITY` with the values of
+the status whose texts it printed (`--plug`/`--identity`: only if they are still those; the app
+passes the ones its dialog showed), prints progress while `state` is `converting`, and once the
+drive is back prints the message and exits 0 (done), 3 (refused, or it could not start) or 1
+(failed). With `--json` the last line is `{"ok":B,"result":R,"message":S}` (plus `"error":S` when
+not done).

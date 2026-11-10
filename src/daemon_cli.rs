@@ -1,9 +1,11 @@
-//! `flashcp drived` (the daemon) and `flashcp drive-mode status|on|off|eject` (its client).
+//! `flashcp drived` (the daemon) and `flashcp drive-mode status|on|off|eject|recluster|offer`
+//! (its client).
 
 use crate::daemon_io::{self, Env};
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -40,7 +42,52 @@ pub enum DriveModeCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Make a drive flashcp serves faster for small files (`flashcp recluster`, run by the
+    /// drive service: it pauses the drive, converts it and mounts it again). Nothing is erased
+    Recluster {
+        device: String,
+        /// Do not ask first
+        #[arg(long)]
+        yes: bool,
+        /// Only if the drive is still the plug-in with this `plug` token (from `status --json`,
+        /// as the app passes it): refused when another drive got its device path meanwhile
+        #[arg(long, value_name = "TOKEN")]
+        plug: Option<String>,
+        /// Only if the drive still has this `identity` (volume serial and disk serial, from
+        /// `status --json`)
+        #[arg(long, value_name = "ID")]
+        identity: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Turn the "Make this drive faster?" notification on or off (the app button stays)
+    Offer {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
+
+/// Print to stdout; a closed pipe (`... | head -1`) ends the program quietly instead of a panic.
+fn emit(text: &str) {
+    let mut o = std::io::stdout().lock();
+    if let Err(e) = o.write_all(text.as_bytes()).and_then(|_| o.flush()) {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("flashcp: cannot write the output: {e}");
+        std::process::exit(1);
+    }
+}
+
+macro_rules! say {
+    ($($t:tt)*) => { emit(&format!("{}\n", format_args!($($t)*))) };
+}
+
+/// The one-sentence Windows caveat of a conversion (docs/drive-mode-interface.md).
+pub const WINDOWS_NOTE: &str = "If it loses power in the second it switches over, Windows may show it as \
+    unformatted until you plug it in here again; your files stay safe.";
 
 /// Ask the running daemon; None if it is not running.
 fn ask(line: &str) -> Option<String> {
@@ -62,10 +109,11 @@ pub fn drive_mode(cmd: DriveModeCmd) -> Result<()> {
         DriveModeCmd::Status { json } => {
             let reply = ask("status").unwrap_or_else(|| {
                 let on = daemon_io::read_enabled(&daemon_io::config_path());
-                format!(r#"{{"ok":true,"running":false,"enabled":{on},"drives":[]}}"#)
+                let offers = daemon_io::read_offers(&daemon_io::config_path());
+                format!(r#"{{"ok":true,"running":false,"enabled":{on},"offers":{offers},"drives":[]}}"#)
             });
             if json {
-                println!("{reply}");
+                say!("{reply}");
             } else {
                 print_status(&reply);
             }
@@ -79,14 +127,143 @@ pub fn drive_mode(cmd: DriveModeCmd) -> Result<()> {
             anyhow::ensure!(device.starts_with("/dev/") || Path::new(&device).is_absolute(), "not a device: {device}");
             let reply = ask(&format!("eject {device}")).context("the drive service (flashcp drived) is not running")?;
             if json {
-                println!("{reply}");
+                say!("{reply}");
             } else if reply.contains("\"ok\":true") {
-                println!("ejecting {device}: you'll get a notification when it can be removed");
+                say!("ejecting {device}: you'll get a notification when it can be removed");
             } else {
                 bail!("{reply}");
             }
             Ok(())
         }
+        DriveModeCmd::Recluster { device, yes, plug, identity, json } => recluster(&device, yes, plug, identity, json),
+        DriveModeCmd::Offer { state, json } => {
+            let on = state == "on";
+            daemon_io::write_offers(&daemon_io::config_path(), on)?;
+            let running = ask(&format!("offers {state}")).is_some();
+            if json {
+                say!(r#"{{"ok":true,"offers":{on},"running":{running}}}"#);
+            } else if on {
+                say!("flashcp offers once per drive to make it faster (a notification with Accept / Not now)");
+            } else {
+                say!("no more offers to make drives faster; the app's \"Make faster\" button still works");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The objects of the status reply's `drives` array (they are flat).
+fn drives(reply: &str) -> Vec<BTreeMap<String, String>> {
+    let Some(arr) = reply.split_once("\"drives\":[").map(|(_, a)| a).filter(|a| !a.starts_with(']')) else {
+        return vec![];
+    };
+    arr.split("},{")
+        .filter_map(|obj| {
+            let obj = format!("{{{}}}", obj.trim_start_matches('{').trim_end_matches(['}', ']']).trim_end_matches('}'));
+            crate::daemon::json::parse_flat(&obj)
+        })
+        .collect()
+}
+
+fn drive_of(reply: &str, device: &str) -> Option<BTreeMap<String, String>> {
+    drives(reply).into_iter().find(|d| d.get("device").is_some_and(|v| v == device))
+}
+
+/// `flashcp drive-mode recluster DEV`: the daemon does the work (the same path as the
+/// notification's Accept); this prints what it says and waits for the end.
+fn recluster(
+    device: &str,
+    yes: bool,
+    expect_plug: Option<String>,
+    expect_identity: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let no_daemon = "the drive service (flashcp drived) is not running";
+    let refuse = |why: &str| -> Result<()> {
+        if json {
+            say!(r#"{{"ok":false,"error":{}}}"#, crate::events::json_str(why));
+            std::process::exit(3);
+        }
+        bail!("{why}");
+    };
+    let reply = ask("status").context(no_daemon)?;
+    let Some(d) = drive_of(&reply, device) else {
+        if expect_plug.is_some() || expect_identity.is_some() {
+            return refuse(crate::daemon::REPLACED);
+        }
+        let served: Vec<String> = drives(&reply).iter().filter_map(|d| d.get("device").cloned()).collect();
+        bail!("{device} is not a drive the drive service knows (it knows: {})", served.join(", "));
+    };
+    // The plug-in and drive these texts are about: the daemon refuses if either changes.
+    let plug = d.get("plug").cloned().unwrap_or_default();
+    let identity = d.get("identity").cloned().unwrap_or_default();
+    if expect_plug.is_some_and(|p| p != plug) || expect_identity.is_some_and(|i| i != identity) {
+        return refuse(crate::daemon::REPLACED);
+    }
+    let name = d.get("label").cloned().unwrap_or_else(|| device.to_string());
+    let secs: u64 = d.get("convert_secs").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if !json {
+        let (title, body) = crate::daemon::offer_texts(&name, secs.max(1));
+        say!("{title}\n{body}\n{WINDOWS_NOTE}");
+    }
+    if !yes {
+        anyhow::ensure!(std::io::stdin().is_terminal(), "not a terminal: add --yes to go ahead");
+        emit("Go ahead? [y/N] ");
+        let mut a = String::new();
+        std::io::stdin().read_line(&mut a)?;
+        if !matches!(a.trim(), "y" | "Y" | "yes") {
+            say!("nothing was changed");
+            return Ok(());
+        }
+    }
+    let r = ask(&format!("recluster {device} {plug} {identity}")).context(no_daemon)?;
+    if !r.contains("\"ok\":true") {
+        let m = crate::daemon::json::parse_flat(&r).unwrap_or_default();
+        let why = m.get("error").cloned().unwrap_or(r);
+        if json {
+            say!(r#"{{"ok":false,"error":{}}}"#, crate::events::json_str(&why));
+            std::process::exit(3);
+        }
+        bail!("{name} cannot be made faster now: {why}");
+    }
+    let mut shown = false;
+    let mut last_pct = None;
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let Some(st) = ask("status") else { bail!("the drive service stopped") };
+        let Some(d) = drive_of(&st, device).filter(|d| d.get("plug").is_some_and(|p| *p == plug)) else {
+            bail!("{name} was removed")
+        };
+        let g = |k: &str| d.get(k).cloned().unwrap_or_default();
+        let state = g("state");
+        if state == "converting" {
+            let (done, total): (u64, u64) =
+                (g("convert_done").parse().unwrap_or(0), g("convert_total").parse().unwrap_or(0));
+            let pct = (total > 0).then(|| done * 100 / total);
+            if !json && (!shown || pct != last_pct) {
+                let p = pct.map(|p| format!(" {p} %")).unwrap_or_default();
+                say!("Making {name} faster… don't unplug it{p}");
+                (shown, last_pct) = (true, pct);
+            }
+            continue;
+        }
+        let result = g("convert_result");
+        if ["checking", "starting", "mounting"].contains(&state.as_str()) || result.is_empty() || result == "null" {
+            continue;
+        }
+        let message = g("convert_message");
+        if json {
+            let m = crate::events::json_str(&message);
+            let err = if result == "done" { String::new() } else { format!(r#","error":{m}"#) };
+            say!(r#"{{"ok":{},"result":{},"message":{m}{err}}}"#, result == "done", crate::events::json_str(&result));
+        } else {
+            say!("{message}");
+        }
+        std::process::exit(match result.as_str() {
+            "done" => 0,
+            "refused" => 3,
+            _ => 1,
+        });
     }
 }
 
@@ -94,9 +271,9 @@ fn set_user(on: bool, json: bool) -> Result<()> {
     daemon_io::write_enabled(&daemon_io::config_path(), on)?;
     let running = ask(if on { "enable" } else { "disable" }).is_some();
     if json {
-        println!(r#"{{"ok":true,"enabled":{on},"running":{running}}}"#);
+        say!(r#"{{"ok":true,"enabled":{on},"running":{running}}}"#);
     } else {
-        println!(
+        say!(
             "drive mode {}{}",
             if on { "on: new USB exFAT drives are served by flashcp" } else { "off: USB drives use the normal driver" },
             if running { "" } else { " (the drive service is not running; it applies when it starts)" }
@@ -124,9 +301,9 @@ fn set_system(on: bool, json: bool) -> Result<()> {
         && udev(&["trigger", "--subsystem-match=block", "--action=change", "--property-match=ID_FS_TYPE=exfat"])
             .unwrap_or(false);
     if json {
-        println!(r#"{{"ok":true,"system_enabled":{on},"udev_reloaded":{reloaded}}}"#);
+        say!(r#"{{"ok":true,"system_enabled":{on},"udev_reloaded":{reloaded}}}"#);
     } else {
-        println!(
+        say!(
             "drive mode {} for every user{}",
             if on { "allowed" } else { "disabled" },
             if reloaded { "" } else { " (udevadm failed: replug the drives)" }
@@ -138,34 +315,40 @@ fn set_system(on: bool, json: bool) -> Result<()> {
 fn print_status(reply: &str) {
     let top = crate::daemon::json::parse_flat(reply).unwrap_or_default();
     let flag = |k: &str| top.get(k).is_some_and(|v| v == "true");
-    println!(
-        "drive mode: {}{}",
+    let mut text = format!(
+        "drive mode: {}{}\n",
         if flag("enabled") { "on" } else { "off" },
         if flag("running") { "" } else { " (the drive service is not running)" }
     );
     if Path::new(SYSTEM_OFF).exists() {
-        println!("  disabled system-wide ({SYSTEM_OFF})");
+        text += &format!("  disabled system-wide ({SYSTEM_OFF})\n");
     }
-    // The drives array: split its objects (they are flat).
-    let Some(arr) = reply.split_once("\"drives\":[").map(|(_, a)| a).filter(|a| !a.starts_with(']')) else { return };
-    for obj in arr.split("},{") {
-        let obj = format!("{{{}}}", obj.trim_start_matches('{').trim_end_matches(['}', ']']).trim_end_matches('}'));
-        let Some(d) = crate::daemon::json::parse_flat(&obj) else { continue };
+    // Older daemons do not report it: the setting decides.
+    let offers =
+        top.get("offers").map(|v| v == "true").unwrap_or_else(|| daemon_io::read_offers(&daemon_io::config_path()));
+    text +=
+        &format!("offer to make drives faster: {}\n", if offers { "on" } else { "off (flashcp drive-mode offer on)" });
+    for d in drives(reply) {
         let g = |k: &str| d.get(k).cloned().unwrap_or_default();
         let bytes: u64 = g("dirty_bytes").parse().unwrap_or(0);
-        let pending = if bytes > 0 { format!(", saving {}", crate::daemon::mb(bytes)) } else { String::new() };
-        println!(
-            "  {} {:?}: {} ({}{}){}",
+        let mut extra = if bytes > 0 { format!(", saving {}", crate::daemon::mb(bytes)) } else { String::new() };
+        let (done, total): (u64, u64) =
+            (g("convert_done").parse().unwrap_or(0), g("convert_total").parse().unwrap_or(0));
+        if g("state") == "converting" && total > 0 {
+            extra += &format!(", {} %", done * 100 / total);
+        } else if g("can_convert") == "true" {
+            extra += &format!(", can be made faster (flashcp drive-mode recluster {})", g("device"));
+        }
+        let at = g("mountpoint");
+        text += &format!(
+            "  {} {:?}: {} ({}{}){}\n",
             g("device"),
             g("label"),
             g("mode"),
             g("state"),
-            pending,
-            if g("mountpoint") != "null" && !g("mountpoint").is_empty() {
-                format!(" at {}", g("mountpoint"))
-            } else {
-                String::new()
-            }
+            extra,
+            if at != "null" && !at.is_empty() { format!(" at {at}") } else { String::new() }
         );
     }
+    emit(&text);
 }

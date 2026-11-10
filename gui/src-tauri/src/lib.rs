@@ -608,7 +608,8 @@ pub fn run() {
             optimize_pending,
             drivemode::drive_mode_status,
             drivemode::drive_mode_set,
-            drivemode::drive_mode_eject
+            drivemode::drive_mode_eject,
+            drivemode::drive_mode_recluster
         ])
         .setup(setup_app)
         .run(tauri::generate_context!())

@@ -5,6 +5,9 @@ import {
   driveModeButtons,
   driveModeNote,
   DRIVE_SERVICE_HINT,
+  canMakeFaster,
+  makeFasterTexts,
+  makeFasterProgress,
   formatBytes,
   formatDuration,
   progressFraction,
@@ -121,7 +124,7 @@ const DEMO_TREE = {
 const DEMO_DOWNLOADS = "/home/demo/Downloads";
 
 // ?usb=stopped (preview only): the drive service is not running.
-const demoUsb = { enabled: true, running: new URLSearchParams(window.location.search).get("usb") !== "stopped", ejected: new Set() };
+const demoUsb = { enabled: true, running: new URLSearchParams(window.location.search).get("usb") !== "stopped", ejected: new Set(), converting: false, converted: false };
 function demoUsbDrives() {
   if (!demoUsb.running) return [];
   const fast = demoUsb.enabled;
@@ -129,6 +132,8 @@ function demoUsbDrives() {
     {
       device: "/dev/sdb1", label: "KINGSTON", mode: fast ? "flashcp" : "kernel", state: fast ? "saving" : "kernel",
       mountpoint: "/media/demo/KINGSTON", dirtyBytes: fast ? 12_000_000 : 0, dirtyFiles: fast ? 3 : 0, safeToRemove: !fast,
+      canConvert: fast && !demoUsb.converted, convertSecs: 7, plug: "demo1", identity: "1A2B-3C4D:",
+      ...(demoUsb.converting ? { state: "converting", dirtyBytes: 0, dirtyFiles: 0, convertDone: 60, convertTotal: 137 } : {}),
     },
     {
       device: "/dev/sdc1", label: "BACKUP", mode: "kernel", state: "kernel",
@@ -199,6 +204,8 @@ const ids = [
   "recovery", "recovery-message", "recovery-text", "recovery-warning", "recovery-resume",
   "recovery-dismiss", "optimize-tip", "tip-open", "tip-dismiss",
   "usb-switch", "usb-note", "usb-service", "usb-service-cmd", "usb-error", "usb-drives",
+  "usb-faster", "usb-faster-title", "usb-faster-body", "usb-faster-windows", "usb-faster-yes",
+  "usb-faster-cancel", "usb-result",
 ];
 const els = Object.fromEntries(ids.map((id) => [id, document.getElementById(id)]));
 
@@ -242,6 +249,12 @@ async function demoInvoke(cmd, args) {
       await new Promise((resolve) => setTimeout(resolve, 700));
       demoUsb.enabled = !!args.enabled;
       return { enabled: demoUsb.enabled, running: demoUsb.running };
+    case "drive_mode_recluster":
+      demoUsb.converting = true;
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      demoUsb.converting = false;
+      demoUsb.converted = true;
+      return "KINGSTON is ready. Small files now copy to it much faster.";
     case "drive_mode_eject":
       await new Promise((resolve) => setTimeout(resolve, 500));
       demoUsb.ejected.add(args.device);
@@ -1329,7 +1342,12 @@ function wireDragDrop() {
 // ---- USB drive mode -------------------------------------------------------
 
 // Kept apart from `state`: it is polled on its own and never affects the copy form.
-let usb = { status: null, pending: null, error: "", ejecting: new Set() };
+// confirming: the device whose "Make faster" dialog is open; converting: the one being converted
+// from this window; result: the last conversion's text.
+let usb = {
+  status: null, pending: null, error: "", ejecting: new Set(),
+  confirming: null, confirmingPlug: null, confirmingIdentity: null, converting: null, result: "",
+};
 let usbSig = null;
 let usbTimer = null;
 let usbSeq = 0;
@@ -1391,6 +1409,41 @@ async function ejectUsb(device) {
   refreshUsbNow();
 }
 
+// The dialog is for one plug-in of one drive: its device path and its plug token.
+function openFaster(drive) {
+  usb = {
+    ...usb, confirming: drive.device, confirmingPlug: drive.plug, confirmingIdentity: drive.identity,
+    result: "", error: "",
+  };
+  renderUsb();
+  els["usb-faster-yes"].focus();
+}
+
+function closeFaster() {
+  usb = { ...usb, confirming: null };
+  renderUsb();
+}
+
+async function confirmFaster() {
+  const device = usb.confirming;
+  const plug = usb.confirmingPlug;
+  const identity = usb.confirmingIdentity;
+  if (!device) return;
+  usb = { ...usb, confirming: null, converting: device, result: "", error: "" };
+  renderUsb();
+  refreshUsbNow();
+  try {
+    // The daemon refuses if another drive has this path by now ("That drive was replaced").
+    const text = await call("drive_mode_recluster", { device, plug, identity });
+    usb = { ...usb, result: text };
+  } catch (err) {
+    usb = { ...usb, error: messageOf(err) };
+  }
+  usb = { ...usb, converting: null };
+  renderUsb();
+  refreshUsbNow();
+}
+
 function usbRow(drive) {
   const badge = driveModeBadge(drive);
   const buttons = driveModeButtons(drive);
@@ -1403,7 +1456,7 @@ function usbRow(drive) {
   tag.className = `badge ${badge.tone}`;
   tag.textContent = badge.text;
   li.append(name, tag);
-  const pending = drivePendingText(drive);
+  const pending = makeFasterProgress(drive) || drivePendingText(drive);
   if (pending) {
     const p = document.createElement("span");
     p.className = "hint";
@@ -1415,6 +1468,15 @@ function usbRow(drive) {
     safe.className = "usb-safe";
     safe.textContent = "Safe to remove";
     li.append(safe);
+  }
+  if (canMakeFaster(drive) && usb.converting === null) {
+    const f = document.createElement("button");
+    f.type = "button";
+    f.textContent = "Make faster";
+    f.disabled = usb.confirming !== null;
+    f.setAttribute("aria-label", `Make ${drive.label || drive.device} faster for small files`);
+    f.addEventListener("click", () => openFaster(drive));
+    li.append(f);
   }
   if (buttons.eject) {
     const b = document.createElement("button");
@@ -1442,15 +1504,33 @@ function renderUsb() {
   els["usb-error"].hidden = !usb.error;
   els["usb-error"].textContent = usb.error;
   const drives = status && status.running ? status.drives : [];
-  const sig = JSON.stringify([drives, [...usb.ejecting]]);
+  const sig = JSON.stringify([drives, [...usb.ejecting], usb.confirming, usb.converting]);
   if (sig !== usbSig) {
     usbSig = sig;
     els["usb-drives"].replaceChildren(...drives.map(usbRow));
   }
+  // The confirm dialog, while its drive is still there and can still be converted.
+  // A different plug-in at the same path (unplugged and another stick plugged in) closes it.
+  const target = drives.find(
+    (d) => d.device === usb.confirming && d.plug === usb.confirmingPlug && d.identity === usb.confirmingIdentity,
+  );
+  const open = Boolean(target && canMakeFaster(target));
+  els["usb-faster"].hidden = !open;
+  if (open) {
+    const t = makeFasterTexts(target);
+    els["usb-faster-title"].textContent = t.title;
+    els["usb-faster-body"].textContent = t.body;
+    els["usb-faster-windows"].textContent = t.windows;
+    els["usb-faster-yes"].textContent = t.confirm;
+  }
+  els["usb-result"].hidden = !usb.result;
+  els["usb-result"].textContent = usb.result;
 }
 
 function startUsb() {
   els["usb-switch"].addEventListener("change", toggleUsb);
+  els["usb-faster-yes"].addEventListener("click", confirmFaster);
+  els["usb-faster-cancel"].addEventListener("click", closeFaster);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       clearTimeout(usbTimer);
