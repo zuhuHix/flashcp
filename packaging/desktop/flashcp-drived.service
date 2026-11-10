@@ -12,6 +12,8 @@ RestartSec=2
 # one SIGTERM from it), then exits. Whatever is left after the timeout is killed.
 KillMode=mixed
 TimeoutStopSec=90
+# Whatever happened to the daemon, new drives go to udisks again until it runs.
+ExecStopPost=/bin/rm -f %t/flashcp/drive-mode-on
 
 [Install]
 WantedBy=default.target

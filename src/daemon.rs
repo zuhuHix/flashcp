@@ -144,6 +144,11 @@ pub enum Input {
         dev: String,
         ok: bool,
     },
+    /// udisks could not unmount a kernel-mounted drive for an eject (it is in use).
+    KernelUnmountFailed {
+        dev: String,
+        error: String,
+    },
     SetEnabled(bool),
     Timer {
         dev: String,
@@ -305,6 +310,7 @@ pub struct Drive {
     pub gone: bool,
     timer_gen: u64,
     busy_tries: usize,
+    kernel_ro: bool,
 }
 
 impl Drive {
@@ -383,9 +389,17 @@ impl Core {
             Input::Shutdown => {
                 self.shutting_down = true;
                 for d in self.drives.values_mut() {
-                    if d.driver_running() && !matches!(d.state, State::Stopping(_)) {
-                        d.state = State::Stopping(Then::Exit);
-                        out.push(Action::StopDriver { dev: d.info.dev.clone() });
+                    match d.state {
+                        // One SIGTERM per driver: ejecting/unmounting/stopping ones are on their way.
+                        State::Starting | State::Mounted if !d.gone => {
+                            d.state = State::Stopping(Then::Exit);
+                            out.push(Action::StopDriver { dev: d.info.dev.clone() });
+                        }
+                        // Hidden from udisks but not served: hand it back now.
+                        State::Checking | State::BusyWait { .. } | State::MakingMountpoint | State::Failed { .. } => {
+                            out.push(Action::Rescan { dev: d.info.dev.clone() })
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -433,6 +447,7 @@ impl Core {
                 }
             }
             Input::Eject { dev } => {
+                let sibling_active = self.sibling_active(&dev);
                 let Some(d) = self.drives.get_mut(&dev) else { return };
                 match d.state {
                     State::Mounted => {
@@ -442,12 +457,17 @@ impl Core {
                         }
                         out.push(Action::Control { dev, cmd: "prepare-eject" });
                     }
-                    State::Kernel { .. } => {
+                    State::Kernel { read_only } => {
+                        d.kernel_ro = read_only;
                         d.state = State::Done { safe: true };
                         out.push(Action::KernelEject { dev, disk: d.info.disk.clone() });
                     }
-                    State::Done { .. } | State::Failed { .. } | State::BusyWait { .. } => {
-                        d.state = State::Done { safe: true };
+                    // Nothing of ours is mounted: just power it off (not while busy: someone
+                    // else holds the device and may be writing).
+                    State::Done { .. } | State::Failed { .. } if !sibling_active => {
+                        if d.state != (State::Done { safe: true }) {
+                            d.state = State::Done { safe: false };
+                        }
                         out.push(Action::PowerOff { dev, disk: d.info.disk.clone() });
                     }
                     _ => {}
@@ -477,23 +497,25 @@ impl Core {
             Input::PoweredOff { dev, ok } => {
                 let Some(d) = self.drives.get_mut(&dev) else { return };
                 let name = d.info.name();
-                if ok {
-                    out.push(notify(
-                        d,
-                        "saving",
-                        format!("{name} can be removed"),
-                        "Everything was saved.".into(),
-                        Urgency::Low,
-                    ));
-                } else {
-                    out.push(notify(
-                        d,
-                        "saving",
-                        format!("{name} can be removed"),
-                        "Everything was saved and it is unmounted (it could not be powered off).".into(),
-                        Urgency::Low,
-                    ));
-                }
+                let saved = d.state == State::Done { safe: true };
+                let body = match (saved, ok) {
+                    (true, true) => "Everything was saved.",
+                    (true, false) => "Everything was saved and it is unmounted (it could not be powered off).",
+                    (false, true) => "It was powered off.",
+                    (false, false) => "It is not mounted (it could not be powered off).",
+                };
+                out.push(notify(d, "removed", format!("{name} can be removed"), body.into(), Urgency::Low));
+            }
+            Input::KernelUnmountFailed { dev, error } => {
+                let Some(d) = self.drives.get_mut(&dev) else { return };
+                d.state = State::Kernel { read_only: d.kernel_ro };
+                out.push(notify(
+                    d,
+                    "removed",
+                    format!("{} is in use", d.info.name()),
+                    format!("It was not ejected: {error}. Close the files and windows using it, then try again."),
+                    Urgency::Normal,
+                ));
             }
             Input::Timer { dev, seq } => {
                 let Some(d) = self.drives.get_mut(&dev) else { return };
@@ -528,6 +550,7 @@ impl Core {
             gone: false,
             timer_gen: 0,
             busy_tries: 0,
+            kernel_ro: false,
         };
         if let Some(m) = d.info.mounted_at.clone() {
             // Already served by the kernel driver (mounted before the daemon started, or by hand).
@@ -625,8 +648,20 @@ impl Core {
         }
     }
 
+    /// Another partition of the same disk is still mounted by us (flashcp or kernel).
+    fn sibling_active(&self, dev: &str) -> bool {
+        let Some(disk) = self.drives.get(dev).map(|d| d.info.disk.clone()) else { return false };
+        self.drives.values().any(|o| {
+            o.info.dev != dev
+                && o.info.disk == disk
+                && !o.gone
+                && !matches!(o.state, State::Done { .. } | State::Failed { .. })
+        })
+    }
+
     fn driver_exit(&mut self, dev: &str, code: Option<i32>, out: &mut Vec<Action>) {
         let enabled = self.enabled && !self.shutting_down;
+        let sibling_active = self.sibling_active(dev);
         let Some(d) = self.drives.get_mut(dev) else { return };
         let was_dirty = d.dirty();
         let (bytes, files) = (d.dirty_bytes, d.dirty_files);
@@ -656,6 +691,20 @@ impl Core {
             (State::Starting | State::Mounted, c) if !(d.state == State::Mounted && c == Some(exit::OK)) => {
                 // The driver crashed (or failed to start): restart once, then the kernel driver.
                 d.failures += 1;
+                if was_dirty && d.failures == 1 && enabled {
+                    out.push(notify(
+                        d,
+                        "lost",
+                        format!("Problem saving to {name}"),
+                        format!(
+                            "flashcp's driver stopped while saving: {} in {} files may be missing. It is restarting \
+                             and repairs the drive; copy those files again.",
+                            mb(bytes),
+                            files
+                        ),
+                        Urgency::Critical,
+                    ));
+                }
                 if d.failures == 1 && enabled {
                     d.state = State::Starting;
                     out.push(Action::StartDriver {
@@ -688,7 +737,18 @@ impl Core {
                 rm(out);
                 d.mountpoint = None;
                 d.state = State::Done { safe: true };
-                out.push(Action::PowerOff { dev: dev.into(), disk: d.info.disk.clone() });
+                if sibling_active {
+                    out.push(notify(
+                        d,
+                        "removed",
+                        format!("{name} was saved and unmounted"),
+                        "Another partition of this drive is still in use: eject it too before removing the drive."
+                            .into(),
+                        Urgency::Low,
+                    ));
+                } else {
+                    out.push(Action::PowerOff { dev: dev.into(), disk: d.info.disk.clone() });
+                }
             }
             (State::Ejecting | State::Unmounting, _) => {
                 rm(out);
@@ -756,7 +816,9 @@ impl Core {
             ));
         }
         // The driver gets I/O errors and exits; make sure it does, its exit removes the mountpoint.
-        out.push(Action::StopDriver { dev: dev.into() });
+        if matches!(d.state, State::Starting | State::Mounted) {
+            out.push(Action::StopDriver { dev: dev.into() });
+        }
     }
 
     fn set_enabled(&mut self, on: bool, out: &mut Vec<Action>) {
@@ -1081,6 +1143,11 @@ mod tests {
                     (check(D, 3), "kernel /dev/sdb1 rw", "mounting"),
                     (Input::KernelMounted { dev: D.into(), result: Ok("/media/u/K".into()) }, "", "kernel"),
                     (Input::Eject { dev: D.into() }, "kernel-eject /dev/sdb1 /dev/sdb", "safe_to_remove"),
+                    (
+                        Input::KernelUnmountFailed { dev: D.into(), error: "target is busy".into() },
+                        "notify /dev/sdb1:removed",
+                        "kernel",
+                    ),
                     (Input::Removed { dev: D.into() }, "", "-"),
                 ],
             ),
@@ -1146,7 +1213,7 @@ mod tests {
                     (ev(D, DIRTY), "inhibit on", "saving"),
                     (
                         Input::DriverExit { dev: D.into(), code: None },
-                        "start /dev/sdb1 /media/u/K; inhibit off",
+                        "notify /dev/sdb1:lost; start /dev/sdb1 /media/u/K; inhibit off",
                         "starting",
                     ),
                     (
@@ -1177,7 +1244,7 @@ mod tests {
                     (reply(D, "prepare-eject", true), "ctl /dev/sdb1 unmount", "ejecting"),
                     (ev(D, r#"{"event":"unmounted","clean":true}"#), "", "ejecting"),
                     (exit_(D, 0), "rmmp /media/u/K; poweroff /dev/sdb", "safe_to_remove"),
-                    (Input::PoweredOff { dev: D.into(), ok: true }, "notify /dev/sdb1:saving", "safe_to_remove"),
+                    (Input::PoweredOff { dev: D.into(), ok: true }, "notify /dev/sdb1:removed", "safe_to_remove"),
                     (Input::Removed { dev: D.into() }, "", "-"),
                 ]),
             ),
@@ -1266,6 +1333,32 @@ mod tests {
                 ]),
             ),
             ("duplicate add (change event) is ignored", true, with(vec![(added(D), "", "ready")])),
+            (
+                "two partitions of one disk: no power-off while the other one is served",
+                true,
+                with(vec![
+                    (Input::Added(info("/dev/sdb2", "L")), "check /dev/sdb2", "ready"),
+                    (
+                        Input::CheckExit { dev: "/dev/sdb2".into(), code: 3, reason: None },
+                        "kernel /dev/sdb2 rw",
+                        "ready",
+                    ),
+                    (Input::KernelMounted { dev: "/dev/sdb2".into(), result: Ok("/media/u/L".into()) }, "", "ready"),
+                    (Input::Eject { dev: D.into() }, "ctl /dev/sdb1 prepare-eject", "ejecting"),
+                    (reply(D, "prepare-eject", true), "ctl /dev/sdb1 unmount", "ejecting"),
+                    (exit_(D, 0), "rmmp /media/u/K; notify /dev/sdb1:removed", "safe_to_remove"),
+                ]),
+            ),
+            (
+                "busy drive: eject refused (another program holds it); logout hands it back",
+                true,
+                vec![
+                    (added(D), "check /dev/sdb1", "checking"),
+                    (check(D, 4), "timer 1000", "busy"),
+                    (Input::Eject { dev: D.into() }, "", "busy"),
+                    (Input::Shutdown, "rescan /dev/sdb1; exit", "busy"),
+                ],
+            ),
         ];
 
         for (name, enabled, steps) in table {

@@ -106,7 +106,8 @@ impl Rig {
         }
         let dev = img.display().to_string();
         let block = format!(
-            "ACTION=add\nDEVNAME={dev}\nDEVTYPE=disk\nID_FS_LABEL=STICK\nID_FS_UUID=1A2B-3C4D\nFLASHCP_DRIVE_MODE=1\n\n"
+            "ACTION=add\nDEVNAME={dev}\nDEVTYPE=disk\nID_FS_LABEL=STICK\nID_FS_UUID=1A2B-3C4D\nFLASHCP_DRIVE_MODE=1\nFLASHCP_DRIVE_UID={}\n\n",
+            unsafe { libc_getuid() }
         );
         self.events.write_all(block.as_bytes()).unwrap();
         dev
@@ -172,6 +173,8 @@ impl Rig {
 unsafe extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
+    #[link_name = "getuid"]
+    fn libc_getuid() -> u32;
 }
 
 fn rig_env(dir: &Path) -> Vec<(&'static str, PathBuf)> {
