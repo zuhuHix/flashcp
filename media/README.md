@@ -30,6 +30,7 @@ checks the sources.
 |---|---|---|
 | `DriveMode` | `drive-mode` | the hero: any app → flashcp's driver → the stick, Eject, and the kernel driver on the same time scale |
 | `ClusterSlack` | `cluster-slack` | why 128 KB clusters make small files slow, and the same copy on 4 KB clusters |
+| `Recluster` | `recluster` | `flashcp recluster`: 128 KB clusters become 4 KB ones in place, and the same add before and after |
 | `SyncOnlyChanged` | `sync-only-changed` | `flashcp sync`: three repeat runs, only the changed files cross over |
 | `BenchmarkChart-usb3`, `-ssd`, `-usb2` | `benchmark-usb3`, … | one bar chart per measured drive |
 | `CopyVsBuild` | `copy-vs-build` | per-file round trips against one pass (`build`) |
