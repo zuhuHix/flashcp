@@ -95,6 +95,10 @@ const SYNC_EVERY: u64 = 32 << 20;
 /// files (drive mode's, `sync`'s) are linked with an entry set that must fit one sector of the
 /// root as it is: a root packed to the last byte would make drive mode read-only.
 const ROOT_SLACK: u64 = 2048;
+/// Test hook: stop (with an error, as if killed) right after the main boot sector of the
+/// named switch (`relocated` | `reclustered`) is on the medium, before its backup copy: the
+/// window a crash can leave, for the cross-OS checks.
+const STOP_ENV: &str = "FLASHCP_TEST_RECLUSTER_STOP";
 /// More files and directories than this are refused (the plan keeps them all in memory).
 const MAX_OBJECTS: usize = 8 << 20;
 
@@ -1544,7 +1548,7 @@ fn tune(f: &File, view: &mut View) -> Result<()> {
 }
 
 /// Makes `view` the volume: its (tuned) sector 0, a sync, then the same sector as backup.
-fn switch(f: &File, dev: &dyn Dev, view: &View, on_main: &mut dyn FnMut()) -> Result<()> {
+fn switch(f: &File, dev: &dyn Dev, view: &View, name: &str, on_main: &mut dyn FnMut()) -> Result<()> {
     let boot = read_boot(f)?;
     let s = SECTOR as usize;
     let mut region = boot[..11 * s].to_vec();
@@ -1556,6 +1560,9 @@ fn switch(f: &File, dev: &dyn Dev, view: &View, on_main: &mut dyn FnMut()) -> Re
     dev.write_at(&view.sector0, 0).context("write the main boot sector")?;
     dev.sync().context("sync")?;
     on_main();
+    if std::env::var(STOP_ENV).as_deref() == Ok(name) {
+        bail!("stopped by {STOP_ENV} after the main boot sector of the {name} switch");
+    }
     dev.write_at(&view.sector0, 12 * SECTOR).context("write the backup boot sector")?;
     dev.sync().context("sync")
 }
@@ -1627,7 +1634,7 @@ impl Run<'_> {
             .context("the prepared volume failed its check; nothing was switched, the volume is as it was")?;
         (self.guard)()?;
         let sink = &mut *self.sink;
-        switch(self.f, self.dev, view, &mut || sink(&Event::Switched { step: name, cluster: view.cs }))?;
+        switch(self.f, self.dev, view, name, &mut || sink(&Event::Switched { step: name, cluster: view.cs }))?;
         self.done += 2 * SECTOR;
         Ok(n)
     }
