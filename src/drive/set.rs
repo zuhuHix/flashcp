@@ -74,11 +74,18 @@ pub(crate) fn set_bytes(name_len: usize) -> usize {
     32 * (2 + name_len.div_ceil(15))
 }
 
-/// The fields of a live, checksum-verified set (as `parse_dir` accepted it).
-pub(crate) fn decode(set: &[u8]) -> SetFields {
+/// The fields of a set. Errs (never panics) on anything that is not a file entry followed by a
+/// stream extension and enough name entries for its NameLength.
+pub(crate) fn decode(set: &[u8]) -> Result<SetFields, &'static str> {
+    if set.len() < 64 || !set.len().is_multiple_of(32) || set[0] & 0x7F != 0x05 || set[32] & 0x7F != 0x40 {
+        return Err("not a file entry set");
+    }
     let nl = set[35] as usize;
+    if nl == 0 || 64 + 32 * nl.div_ceil(15) > set.len() {
+        return Err("NameLength does not fit the entry set");
+    }
     let name = (0..nl).map(|i| le16(set, 64 + 32 * (i / 15) + 2 + 2 * (i % 15))).collect();
-    SetFields {
+    Ok(SetFields {
         name,
         attrs: le16(set, 4),
         first: le32(set, 52),
@@ -88,7 +95,7 @@ pub(crate) fn decode(set: &[u8]) -> SetFields {
         ctime: (le32(set, 8), set[20], set[22]),
         mtime: (le32(set, 12), set[21], set[23]),
         atime: (le32(set, 16), 0, set[24]),
-    }
+    })
 }
 
 /// Vendor (benign) secondaries of a set: everything after the name entries.
@@ -198,7 +205,7 @@ mod tests {
             atime: raw_ts((1_700_000_200, 0)),
         };
         let mut e = encode(&f, &upc, None);
-        assert_eq!(decode(&e), SetFields { atime: (f.atime.0, 0, f.atime.2), ..f.clone() });
+        assert_eq!(decode(&e).unwrap(), SetFields { atime: (f.atime.0, 0, f.atime.2), ..f.clone() });
         assert!(crate::volume::checksum_ok_set(&e));
         // a vendor secondary survives a rename to a shorter name
         let mut vendor = [0u8; 32];
@@ -211,6 +218,6 @@ mod tests {
         assert_eq!(e2[1], 3);
         assert_eq!(e2[96], 0xE0);
         assert!(crate::volume::checksum_ok_set(&e2));
-        assert_eq!(decode(&e2).name, w("short"));
+        assert_eq!(decode(&e2).unwrap().name, w("short"));
     }
 }

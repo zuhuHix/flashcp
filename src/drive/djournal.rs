@@ -94,12 +94,14 @@ pub(crate) fn locate_raw(v: &mut Vol, max_root: u64) -> Result<Option<Place>> {
         }
         if t == 0x85 && data[i + 1] as usize == want / 32 - 1 && data[i + 32] == 0xC0 {
             let set = &data[i..i + want];
-            if crate::volume::checksum_ok_set(set) {
-                let f = super::set::decode(set);
-                if f.name == name && f.attrs & 0x16 == 0x06 {
-                    ensure!(found.is_none(), "the root holds two {NAME} entries; run fsck.exfat");
-                    found = Some(Place { first: f.first, len: f.len, nfc: f.nfc });
-                }
+            if crate::volume::checksum_ok_set(set)
+                && set[35] as usize == name.len()
+                && let Ok(f) = super::set::decode(set)
+                && f.name == name
+                && f.attrs & 0x16 == 0x06
+            {
+                ensure!(found.is_none(), "the root holds two {NAME} entries; run fsck.exfat");
+                found = Some(Place { first: f.first, len: f.len, nfc: f.nfc });
             }
         }
         i += 32;
@@ -327,6 +329,7 @@ pub(crate) fn recover(v: &Vol, dev: &dyn Dev, p: &Place) -> Result<Recovered> {
             )));
         }
     }
+    validate(v, &body.writes).map_err(|e| Refused(format!("{e:#}; nothing was written. Run fsck.exfat.")))?;
     let jw: Vec<crate::journal::JWrite> = body
         .writes
         .iter()
@@ -357,6 +360,164 @@ pub(crate) fn recover(v: &Vol, dev: &dyn Dev, p: &Place) -> Result<Recovered> {
     apply(dev, &body.writes, |_| {})?;
     write_idle(dev, v, p, h.seq)?;
     Ok(Recovered::Replayed(body.writes.len()))
+}
+
+/// Checks that every journaled write is one a commit can make, before anything is replayed:
+/// - inside the volume, `pre` and `post` of one length;
+/// - `dirty` / `clean`: VolumeFlags (bytes 106–107) and PercentInUse (112) of sector 0 only;
+/// - `alloc` / `link`: FAT entries (whole, aligned), or bitmap clusters (`alloc`, `free`);
+/// - `link`: directory clusters.
+///
+/// Which clusters hold the bitmap and the directories comes from the tree as it will be after
+/// the replay: the device's bytes with every write's `post` applied, walked from the root with
+/// the shared validating parser (bounded, every cluster visited once). A write anywhere else
+/// (file data, the up-case table, the journal, the backup boot region) is refused, so a forged
+/// journal can never alter file contents.
+pub(crate) fn validate(v: &Vol, writes: &[JW]) -> Result<()> {
+    use std::collections::{BTreeMap, HashSet};
+    let bps = v.bps;
+    let fat_len = le32(&v.sector0, 84) as u64 * bps;
+    let (fat_a, fat_b) = (v.fat_off, v.fat_off + fat_len);
+    let (heap_a, heap_b) = (v.heap_off, v.heap_off + v.cc * v.cs);
+    // the post-replay image of every touched sector
+    let mut img: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    for w in writes {
+        ensure!(!w.post.is_empty() && w.pre.len() == w.post.len(), "a journaled write is malformed");
+        let end = w.off.checked_add(w.post.len() as u64).context("a journaled write overflows")?;
+        ensure!(end <= v.vol_bytes, "a journaled write at byte {} lies outside the volume", w.off);
+        for s in w.off / 512..end.div_ceil(512) {
+            if let std::collections::btree_map::Entry::Vacant(e) = img.entry(s) {
+                e.insert(v.read_at(s * 512, 512)?);
+            }
+        }
+        for (i, &b) in w.post.iter().enumerate() {
+            let at = w.off + i as u64;
+            img.get_mut(&(at / 512)).unwrap()[(at % 512) as usize] = b;
+        }
+    }
+    let read = |off: u64, len: u64| -> Result<Vec<u8>> {
+        let mut out = v.read_at(off, len)?;
+        for (&s, b) in img.range(off / 512..(off + len).div_ceil(512)) {
+            let (a, z) = ((s * 512).max(off), ((s + 1) * 512).min(off + len));
+            out[(a - off) as usize..(z - off) as usize]
+                .copy_from_slice(&b[(a - s * 512) as usize..(z - s * 512) as usize]);
+        }
+        Ok(out)
+    };
+    let fat = |c: u32| -> Result<u32> {
+        ensure!(c >= 2 && (c as u64) < v.cc + 2, "cluster {c:#x} out of range");
+        Ok(le32(&read(fat_a + c as u64 * 4, 4)?, 0))
+    };
+    let cluster_of = |off: u64| ((off - heap_a) / v.cs) as u32 + 2;
+    // heap clusters the writes touch, by phase
+    let mut need: HashSet<u32> = HashSet::new();
+    for w in writes {
+        let (a, z) = (w.off, w.off + w.post.len() as u64);
+        let phase = PHASES[w.phase as usize];
+        if z <= 512 {
+            let only = |ok: &[u64]| (a..z).all(|x| ok.contains(&x));
+            match phase {
+                "dirty" => ensure!(only(&[106, 107]), "the journal writes the boot sector beyond VolumeFlags"),
+                "clean" => ensure!(only(&[106, 107, 112]), "the journal writes the boot sector beyond its flags"),
+                _ => bail!("the journal writes the boot sector in phase {phase}"),
+            }
+        } else if a >= fat_a && z <= fat_b {
+            ensure!(matches!(phase, "alloc" | "link"), "the journal writes the FAT in phase {phase}");
+            ensure!((a - fat_a).is_multiple_of(4) && (z - a).is_multiple_of(4), "a FAT write is not whole entries");
+        } else if a >= heap_a && z <= heap_b {
+            ensure!(matches!(phase, "alloc" | "link" | "free"), "the journal writes the cluster heap in phase {phase}");
+            for c in cluster_of(a)..=cluster_of(z - 1) {
+                need.insert(c);
+            }
+        } else {
+            bail!("a journaled write at byte {a} is outside every metadata region");
+        }
+    }
+    if need.is_empty() {
+        return Ok(());
+    }
+    // walk the post-replay tree: the bitmap's clusters and every directory's
+    let chain = |first: u32, nfc: bool, len: u64, seen: &mut HashSet<u32>| -> Result<Vec<u32>> {
+        let n = len.div_ceil(v.cs);
+        ensure!(n <= v.cc, "an object is longer than the volume");
+        let mut out = Vec::with_capacity(n.min(1 << 16) as usize);
+        let mut c = first;
+        for k in 0..n {
+            ensure!(c >= 2 && (c as u64) < v.cc + 2, "a chain leaves the cluster heap");
+            ensure!(seen.insert(c), "cluster {c:#x} is referenced twice");
+            out.push(c);
+            if k + 1 < n {
+                c = if nfc { c + 1 } else { fat(c)? };
+            }
+        }
+        Ok(out)
+    };
+    let mut seen: HashSet<u32> = HashSet::new();
+    let root = le32(&v.sector0, 96);
+    let mut root_cl = Vec::new();
+    let mut c = root;
+    loop {
+        ensure!(c >= 2 && (c as u64) < v.cc + 2 && seen.insert(c), "the root directory's chain is broken");
+        root_cl.push(c);
+        ensure!(root_cl.len() as u64 * v.cs <= crate::volume::MAX_DIR_BYTES, "the root directory is too long");
+        c = fat(c)?;
+        if c == crate::volume::EOC {
+            break;
+        }
+    }
+    let mut allowed: std::collections::HashMap<u32, &'static str> = std::collections::HashMap::new();
+    let load = |cl: &[u32]| -> Result<Vec<u8>> {
+        let mut d = Vec::with_capacity(cl.len() * v.cs as usize);
+        for &c in cl {
+            d.extend(read(v.cluster_off(c), v.cs)?);
+        }
+        Ok(d)
+    };
+    let mut extras = crate::volume::RootExtras::default();
+    let data = load(&root_cl)?;
+    let parsed = crate::volume::parse_dir(&data, Some(&mut extras), "/", v.cs, false)?;
+    for &c in &root_cl {
+        allowed.insert(c, "dir");
+    }
+    ensure!(extras.bitmaps.len() == 1, "the volume after the replay has no single bitmap");
+    let bm = extras.bitmaps[0];
+    for c in chain(le32(&bm, 20), false, le64(&bm, 24), &mut seen)? {
+        allowed.insert(c, "bitmap");
+    }
+    let mut stack: Vec<(Vec<crate::volume::Child>, String)> = vec![(parsed.1, String::new())];
+    'walk: while let Some((kids, path)) = stack.pop() {
+        for ch in kids.into_iter().filter(|c| c.is_dir) {
+            if need.iter().all(|c| allowed.contains_key(c)) {
+                break 'walk;
+            }
+            ensure!(ch.len <= crate::volume::MAX_DIR_BYTES && ch.len > 0, "a directory has an invalid size");
+            let p = format!("{path}/{}", String::from_utf16_lossy(&ch.name));
+            let cl = chain(ch.first, ch.no_fat_chain, ch.len, &mut seen)?;
+            for &c in &cl {
+                allowed.insert(c, "dir");
+            }
+            let d = load(&cl)?;
+            let (_, sub, _) = crate::volume::parse_dir(&d, None, &p, v.cs, false)?;
+            stack.push((sub, p));
+        }
+    }
+    for w in writes {
+        let (a, z) = (w.off, w.off + w.post.len() as u64);
+        if a < heap_a || z > heap_b {
+            continue;
+        }
+        let phase = PHASES[w.phase as usize];
+        for c in cluster_of(a)..=cluster_of(z - 1) {
+            match (allowed.get(&c).copied(), phase) {
+                (Some("bitmap"), "alloc" | "free") | (Some("dir"), "link") => {}
+                (what, _) => bail!(
+                    "the journal writes cluster {c:#x} ({}) in phase {phase}: not a commit's write",
+                    what.unwrap_or("file data or free space")
+                ),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The entry set of the journal file.
