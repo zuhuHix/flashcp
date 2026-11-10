@@ -153,18 +153,61 @@ fn now() -> u64 {
 /// is the simulated device's name when `FLASHCP_SIM_DEVICE` is set. A trace file that cannot
 /// be created is an error: the user asked for it.
 pub fn init_from_env(cmd: &str) -> anyhow::Result<()> {
+    init_from_env_guarded(cmd, &[])
+}
+
+/// [`init_from_env`], refusing a trace file that is one of `forbid` (see [`init_guarded`]).
+pub fn init_from_env_guarded(cmd: &str, forbid: &[(u64, u64)]) -> anyhow::Result<()> {
     match std::env::var_os(TRACE_ENV).filter(|p| !p.is_empty()) {
-        Some(p) => init(std::path::Path::new(&p), cmd),
+        Some(p) => init_guarded(std::path::Path::new(&p), cmd, forbid),
         None => Ok(()),
     }
 }
 
 /// Starts tracing into `path` (see [`init_from_env`]).
 pub fn init(path: &std::path::Path, cmd: &str) -> anyhow::Result<()> {
+    init_guarded(path, cmd, &[])
+}
+
+/// (st_dev, st_ino) of each of `paths` and `fds` that exists: the files a command works on,
+/// which a trace file must never be.
+pub fn identities(paths: &[&std::path::Path], fds: &[i32]) -> Vec<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out: Vec<(u64, u64)> =
+        paths.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| (m.dev(), m.ino())).collect();
+    for &fd in fds {
+        if let Ok(m) = std::fs::metadata(format!("/proc/self/fd/{fd}")) {
+            out.push((m.dev(), m.ino()));
+        }
+    }
+    out
+}
+
+/// Starts tracing into `path`, which must be (or become) a regular file that is none of
+/// `forbid` (the command's own target and sources, by st_dev/st_ino). It is opened without
+/// truncating and without following a symlink, checked, and only then emptied: a trace path
+/// that names a block device, a FIFO, a symlink or the volume image being written is refused
+/// before a single byte is written to it.
+pub fn init_guarded(path: &std::path::Path, cmd: &str, forbid: &[(u64, u64)]) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     if SINK.get().is_some() {
         return Ok(());
     }
-    let f = File::create(path).map_err(|e| anyhow::anyhow!("create trace file {}: {e}", path.display()))?;
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("create trace file {}: {e}", path.display()))?;
+    let md = f.metadata().map_err(|e| anyhow::anyhow!("trace file {}: {e}", path.display()))?;
+    anyhow::ensure!(md.is_file(), "trace file {} is not a regular file; refusing to write to it", path.display());
+    anyhow::ensure!(
+        !forbid.contains(&(md.dev(), md.ino())),
+        "trace file {} is a file this command works on; refusing to write to it",
+        path.display()
+    );
+    f.set_len(0).map_err(|e| anyhow::anyhow!("truncate trace file {}: {e}", path.display()))?;
     let _ = SINK.set(Sink { out: Mutex::new(BufWriter::with_capacity(1 << 20, f)), t0: Instant::now() });
     let dev = crate::sim::device::sim_device().map(|d| d.name.clone());
     line(&format!(
