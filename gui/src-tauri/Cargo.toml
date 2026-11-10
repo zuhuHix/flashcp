@@ -1,6 +1,6 @@
 [package]
 name = "flashcp-gui"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Tray app: fast copy to USB exFAT drives with flashcp"
 license = "GPL-3.0-or-later"
