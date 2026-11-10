@@ -337,8 +337,20 @@ impl Io {
                     let (code, reason) = match run_with_timeout(c, Duration::from_secs(10)) {
                         Ok((code, out)) => {
                             let line = String::from_utf8_lossy(&out).lines().last().unwrap_or("").to_string();
-                            let reason = crate::daemon::json::parse_flat(&line).and_then(|m| m.get("reason").cloned());
-                            (code.unwrap_or(1), reason.filter(|r| r != "null"))
+                            let m = crate::daemon::json::parse_flat(&line).unwrap_or_default();
+                            let code = code.unwrap_or(1);
+                            // Exit 0 counts only with a `check` event saying ok and no busy_unknown.
+                            let reason = if m.contains_key("busy_unknown") {
+                                Some("busy_unknown".to_string())
+                            } else if code == 0
+                                && !(m.get("event").is_some_and(|e| e == "check")
+                                    && m.get("ok").is_some_and(|v| v == "true"))
+                            {
+                                Some("unexpected check output".to_string())
+                            } else {
+                                m.get("reason").cloned().filter(|r| r != "null")
+                            };
+                            (code, reason)
                         }
                         Err(e) => (1, Some(e.to_string())),
                     };
@@ -379,10 +391,11 @@ impl Io {
                     dev,
                 });
             }
-            Action::KernelEject { dev, disk } => {
+            Action::KernelEject { dev, disk, checked } => {
                 let u = self.env.udisksctl.clone();
                 self.send_later(move || match run_ok(&u, &["unmount", "-b", &dev, "--no-user-interaction"]) {
-                    // Not mounted (the eject of a drive nobody serves): straight to power-off.
+                    // Not mounted: a power-off only right after the holder/mount re-check.
+                    Err(error) if error.contains("NotMounted") && !checked => Input::KernelNotMounted { dev },
                     Err(error) if !error.contains("NotMounted") => Input::KernelUnmountFailed { dev, error },
                     _ => {
                         let ok = run_ok(&u, &["power-off", "-b", &disk, "--no-user-interaction"]).is_ok();

@@ -223,7 +223,7 @@ unmounted before the daemon exits.
 
 | Command | Effect |
 | --- | --- |
-| the app's "Speed up USB drives" / `flashcp drive-mode on\|off` | Per user, persisted in `~/.config/flashcp/drive-mode.conf`. Off: current flashcp drives are flushed and remounted by the kernel driver; new drives go to udisks. |
+| the app's "Speed up USB drives" / `flashcp drive-mode on\|off` | Per user, persisted in `~/.config/flashcp/drive-mode.conf`. Off: current flashcp drives are flushed and remounted by the kernel driver (read-only, with a notification, if flashcp could not finish saving: turn it on and replug to recover); new drives go to udisks. |
 | `flashcp drive-mode status [--json]` | Mode, state and pending bytes per drive |
 | `sudo flashcp drive-mode off --system` | For every user (`/etc/flashcp/drive-mode-disabled`); re-runs the rules so plugged drives go back to udisks. `on --system` undoes it. |
 | `systemctl --user disable --now flashcp-drived` | Stop the daemon for one user (its drives are flushed and unmounted; new drives get udisks) |

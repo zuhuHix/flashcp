@@ -144,6 +144,10 @@ pub enum Input {
         dev: String,
         ok: bool,
     },
+    /// udisks says an unchecked [`Action::KernelEject`]'s drive is not mounted.
+    KernelNotMounted {
+        dev: String,
+    },
     /// udisks could not unmount a kernel-mounted drive for an eject (it is in use).
     KernelUnmountFailed {
         dev: String,
@@ -195,10 +199,13 @@ pub enum Action {
         dev: String,
         read_only: bool,
     },
-    /// Unmount a kernel mount through udisks and power the drive off.
+    /// Unmount a kernel mount through udisks and power the drive off. `checked`: holders and
+    /// mounts were just re-checked, so "not mounted" may go on to the power-off; otherwise a "not
+    /// mounted" answer comes back as [`Input::KernelNotMounted`] for that re-check.
     KernelEject {
         dev: String,
         disk: String,
+        checked: bool,
     },
     PowerOff {
         dev: String,
@@ -244,7 +251,9 @@ impl fmt::Display for Action {
             Action::KernelMount { dev, read_only } => {
                 write!(f, "kernel {dev} {}", if *read_only { "ro" } else { "rw" })
             }
-            Action::KernelEject { dev, disk } => write!(f, "kernel-eject {dev} {disk}"),
+            Action::KernelEject { dev, disk, checked } => {
+                write!(f, "kernel-eject {dev} {disk}{}", if *checked { " checked" } else { "" })
+            }
             Action::PowerOff { disk, .. } => write!(f, "poweroff {disk}"),
             Action::RemoveMountpoint { path } => write!(f, "rmmp {path}"),
             Action::Notify { key, .. } => write!(f, "notify {key}"),
@@ -313,6 +322,8 @@ pub struct Drive {
     timer_gen: u64,
     busy_tries: usize,
     kernel_ro: bool,
+    /// The driver reported `unmounted` clean with nothing pending (reset when it mounts).
+    clean_unmount: bool,
 }
 
 impl Drive {
@@ -464,7 +475,7 @@ impl Core {
                     State::Kernel { read_only } => {
                         d.kernel_ro = read_only;
                         d.state = State::Done { safe: true };
-                        out.push(Action::KernelEject { dev, disk: d.info.disk.clone() });
+                        out.push(Action::KernelEject { dev, disk: d.info.disk.clone(), checked: false });
                     }
                     // Nothing of ours is mounted, but someone else may hold the device (the busy
                     // retries ran out) or have mounted it since: re-check holders and mounts first,
@@ -508,6 +519,12 @@ impl Core {
                     (false, false) => "It is not mounted (it could not be powered off).",
                 };
                 out.push(notify(d, "removed", format!("{name} can be removed"), body.into(), Urgency::Low));
+            }
+            Input::KernelNotMounted { dev } => {
+                // Someone unmounted it meanwhile: re-check holders and mounts before powering off.
+                let Some(d) = self.drives.get_mut(&dev) else { return };
+                d.state = State::EjectChecking;
+                out.push(Action::Check { dev });
             }
             Input::KernelUnmountFailed { dev, error } => {
                 let Some(d) = self.drives.get_mut(&dev) else { return };
@@ -554,6 +571,7 @@ impl Core {
             timer_gen: 0,
             busy_tries: 0,
             kernel_ro: false,
+            clean_unmount: false,
         };
         if let Some(m) = d.info.mounted_at.clone() {
             // Already served by the kernel driver (mounted before the daemon started, or by hand).
@@ -571,19 +589,30 @@ impl Core {
         let enabled = self.enabled && !self.shutting_down;
         let Some(d) = self.drives.get_mut(dev) else { return };
         if d.state == State::EjectChecking {
-            if code == exit::BUSY {
-                out.push(notify(
-                    d,
-                    "removed",
-                    format!("{} is in use by another program", d.info.name()),
-                    "It was not ejected. Close the program using it, then try again.".into(),
-                    Urgency::Normal,
-                ));
-                d.state = State::Failed { message: "in use by another program".into() };
-            } else {
+            // Allow-list: only a clean "nothing holds it" answer may lead to a power-off.
+            if code == exit::OK && reason.is_none() {
                 d.state = State::Done { safe: true };
-                out.push(Action::KernelEject { dev: dev.into(), disk: d.info.disk.clone() });
+                out.push(Action::KernelEject { dev: dev.into(), disk: d.info.disk.clone(), checked: true });
+                return;
             }
+            let name = d.info.name();
+            let (title, body) = if code == exit::BUSY {
+                (
+                    format!("{name} is in use by another program"),
+                    "Close the program using it, then try again.".to_string(),
+                )
+            } else {
+                (
+                    format!("{name} was not ejected"),
+                    format!(
+                        "flashcp could not make sure nothing is using it ({}). Unplug it only once nothing \
+                         uses it.",
+                        reason.unwrap_or_else(|| format!("check exit {code}"))
+                    ),
+                )
+            };
+            out.push(notify(d, "removed", title, body, Urgency::Normal));
+            d.state = State::Failed { message: "eject refused".into() };
             return;
         }
         if d.state != State::Checking {
@@ -593,6 +622,10 @@ impl Core {
             return kernel(d, false, out);
         }
         match code {
+            // The check could not see holders/mounts: as good as busy.
+            exit::OK if reason.as_deref() == Some("busy_unknown") => refused(d, exit::BUSY, reason, out),
+            // Exit 0 without a proper `check` answer: not trusted, the kernel driver gets it.
+            exit::OK if reason.is_some() => refused(d, exit::FALLBACK, reason, out),
             exit::OK => {
                 d.state = State::MakingMountpoint;
                 out.push(Action::MakeMountpoint { dev: dev.into(), name: mountpoint_name(&d.info) });
@@ -605,6 +638,7 @@ impl Core {
         let Some(d) = self.drives.get_mut(dev) else { return };
         match ev {
             DriverEvent::Mounted { recovered } => {
+                d.clean_unmount = false;
                 if d.state == State::Starting {
                     d.state = State::Mounted;
                 }
@@ -658,7 +692,8 @@ impl Core {
                     ));
                 }
             }
-            DriverEvent::Unmounted { .. } => {
+            DriverEvent::Unmounted { clean } => {
+                d.clean_unmount = clean && !d.dirty();
                 if d.state == State::Mounted {
                     d.state = State::Unmounting;
                 }
@@ -788,16 +823,22 @@ impl Core {
             (State::Stopping(Then::Kernel), c) => {
                 rm(out);
                 d.mountpoint = None;
-                if c != Some(exit::OK) && was_dirty {
+                // Read-write only after a clean stop: exit 0 and `unmounted` with nothing pending.
+                let clean = c == Some(exit::OK) && d.clean_unmount;
+                if !clean {
+                    let lost = if was_dirty { format!(" Up to {} may be missing.", mb(bytes)) } else { String::new() };
                     out.push(notify(
                         d,
                         "failed",
-                        format!("Problem saving to {name}"),
-                        format!("Up to {} may not have been saved.", mb(bytes)),
+                        format!("flashcp couldn't finish saving to {name}"),
+                        format!(
+                            "It is opened read-only.{lost} To recover it, turn \"Speed up USB drives\" on and plug \
+                             it in again."
+                        ),
                         Urgency::Critical,
                     ));
                 }
-                kernel(d, false, out);
+                kernel(d, !clean, out);
             }
             (State::Stopping(Then::Exit), _) => {
                 rm(out);
@@ -1167,6 +1208,10 @@ mod tests {
                         "notify /dev/sdb1:removed",
                         "kernel",
                     ),
+                    // Unmounted behind our back: re-check, and a holder refuses the power-off.
+                    (Input::Eject { dev: D.into() }, "kernel-eject /dev/sdb1 /dev/sdb", "safe_to_remove"),
+                    (Input::KernelNotMounted { dev: D.into() }, "check /dev/sdb1", "ejecting"),
+                    (check(D, 4), "notify /dev/sdb1:removed", "failed"),
                     (Input::Removed { dev: D.into() }, "", "-"),
                 ],
             ),
@@ -1195,12 +1240,34 @@ mod tests {
                     (check(D, 4), "timer 10000", "busy"),
                     (Input::Timer { dev: D.into(), seq: 3 }, "check /dev/sdb1", "checking"),
                     (check(D, 4), "notify /dev/sdb1:failed", "failed"),
-                    // Eject after the retries ran out: re-check first; still held → refused.
+                    // Eject after the retries ran out: re-check first; anything but a clean "nothing
+                    // holds it" refuses (busy, an error, an unknown code, a spawn failure,
+                    // busy_unknown).
+                    (Input::Eject { dev: D.into() }, "check /dev/sdb1", "ejecting"),
+                    (
+                        Input::CheckExit { dev: D.into(), code: 1, reason: Some("I/O error".into()) },
+                        "notify /dev/sdb1:removed",
+                        "failed",
+                    ),
+                    (Input::Eject { dev: D.into() }, "check /dev/sdb1", "ejecting"),
+                    (check(D, 42), "notify /dev/sdb1:removed", "failed"),
+                    (Input::Eject { dev: D.into() }, "check /dev/sdb1", "ejecting"),
+                    (
+                        Input::CheckExit { dev: D.into(), code: 1, reason: Some("spawn: No such file".into()) },
+                        "notify /dev/sdb1:removed",
+                        "failed",
+                    ),
+                    (Input::Eject { dev: D.into() }, "check /dev/sdb1", "ejecting"),
+                    (
+                        Input::CheckExit { dev: D.into(), code: 0, reason: Some("busy_unknown".into()) },
+                        "notify /dev/sdb1:removed",
+                        "failed",
+                    ),
                     (Input::Eject { dev: D.into() }, "check /dev/sdb1", "ejecting"),
                     (check(D, 4), "notify /dev/sdb1:removed", "failed"),
                     // Released since: the udisks path (unmount + power off), never a bare power-off.
                     (Input::Eject { dev: D.into() }, "check /dev/sdb1", "ejecting"),
-                    (check(D, 0), "kernel-eject /dev/sdb1 /dev/sdb", "safe_to_remove"),
+                    (check(D, 0), "kernel-eject /dev/sdb1 /dev/sdb checked", "safe_to_remove"),
                 ],
             ),
             (
@@ -1323,9 +1390,31 @@ mod tests {
                 true,
                 with(vec![
                     (Input::SetEnabled(false), "stop /dev/sdb1", "stopping"),
+                    (ev(D, r#"{"event":"unmounted","clean":true}"#), "", "stopping"),
                     (exit_(D, 0), "rmmp /media/u/K; kernel /dev/sdb1 rw", "mounting"),
                     (Input::Added(info("/dev/sdc1", "L")), "kernel /dev/sdc1 rw", "mounting"),
                     (Input::SetEnabled(true), "", "mounting"),
+                ]),
+            ),
+            (
+                "off switch, but the driver could not finish (or never said unmounted): kernel READ-ONLY",
+                true,
+                with(vec![
+                    (ev(D, DIRTY), "inhibit on", "saving"),
+                    (Input::SetEnabled(false), "stop /dev/sdb1", "stopping"),
+                    (
+                        exit_(D, 1),
+                        "rmmp /media/u/K; notify /dev/sdb1:failed; kernel /dev/sdb1 ro; inhibit off",
+                        "mounting",
+                    ),
+                ]),
+            ),
+            (
+                "off switch: exit 0 but no `unmounted` event: read-only",
+                true,
+                with(vec![
+                    (Input::SetEnabled(false), "stop /dev/sdb1", "stopping"),
+                    (exit_(D, 0), "rmmp /media/u/K; notify /dev/sdb1:failed; kernel /dev/sdb1 ro", "mounting"),
                 ]),
             ),
             (
