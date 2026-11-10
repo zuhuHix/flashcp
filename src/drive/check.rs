@@ -181,6 +181,10 @@ mod tests {
     /// Hostile boot regions and root directories: the check never panics, never reads past
     /// its budget, and anything it accepts the full parser accepts too. A bounded, seeded
     /// mutation corpus (FLASHCP_FUZZ_ITERS, default 300).
+    fn dev2(f: &File) -> crate::drive::dev::FileDev {
+        crate::drive::dev::FileDev::new(std::sync::Arc::new(f.try_clone().unwrap()))
+    }
+
     #[test]
     fn check_survives_hostile_volumes() {
         let img = image("check-fuzz", 16, 512);
@@ -307,6 +311,15 @@ mod tests {
         assert!(e.downcast_ref::<crate::drive::djournal::Refused>().is_some(), "{e:#}");
         assert!(format!("{e:#}").contains("not a commit's write"), "{e:#}");
         assert_eq!(v.read_at(at, 16).unwrap(), pre, "recovery wrote the forged bytes");
+        // a hostile ACTIVE journal whose small body decodes to 64 MiB: refused before anything
+        // is allocated for it
+        let bomb = zstd::bulk::compress(&vec![0u8; 64 << 20], 3).unwrap();
+        crate::drive::djournal::write_active(&dev2(&rw), &v, &place, 8, &bomb).unwrap();
+        let e = crate::drive::tests::open_with(&path, std::sync::Arc::new(dev2(&rw)), crate::drive::tests::manual())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(e.downcast_ref::<crate::drive::djournal::Refused>().is_some(), "{e:#}");
+        assert!(format!("{e:#}").contains("more than a commit writes"), "{e:#}");
         v.dev.sync_all().unwrap();
     }
 }
