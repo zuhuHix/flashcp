@@ -33,6 +33,10 @@ pub(crate) const ATTRS: u16 = super::set::ATTR_HIDDEN | super::set::ATTR_SYSTEM 
 /// split until it fits both, and recovery refuses anything bigger before allocating for it.
 pub(crate) const MAX_BODY: u64 = 8 << 20;
 pub(crate) const MAX_RAW: usize = 16 << 20;
+/// A data sample is at most this long (commits sample ≤ 512 bytes), and all of them together
+/// at most [`MAX_SAMPLED`]: checked before any is read.
+const MAX_SAMPLE: u64 = 4096;
+const MAX_SAMPLED: u64 = 32 << 20;
 
 /// Bytes the encoded (uncompressed) body of `writes` and `samples` takes.
 pub(crate) fn raw_len(v: &Vol, writes: &[JW], samples: usize) -> usize {
@@ -210,8 +214,11 @@ fn decode_body(z: &[u8], max: usize) -> Result<Body> {
     let serial = u32::from_le_bytes(take(4)?.try_into()?);
     let gl = u16::from_le_bytes(take(2)?.try_into()?) as usize;
     let geometry = String::from_utf8(take(gl)?.to_vec())?;
+    // counts are never trusted to size anything: records are pushed as they parse, and a
+    // count that cannot fit the remaining bytes is refused first
     let nw = u32::from_le_bytes(take(4)?.try_into()?) as usize;
-    let mut writes = Vec::with_capacity(nw.min(1 << 20));
+    ensure!(nw.saturating_mul(13) <= b.len(), "the journal declares more writes than its body holds");
+    let mut writes = Vec::new();
     for _ in 0..nw {
         let phase = take(1)?[0];
         ensure!((phase as usize) < PHASES.len(), "bad phase in journal");
@@ -222,10 +229,12 @@ fn decode_body(z: &[u8], max: usize) -> Result<Body> {
         writes.push(JW { phase, off, pre, post });
     }
     let ns = u32::from_le_bytes(take(4)?.try_into()?) as usize;
-    let mut samples = Vec::with_capacity(ns.min(1 << 20));
+    ensure!(ns.saturating_mul(20) <= b.len(), "the journal declares more samples than its body holds");
+    let mut samples = Vec::new();
     for _ in 0..ns {
         let off = u64::from_le_bytes(take(8)?.try_into()?);
         let len = u32::from_le_bytes(take(4)?.try_into()?);
+        ensure!(len as u64 <= MAX_SAMPLE, "a journal sample of {len} bytes is longer than a commit writes");
         let h = u64::from_le_bytes(take(8)?.try_into()?);
         samples.push((off, len, h));
     }
@@ -339,6 +348,11 @@ pub(crate) fn recover(v: &Vol, dev: &dyn Dev, p: &Place) -> Result<Recovered> {
              nothing was written",
             body.serial, body.geometry
         )));
+    }
+    let sampled: u64 = body.samples.iter().map(|s| s.1 as u64).sum();
+    if sampled > MAX_SAMPLED || body.samples.iter().any(|s| s.0.checked_add(s.1 as u64).is_none_or(|e| e > v.vol_bytes))
+    {
+        bail!(Refused(format!("the journal's data samples ({sampled} bytes) are not a commit's; nothing was written")));
     }
     for &(off, len, hash) in &body.samples {
         let b = v.read_at(off, len as u64)?;
@@ -515,6 +529,7 @@ pub(crate) fn validate(v: &Vol, writes: &[JW]) -> Result<()> {
     }
     ensure!(extras.bitmaps.len() == 1, "the volume after the replay has no single bitmap");
     let bm = extras.bitmaps[0];
+    ensure!(le64(&bm, 24) == v.cc.div_ceil(8), "the bitmap's length does not match the cluster count");
     for c in chain(le32(&bm, 20), false, le64(&bm, 24), &mut seen)? {
         allowed.insert(c, "bitmap");
     }
