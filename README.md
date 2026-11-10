@@ -906,7 +906,8 @@ The same operations are available as a Rust library: `flashcp::build`, `flashcp:
 **Coming in 0.3.0 (merged, not released yet):** [drive mode](#drive-mode). `flashcp mount`, a
 crash-safe read-write exFAT driver in userspace with write-behind
 ([#22](https://github.com/zuhuHix/flashcp/pull/22)), saving when files are closed
-([#24](https://github.com/zuhuHix/flashcp/pull/24)), and the always-on integration: the udev
+([#24](https://github.com/zuhuHix/flashcp/pull/24)), a round of commit and read-ahead fixes
+([#25](https://github.com/zuhuHix/flashcp/pull/25)), and the always-on integration: the udev
 takeover, `flashcp drived`, the eject guard, the **Speed up USB drives** switch and
 `flashcp drive-mode` ([#20](https://github.com/zuhuHix/flashcp/pull/20)).
 
