@@ -24,11 +24,13 @@
 
 use super::commit::{JW, PHASES};
 use super::dev::Dev;
-use crate::volume::{Child, Vol, le16, le32, le64};
+use crate::volume::{Child, Vol, le32, le64};
 use anyhow::{Context, Result, bail, ensure};
 
 pub(crate) const NAME: &str = ".flashcp-drive-journal";
-pub(crate) const ATTRS: u16 = 0x02 | 0x04 | 0x20;
+pub(crate) const ATTRS: u16 = super::set::ATTR_HIDDEN | super::set::ATTR_SYSTEM | super::set::ATTR_ARCHIVE;
+/// Test hook: the size of a journal file created now.
+pub(crate) const JOURNAL_BYTES_ENV: &str = "FLASHCP_TEST_JOURNAL_BYTES";
 const MAGIC: &[u8; 16] = b"FLASHCP-DRIVEJ1\0";
 const STATE_IDLE: u8 = 0;
 const STATE_ACTIVE: u8 = 1;
@@ -52,6 +54,23 @@ pub(crate) fn reserved_name(key: &[u16], upc: &[u16]) -> bool {
         let k: Vec<u16> = n.encode_utf16().map(|c| upc[c as usize]).collect();
         k == key
     })
+}
+
+/// For `add` and `sync` on a volume drive mode used: refuses while a commit of `flashcp
+/// mount` is pending (only a mount replays it), and hides the journal file from their view of
+/// the root (it is never a user file; its clusters stay allocated).
+pub(crate) fn hide_from(v: &mut Vol) -> Result<()> {
+    let Some(root) = v.dirs.first_mut() else { return Ok(()) };
+    let key = root.children.iter().find(|(_, c)| is_journal(c)).map(|(k, _)| k.clone());
+    let Some(key) = key else { return Ok(()) };
+    let c = root.children.remove(&key).unwrap();
+    let p = Place { first: c.first, len: c.len, nfc: c.no_fat_chain };
+    ensure!(
+        header_state(v, &p) != Some(true),
+        "the volume holds an interrupted commit of flashcp mount; mount it with `flashcp mount` once (that \
+         recovers it), then retry (nothing was written)"
+    );
+    Ok(())
 }
 
 pub(crate) fn find(root: &[Child]) -> Option<Place> {
@@ -90,6 +109,10 @@ pub(crate) fn locate_raw(v: &mut Vol, max_root: u64) -> Result<Option<Place>> {
 
 /// The journal's size for a volume of `vol_bytes` with clusters of `cs`.
 pub(crate) fn capacity(vol_bytes: u64, cs: u64) -> u64 {
+    // test hook: a small journal file, to exercise split commits
+    if let Some(b) = std::env::var(JOURNAL_BYTES_ENV).ok().and_then(|v| v.parse::<u64>().ok()) {
+        return b.max(4096).div_ceil(cs) * cs;
+    }
     (vol_bytes / 512).clamp(1 << 20, 8 << 20).div_ceil(cs) * cs
 }
 
@@ -275,11 +298,6 @@ fn load(v: &Vol, p: &Place) -> Result<Option<(Header, Body)>> {
     Ok(Some((h, body)))
 }
 
-/// Whether the journal is ACTIVE (a commit was interrupted): read-only.
-pub(crate) fn pending(v: &Vol, p: &Place) -> bool {
-    matches!(load(v, p), Ok(Some(_)))
-}
-
 /// Replays an interrupted commit (see the module doc). Err([`Refused`]) when the volume
 /// changed since; nothing is written then.
 pub(crate) fn recover(v: &Vol, dev: &dyn Dev, p: &Place) -> Result<Recovered> {
@@ -370,9 +388,4 @@ pub(crate) fn one_sector_slot(d: &[u8], end: usize, need: usize) -> Option<(usiz
 pub(crate) fn header_state(v: &Vol, p: &Place) -> Option<bool> {
     let h = v.read_at(base(v, p), 512).ok()?;
     parse_header(&h).map(|h| h.state == STATE_ACTIVE)
-}
-
-#[allow(dead_code)]
-fn _unused(v: &[u8]) -> u16 {
-    le16(v, 0)
 }

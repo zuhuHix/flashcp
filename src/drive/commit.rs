@@ -83,11 +83,14 @@ pub(crate) struct Plan {
     pub(crate) fins: Vec<(Ino, InoFin)>,
     pub(crate) dirs: Vec<(Ino, DirData)>,
     pub(crate) alloc_runs: Vec<(u64, u64)>,
+    /// The bitmap before this commit (which gaps between data writes may be zero-filled).
+    pub(crate) pre_bm: Arc<Vec<u8>>,
+    /// Inodes planned.
+    pub(crate) inodes: usize,
     pub(crate) free_runs: Vec<(u64, u64)>,
     pub(crate) files: u64,
     pub(crate) bytes: u64,
     pub(crate) sector0: Vec<u8>,
-    pub(crate) batch: Vec<Ino>,
 }
 
 /// A directory's working copy during planning.
@@ -289,6 +292,7 @@ impl Planner<'_> {
 
     /// Plans a changed file's new data: layout, data segments, freed clusters. Returns
     /// (layout, keep).
+    #[allow(clippy::needless_range_loop)]
     fn plan_file(&mut self, i: Ino) -> Result<(Layout, u64)> {
         let cs = self.cs();
         let runs = self.c.runs(i).map_err(|e| anyhow::anyhow!("reading {}: errno {e}", self.c.path(i)))?;
@@ -490,11 +494,19 @@ fn materialize(c: &mut Core, i: Ino) -> Result<()> {
 }
 
 /// Plans a commit of everything dirty. None when there is nothing to do.
-pub(crate) fn plan(c: &mut Core) -> Result<Option<Plan>> {
+/// With `limit`, at most that many inodes go into this commit (the rest stays dirty for the
+/// next one): unlinked ones first (a replaced target must go with its replacement), then by
+/// depth, so a new directory is always committed with or before its entries.
+pub(crate) fn plan(c: &mut Core, limit: Option<usize>) -> Result<Option<Plan>> {
     if c.dirty.is_empty() {
         return Ok(None);
     }
-    let batch: Vec<Ino> = c.dirty.iter().copied().collect();
+    let mut batch: Vec<Ino> = c.dirty.iter().copied().collect();
+    if let Some(n) = limit.filter(|&n| n < batch.len()) {
+        batch.sort_by_cached_key(|&i| (c.inodes.get(&i).is_some_and(|x| x.linked), depth(c, i), i));
+        let unlinked = batch.iter().take_while(|&&i| c.inodes.get(&i).is_none_or(|x| !x.linked)).count();
+        batch.truncate(n.max(unlinked));
+    }
     // Unlinked inodes that never reached the volume: nothing to write.
     let mut work: Vec<Ino> = Vec::new();
     for &i in &batch {
@@ -704,12 +716,12 @@ pub(crate) fn plan(c: &mut Core) -> Result<Option<Plan>> {
         // a new directory's parent must have its set placed too (it is queued: dirty)
     }
     // Directories extended but not otherwise dirty were queued above; the root has no set.
-    finish(p, work, seq).map(Some)
+    let n_inodes = work.len();
+    finish(p, n_inodes).map(Some)
 }
 
 /// Turns the planner's state into the journaled writes.
-fn finish(mut p: Planner<'_>, batch: Vec<Ino>, _seq: u64) -> Result<Plan> {
-    let cs = p.cs();
+fn finish(mut p: Planner<'_>, n_inodes: usize) -> Result<Plan> {
     let mut writes: Vec<JW> = Vec::new();
     // dirty
     let s0 = p.c.vol.sector0.clone();
@@ -846,7 +858,6 @@ fn finish(mut p: Planner<'_>, batch: Vec<Ino>, _seq: u64) -> Result<Plan> {
             bail!("internal error: overlapping data segments at {}", w[1].dev);
         }
     }
-    let _ = cs;
     let mut s0n = s0.clone();
     s0n[106..108].copy_from_slice(&cf.to_le_bytes());
     s0n[112] = pct;
@@ -856,11 +867,12 @@ fn finish(mut p: Planner<'_>, batch: Vec<Ino>, _seq: u64) -> Result<Plan> {
         fins: p.fins.into_iter().collect(),
         dirs: dirs_out,
         alloc_runs,
+        pre_bm: Arc::new(p.c.bm.clone()),
+        inodes: n_inodes,
         free_runs,
         files: p.files,
         bytes: p.bytes,
         sector0: s0n,
-        batch,
     })
 }
 

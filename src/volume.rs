@@ -664,8 +664,11 @@ pub(crate) const SYNC_JOURNAL_ATTRS: u16 = 0x02 | 0x04 | 0x20;
 
 /// Whether `ch`, a child of the ROOT directory, is the on-volume sync journal: that exact name,
 /// a file, Hidden and System. Every command that lists user files skips it.
+/// Also true for drive mode's permanent journal ([`crate::drive::djournal::NAME`]).
 pub(crate) fn is_sync_journal(ch: &Child) -> bool {
-    !ch.is_dir && ch.attrs & 0x06 == 0x06 && ch.name.iter().copied().eq(SYNC_JOURNAL_NAME.encode_utf16())
+    !ch.is_dir
+        && ch.attrs & 0x06 == 0x06
+        && (ch.name.iter().copied().eq(SYNC_JOURNAL_NAME.encode_utf16()) || crate::drive::djournal::is_journal(ch))
 }
 
 /// Whether an entry set's SetChecksum is right.
@@ -696,11 +699,14 @@ pub(crate) fn refuse_journal_name(src: &std::path::Path, to: Option<&str>) -> Re
     }
     let Ok(rd) = std::fs::read_dir(src) else { return Ok(()) };
     for e in rd.flatten() {
-        if e.file_name().to_str().is_some_and(|n| n.eq_ignore_ascii_case(SYNC_JOURNAL_NAME)) {
+        if e.file_name().to_str().is_some_and(|n| {
+            n.eq_ignore_ascii_case(SYNC_JOURNAL_NAME) || n.eq_ignore_ascii_case(crate::drive::djournal::NAME)
+        }) {
             bail!(
-                "{} would be written to the volume's root as {SYNC_JOURNAL_NAME}, the name flashcp sync keeps its \
-                 on-volume journal under; rename it (nothing was written)",
-                e.path().display()
+                "{} would be written to the volume's root as {}, a name flashcp keeps its on-volume journal \
+                 under; rename it (nothing was written)",
+                e.path().display(),
+                e.file_name().to_string_lossy()
             );
         }
     }
