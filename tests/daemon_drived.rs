@@ -151,11 +151,22 @@ impl Rig {
         img
     }
 
-    /// The udev add event for an image.
+    /// The udev add event for an image, with its volume serial as `ID_FS_UUID` (as blkid
+    /// prints it); 1A2B-3C4D for the stand-in images, which have none.
     fn announce(&mut self, img: &Path) -> String {
+        let mut b = [0u8; 104];
+        use std::io::Read;
+        let _ = File::open(img).unwrap().read_exact(&mut b);
+        let serial = u32::from_le_bytes([b[100], b[101], b[102], b[103]]);
+        let uuid =
+            if serial == 0 { "1A2B-3C4D".to_string() } else { format!("{:04X}-{:04X}", serial >> 16, serial & 0xffff) };
+        self.announce_as(img, &uuid)
+    }
+
+    fn announce_as(&mut self, img: &Path, uuid: &str) -> String {
         let dev = img.display().to_string();
         let block = format!(
-            "ACTION=add\nDEVNAME={dev}\nDEVTYPE=disk\nID_FS_LABEL=STICK\nID_FS_UUID=1A2B-3C4D\nFLASHCP_DRIVE_MODE=1\nFLASHCP_DRIVE_UID={}\n\n",
+            "ACTION=add\nDEVNAME={dev}\nDEVTYPE=disk\nID_FS_LABEL=STICK\nID_FS_UUID={uuid}\nFLASHCP_DRIVE_MODE=1\nFLASHCP_DRIVE_UID={}\n\n",
             unsafe { libc_getuid() }
         );
         self.events.write_all(block.as_bytes()).unwrap();
@@ -391,8 +402,9 @@ fn offer_accept_converts_the_image_and_remounts() {
     assert_eq!(r.log("daemon").matches("-> start ").count(), 2, "flashcp mounted it again: {}", r.log("daemon"));
     let c = recluster_check(&img);
     assert!(c.contains("\"cluster\":4096") && c.contains("\"finish\":false"), "{c}");
+    // Written when the answer came, before the conversion started (so before "ready again").
     let saved = fs::read_to_string(r.dir.join("state/flashcp/recluster-offers")).unwrap();
-    assert_eq!(saved, "1A2B-3C4D:STICK\taccepted\n");
+    assert!(saved.ends_with("::STICK\taccepted\n") && saved.lines().count() == 1, "{saved}");
     assert!(r.log("gdbus").contains("CloseNotification 77"), "{}", r.log("gdbus"));
 
     // Plugged in again: no second offer (and the check says no anyway).
@@ -507,5 +519,83 @@ fn status_survives_a_closed_pipe_and_sees_a_manual_unmount() {
         let err = String::from_utf8_lossy(&o.stderr);
         assert!(o.status.success() && !err.contains("panicked") && err.is_empty(), "{args:?}: {:?} {err}", o.status);
     }
+    r.stop();
+}
+
+/// The daemon's control socket, one request.
+fn daemon_request(r: &Rig, line: &str) -> String {
+    let mut s = UnixStream::connect(r.dir.join("run/flashcp/drived.sock")).unwrap();
+    s.write_all(format!("{line}\n").as_bytes()).unwrap();
+    let mut l = String::new();
+    BufReader::new(s).read_line(&mut l).unwrap();
+    l
+}
+
+fn plug_of(status: &str) -> String {
+    let rest = &status[status.find("\"plug\":").expect("a plug field") + 7..];
+    rest[..rest.find([',', '}']).unwrap()].to_string()
+}
+
+/// Stick A is unplugged and stick B arrives at the same path: a confirmation made for A (the
+/// app's `--plug`, a raw `recluster DEV PLUG`) is refused for B and nothing is written to B.
+#[test]
+fn a_confirmation_for_a_replaced_stick_is_refused() {
+    let mut r = Rig::new("replaced");
+    r.cli(&["drive-mode", "offer", "off"]);
+    let img = r.big_cluster_image("a");
+    let dev = r.announce(&img);
+    r.wait("A ready", r.state_is("ready"));
+    let a_plug = plug_of(&r.status());
+    r.unplug(&dev);
+    r.wait("A forgotten", || !r.status().contains(&dev));
+    // B: another stick (a new volume serial), the same device path.
+    let b = r.big_cluster_image("b");
+    fs::rename(&b, &img).unwrap();
+    r.announce(&img);
+    r.wait("B ready", r.state_is("ready"));
+    assert_ne!(plug_of(&r.status()), a_plug);
+    let before = fs::read(&img).unwrap();
+
+    let reply = daemon_request(&r, &format!("recluster {dev} {a_plug}"));
+    assert!(
+        reply.contains("\"ok\":false") && reply.contains("That drive was replaced. Nothing was changed."),
+        "{reply}"
+    );
+    let o = Command::new(env!("CARGO_BIN_EXE_flashcp"))
+        .args(["drive-mode", "recluster", &dev, "--yes", "--json", "--plug", &a_plug])
+        .envs(rig_env(&r.dir))
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(o.status.code(), Some(3), "{text}");
+    assert!(text.contains("That drive was replaced. Nothing was changed."), "{text}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(r.status().contains("\"state\":\"ready\""), "{}", r.status());
+    assert_eq!(fs::read(&img).unwrap(), before, "B was written to");
+    assert!(!r.dir.join("state/flashcp/recluster-offers").exists());
+    r.stop();
+}
+
+/// The last line of defence: recluster itself compares the volume serial it reads through the
+/// claimed fd with the one the user was asked about, before its first write.
+#[test]
+fn recluster_refuses_a_volume_with_another_serial() {
+    let mut r = Rig::new("serial");
+    r.cli(&["drive-mode", "offer", "off"]);
+    let img = r.big_cluster_image("s");
+    // udev says one serial, the medium has another (it was swapped under the same name).
+    let dev = r.announce_as(&img, "0BAD-F00D");
+    r.wait("ready", r.state_is("ready"));
+    let before = fs::read(&img).unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_flashcp"))
+        .args(["drive-mode", "recluster", &dev, "--yes", "--json"])
+        .envs(rig_env(&r.dir))
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(o.status.code(), Some(3), "{text}\n{}", r.log("daemon"));
+    assert!(text.contains("\"result\":\"refused\"") && text.contains("not the volume that was checked"), "{text}");
+    assert_eq!(fs::read(&img).unwrap(), before, "nothing was written");
+    r.wait("mounted again", r.state_is("ready"));
     r.stop();
 }

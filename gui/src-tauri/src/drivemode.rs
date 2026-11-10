@@ -49,6 +49,10 @@ pub struct DriveModeDrive {
     pub convert_result: Option<String>,
     #[serde(default, alias = "convert_message")]
     pub convert_message: Option<String>,
+    /// This plug-in's token: "Make faster" sends it back, so a dialog opened for one stick is
+    /// never applied to another one that got the same device path.
+    #[serde(default)]
+    pub plug: u64,
 }
 
 /// The daemon and setting state for the window.
@@ -231,10 +235,11 @@ pub async fn drive_mode_eject(device: String) -> Result<(), String> {
 /// "Make faster": the daemon pauses the drive, converts it and mounts it again. Returns the
 /// result text; a refusal or failure comes back as the error (the drive works as before).
 #[tauri::command]
-pub async fn drive_mode_recluster(device: String) -> Result<String, String> {
+pub async fn drive_mode_recluster(device: String, plug: u64) -> Result<String, String> {
     validate_device(&device)?;
     blocking(move || {
-        let args = ["drive-mode", "recluster", device.as_str(), "--yes", "--json"];
+        let plug = plug.to_string();
+        let args = ["drive-mode", "recluster", device.as_str(), "--yes", "--plug", plug.as_str(), "--json"];
         parse_recluster(&run(&program(), &args, RECLUSTER_TIMEOUT)?)
     })
     .await
@@ -263,9 +268,10 @@ mod tests {
             DriveModeSet { enabled: false, running: true }
         );
         assert!(parse_ok(r#"{"ok":true}"#).is_ok());
-        let conv = r#"{"ok":true,"running":true,"enabled":true,"offers":true,"drives":[{"device":"/dev/sdb1","label":"K","mode":"flashcp","state":"converting","mountpoint":"/media/u/K","dirty_bytes":0,"dirty_files":0,"safe_to_remove":false,"can_convert":true,"cluster":131072,"convert_secs":7,"convert_done":5,"convert_total":10,"convert_result":null,"convert_message":null}]}"#;
+        let conv = r#"{"ok":true,"running":true,"enabled":true,"offers":true,"drives":[{"device":"/dev/sdb1","label":"K","mode":"flashcp","state":"converting","mountpoint":"/media/u/K","dirty_bytes":0,"dirty_files":0,"safe_to_remove":false,"can_convert":true,"cluster":131072,"convert_secs":7,"convert_done":5,"convert_total":10,"convert_result":null,"convert_message":null,"plug":4,"volume":"1A2B-3C4D::K"}]}"#;
         let d = &parse_status(conv).unwrap().drives[0];
         assert!(d.can_convert && d.convert_secs == 7 && d.convert_done == 5 && d.convert_total == 10);
+        assert_eq!(d.plug, 4);
         assert_eq!(d.convert_result, None);
         assert_eq!(
             parse_recluster(

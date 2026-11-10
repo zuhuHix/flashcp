@@ -59,6 +59,13 @@ fn check_dry_run_run_and_refusal_speak_the_contract() {
     );
     assert_eq!((field(&l[0], "cluster"), field(&l[0], "new_cluster")), ("32768", "4096"));
 
+    // --expect-serial: another volume's serial is refused before anything is written.
+    let out = recluster(&img, &["--json", "--expect-serial", "0BAD-F00D"]);
+    let l = lines(&out);
+    assert_eq!(out.status.code(), Some(3), "{l:?}");
+    assert_eq!((field(&l[0], "event"), field(&l[0], "reason")), ("refused", "wrong-volume"));
+    assert_eq!(sum(&img), built, "a refused --expect-serial wrote to the image");
+
     // --dry-run: the plan and nothing else, nothing written.
     let out = recluster(&img, &["--dry-run", "--json"]);
     let l = lines(&out);
@@ -67,8 +74,11 @@ fn check_dry_run_run_and_refusal_speak_the_contract() {
     let planned: u64 = field(&l[0], "write_bytes").parse().unwrap();
     assert_eq!(sum(&img), built, "--dry-run wrote to the image");
 
-    // The run: plan, the switches, a last progress at 100 %, done.
-    let out = recluster(&img, &["--json"]);
+    // The run (with this volume's own serial): plan, the switches, a last progress at 100 %, done.
+    let boot = std::fs::read(&img).unwrap();
+    let serial = u32::from_le_bytes([boot[100], boot[101], boot[102], boot[103]]);
+    let own = format!("{:04X}-{:04X}", serial >> 16, serial & 0xffff);
+    let out = recluster(&img, &["--json", "--expect-serial", &own]);
     let l = lines(&out);
     assert_eq!(out.status.code(), Some(0), "{l:?}\n{}", String::from_utf8_lossy(&out.stderr));
     let events: Vec<&str> = l.iter().map(|x| field(x, "event")).filter(|e| *e != "progress").collect();

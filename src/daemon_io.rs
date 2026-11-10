@@ -4,7 +4,7 @@
 //! drivers' stdout and exit, `--check` runs, control-socket replies, timers, logind's
 //! PrepareForSleep/PrepareForShutdown (`gdbus monitor`), SIGTERM, and the daemon's own control
 //! socket (`$XDG_RUNTIME_DIR/flashcp/drived.sock`: `status`, `enable`, `disable`, `eject DEV`,
-//! `recluster DEV`, `offers on|off`).
+//! `recluster DEV PLUG`, `offers on|off`).
 //!
 //! The offer to make a stick faster is a notification with two buttons, sent through
 //! `org.freedesktop.Notifications` with `gdbus` (`Notify` with actions, then `ActionInvoked` /
@@ -199,12 +199,37 @@ pub fn read_answered(path: &Path) -> std::collections::BTreeSet<String> {
     s.lines().filter_map(|l| l.split_once('\t')).map(|(k, _)| k.to_string()).collect()
 }
 
+/// Add one answer: the whole file rewritten to a new temp file (0600, never through a
+/// symlink), fsynced, renamed over the old one, the directory fsynced.
 fn remember(path: &Path, volume: &str, answer: &str) -> std::io::Result<()> {
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+    std::fs::create_dir_all(dir)?;
+    // A symlink there is not ours: its target is neither read nor written, it is replaced.
+    let regular = std::fs::symlink_metadata(path).map(|m| m.file_type().is_file()).unwrap_or(false);
+    let mut text = if regular { std::fs::read_to_string(path)? } else { String::new() };
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
     }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{volume}\t{answer}")
+    text += &format!("{volume}\t{answer}\n");
+    let tmp = dir.join(format!(".recluster-offers.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
@@ -349,10 +374,14 @@ fn main_loop(core: &mut Core, io: &mut Io, rx: &Receiver<Msg>) {
                         refresh_kernel_mounts(core);
                         (core.status_json().replacen("{\"ok\":true", "{\"ok\":true,\"running\":true", 1), None)
                     }
-                    (Some("recluster"), Some(dev)) => match core.convert_blocker(dev) {
-                        None => ("{\"ok\":true}".into(), Some(Input::Convert { dev: dev.into() })),
-                        Some(why) => (format!("{{\"ok\":false,\"error\":{}}}", crate::events::json_str(why)), None),
-                    },
+                    // `recluster DEV PLUG`: PLUG is the `plug` of the status the user was shown.
+                    (Some("recluster"), Some(dev)) => {
+                        let plug = words.next().and_then(|p| p.parse::<u64>().ok()).unwrap_or(0);
+                        match core.convert_blocker(dev, plug) {
+                            None => ("{\"ok\":true}".into(), Some(Input::Convert { dev: dev.into(), plug })),
+                            Some(why) => (format!("{{\"ok\":false,\"error\":{}}}", crate::events::json_str(why)), None),
+                        }
+                    }
                     (Some("offers"), Some(w @ ("on" | "off"))) => {
                         (format!("{{\"ok\":true,\"offers\":{}}}", w == "on"), Some(Input::SetOffers(w == "on")))
                     }
@@ -423,8 +452,8 @@ struct Io {
     drivers: HashMap<String, u32>,
     /// Notification ids by key, to replace a notification instead of stacking a new one.
     notes: HashMap<String, u32>,
-    /// The offer notifications on screen, by device: their D-Bus id.
-    offers: Arc<Mutex<HashMap<String, u32>>>,
+    /// The offer notifications on screen, by device and plug-in: their D-Bus id.
+    offers: Arc<Mutex<HashMap<(String, u64), u32>>>,
     inhibitor: Option<Child>,
 }
 
@@ -568,23 +597,26 @@ impl Io {
                     Input::ReclusterChecked { dev, check }
                 });
             }
-            Action::Recluster { dev } => self.recluster(dev),
-            Action::Offer { dev, title, body } => {
+            Action::Recluster { dev, serial } => self.recluster(dev, serial),
+            Action::Offer { dev, plug, title, body } => {
                 let (gdbus, offers, tx) = (self.env.gdbus.clone(), self.offers.clone(), self.tx.clone());
                 std::thread::spawn(move || {
-                    let answer = offer(&gdbus, &offers, &dev, &title, &body);
-                    offers.lock().unwrap().remove(&dev);
-                    let _ = tx.send(Msg::In(Input::OfferAnswer { dev, answer }));
+                    // The answer carries the plug-in it was asked for: the core drops it if
+                    // another stick has this path by then.
+                    let answer = offer(&gdbus, &offers, (&dev, plug), &title, &body);
+                    offers.lock().unwrap().remove(&(dev.clone(), plug));
+                    let _ = tx.send(Msg::In(Input::OfferAnswer { dev, plug, answer }));
                 });
             }
-            Action::CloseOffer { dev } => {
-                if let Some(id) = self.offers.lock().unwrap().get(&dev).copied() {
+            Action::CloseOffer { dev, plug } => {
+                if let Some(id) = self.offers.lock().unwrap().get(&(dev, plug)).copied() {
                     let _ = notifications(&self.env.gdbus, "CloseNotification", &[&id.to_string()]);
                 }
             }
-            Action::Remember { volume, answer } => {
+            Action::Remember { dev, volume, answer } => {
                 if let Err(e) = remember(&self.env.offers_state, &volume, answer) {
                     eprintln!("flashcp drived: cannot save the answer for {volume}: {e}");
+                    self.send_later(move || Input::RememberFailed { dev });
                 }
             }
             Action::Rescan { dev } => {
@@ -631,13 +663,14 @@ impl Io {
 
     /// `flashcp recluster DEV --json`: its events and exit go back to the core. It opens the
     /// device itself (O_EXCL + flock), like `flashcp mount`: the uaccess ACL is enough.
-    fn recluster(&mut self, dev: String) {
-        let spawned = Command::new(&self.env.me)
-            .args(["recluster", "--json"])
-            .arg(&dev)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .spawn();
+    fn recluster(&mut self, dev: String, serial: Option<String>) {
+        let mut c = Command::new(&self.env.me);
+        c.args(["recluster", "--json"]);
+        // Checked on the claimed fd before the first write: the stick the user said yes to.
+        if let Some(s) = serial {
+            c.arg("--expect-serial").arg(s);
+        }
+        let spawned = c.arg(&dev).stdin(Stdio::null()).stdout(Stdio::piped()).spawn();
         let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
@@ -947,7 +980,7 @@ fn notifications(gdbus: &str, method: &str, args: &[&str]) -> Result<String, Str
 
 /// Show the offer with Accept / Not now and wait for the answer. No "actions" capability, no
 /// server, no gdbus: [`Answer::None`] (nothing is shown, nothing remembered).
-fn offer(gdbus: &str, ids: &Mutex<HashMap<String, u32>>, dev: &str, title: &str, body: &str) -> Answer {
+fn offer(gdbus: &str, ids: &Mutex<HashMap<(String, u64), u32>>, key: (&str, u64), title: &str, body: &str) -> Answer {
     match notifications(gdbus, "GetCapabilities", &[]) {
         Ok(caps) if caps.contains("'actions'") => {}
         _ => return Answer::None,
@@ -991,7 +1024,7 @@ fn offer(gdbus: &str, ids: &Mutex<HashMap<String, u32>>, dev: &str, title: &str,
         let _ = monitor.wait();
         return Answer::None;
     };
-    ids.lock().unwrap().insert(dev.into(), id);
+    ids.lock().unwrap().insert((key.0.into(), key.1), id);
     let mut answer = Answer::None;
     for line in lines.map_while(Result::ok) {
         let mine = line.contains(&format!("(uint32 {id},"));
@@ -1121,6 +1154,11 @@ pub fn to_input(p: &BTreeMap<String, String>) -> Option<Input> {
                 label: label.filter(|l| !l.is_empty()),
                 uuid: p.get("ID_FS_UUID").cloned().filter(|u| !u.is_empty()),
                 recover: p.get("FLASHCP_RECOVER").is_some_and(|v| v == "1"),
+                disk_serial: p
+                    .get("ID_SERIAL_SHORT")
+                    .or_else(|| p.get("ID_SERIAL"))
+                    .cloned()
+                    .filter(|s| !s.trim().is_empty()),
             }))
         }
         _ => None,
@@ -1166,6 +1204,32 @@ mod tests {
         remember(&st, "5E6F-0000:", "accepted").unwrap();
         let a = read_answered(&st);
         assert!(a.contains("1A2B-3C4D:KINGSTON") && a.contains("5E6F-0000:") && a.len() == 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The answers file is replaced whole (0600), never written through a symlink, and a write
+    /// that cannot happen is an error the caller sees.
+    #[test]
+    fn answers_are_written_atomically_and_not_through_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("flashcp-drived-answers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let victim = d.join("victim");
+        std::fs::write(&victim, "someone else's file\n").unwrap();
+        let st = d.join("recluster-offers");
+        std::os::unix::fs::symlink(&victim, &st).unwrap();
+        remember(&st, "1A2B-3C4D::K", "declined").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "someone else's file\n");
+        let md = std::fs::symlink_metadata(&st).unwrap();
+        assert!(md.file_type().is_file(), "the symlink was replaced by the file");
+        assert_eq!(md.permissions().mode() & 0o777, 0o600);
+        remember(&st, "5E6F-0000:X:L", "accepted").unwrap();
+        assert_eq!(std::fs::read_to_string(&st).unwrap(), "1A2B-3C4D::K\tdeclined\n5E6F-0000:X:L\taccepted\n");
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 2, "no temp file left behind");
+        // The state directory cannot be created (a file is in the way): an error, not a claim.
+        std::fs::write(d.join("blocked"), "").unwrap();
+        assert!(remember(&d.join("blocked/recluster-offers"), "k", "declined").is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 

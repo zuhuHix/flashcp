@@ -128,6 +128,20 @@ pub struct ReclusterOpts {
     /// `Prefix`: write only the FAT entries in use. `Full`: zero the rest of the new FAT too.
     pub fat: FatMode,
     pub dry_run: bool,
+    /// Refuse (reason `wrong-volume`, nothing written) unless the boot sector read through the
+    /// claimed fd carries this volume serial: the caller checked and asked about that volume.
+    pub expect_serial: Option<u32>,
+}
+
+/// The volume serial of a boot sector (what udev shows as `ID_FS_UUID`, `XXXX-XXXX`).
+pub fn boot_serial(boot: &[u8]) -> u32 {
+    u32::from_le_bytes([boot[100], boot[101], boot[102], boot[103]])
+}
+
+/// `1A2B-3C4D` (udev's `ID_FS_UUID` of an exFAT volume) as the serial number.
+pub fn parse_serial(s: &str) -> Option<u32> {
+    let h: String = s.chars().filter(|c| *c != '-').collect();
+    (h.len() == 8).then(|| u32::from_str_radix(&h, 16).ok()).flatten()
 }
 
 /// Why `recluster` will not touch a volume. Nothing was written.
@@ -1761,6 +1775,23 @@ pub(crate) fn run_on(
     let t0 = Instant::now();
     let boot = read_boot(f).map_err(invalid)?;
     precheck(&boot)?;
+    // Before anything is written, on the same claimed fd: is this still the volume?
+    if let Some(want) = o.expect_serial {
+        let got = boot_serial(&boot);
+        if got != want {
+            return Err(refused(
+                "wrong-volume",
+                format!(
+                    "this is not the volume that was checked (serial {:04X}-{:04X}, expected {:04X}-{:04X}); \
+                     nothing was written",
+                    got >> 16,
+                    got & 0xffff,
+                    want >> 16,
+                    want & 0xffff
+                ),
+            ));
+        }
+    }
     let pending = backup_state(&boot)? == Backup::SwitchPending;
     let mut t = open_tree(f, dev_len).map_err(invalid)?;
     // The backup boot sector an interrupted switch still owes. The main region has just passed

@@ -294,6 +294,10 @@ enum Cmd {
         /// Print events as JSON lines on stdout
         #[arg(long)]
         json: bool,
+        /// Refuse (exit 3, reason wrong-volume, nothing written) unless the volume serial read
+        /// through the claimed device is this one (XXXX-XXXX, as udev's UUID)
+        #[arg(long, value_name = "UUID", conflicts_with = "check")]
+        expect_serial: Option<String>,
     },
     /// Show an exFAT volume's label, size, free space and file count (read-only)
     Info {
@@ -750,7 +754,7 @@ fn run(cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Recluster { target, target_fd, cluster, fat, dry_run, check, json } => {
+        Cmd::Recluster { target, target_fd, cluster, fat, dry_run, check, json, expect_serial } => {
             let target = spec(target, target_fd);
             if check {
                 let c = recluster::check(&target)?;
@@ -767,7 +771,13 @@ fn run(cmd: Cmd) -> Result<()> {
                 flashcp::sim::trace::finish();
                 std::process::exit(if c.benefit { 0 } else { 3 });
             }
-            let o = recluster::ReclusterOpts { cluster, fat, dry_run };
+            let expect_serial = match expect_serial.as_deref() {
+                Some(s) => Some(anyhow::Context::with_context(recluster::parse_serial(s), || {
+                    format!("--expect-serial {s}: not XXXX-XXXX")
+                })?),
+                None => None,
+            };
+            let o = recluster::ReclusterOpts { cluster, fat, dry_run, expect_serial };
             let mut out = |e: &recluster::Event| {
                 if json {
                     use std::io::Write;

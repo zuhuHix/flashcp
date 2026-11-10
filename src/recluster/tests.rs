@@ -25,7 +25,7 @@ fn rw(p: &Path) -> File {
 }
 
 fn opts(cluster: Option<u32>, fat: FatMode) -> ReclusterOpts {
-    ReclusterOpts { cluster, fat, dry_run: false }
+    ReclusterOpts { cluster, fat, dry_run: false, expect_serial: None }
 }
 
 /// `recluster` of the image at `p` through `dev` (the plain file when None).

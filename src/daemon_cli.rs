@@ -49,6 +49,10 @@ pub enum DriveModeCmd {
         /// Do not ask first
         #[arg(long)]
         yes: bool,
+        /// Only if the drive is still the plug-in with this `plug` number (from `status --json`,
+        /// as the app passes it): refused when another drive got its device path meanwhile
+        #[arg(long, value_name = "N")]
+        plug: Option<u64>,
         #[arg(long)]
         json: bool,
     },
@@ -127,7 +131,7 @@ pub fn drive_mode(cmd: DriveModeCmd) -> Result<()> {
             }
             Ok(())
         }
-        DriveModeCmd::Recluster { device, yes, json } => recluster(&device, yes, json),
+        DriveModeCmd::Recluster { device, yes, plug, json } => recluster(&device, yes, plug, json),
         DriveModeCmd::Offer { state, json } => {
             let on = state == "on";
             daemon_io::write_offers(&daemon_io::config_path(), on)?;
@@ -163,13 +167,28 @@ fn drive_of(reply: &str, device: &str) -> Option<BTreeMap<String, String>> {
 
 /// `flashcp drive-mode recluster DEV`: the daemon does the work (the same path as the
 /// notification's Accept); this prints what it says and waits for the end.
-fn recluster(device: &str, yes: bool, json: bool) -> Result<()> {
+fn recluster(device: &str, yes: bool, expect_plug: Option<u64>, json: bool) -> Result<()> {
     let no_daemon = "the drive service (flashcp drived) is not running";
+    let refuse = |why: &str| -> Result<()> {
+        if json {
+            say!(r#"{{"ok":false,"error":{}}}"#, crate::events::json_str(why));
+            std::process::exit(3);
+        }
+        bail!("{why}");
+    };
     let reply = ask("status").context(no_daemon)?;
     let Some(d) = drive_of(&reply, device) else {
+        if expect_plug.is_some() {
+            return refuse(crate::daemon::REPLACED);
+        }
         let served: Vec<String> = drives(&reply).iter().filter_map(|d| d.get("device").cloned()).collect();
         bail!("{device} is not a drive the drive service knows (it knows: {})", served.join(", "));
     };
+    // The plug-in these texts are about: the daemon refuses if the drive at this path changes.
+    let plug: u64 = d.get("plug").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if expect_plug.is_some_and(|p| p != plug) {
+        return refuse(crate::daemon::REPLACED);
+    }
     let name = d.get("label").cloned().unwrap_or_else(|| device.to_string());
     let secs: u64 = d.get("convert_secs").and_then(|v| v.parse().ok()).unwrap_or(0);
     if !json {
@@ -186,7 +205,7 @@ fn recluster(device: &str, yes: bool, json: bool) -> Result<()> {
             return Ok(());
         }
     }
-    let r = ask(&format!("recluster {device}")).context(no_daemon)?;
+    let r = ask(&format!("recluster {device} {plug}")).context(no_daemon)?;
     if !r.contains("\"ok\":true") {
         let m = crate::daemon::json::parse_flat(&r).unwrap_or_default();
         let why = m.get("error").cloned().unwrap_or(r);
@@ -201,7 +220,9 @@ fn recluster(device: &str, yes: bool, json: bool) -> Result<()> {
     loop {
         std::thread::sleep(Duration::from_millis(250));
         let Some(st) = ask("status") else { bail!("the drive service stopped") };
-        let Some(d) = drive_of(&st, device) else { bail!("{name} was removed") };
+        let Some(d) = drive_of(&st, device).filter(|d| d.get("plug").is_some_and(|p| *p == plug.to_string())) else {
+            bail!("{name} was removed")
+        };
         let g = |k: &str| d.get(k).cloned().unwrap_or_default();
         let state = g("state");
         if state == "converting" {
