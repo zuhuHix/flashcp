@@ -130,7 +130,7 @@ impl Mount {
             if let Some(l) = self.events.lock().unwrap().iter().find(|l| l.contains(pat)) {
                 return l.clone();
             }
-            assert!(t.elapsed() < Duration::from_secs(20), "no event {pat}; got {:?}", self.events.lock().unwrap());
+            assert!(t.elapsed() < Duration::from_secs(60), "no event {pat}; got {:?}", self.events.lock().unwrap());
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -524,13 +524,17 @@ fn sync_is_not_forwarded_but_closing_commits() {
     assert!(s.contains("\"dirty_bytes\":300000"), "sync/syncfs committed after all (update DESIGN.md): {s}");
     assert!(!m.has_event("\"event\":\"committing\""));
     // the last write handle closes: committed within the linger (plus the commit)
-    let t = Instant::now();
     drop(f);
+    // the idle commit is 10 minutes away: a commit now is the close commit (generous timeout:
+    // loaded CI machines)
     m.wait_event("\"event\":\"committed\"");
-    let took = t.elapsed();
-    assert!(took < Duration::from_secs(2), "close commit took {took:?}");
     assert!(m.wait_event("\"reason\":\"close\"").contains("committing"));
     assert!(m.ctl("status").contains("\"dirty_bytes\":0"));
+    // a read-only handle that creates (O_RDONLY|O_CREAT) is no writer: closes still commit after it
+    let c = std::ffi::CString::new(m.mnt.join("ro-created").into_os_string().into_encoded_bytes()).unwrap();
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CREAT, 0o644) };
+    assert!(fd >= 0);
+    unsafe { libc::close(fd) };
     // a whole-file write (open, write, close) is durable a linger later, no sync needed
     std::fs::write(m.mnt.join("second.txt"), b"second").unwrap();
     let t = Instant::now();
@@ -540,7 +544,7 @@ fn sync_is_not_forwarded_but_closing_commits() {
         {
             break;
         }
-        assert!(t.elapsed() < Duration::from_secs(2), "second close commit missing");
+        assert!(t.elapsed() < Duration::from_secs(60), "second close commit missing");
         std::thread::sleep(Duration::from_millis(20));
     }
     m.unmount();

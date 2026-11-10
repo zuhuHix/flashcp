@@ -386,6 +386,10 @@ fn main() {
         let code = if check {
             flashcp::drive::mount::run_check(&device, device_fd, json)
         } else {
+            // the mount itself is traced like every other command (FLASHCP_TRACE); --check is not
+            if let Err(e) = flashcp::sim::trace::init_from_env("mount") {
+                eprintln!("Error: {e:#}");
+            }
             flashcp::drive::mount::run_mount(flashcp::drive::mount::MountArgs {
                 device,
                 mountpoint: mountpoint.expect("clap requires MOUNTPOINT"),
@@ -398,6 +402,7 @@ fn main() {
                 threads,
             })
         };
+        flashcp::sim::trace::finish();
         std::process::exit(code);
     }
     let traced = match (&cli.trace_out, &cli.cmd) {
