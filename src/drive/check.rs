@@ -320,6 +320,28 @@ mod tests {
             .unwrap_err();
         assert!(e.downcast_ref::<crate::drive::djournal::Refused>().is_some(), "{e:#}");
         assert!(format!("{e:#}").contains("more than a commit writes"), "{e:#}");
+        // journal fields that would size allocations: a u32::MAX data sample, and counts far
+        // past what the body holds; refused before any of it is allocated or read
+        let mut hostile: Vec<Vec<u8>> =
+            vec![crate::drive::djournal::encode_body(&v, &[], &[(0, u32::MAX, 0)]).unwrap()];
+        for (writes, samples) in [(u32::MAX, 0u32), (0, u32::MAX)] {
+            let geom = crate::journal::geometry_of(&v.sector0);
+            let mut raw = b"DJB1".to_vec();
+            raw.extend_from_slice(&le32(&v.sector0, 100).to_le_bytes());
+            raw.extend_from_slice(&(geom.len() as u16).to_le_bytes());
+            raw.extend_from_slice(geom.as_bytes());
+            raw.extend_from_slice(&writes.to_le_bytes());
+            raw.extend_from_slice(&samples.to_le_bytes());
+            hostile.push(zstd::bulk::compress(&raw, 3).unwrap());
+        }
+        for (k, body) in hostile.iter().enumerate() {
+            crate::drive::djournal::write_active(&dev2(&rw), &v, &place, 9 + k as u64, body).unwrap();
+            let e =
+                crate::drive::tests::open_with(&path, std::sync::Arc::new(dev2(&rw)), crate::drive::tests::manual())
+                    .map(|_| ())
+                    .unwrap_err();
+            assert!(e.downcast_ref::<crate::drive::djournal::Refused>().is_some(), "case {k}: {e:#}");
+        }
         v.dev.sync_all().unwrap();
     }
 }
