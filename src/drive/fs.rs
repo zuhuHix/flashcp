@@ -30,6 +30,8 @@ pub struct FsOpts {
     pub readahead: bool,
     /// Readahead cache, bytes.
     pub ra_cap: u64,
+    /// The volume's offset on its disk (bytes): the write probe aligns its windows to it.
+    pub part_off: u64,
 }
 
 impl Default for FsOpts {
@@ -43,6 +45,7 @@ impl Default for FsOpts {
             spill_dir: None,
             readahead: true,
             ra_cap: 64 << 20,
+            part_off: 0,
         }
     }
 }
@@ -96,22 +99,36 @@ struct Shared {
 #[derive(Default)]
 struct Track {
     dirs: std::collections::HashMap<Ino, DirTrack>,
-    files: std::collections::HashMap<Ino, (u64, u64)>,
+    files: std::collections::HashMap<Ino, FileTrack>,
     /// When a bulk copy was last seen.
     bulk: Option<Instant>,
+    /// The reader seen last takes heads only (see [`DirTrack::head`]).
+    head: bool,
 }
 
 #[derive(Default)]
 struct DirTrack {
     opened: u32,
-    queued: bool,
-    next: bool,
+    /// When its files were queued, and its next sibling's (a later pass re-arms both).
+    queued: Option<Instant>,
+    next: Option<Instant>,
+    /// The file read from its start last, and whether the reader takes only heads.
+    last: Option<Ino>,
+    head: bool,
+}
+
+/// A file's reader: where its last read ended, how far ahead is queued, the current window.
+#[derive(Default)]
+struct FileTrack {
+    next: u64,
+    upto: u64,
+    window: u64,
 }
 
 /// Device ranges of `dir`'s committed files after set offset `after`, in its order (up to
 /// [`RA_DIR_FILE_MAX`] each, [`RA_DIR_MAX`] in all); marks them queued for the sequential
 /// readahead.
-fn dir_ranges(c: &mut Core, tr: &mut Track, dir: Ino, after: usize) -> Vec<(u64, u64)> {
+fn dir_ranges(c: &mut Core, tr: &mut Track, dir: Ino, after: usize, per_file: u64) -> Vec<(u64, u64)> {
     let mut files: Vec<(usize, Ino)> = c
         .ino(dir)
         .ok()
@@ -130,13 +147,13 @@ fn dir_ranges(c: &mut Core, tr: &mut Track, dir: Ino, after: usize) -> Vec<(u64,
     let mut out = Vec::new();
     let mut total = 0u64;
     for (_, k) in files {
-        let keep = c.inodes[&k].keep.min(RA_DIR_FILE_MAX);
+        let keep = c.inodes[&k].keep.min(per_file);
         total += keep;
         if total > RA_DIR_MAX {
             break;
         }
         out.extend(base_ranges(c, k, 0, keep));
-        tr.files.insert(k, (0, keep));
+        tr.files.insert(k, FileTrack { next: 0, upto: keep, window: 0 });
     }
     out
 }
@@ -160,6 +177,14 @@ fn next_sibling(c: &Core, dir: Ino) -> Option<Ino> {
 
 /// Bytes of a big file queued ahead of its sequential reader.
 const RA_WINDOW: u64 = 16 << 20;
+/// A big file's first window (doubled per continued read, up to [`RA_WINDOW`]).
+const RA_WINDOW_MIN: u64 = 256 << 10;
+/// Per file, for a reader that takes heads only.
+const RA_HEAD: u64 = 128 << 10;
+/// A directory's prefetch is queued again after this (a second pass over a tree).
+const RA_REARM: Duration = Duration::from_secs(3);
+/// Tracked files and directories at most (then the tracking starts over).
+const RA_TRACK_MAX: usize = 1 << 17;
 /// A directory's files are queued up to this many bytes each (the rest follows as they are
 /// read sequentially).
 const RA_DIR_FILE_MAX: u64 = 2 << 20;
@@ -379,6 +404,9 @@ impl Fs {
                     if c.ino(i)?.is_dir {
                         return Err(libc::EISDIR);
                     }
+                    if write && c.ino(i)?.attrs & super::set::ATTR_RO != 0 {
+                        return Err(libc::EACCES);
+                    }
                     if trunc {
                         c.truncate(i, 0)?;
                     }
@@ -483,15 +511,23 @@ impl Fs {
         let Ok(n) = c.ino(ino) else { return out };
         let (parent, fsize) = (n.parent, n.size);
         let mut tr = self.sh.track.lock().unwrap();
+        if tr.files.len() > RA_TRACK_MAX || tr.dirs.len() > RA_TRACK_MAX {
+            tr.files.clear();
+            tr.dirs.clear();
+        }
         let end = off + size as u64;
-        let f = tr.files.entry(ino).or_insert((0, 0));
-        let sequential = off == 0 || off == f.0;
-        f.0 = end;
-        if sequential && fsize > RA_DIR_FILE_MAX.min(1 << 20) {
-            let target = (end + RA_WINDOW).min(fsize);
-            let from = f.1.max(end);
-            if from < target && (f.1 <= end + RA_WINDOW / 2) {
-                f.1 = target;
+        let f = tr.files.entry(ino).or_default();
+        let sequential = off == 0 || off == f.next;
+        f.next = end;
+        if sequential && fsize > 1 << 20 {
+            // a big file read sequentially: the window starts small (a thumbnailer reading a
+            // head pays for little) and doubles while the reader keeps going
+            let window = if f.window == 0 { RA_WINDOW_MIN } else { (f.window * 2).min(RA_WINDOW) };
+            let target = (end + window).min(fsize);
+            let from = f.upto.max(end);
+            if from < target && f.upto <= end + window / 2 {
+                f.upto = target;
+                f.window = window;
                 out.extend(base_ranges(c, ino, from, target));
             }
         }
@@ -500,24 +536,50 @@ impl Fs {
             // file while one was seen within the last 2 s): queue this directory's remaining
             // files and its next sibling directory's, so the device never idles at a boundary
             let bulk = tr.bulk.is_some_and(|t| t.elapsed() < Duration::from_secs(2));
+            let prev = tr.dirs.get(&parent).and_then(|d| d.last);
+            // did the reader stop early in the previous file of this directory? then it reads
+            // heads (a thumbnailer, an indexer): queue heads, not whole files
+            let head = prev.filter(|&p| p != ino).and_then(|p| {
+                let size = c.inodes.get(&p)?.size;
+                let got = tr.files.get(&p)?.next;
+                Some(got < size.min(RA_DIR_FILE_MAX))
+            });
+            let global_head = tr.head;
+            if let Some(h) = head {
+                tr.head = h;
+            }
             let d = tr.dirs.entry(parent).or_default();
+            if d.opened == 0 {
+                d.head = global_head; // a new directory: as the reader did so far
+            }
             d.opened += 1;
+            d.last = Some(ino);
+            if let Some(h) = head {
+                d.head = h;
+            }
             if d.opened >= 2 || bulk {
                 tr.bulk = Some(Instant::now());
                 let my = c.ino(ino).ok().and_then(|n| n.disk).map_or(0, |d| d.off);
                 let d = tr.dirs.get_mut(&parent).unwrap();
-                let (queue_me, queue_next) = (!d.queued, !d.next);
-                d.queued = true;
-                d.next = true;
+                // queued once per pass: a later pass over the same tree re-arms it
+                let stale = |t: Option<Instant>| t.is_none_or(|t| t.elapsed() > RA_REARM);
+                let (queue_me, queue_next) = (stale(d.queued), stale(d.next));
+                let cap = if d.head { RA_HEAD } else { RA_DIR_FILE_MAX };
                 if queue_me {
-                    out.extend(dir_ranges(c, &mut tr, parent, my));
+                    d.queued = Some(Instant::now());
+                }
+                if queue_next {
+                    d.next = Some(Instant::now());
+                }
+                if queue_me {
+                    out.extend(dir_ranges(c, &mut tr, parent, my, cap));
                 }
                 if queue_next && let Some(sib) = next_sibling(c, parent) {
                     let sd = tr.dirs.entry(sib).or_default();
-                    if !sd.queued {
-                        sd.queued = true;
+                    if stale(sd.queued) {
+                        sd.queued = Some(Instant::now());
                         if c.load(sib).is_ok() {
-                            out.extend(dir_ranges(c, &mut tr, sib, 0));
+                            out.extend(dir_ranges(c, &mut tr, sib, 0, cap));
                         }
                     }
                 }
@@ -738,6 +800,12 @@ impl Fs {
         self.core().commits
     }
 
+    /// Bytes the readahead read from the device (tests).
+    #[cfg(test)]
+    pub(crate) fn ra_bytes(&self) -> u64 {
+        self.sh.ra.as_ref().map_or(0, |r| r.read_bytes())
+    }
+
     /// Readahead cache hits and misses (tests, benchmarks).
     pub fn ra_stats(&self) -> Option<(u64, u64)> {
         self.sh.ra.as_ref().map(|r| r.stats())
@@ -873,7 +941,7 @@ impl Fs {
         self.note(Note::Committing { bytes: plan.bytes, files: plan.files, reason: why });
         // The executor reads the volume through its own handle on the same file.
         let vol_view = { self.core().vol.view()? };
-        execute(&*self.sh.dev, &vol_view, &plan, &place, seq)?;
+        execute(&*self.sh.dev, &vol_view, &plan, &place, seq, self.sh.opts.part_off)?;
         let (bytes, files) = (plan.bytes, plan.files);
         let mut c = self.core();
         if let Some(ra) = &self.sh.ra {
@@ -926,7 +994,7 @@ fn base_ranges(c: &mut Core, ino: Ino, a: u64, b: u64) -> Vec<(u64, u64)> {
 }
 
 /// Writes a commit: data, journal, the journaled phases, the idle header.
-pub(crate) fn execute(dev: &dyn Dev, v: &Vol, plan: &Plan, place: &Place, seq: u64) -> Result<()> {
+pub(crate) fn execute(dev: &dyn Dev, v: &Vol, plan: &Plan, place: &Place, seq: u64, dev_off: u64) -> Result<()> {
     crate::sim::trace::phase("data");
     let mut samples = match dev.file() {
         Some(f) if !plan.segs.is_empty() => {
@@ -943,7 +1011,12 @@ pub(crate) fn execute(dev: &dyn Dev, v: &Vol, plan: &Plan, place: &Place, seq: u
             for p in &mut probe {
                 p.len = p.payload.div_ceil(cs) * cs;
             }
-            let pol = crate::add::choose_gap_policy(f, direct_ok, v, 0, false, &probe);
+            // the probe writes only into clusters the pre-commit bitmap calls free (a view has
+            // no bitmap of its own), its windows aligned to the partition's offset on the disk
+            let mut pv = v.view()?;
+            pv.bitmap = plan.pre_bm.as_ref().clone();
+            let pol = crate::add::choose_gap_policy(f, direct_ok, &pv, dev_off, false, &probe);
+            crate::sim::trace::phase("data");
             if std::env::var_os("FLASHCP_DEBUG_DATA").is_some() {
                 eprintln!("data: {} segments, {} runs, cs {cs}, {}", plan.segs.len(), probe.len(), pol.describe());
             }

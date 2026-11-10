@@ -41,6 +41,15 @@ read-write exFAT implementation with crash ordering for every operation.
   unpaired surrogates. More than 255 UTF-16 units gets ENAMETOOLONG.
 - mmap: reads through the page cache (`FOPEN_KEEP_CACHE`, safe because flashcp is the only
   writer). Shared writable mappings work as FUSE allows (dirty pages arrive as writes).
+- Permissions: the mount runs without `default_permissions`, which cost one GETATTR of the
+  parent per created file (5.04 → 4.02 FUSE requests per created file). The driver makes the
+  checks the kernel made against the modes it reports (0644/0755, 0444/0555 with the
+  read-only attribute), and only the mounting user reaches the mount (no `allow_other`):
+  - a read-only file refuses opens for writing and truncation by path;
+  - a read-only directory refuses create, mkdir, unlink, rmdir and renames out of or into it;
+  - `access(2)` refuses W_OK on read-only objects and X_OK on files;
+  - chown to another owner gets EPERM.
+  Executing a file is refused by the kernel itself (no file has an x bit).
 - Not supported: symlinks, hard links, xattrs, ownership (EPERM/ENOTSUP), TexFAT (two FATs),
   volumes over 2^32 clusters. These, a dirty volume and a failed validation go to the kernel
   driver (`--check` exit 3).
@@ -97,6 +106,12 @@ Data layout:
   committed ValidDataLength are not part of its committed content, so its slack clusters are
   written in place. Appends continue right after the last cluster when it is free, so files
   stay NoFatChain.
+- **One stream per commit.** A commit reserves its arena once: the smallest free extent that
+  holds the whole batch (changed files and new directories), else the fewest large extents,
+  like `add`. Every allocation without a preferred position is carved from it in order. Before
+  this, each file took the smallest hole that fit it, so a volume full of holes turned a
+  300-file commit into 316 device writes instead of 15. The arena is taken from the clusters
+  free before the commit, so copy-on-write is unchanged.
 - Freed clusters are reusable only by the next commit, after this one is durable.
 - Every gap between data writes is decided by `add`'s gap policy: zero-fill or skip, from the
   device's measured cost per request. A gap may be filled only where it is our own slack or
@@ -181,15 +196,22 @@ reading them. A read goes to the readahead cache first:
   or any first file while a bulk copy was seen in the last 2 s, the directory's remaining
   committed files (up to 2 MB each, 1 GB in all) are queued in directory order, together with
   the next sibling directory's files. That way the device never idles while `cp -r` opens the
-  next directory.
-- **Big files.** A sequential reader keeps 16 MB queued ahead of it.
+  next directory. Inode numbers follow the on-disk order, because `cp -r` opens files in inode
+  order. A directory is queued again on a later pass over it (after 3 s).
+- **Heads.** When the reader left the previous file of a directory before its end (a
+  thumbnailer, an indexer), files are queued 128 KB each instead of 2 MB.
+- **Big files.** A sequential reader's window starts at 256 KB and doubles while it keeps
+  reading, up to 16 MB.
 
 The queued extents are coalesced with `pull`'s read planner, using the gap from the device's
 request overhead × bandwidth on USB BOT and the transport's defaults on UAS. `inflight` worker
 threads read them with O_DIRECT, on a separate file description, into a 64 MB cache. A chunk
 is dropped once every byte of it was served. A chunk a reader needs is waited for while a
-worker reads it; one no worker has started within 20 ms is read directly, so a reader in
-another order never stalls. Every chunk overlapping a range a commit writes is invalidated at
+worker reads it. One no worker has started yet, the reader reads itself, at once: a reader in
+another order never waits for the queue, and nothing is read twice. Readers and workers wait
+on separate condition variables, and a hit wakes one worker. Before this, every hit woke all
+of them and an out-of-order reader waited out 20 ms timeouts: reading 20k files back from a
+tmpfs image took 32.9 s, now 1.0 s. Every chunk overlapping a range a commit writes is invalidated at
 planning time, and a read in flight at that moment is discarded on completion (epoch counter).
 
 ## Safety

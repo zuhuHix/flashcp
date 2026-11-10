@@ -297,6 +297,7 @@ fn control_reply(cmd: &str, fs: &Fs, tx: &Sender<Msg>) -> String {
             let _ = tx.send(Msg::Unmount);
             r#"{"ok":true}"#.into()
         }
+        "stats" => super::fuse::stats_json(),
         _ => fail("unknown command".into()),
     }
 }
@@ -371,6 +372,7 @@ pub fn run_mount(a: MountArgs) -> i32 {
     let mut opts = FsOpts {
         idle: Duration::from_millis(a.idle_ms),
         close_linger: Duration::from_millis(a.close_ms),
+        part_off: target.part_off,
         ..FsOpts::default()
     };
     if let Some(mb) = a.max_dirty_mb {

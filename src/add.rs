@@ -604,6 +604,14 @@ pub(crate) fn choose_gap_policy(
     if !direct || (probe_windows(segs, dev_off).len() as u64) < PROBE_MIN_WINDOWS {
         return unmeasured("too little to measure in");
     }
+    // nothing to decide when skipping and filling write the very same requests (small
+    // clusters: no slack worth a request): no probe writes
+    let (skip, fill) = (GapPolicy::of(GapMode::Skip, tq, ""), GapPolicy::of(GapMode::Fill, tq, ""));
+    if planned_writes(segs, &skip, &v.bitmap, v.heap_off, v.cs)
+        == planned_writes(segs, &fill, &v.bitmap, v.heap_off, v.cs)
+    {
+        return GapPolicy::of(GapMode::Skip, tq, "skip and fill plan the same writes: nothing to measure");
+    }
     if !set_direct(dev, true) {
         return unmeasured("no O_DIRECT");
     }

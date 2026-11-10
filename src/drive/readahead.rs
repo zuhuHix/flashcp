@@ -43,6 +43,10 @@ struct St {
     last_hit: Option<Instant>,
     pub(crate) hits: u64,
     pub(crate) misses: u64,
+    /// Queued chunks a reader read itself before any worker took them.
+    pub(crate) claimed: u64,
+    /// Bytes read into the cache.
+    pub(crate) read_bytes: u64,
 }
 
 pub(crate) struct Ra {
@@ -52,7 +56,10 @@ pub(crate) struct Ra {
     /// Trace group of the worker reads (they run `inflight` deep among themselves).
     grp: u32,
     st: Mutex<St>,
-    cv: Condvar,
+    /// Workers wait on `work` (queued chunks, room in the cache); readers on `ready` (a
+    /// chunk they need was stored).
+    work: Condvar,
+    ready: Condvar,
 }
 
 impl Ra {
@@ -63,7 +70,8 @@ impl Ra {
             cap,
             grp: crate::sim::trace::group(),
             st: Mutex::new(St::default()),
-            cv: Condvar::new(),
+            work: Condvar::new(),
+            ready: Condvar::new(),
         });
         for _ in 0..ra.strat.inflight.max(1) {
             let r = ra.clone();
@@ -74,7 +82,8 @@ impl Ra {
 
     pub(crate) fn stop(&self) {
         self.st.lock().unwrap().stop = true;
-        self.cv.notify_all();
+        self.work.notify_all();
+        self.ready.notify_all();
     }
 
     fn worker(&self) {
@@ -103,35 +112,43 @@ impl Ra {
                         }
                         continue;
                     }
-                    st = self.cv.wait_timeout(st, Duration::from_millis(500)).unwrap().0;
+                    st = self.work.wait_timeout(st, Duration::from_millis(500)).unwrap().0;
                 }
             };
-            let mut buf = AlignedBuf::new(len);
-            let ok = crate::sim::trace::io(
-                crate::sim::trace::Op::Read,
-                start,
-                len as u64,
-                self.strat.inflight,
-                self.grp,
-                start,
-                || read_full(&self.file, buf.as_mut(), start),
-            );
-            let mut st = self.st.lock().unwrap();
-            let stale = st.epoch != epoch;
-            if let Some(c) = st.chunks.get_mut(&start) {
-                if stale || c.born != epoch {
-                    let l = c.len as u64;
-                    st.chunks.remove(&start);
-                    st.bytes -= l; // counted: a worker read it
-                } else {
-                    match ok {
-                        Ok(n) if n >= len.min(1) => c.data = Some(Arc::new(buf)),
-                        _ => c.failed = true,
-                    }
+            self.fill(start, len, epoch);
+        }
+    }
+
+    /// Reads a chunk a worker or a reader took (counted, out of the queue) and stores it,
+    /// unless a commit invalidated it meanwhile (the epoch moved): then it is dropped.
+    fn fill(&self, start: u64, len: usize, epoch: u64) {
+        let mut buf = AlignedBuf::new(len);
+        let ok = crate::sim::trace::io(
+            crate::sim::trace::Op::Read,
+            start,
+            len as u64,
+            self.strat.inflight,
+            self.grp,
+            start,
+            || read_full(&self.file, buf.as_mut(), start),
+        );
+        let mut st = self.st.lock().unwrap();
+        st.read_bytes += len as u64;
+        let stale = st.epoch != epoch;
+        if let Some(c) = st.chunks.get_mut(&start) {
+            if stale || c.born != epoch {
+                let l = c.len as u64;
+                st.chunks.remove(&start);
+                st.bytes -= l; // counted: it was taken
+            } else {
+                match ok {
+                    Ok(n) if n >= len.min(1) => c.data = Some(Arc::new(buf)),
+                    _ => c.failed = true,
                 }
             }
-            self.cv.notify_all();
         }
+        // readers waiting for a chunk; none of the workers needs this
+        self.ready.notify_all();
     }
 
     /// Queues reads of `exts` (device offset, length), ascending as given (the order readers
@@ -157,14 +174,19 @@ impl Ra {
         let epoch = st.epoch;
         for ch in plan {
             let payload: u64 = exts[ch.exts.clone()].iter().map(|e| e.len as u64).sum();
-            // skip what overlaps a cached or queued chunk
-            let overlaps = st
-                .chunks
-                .range(..ch.start + ch.len as u64)
-                .next_back()
-                .is_some_and(|(s, c)| *s + c.len as u64 > ch.start);
-            if overlaps {
+            // a chunk queued or being read over the same bytes stays (no double read); ready or
+            // failed leftovers (a reader that skipped files, an earlier pass) are replaced
+            let end = ch.start + ch.len as u64;
+            let over: Vec<u64> =
+                st.chunks.range(..end).filter(|(s, c)| **s + c.len as u64 > ch.start).map(|(s, _)| *s).collect();
+            if over.iter().any(|s| st.chunks[s].data.is_none() && !st.chunks[s].failed) {
                 continue;
+            }
+            for o in over {
+                let c = st.chunks.remove(&o).unwrap();
+                if c.counted {
+                    st.bytes -= c.len as u64;
+                }
             }
             st.chunks.insert(
                 ch.start,
@@ -182,10 +204,11 @@ impl Ra {
             st.order.push_back(ch.start);
             st.queue.push_back((ch.start, ch.len, epoch));
         }
-        st.last_hit.get_or_insert_with(Instant::now);
+        st.last_hit = Some(Instant::now()); // a fresh queue is not an abandoned one
         drop(st);
         self.evict();
-        self.cv.notify_all();
+        self.work.notify_all();
+        self.ready.notify_all();
     }
 
     fn evict(&self) {
@@ -211,7 +234,6 @@ impl Ra {
     /// cached chunk).
     pub(crate) fn read_some(&self, off: u64, out: &mut [u8]) -> (usize, usize) {
         let mut st = self.st.lock().unwrap();
-        let mut waited_since: Option<Instant> = None;
         loop {
             let cur = st.chunks.range(..=off).next_back().filter(|(s, c)| **s + c.len as u64 > off).map(|(s, _)| *s);
             let Some(s) = cur else {
@@ -238,20 +260,26 @@ impl Ra {
                 }
                 st.hits += 1;
                 st.last_hit = Some(Instant::now());
-                self.cv.notify_all();
+                // room in the cache for one more chunk: one worker, not all of them
+                self.work.notify_one();
                 return (n, 0);
             }
-            // queued: wait while a worker reads it; if none has started it soon, read directly
-            // (the reader may want chunks in another order than they were queued)
             if !c.counted {
-                let waited = waited_since.get_or_insert_with(Instant::now);
-                if waited.elapsed() > Duration::from_millis(20) {
-                    let n = (s + c.len as u64 - off).min(out.len() as u64) as usize;
-                    st.misses += 1;
-                    return (0, n);
-                }
+                // queued, and no worker has taken it: the reader takes it itself (reading it
+                // once, where waiting would stall and reading around it would read it twice)
+                let len = c.len;
+                st.queue.retain(|j| j.0 != s);
+                st.chunks.get_mut(&s).unwrap().counted = true;
+                st.bytes += len as u64;
+                st.claimed += 1;
+                let epoch = st.epoch;
+                drop(st);
+                self.fill(s, len, epoch);
+                st = self.st.lock().unwrap();
+                continue;
             }
-            st = self.cv.wait_timeout(st, Duration::from_millis(5)).unwrap().0;
+            // a worker is reading it right now
+            st = self.ready.wait_timeout(st, Duration::from_millis(50)).unwrap().0;
         }
     }
 
@@ -287,7 +315,14 @@ impl Ra {
         for j in st.queue.iter_mut() {
             j.2 = g;
         }
-        self.cv.notify_all();
+        self.work.notify_all();
+        self.ready.notify_all();
+    }
+
+    /// Bytes read into the cache so far.
+    #[cfg(test)]
+    pub(crate) fn read_bytes(&self) -> u64 {
+        self.st.lock().unwrap().read_bytes
     }
 
     pub(crate) fn stats(&self) -> (u64, u64) {
