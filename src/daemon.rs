@@ -53,6 +53,9 @@ pub struct DevInfo {
     pub uuid: Option<String>,
     /// Where it is already mounted (by the kernel driver), if it is.
     pub mounted_at: Option<String>,
+    /// The volume has an interrupted flashcp commit (udev: `FLASHCP_RECOVER=1`): flashcp mounts
+    /// it once to recover, even with drive mode off, then hands it over.
+    pub recover: bool,
 }
 
 impl DevInfo {
@@ -324,6 +327,8 @@ pub struct Drive {
     kernel_ro: bool,
     /// The driver reported `unmounted` clean with nothing pending (reset when it mounts).
     clean_unmount: bool,
+    /// A driver reported `mounted` for this plug-in at least once.
+    ever_mounted: bool,
 }
 
 impl Drive {
@@ -413,7 +418,7 @@ impl Core {
                         | State::BusyWait { .. }
                         | State::MakingMountpoint
                         | State::EjectChecking
-                        | State::Failed { .. } => out.push(Action::Rescan { dev: d.info.dev.clone() }),
+                        | State::Failed { .. } => handover(d, Outcome::NotServed, To::Release, false, out),
                         _ => {}
                     }
                 }
@@ -426,7 +431,7 @@ impl Core {
                     return;
                 }
                 match result {
-                    Ok(path) if self.enabled && !self.shutting_down => {
+                    Ok(path) if (self.enabled || d.info.recover) && !self.shutting_down => {
                         d.mountpoint = Some(path.clone());
                         d.state = State::Starting;
                         out.push(Action::StartDriver { dev, mountpoint: path, label: d.info.name() });
@@ -474,9 +479,10 @@ impl Core {
                     }
                     State::Kernel { read_only } => {
                         d.kernel_ro = read_only;
-                        d.state = State::Done { safe: true };
-                        out.push(Action::KernelEject { dev, disk: d.info.disk.clone(), checked: false });
+                        handover(d, Outcome::NotServed, To::KernelEject { checked: false }, false, out);
                     }
+                    // flashcp couldn't finish: nothing is mounted, no power-off, say so again.
+                    State::Done { safe: false } => handover(d, Outcome::Unclean, To::PowerOff, false, out),
                     // Nothing of ours is mounted, but someone else may hold the device (the busy
                     // retries ran out) or have mounted it since: re-check holders and mounts first,
                     // then eject through udisks (unmount + power off), never a bare power-off.
@@ -572,12 +578,13 @@ impl Core {
             busy_tries: 0,
             kernel_ro: false,
             clean_unmount: false,
+            ever_mounted: false,
         };
         if let Some(m) = d.info.mounted_at.clone() {
             // Already served by the kernel driver (mounted before the daemon started, or by hand).
             d.mountpoint = Some(m);
             d.state = State::Kernel { read_only: false };
-        } else if !self.enabled || self.shutting_down {
+        } else if self.shutting_down || !(self.enabled || d.info.recover) {
             kernel(&mut d, false, out);
         } else {
             out.push(Action::Check { dev: dev.clone() });
@@ -591,8 +598,7 @@ impl Core {
         if d.state == State::EjectChecking {
             // Allow-list: only a clean "nothing holds it" answer may lead to a power-off.
             if code == exit::OK && reason.is_none() {
-                d.state = State::Done { safe: true };
-                out.push(Action::KernelEject { dev: dev.into(), disk: d.info.disk.clone(), checked: true });
+                handover(d, Outcome::NotServed, To::KernelEject { checked: true }, false, out);
                 return;
             }
             let name = d.info.name();
@@ -618,7 +624,7 @@ impl Core {
         if d.state != State::Checking {
             return;
         }
-        if !enabled {
+        if !(enabled || d.info.recover && !self.shutting_down) {
             return kernel(d, false, out);
         }
         match code {
@@ -639,8 +645,14 @@ impl Core {
         match ev {
             DriverEvent::Mounted { recovered } => {
                 d.clean_unmount = false;
+                d.ever_mounted = true;
                 if d.state == State::Starting {
                     d.state = State::Mounted;
+                    if !self.enabled {
+                        // Mounted only to recover (drive mode off): hand it to the kernel now.
+                        d.state = State::Stopping(Then::Kernel);
+                        out.push(Action::StopDriver { dev: dev.into() });
+                    }
                 }
                 if let Some(r) = recovered {
                     let body = if r == "replayed" {
@@ -734,6 +746,8 @@ impl Core {
             return;
         }
         let name = d.info.name();
+        // The evidence for a clean end: exit 0 AND a clean `unmounted` with nothing pending.
+        let outcome = if code == Some(exit::OK) && d.clean_unmount { Outcome::Clean } else { Outcome::Unclean };
         match (d.state.clone(), code) {
             (State::Starting, Some(c))
                 if [exit::FALLBACK, exit::BUSY, exit::NO_ACCESS, exit::RECOVERY_REFUSED].contains(&c) =>
@@ -769,82 +783,35 @@ impl Core {
                 } else {
                     rm(out);
                     d.mountpoint = None;
-                    let lost = if was_dirty {
-                        format!(" {} in {} files that were still being saved may be missing.", mb(bytes), files)
-                    } else {
-                        String::new()
-                    };
                     if enabled {
                         out.push(notify(
                             d,
                             "failed",
                             format!("{name}: fast mode stopped"),
-                            format!("flashcp's driver failed twice, so {name} now uses the normal driver.{lost}"),
+                            format!("flashcp's driver failed twice, so {name} now uses the normal driver."),
                             Urgency::Critical,
                         ));
                     }
-                    kernel(d, false, out);
+                    // A driver that never got as far as mounting wrote nothing.
+                    let o = if d.ever_mounted { Outcome::Unclean } else { Outcome::NotServed };
+                    handover(d, o, To::Kernel { read_only: false }, false, out);
                 }
             }
-            (State::Mounted | State::Ejecting | State::Unmounting, Some(exit::OK)) => {
-                // Our eject, or an unmount from outside, finished: everything is on the drive.
+            // Our eject, or an unmount from outside (exit 0 from Mounted), finished.
+            (State::Mounted | State::Ejecting | State::Unmounting, _) => {
                 rm(out);
                 d.mountpoint = None;
-                d.state = State::Done { safe: true };
-                if sibling_active {
-                    out.push(notify(
-                        d,
-                        "removed",
-                        format!("{name} was saved and unmounted"),
-                        "Another partition of this drive is still in use: eject it too before removing the drive."
-                            .into(),
-                        Urgency::Low,
-                    ));
-                } else {
-                    out.push(Action::PowerOff { dev: dev.into(), disk: d.info.disk.clone() });
-                }
+                handover(d, outcome, To::PowerOff, sibling_active, out);
             }
-            (State::Ejecting | State::Unmounting, _) => {
+            (State::Stopping(Then::Kernel), _) => {
                 rm(out);
                 d.mountpoint = None;
-                let lost =
-                    if was_dirty { format!(" Up to {} may not have been saved.", mb(bytes)) } else { String::new() };
-                out.push(notify(
-                    d,
-                    "saving",
-                    format!("Problem saving to {name}"),
-                    format!(
-                        "flashcp's driver stopped with an error while finishing.{lost} Plug it in again to repair it."
-                    ),
-                    Urgency::Critical,
-                ));
-                d.state = State::Done { safe: false };
-            }
-            (State::Stopping(Then::Kernel), c) => {
-                rm(out);
-                d.mountpoint = None;
-                // Read-write only after a clean stop: exit 0 and `unmounted` with nothing pending.
-                let clean = c == Some(exit::OK) && d.clean_unmount;
-                if !clean {
-                    let lost = if was_dirty { format!(" Up to {} may be missing.", mb(bytes)) } else { String::new() };
-                    out.push(notify(
-                        d,
-                        "failed",
-                        format!("flashcp couldn't finish saving to {name}"),
-                        format!(
-                            "It is opened read-only.{lost} To recover it, turn \"Speed up USB drives\" on and plug \
-                             it in again."
-                        ),
-                        Urgency::Critical,
-                    ));
-                }
-                kernel(d, !clean, out);
+                handover(d, outcome, To::Kernel { read_only: false }, false, out);
             }
             (State::Stopping(Then::Exit), _) => {
                 rm(out);
-                out.push(Action::Rescan { dev: dev.into() });
                 d.mountpoint = None;
-                d.state = State::Done { safe: code == Some(exit::OK) };
+                handover(d, outcome, To::Release, false, out);
             }
             _ => {}
         }
@@ -952,9 +919,93 @@ impl Core {
     }
 }
 
+/// How the volume was left when it is handed over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// flashcp never served it (refused, busy, no mountpoint, drive mode off): nothing was written.
+    NotServed,
+    /// The driver exited 0 after an `unmounted` event that was clean with nothing pending.
+    Clean,
+    /// Anything else (a crash, an error exit, exit 0 without that evidence): data may be missing
+    /// or a commit half done.
+    Unclean,
+}
+
+/// Where a drive goes when flashcp (no longer) serves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum To {
+    Kernel {
+        read_only: bool,
+    },
+    /// Eject: power off (nothing of ours is mounted any more).
+    PowerOff,
+    /// Eject a kernel mount: udisks unmount, then power off (`checked`: holders were re-checked).
+    KernelEject {
+        checked: bool,
+    },
+    /// The daemon is going away: Rescan so the udev rule hands it to udisks.
+    Release,
+}
+
+/// THE choke point: the only place that powers a drive off, mounts it with the kernel driver or
+/// gives it back to udisks (Rescan). After an unclean end there is no power-off, no "safe"
+/// message and no Rescan: the kernel gets it read-only at most (else it stays unmounted and
+/// hidden), with a persistent notification. The interrupted commit's journal is on the volume,
+/// so on the next plug-in the udev check (`pending_journal`) gives it to flashcp's recovery
+/// first, even with drive mode off.
+fn handover(d: &mut Drive, outcome: Outcome, to: To, sibling_active: bool, out: &mut Vec<Action>) {
+    let dev = d.info.dev.clone();
+    let disk = d.info.disk.clone();
+    if outcome == Outcome::Unclean {
+        let name = d.info.name();
+        let meanwhile = if matches!(to, To::Kernel { .. }) { " Until then it is opened read-only." } else { "" };
+        out.push(notify(
+            d,
+            "unclean",
+            format!("flashcp couldn't finish saving to {name}"),
+            format!("Plug it in again to recover.{meanwhile}"),
+            Urgency::Critical,
+        ));
+        if let To::Kernel { .. } = to {
+            d.state = State::KernelMounting { read_only: true };
+            out.push(Action::KernelMount { dev, read_only: true });
+        } else {
+            d.state = State::Done { safe: false };
+        }
+        return;
+    }
+    match to {
+        To::Kernel { read_only } => {
+            d.state = State::KernelMounting { read_only };
+            out.push(Action::KernelMount { dev, read_only });
+        }
+        To::PowerOff if sibling_active => {
+            d.state = State::Done { safe: true };
+            out.push(notify(
+                d,
+                "removed",
+                format!("{} was saved and unmounted", d.info.name()),
+                "Another partition of this drive is still in use: eject it too before removing the drive.".into(),
+                Urgency::Low,
+            ));
+        }
+        To::PowerOff => {
+            d.state = State::Done { safe: true };
+            out.push(Action::PowerOff { dev, disk });
+        }
+        To::KernelEject { checked } => {
+            d.state = State::Done { safe: true };
+            out.push(Action::KernelEject { dev, disk, checked });
+        }
+        To::Release => {
+            d.state = State::Done { safe: outcome == Outcome::Clean };
+            out.push(Action::Rescan { dev });
+        }
+    }
+}
+
 fn kernel(d: &mut Drive, read_only: bool, out: &mut Vec<Action>) {
-    d.state = State::KernelMounting { read_only };
-    out.push(Action::KernelMount { dev: d.info.dev.clone(), read_only });
+    handover(d, Outcome::NotServed, To::Kernel { read_only }, false, out);
 }
 
 /// The policy for a check/mount that did not serve the volume (docs/drive-mode-interface.md).
@@ -1152,6 +1203,7 @@ mod tests {
             label: Some(label.into()),
             uuid: Some("1A2B-3C4D".into()),
             mounted_at: None,
+            recover: false,
         }
     }
     fn ev(dev: &str, line: &str) -> Input {
@@ -1176,6 +1228,7 @@ mod tests {
     const MOUNTED: &str = r#"{"event":"mounted","proto":1,"device":"/dev/sdb1","recovered":null}"#;
     const DIRTY: &str = r#"{"event":"dirty_bytes","bytes":5000000,"files":3}"#;
     const CLEAN: &str = r#"{"event":"dirty_bytes","bytes":0,"files":0}"#;
+    const UNMOUNTED: &str = r#"{"event":"unmounted","clean":true}"#;
 
     /// The common prefix: plug in, check ok, mountpoint ready, the driver reports mounted.
     fn serving() -> Vec<(Input, &'static str, &'static str)> {
@@ -1313,7 +1366,11 @@ mod tests {
                         "notify /dev/sdb1:recovered",
                         "ready",
                     ),
-                    (exit_(D, 1), "rmmp /media/u/K; notify /dev/sdb1:failed; kernel /dev/sdb1 rw", "mounting"),
+                    (
+                        exit_(D, 1),
+                        "rmmp /media/u/K; notify /dev/sdb1:failed; notify /dev/sdb1:unclean; kernel /dev/sdb1 ro",
+                        "mounting",
+                    ),
                 ]),
             ),
             (
@@ -1360,8 +1417,60 @@ mod tests {
                     ),
                     (ev(D, r#"{"event":"committed","bytes":5000000,"files":3,"secs":0.5}"#), "", "ejecting"),
                     (ev(D, CLEAN), "inhibit off", "ejecting"),
+                    (ev(D, UNMOUNTED), "", "ejecting"),
                     (exit_(D, 0), "rmmp /media/u/K; poweroff /dev/sdb", "safe_to_remove"),
                 ]),
+            ),
+            (
+                "handover, unclean: outside unmount whose driver fails: no power-off, no 'safe'",
+                true,
+                with(vec![
+                    (ev(D, DIRTY), "inhibit on", "saving"),
+                    (
+                        ev(D, r#"{"event":"committing","bytes":5000000,"files":3,"reason":"unmount"}"#),
+                        "notify /dev/sdb1:saving",
+                        "ejecting",
+                    ),
+                    (exit_(D, 1), "rmmp /media/u/K; notify /dev/sdb1:unclean; inhibit off", "stopped"),
+                    (Input::Eject { dev: D.into() }, "notify /dev/sdb1:unclean", "stopped"),
+                ]),
+            ),
+            (
+                "handover, unclean: our eject ends with exit 0 but no clean `unmounted`",
+                true,
+                with(vec![
+                    (Input::Eject { dev: D.into() }, "ctl /dev/sdb1 prepare-eject", "ejecting"),
+                    (reply(D, "prepare-eject", true), "ctl /dev/sdb1 unmount", "ejecting"),
+                    (ev(D, r#"{"event":"unmounted","clean":false}"#), "", "ejecting"),
+                    (exit_(D, 0), "rmmp /media/u/K; notify /dev/sdb1:unclean", "stopped"),
+                ]),
+            ),
+            (
+                "handover: a driver that never mounted fails twice: nothing was written, kernel rw",
+                true,
+                vec![
+                    (added(D), "check /dev/sdb1", "checking"),
+                    (check(D, 0), "mkmp /dev/sdb1 K", "starting"),
+                    (mp(D), "start /dev/sdb1 /media/u/K", "starting"),
+                    (exit_(D, 1), "start /dev/sdb1 /media/u/K", "starting"),
+                    (exit_(D, 1), "rmmp /media/u/K; notify /dev/sdb1:failed; kernel /dev/sdb1 rw", "mounting"),
+                ],
+            ),
+            (
+                "handover: pending journal with drive mode off: flashcp recovers once, then the kernel (rw if clean)",
+                false,
+                vec![
+                    (Input::Added(DevInfo { recover: true, ..info(D, "K") }), "check /dev/sdb1", "checking"),
+                    (check(D, 0), "mkmp /dev/sdb1 K", "starting"),
+                    (mp(D), "start /dev/sdb1 /media/u/K", "starting"),
+                    (
+                        ev(D, r#"{"event":"mounted","proto":1,"recovered":"replayed"}"#),
+                        "stop /dev/sdb1; notify /dev/sdb1:recovered",
+                        "stopping",
+                    ),
+                    (ev(D, UNMOUNTED), "", "stopping"),
+                    (exit_(D, 0), "rmmp /media/u/K; kernel /dev/sdb1 rw", "mounting"),
+                ],
             ),
             (
                 "yank while dirty: warning, driver stopped, mountpoint removed, replug recovers",
@@ -1404,7 +1513,7 @@ mod tests {
                     (Input::SetEnabled(false), "stop /dev/sdb1", "stopping"),
                     (
                         exit_(D, 1),
-                        "rmmp /media/u/K; notify /dev/sdb1:failed; kernel /dev/sdb1 ro; inhibit off",
+                        "rmmp /media/u/K; notify /dev/sdb1:unclean; kernel /dev/sdb1 ro; inhibit off",
                         "mounting",
                     ),
                 ]),
@@ -1414,7 +1523,7 @@ mod tests {
                 true,
                 with(vec![
                     (Input::SetEnabled(false), "stop /dev/sdb1", "stopping"),
-                    (exit_(D, 0), "rmmp /media/u/K; notify /dev/sdb1:failed; kernel /dev/sdb1 ro", "mounting"),
+                    (exit_(D, 0), "rmmp /media/u/K; notify /dev/sdb1:unclean; kernel /dev/sdb1 ro", "mounting"),
                 ]),
             ),
             (
@@ -1443,7 +1552,16 @@ mod tests {
                 true,
                 with(vec![
                     (Input::Shutdown, "stop /dev/sdb1", "stopping"),
+                    (ev(D, UNMOUNTED), "", "stopping"),
                     (exit_(D, 0), "rmmp /media/u/K; rescan /dev/sdb1; exit", "safe_to_remove"),
+                ]),
+            ),
+            (
+                "handover, unclean: daemon stop and the driver fails: no Rescan (stays hidden for recovery)",
+                true,
+                with(vec![
+                    (Input::Shutdown, "stop /dev/sdb1", "stopping"),
+                    (exit_(D, 1), "rmmp /media/u/K; notify /dev/sdb1:unclean; exit", "stopped"),
                 ]),
             ),
             ("duplicate add (change event) is ignored", true, with(vec![(added(D), "", "ready")])),
@@ -1460,6 +1578,7 @@ mod tests {
                     (Input::KernelMounted { dev: "/dev/sdb2".into(), result: Ok("/media/u/L".into()) }, "", "ready"),
                     (Input::Eject { dev: D.into() }, "ctl /dev/sdb1 prepare-eject", "ejecting"),
                     (reply(D, "prepare-eject", true), "ctl /dev/sdb1 unmount", "ejecting"),
+                    (ev(D, UNMOUNTED), "", "ejecting"),
                     (exit_(D, 0), "rmmp /media/u/K; notify /dev/sdb1:removed", "safe_to_remove"),
                 ]),
             ),
@@ -1470,7 +1589,7 @@ mod tests {
                     (added(D), "check /dev/sdb1", "checking"),
                     (check(D, 4), "timer 1000", "busy"),
                     (Input::Eject { dev: D.into() }, "", "busy"),
-                    (Input::Shutdown, "rescan /dev/sdb1; exit", "busy"),
+                    (Input::Shutdown, "rescan /dev/sdb1; exit", "stopped"),
                 ],
             ),
         ];

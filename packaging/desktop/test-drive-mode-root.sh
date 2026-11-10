@@ -15,6 +15,7 @@ sandbox() {
   local loop; loop=$(losetup --find --show "$w/img")
   trap 'losetup -d '"$loop"'; rm -rf '"$w" RETURN
   local uid=4242
+  echo "kernel $(uname -r), LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unknown)"
   # A fake /usr/bin/flashcp that exits 0 only if the sandbox holds (bind-mounted in a private
   # mount namespace, together with a fake seat0 and the user's runtime dir).
   cat > "$w/ok" <<EOF
@@ -41,10 +42,11 @@ except OSError:
     sys.exit(0)
 sys.exit(19)
 EOF
+  printf '#!/bin/sh\necho %s\nexit 0\n' "'{\"event\":\"check\",\"ok\":true,\"pending_journal\":true}'" > "$w/pending"
   printf '#!/bin/sh\nexit 3\n' > "$w/refuse"
   printf '#!/bin/sh\nexit 4\n' > "$w/busy"
   printf '#!/bin/sh\nexec sleep 30\n' > "$w/hang"
-  chmod 755 "$w"/ok "$w"/net "$w"/unknown "$w"/refuse "$w"/busy "$w"/hang
+  chmod 755 "$w"/ok "$w"/pending "$w"/net "$w"/unknown "$w"/refuse "$w"/busy "$w"/hang
   # run <fake> <setup shell commands> -> prints the helper's stdout
   run() {
     local ll=""; [ -n "${NO_LL:-}" ] && ll="FLASHCP_UDEV_CHECK_NO_LANDLOCK=1"
@@ -58,7 +60,7 @@ EOF
       mount --bind '$w/$1' /usr/bin/flashcp
       $2
       exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-   # like udev: only 0-2 open, so the device lands on fd 3
-      ID_FS_UUID=1A2B-3C4D HOME=/root $ll '$helper' '$loop'"
+      FLASHCP_UDEV_CHECK_DEBUG=1 ID_FS_UUID=1A2B-3C4D HOME=/root $ll '$helper' '$loop'"
   }
   expect() { # name fake setup want
     local t0 got; t0=$(date +%s%N)
@@ -80,6 +82,8 @@ EOF
   expect busy busy "" "FLASHCP_KEEP=1 "
   expect hang hang "" ""
   expect "daemon off" ok "rm /run/user/$uid/flashcp/drive-mode-on" ""
+  expect "daemon off, pending journal: recovery first" pending "rm /run/user/$uid/flashcp/drive-mode-on" \
+    "FLASHCP_DRIVE_MODE=1 FLASHCP_DRIVE_UID=$uid UDISKS_IGNORE=1 FLASHCP_RECOVER=1 "
   expect "marker is a symlink" ok "rm /run/user/$uid/flashcp/drive-mode-on; ln -s /etc/passwd /run/user/$uid/flashcp/drive-mode-on" ""
   expect "marker owned by root" ok "chown 0 /run/user/$uid/flashcp/drive-mode-on" ""
   expect "fallback flag" ok "touch /run/user/$uid/flashcp/kernel/1A2B-3C4D; chown $uid /run/user/$uid/flashcp/kernel/1A2B-3C4D" "UDISKS_AUTO=0 "

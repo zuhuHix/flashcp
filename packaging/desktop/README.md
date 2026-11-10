@@ -207,6 +207,16 @@ afterwards. Either way, a notification shows "Saving N MB to LABEL…" while dat
 data is pending shows what may be missing. On the next plug-in the driver's journal recovery
 completes or rolls back the interrupted commit, and a notification says so.
 
+**One rule for every handover** (`handover()` in `src/daemon.rs`, the only code that powers a
+drive off, mounts it with the kernel driver or gives it back to udisks): read-write, power-off
+and "can be removed" need a *clean* end, which means the driver exited 0 after an `unmounted`
+event with nothing pending. Anything else gets no power-off, no "safe" message and no Rescan,
+only a read-only kernel mount at most, plus a persistent "flashcp couldn't finish saving to LABEL.
+Plug it in again to recover." The interrupted commit's journal is on the volume, and the udev
+check sees it (`pending_journal`), so the next plug-in goes to flashcp's recovery first, even
+with drive mode off (the daemon mounts it once, then hands it to the kernel driver). If no
+daemon runs, such a volume stays hidden rather than being mounted unrecovered.
+
 **Robustness.** A driver that dies is restarted once (its recovery runs); a second failure
 falls back to the kernel driver with a notification. systemd restarts the daemon itself
 (`Restart=on-failure`); if it dies, its drivers are killed with it (systemd), and the restarted
