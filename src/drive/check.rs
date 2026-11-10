@@ -33,7 +33,7 @@ pub enum Busy {
     Unknown(String),
 }
 
-fn classify(e: &anyhow::Error) -> Fallback {
+pub(crate) fn classify(e: &anyhow::Error) -> Fallback {
     let m = format!("{e:#}");
     let unsupported = ["TexFAT", "unsupported", "two allocation bitmaps", "second FAT", "larger than 1 MB"];
     if unsupported.iter().any(|k| m.contains(k)) {

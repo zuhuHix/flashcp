@@ -104,6 +104,23 @@ pub(crate) fn open_core(
     Ok((core, rec))
 }
 
+/// Opens the volume in `file` (`len` bytes, already claimed by the caller) for serving:
+/// recovery first, then the in-memory state. Errors: [`super::Fallback`] (exit 3: the kernel's),
+/// [`djournal::Refused`] (exit 6), anything else (exit 1).
+pub fn mount_file(file: std::fs::File, len: u64, opts: FsOpts) -> Result<(Fs, Recovered)> {
+    let dev: Arc<dyn Dev> = Arc::new(super::dev::FileDev(Arc::new(file.try_clone().context("dup")?)));
+    let (core, rec) = match open_core(file, len, &*dev, &opts) {
+        Ok(x) => x,
+        Err(e) if e.downcast_ref::<super::Fallback>().is_some() || e.downcast_ref::<djournal::Refused>().is_some() => {
+            return Err(e);
+        }
+        Err(e) => return Err(anyhow::Error::new(super::check::classify(&e)).context(format!("{e:#}"))),
+    };
+    Ok((Fs::new(core, dev, opts), rec))
+}
+
+pub use djournal::Recovered;
+
 impl Fs {
     pub(crate) fn new(core: Core, dev: Arc<dyn Dev>, opts: FsOpts) -> Fs {
         let sh = Arc::new(Shared {

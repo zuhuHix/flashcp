@@ -13,7 +13,7 @@ pub mod check;
 pub(crate) mod commit;
 pub mod core;
 pub(crate) mod dev;
-pub(crate) mod djournal;
+pub mod djournal;
 pub mod fs;
 pub(crate) mod set;
 pub(crate) mod stage;
@@ -21,7 +21,8 @@ pub(crate) mod stage;
 pub(crate) mod tests;
 
 pub use self::core::{Attr, Errno, Ino, ROOT, RenameFlags, SetAttr, Statfs};
-pub use fs::{Fs, FsOpts, Note, Status};
+pub use djournal::Refused;
+pub use fs::{Fs, FsOpts, Note, Recovered, Status, mount_file};
 
 /// Why a volume goes to the kernel driver instead (exit code 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
