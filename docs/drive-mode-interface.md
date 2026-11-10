@@ -263,7 +263,7 @@ idle journal file is not carried over; `flashcp mount` creates a new one at its 
 | `geometry`, `too-many-clusters`, `too-many-files`, `checksum` | the volume cannot be described with clusters that small (or is too large to plan in memory) | nothing |
 | `bad-clusters` | clusters are marked bad in the FAT; a recluster would lose the marks | nothing |
 | `bad-cluster-size` | `--cluster` is not a power of two below the current size | bug in the caller |
-| `wrong-volume` | (run only) `--expect-serial` was given and the volume read through the claimed fd has another serial | the stick was swapped: say so, nothing was written |
+| `wrong-volume` | (run only) `--expect-serial` / `--expect-hw` was given and the claimed device holds another volume or is another drive; or the medium changed during the run, or its boot sector could not be read past the cache | the stick was swapped: say so; nothing (further) was written |
 
 A reason the integration does not know means "do not offer".
 
@@ -294,8 +294,15 @@ A reason the integration does not know means "do not offer".
    new metadata, switch 2, an owed backup sector) it reads the boot sector again through the fd
    (O_DIRECT on a block device, past the page cache) and stops with `wrong-volume` if it is not
    the one the plan was built on (or the last switch wrote): a medium changed behind the fd (a
-   card in a reader) gets nothing further. The backup sector of a switch follows its main
-   sector without a read in between, so as not to widen the crash window. Then `flashcp mount` again on the same mountpoint, and a notification once it is
+   card in a reader) gets nothing further. Between a switch's main and backup boot-sector
+   writes it reads sector 0 once more and writes the backup only if it is the sector just
+   written; otherwise it stops (`wrong-volume`) and the original drive is left in the normal
+   "backup owed" state the next run completes. On a block device these reads are O_DIRECT;
+   if that cannot be done the run stops, it never trusts a cached copy. With `--expect-hw
+   SERIAL` (the daemon passes the disk's hardware serial when it has one) the claimed device's
+   hardware serial, from sysfs through the fd (`rdev` → `/sys/dev/block/MAJ:MIN` → the USB
+   parent's `serial`), must be that one before the first write; a clone has the same volume
+   serial, not that. Then `flashcp mount` again on the same mountpoint, and a notification once it is
    mounted: done, refused (exit 3, "nothing was written; it works as before") or failed (exit 1,
    the volume is the old or the new one, complete). `prepare-eject` refused: `resume`, nothing
    changed, a notification.
@@ -310,20 +317,26 @@ bits from the OS (so a token from an earlier daemon run never matches). The offe
 the app's dialog and `drive-mode recluster` carry the `plug` and the `identity` (volume serial
 and disk hardware serial, `UUID:SERIAL`) of the drive they showed; the daemon accepts an answer
 or a request only while the drive at that path is still that plug-in with that identity, else
-`That drive was replaced. Nothing was changed.` An `ActionInvoked` counts only for the
+`That drive was replaced. Nothing was changed.` When an answer or a request is accepted, the
+identity of what is at the path NOW is read from the device itself (its volume serial, past
+the page cache) and from sysfs (its hardware serial) and must be that identity too, so a swap
+udev has not reported yet is refused as well. An `ActionInvoked` counts only for the
 notification id created for that plug-in. Offers still on screen when the daemon stops are
-closed.
+closed, also one whose `Notify` was still on its way. When the OS gives no random bytes for a
+token, that drive is served as usual but never offered or converted.
 
 Notification bodies are escaped (`& < > " '`) where the server reads them as markup (its
 capabilities list `body-markup`, or it cannot be asked); summaries (titles) are plain text by
 the spec and are sent as they are. Labels lose their control characters and newlines.
 
 The answers: `$XDG_STATE_HOME/flashcp/recluster-offers` (default `~/.local/state/...`), one
-`<UUID>:<disk serial>:<label>\t<accepted|declined>` line per volume (`volume_key`; the disk
-serial is udev's `ID_SERIAL_SHORT`, else `ID_SERIAL`, empty when the reader reports none; all
-three survive a conversion). "Once per stick" therefore means once per volume on one physical
-stick; on a reader without a hardware serial, two sticks cloned from one image (same volume
-serial and label) count as one. The file is rewritten whole (temp file, mode 0600, fsync,
+`<key>\t<accepted|declined>` line per volume. The key (`volume_key`) is `<UUID>:<hardware
+serial>:` when the disk has a hardware serial (the USB device's `serial` in sysfs, what udev's
+`ID_SERIAL_SHORT` is made from): renaming the stick keeps it, two cloned sticks differ. Without a
+hardware serial it is `<UUID>::<label>`: then two sticks cloned from one image (same volume
+serial and label) count as one, and a renamed stick is asked again. Both forms survive a
+conversion. Keys written by an earlier build of this branch (`UUID:SERIAL:LABEL`) are read as
+`UUID:SERIAL:`. The file is rewritten whole (temp file, mode 0600, fsync,
 rename; a symlink there is replaced, never followed). If it cannot be written the user is told
 once ("flashcp could not save your answer" / "It may ask about KINGSTON again."); the answer
 holds until the daemon restarts. Accept → `accepted`; Not now, dismissed or expired → `declined`; never
@@ -368,7 +381,8 @@ actions `accept` ("Accept") and `notnow` ("Not now"), expire timeout 0; the answ
 "dirty_bytes":N,"dirty_files":N,"safe_to_remove":B,"can_convert":B,"cluster":N,"convert_secs":N,
 "convert_done":N,"convert_total":N,"convert_result":"done"|"refused"|"failed"|null,
 "convert_message":S|null,"plug":S,"identity":S,"volume":S|null}`. `plug` is this plug-in's
-random token (32 hex digits), `identity` the drive's `UUID:SERIAL`, `volume` its `volume_key`. `state` is one of `checking`, `busy`, `starting`, `ready`, `saving`,
+random token (32 hex digits, empty if none could be made), `identity` the drive's
+`UUID:SERIAL`, `volume` its `volume_key`. `state` is one of `checking`, `busy`, `starting`, `ready`, `saving`,
 `ejecting`, `stopping`, `mounting`, `kernel`, `read_only`, `unmounted` (a kernel mount someone
 unmounted by hand), `converting`, `safe_to_remove`, `stopped`, `failed`. `cluster` and
 `convert_secs` come from `recluster --check` (0 when it said no); while converting,

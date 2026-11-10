@@ -66,7 +66,7 @@ impl Rig {
                    exec sleep 30;;\n\
                  'call --session') case \"$*\" in\n\
                    *GetCapabilities*) if [ -f {d}/no-actions ]; then echo \"(['body'],)\"; else echo \"(['actions', 'body'],)\"; fi;;\n\
-                   *.Notify*) echo '(uint32 77,)';; esac;;\nesac",
+                   *.Notify*) if [ -f {d}/slow-notify ]; then sleep 1.5; fi; echo '(uint32 77,)';; esac;;\nesac",
                 log = log("gdbus")
             ),
         );
@@ -601,14 +601,15 @@ fn a_confirmation_for_a_replaced_stick_is_refused() {
     r.stop();
 }
 
-/// The last line of defence: recluster itself compares the volume serial it reads through the
-/// claimed fd with the one the user was asked about, before its first write.
+/// The daemon's cached info (from udev) says one volume, the device at the path holds another
+/// (swapped before udev told us): the identity read from the device when the request comes
+/// does not match, so the request is refused before anything runs. (recluster's own check on
+/// the claimed fd is in tests/recluster.rs and src/recluster/tests.rs.)
 #[test]
-fn recluster_refuses_a_volume_with_another_serial() {
+fn a_device_that_disagrees_with_the_cached_info_is_refused() {
     let mut r = Rig::new("serial");
     r.cli(&["drive-mode", "offer", "off"]);
     let img = r.big_cluster_image("s");
-    // udev says one serial, the medium has another (it was swapped under the same name).
     let dev = r.announce_as(&img, "0BAD-F00D");
     r.wait("ready", r.state_is("ready"));
     let before = fs::read(&img).unwrap();
@@ -619,9 +620,10 @@ fn recluster_refuses_a_volume_with_another_serial() {
         .unwrap();
     let text = String::from_utf8_lossy(&o.stdout);
     assert_eq!(o.status.code(), Some(3), "{text}\n{}", r.log("daemon"));
-    assert!(text.contains("\"result\":\"refused\"") && text.contains("not the volume that was checked"), "{text}");
+    assert!(text.contains("That drive was replaced. Nothing was changed."), "{text}");
+    assert!(!r.log("daemon").contains(&format!("recluster {dev}")), "recluster was started: {}", r.log("daemon"));
     assert_eq!(fs::read(&img).unwrap(), before, "nothing was written");
-    r.wait("mounted again", r.state_is("ready"));
+    assert!(r.status().contains("\"state\":\"ready\""));
     r.stop();
 }
 
@@ -658,4 +660,28 @@ fn a_confirmation_from_before_a_daemon_restart_is_refused() {
     assert_eq!(fs::read(&img).unwrap(), before, "written to");
     assert!(!r.dir.join("state/flashcp/recluster-offers").exists());
     r.stop();
+}
+
+/// The daemon is stopped while an offer's Notify is still on its way (the id not known yet):
+/// that notification is closed anyway once its id arrives, before the daemon exits.
+#[test]
+fn an_offer_whose_notify_is_in_flight_at_shutdown_is_closed() {
+    let mut r = Rig::new("inflight");
+    fs::write(r.dir.join("slow-notify"), "").unwrap();
+    let img = r.big_cluster_image("n");
+    r.announce(&img);
+    r.wait("Notify sent", || r.log("gdbus").contains(".Notify "));
+    assert!(!r.log("gdbus").contains("CloseNotification"));
+    unsafe { libc_kill(r.daemon.id() as i32, 15) };
+    let t = Instant::now();
+    let st = loop {
+        if let Some(st) = r.daemon.try_wait().unwrap() {
+            break st;
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "the daemon did not exit\n{}", r.log("daemon"));
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(st.success(), "{st:?}\n{}", r.log("daemon"));
+    assert!(r.log("gdbus").contains("CloseNotification 77"), "the offer was left on screen:\n{}", r.log("gdbus"));
+    let _ = fs::remove_dir_all(&r.dir);
 }

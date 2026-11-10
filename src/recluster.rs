@@ -131,28 +131,78 @@ pub struct ReclusterOpts {
     /// Refuse (reason `wrong-volume`, nothing written) unless the boot sector read through the
     /// claimed fd carries this volume serial: the caller checked and asked about that volume.
     pub expect_serial: Option<u32>,
+    /// Refuse the same way unless the claimed device's hardware serial (from sysfs, through
+    /// the fd: [`hw_serial_of`]) is this one; an unreadable one is refused too.
+    pub expect_hw: Option<String>,
 }
 
-/// Sector 0 as the medium holds it now: on a block device read with O_DIRECT through the same
-/// open file (a reopen of `/proc/self/fd/N`), so a changed medium is not hidden by the page cache.
-fn fresh_sector0(f: &File) -> Result<Vec<u8>> {
+#[cfg(test)]
+thread_local! {
+    /// Tests: treat the target as a block device whose O_DIRECT read fails.
+    pub(crate) static DIRECT_READ_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: the hardware serial [`hw_serial_of`] reports (Some(None): none can be read).
+    pub(crate) static HW_SERIAL: std::cell::RefCell<Option<Option<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Sector 0 as the medium holds it now. On a block device it is read with O_DIRECT through the
+/// same open file (a reopen of `/proc/self/fd/N`), so a changed medium is not hidden by the page
+/// cache; if that cannot be done the answer is an error, never a cached copy. An image file is
+/// read normally (its page cache is the file).
+pub(crate) fn fresh_sector0(f: &File) -> Result<Vec<u8>> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-    if f.metadata()?.file_type().is_block_device()
-        && let Ok(d) = std::fs::OpenOptions::new()
+    #[cfg(test)]
+    if DIRECT_READ_FAILS.with(|c| c.get()) {
+        bail!("O_DIRECT read of the boot sector failed (injected)");
+    }
+    if f.metadata()?.file_type().is_block_device() {
+        let d = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
             .open(format!("/proc/self/fd/{}", f.as_raw_fd()))
-    {
+            .context("open the device for a read past the page cache")?;
         // 4096 bytes, aligned: valid for 512- and 4096-byte logical blocks.
         let mut b = crate::util::AlignedBuf::new(4096);
-        if d.read_exact_at(b.as_mut(), 0).is_ok() {
-            return Ok(b.as_ref()[..SECTOR as usize].to_vec());
-        }
+        d.read_exact_at(b.as_mut(), 0).context("read the boot sector past the page cache")?;
+        return Ok(b.as_ref()[..SECTOR as usize].to_vec());
     }
     let mut b = vec![0u8; SECTOR as usize];
     f.read_exact_at(&mut b, 0)?;
     Ok(b)
+}
+
+/// The hardware serial of the disk behind an open block device, from sysfs: `rdev` →
+/// `/sys/dev/block/MAJ:MIN` → the first parent that is a USB device (`idVendor`) → its
+/// `serial` (what udev's `ID_SERIAL_SHORT` is made from). None for an image file or a device
+/// without one. Whitespace and control characters become `_`.
+pub fn hw_serial_of(f: &File) -> Option<String> {
+    #[cfg(test)]
+    if let Some(v) = HW_SERIAL.with(|h| h.borrow().clone()) {
+        return v;
+    }
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let md = f.metadata().ok()?;
+    md.file_type().is_block_device().then(|| hw_serial_in(std::path::Path::new("/sys"), md.rdev())).flatten()
+}
+
+/// [`hw_serial_of`] for a device number under the sysfs tree `sys`.
+pub fn hw_serial_in(sys: &std::path::Path, rdev: u64) -> Option<String> {
+    let (maj, min) = (libc::major(rdev), libc::minor(rdev));
+    let mut dir = std::fs::canonicalize(sys.join(format!("dev/block/{maj}:{min}"))).ok()?;
+    let top = std::fs::canonicalize(sys).ok()?;
+    while dir.starts_with(&top) && dir != top {
+        if dir.join("idVendor").is_file()
+            && let Ok(s) = std::fs::read_to_string(dir.join("serial"))
+        {
+            let s: String =
+                s.trim().chars().map(|c| if c.is_whitespace() || c.is_control() { '_' } else { c }).collect();
+            return (!s.is_empty()).then_some(s);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
 }
 
 /// The volume serial of a boot sector (what udev shows as `ID_FS_UUID`, `XXXX-XXXX`).
@@ -1700,6 +1750,16 @@ fn switch(f: &File, dev: &dyn Dev, view: &View, name: &str, on_main: &mut dyn Fn
     dev.write_at(&view.sector0, 0).context("write the main boot sector")?;
     dev.sync().context("sync")?;
     on_main();
+    // The medium must still be the one just switched: else the backup write would put this
+    // volume's boot sector onto another one. Stopping here leaves this volume in the normal
+    // "backup owed" state that the next run completes.
+    if !fresh_sector0(f).is_ok_and(|now| now == view.sector0) {
+        return Err(refused(
+            "wrong-volume",
+            "the medium changed right after the switch (its boot sector is not the one just written); the backup \
+             boot sector was not written, run flashcp recluster on the original drive to complete it",
+        ));
+    }
     #[cfg(feature = "test-hooks")]
     if std::env::var(STOP_ENV).as_deref() == Ok(name) {
         bail!("stopped by {STOP_ENV} after the main boot sector of the {name} switch");
@@ -1800,7 +1860,21 @@ pub(crate) fn run_on(
     let t0 = Instant::now();
     let boot = read_boot(f).map_err(invalid)?;
     precheck(&boot)?;
-    // Before anything is written, on the same claimed fd: is this still the volume?
+    // Before anything is written, on the same claimed fd: is this still the volume, and the
+    // physical device the user was asked about?
+    if let Some(want) = &o.expect_hw {
+        let got = hw_serial_of(f);
+        if got.as_deref() != Some(want.as_str()) {
+            return Err(refused(
+                "wrong-volume",
+                format!(
+                    "this is not the drive that was checked (hardware serial {}, expected {want}); nothing was \
+                     written",
+                    got.as_deref().unwrap_or("unreadable")
+                ),
+            ));
+        }
+    }
     if let Some(want) = o.expect_serial {
         let got = boot_serial(&boot);
         if got != want {
@@ -1823,7 +1897,13 @@ pub(crate) fn run_on(
     // planned from, or the one its last switch wrote.
     let expected = std::cell::RefCell::new(boot[..SECTOR as usize].to_vec());
     let medium = || -> Result<()> {
-        let now = fresh_sector0(f).context("read the boot sector again")?;
+        let Ok(now) = fresh_sector0(f) else {
+            return Err(refused(
+                "wrong-volume",
+                "the boot sector cannot be read again past the cache, so a changed medium could not be noticed; \
+                 nothing further was written",
+            ));
+        };
         let same = {
             let want = expected.borrow();
             (0..SECTOR as usize).all(|i| now[i] == want[i] || matches!(i, 106 | 107 | 112))

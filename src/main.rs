@@ -298,6 +298,10 @@ enum Cmd {
         /// through the claimed device is this one (XXXX-XXXX, as udev's UUID)
         #[arg(long, value_name = "UUID", conflicts_with = "check")]
         expect_serial: Option<String>,
+        /// Refuse the same way unless the claimed device's hardware serial (sysfs, through the
+        /// device itself) is this one; also when it has none that can be read
+        #[arg(long, value_name = "SERIAL", conflicts_with = "check")]
+        expect_hw: Option<String>,
     },
     /// Show an exFAT volume's label, size, free space and file count (read-only)
     Info {
@@ -754,7 +758,7 @@ fn run(cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Recluster { target, target_fd, cluster, fat, dry_run, check, json, expect_serial } => {
+        Cmd::Recluster { target, target_fd, cluster, fat, dry_run, check, json, expect_serial, expect_hw } => {
             let target = spec(target, target_fd);
             if check {
                 let c = recluster::check(&target)?;
@@ -777,7 +781,7 @@ fn run(cmd: Cmd) -> Result<()> {
                 })?),
                 None => None,
             };
-            let o = recluster::ReclusterOpts { cluster, fat, dry_run, expect_serial };
+            let o = recluster::ReclusterOpts { cluster, fat, dry_run, expect_serial, expect_hw };
             let mut out = |e: &recluster::Event| {
                 if json {
                     use std::io::Write;

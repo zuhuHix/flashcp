@@ -273,12 +273,17 @@ pub enum Input {
         plug: String,
         /// The [`drive_identity`] the user was shown.
         identity: String,
+        /// The identity of what is at `dev` now, read from the device and sysfs when the request
+        /// came (None: it could not be read).
+        live: Option<String>,
     },
     /// The answer to the offer made for plug-in `plug` of the drive `identity`.
     OfferAnswer {
         dev: String,
         plug: String,
         identity: String,
+        /// As for [`Input::Convert`], read when the answer came.
+        live: Option<String>,
         answer: Answer,
     },
     /// The answer could not be saved (the offer may come back after a restart).
@@ -377,6 +382,8 @@ pub enum Action {
     Recluster {
         dev: String,
         serial: Option<String>,
+        /// `--expect-hw`: the hardware serial, checked through the claimed fd.
+        hw: Option<String>,
     },
     /// A notification with Accept / Not now buttons for plug-in `plug`; the answer comes back
     /// as [`Input::OfferAnswer`] with the same `plug`.
@@ -609,7 +616,12 @@ pub struct Core {
 }
 
 /// 128 random bits from the OS, as 32 hex digits.
-pub fn random_token() -> String {
+/// None when the OS gives no random bytes (neither getrandom nor /dev/urandom).
+pub fn random_token() -> Option<String> {
+    #[cfg(test)]
+    if NO_RANDOM.with(|c| c.get()) {
+        return None;
+    }
     let mut b = [0u8; 16];
     let mut got = 0;
     while got < b.len() {
@@ -619,11 +631,17 @@ pub fn random_token() -> String {
         } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             // No getrandom: the kernel's pool through the device instead.
             use std::io::Read;
-            std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).expect("random bytes");
+            std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).ok()?;
             break;
         }
     }
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    Some(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`random_token`] finds no random bytes.
+    static NO_RANDOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// What identifies the stick a confirmation was made for: the volume serial and the disk's
@@ -639,19 +657,26 @@ pub fn drive_identity(info: &DevInfo) -> String {
 /// What a conversion request for a stick that is no longer there gets.
 pub const REPLACED: &str = "That drive was replaced. Nothing was changed.";
 
-/// The identity the offer is remembered by: the volume serial, the disk's hardware serial when
-/// udev has one (two sticks cloned from one image share the volume serial and label, not
-/// that), and the label. All three survive a conversion; a reformat gives a new volume serial.
-/// None without a volume serial.
+/// The identity the offer is remembered by: `UUID:HWSERIAL:` (the volume serial and the disk's
+/// hardware serial; a relabel keeps it, two cloned sticks differ), or `UUID::LABEL` when the
+/// disk reports no hardware serial (then two clones of one image count as one stick). Both
+/// survive a conversion; a reformat gives a new volume serial. None without a volume serial.
 pub fn volume_key(info: &DevInfo) -> Option<String> {
     let clean = |s: &str| s.chars().filter(|c| !c.is_control()).collect::<String>();
     let uuid = info.uuid.as_deref().filter(|u| !u.trim().is_empty())?;
-    Some(format!(
-        "{}:{}:{}",
-        clean(uuid),
-        clean(info.disk_serial.as_deref().unwrap_or("")),
-        clean(info.label.as_deref().unwrap_or(""))
-    ))
+    Some(match info.disk_serial.as_deref().filter(|s| !s.is_empty()) {
+        Some(hw) => format!("{}:{}:", clean(uuid), clean(hw)),
+        None => format!("{}::{}", clean(uuid), clean(info.label.as_deref().unwrap_or(""))),
+    })
+}
+
+/// A key as an earlier build of this branch wrote it (`UUID:HWSERIAL:LABEL`), in today's form.
+pub fn normalize_key(k: &str) -> String {
+    let mut p = k.splitn(3, ':');
+    match (p.next(), p.next(), p.next()) {
+        (Some(u), Some(hw), Some(_)) if !hw.is_empty() => format!("{u}:{hw}:"),
+        _ => k.to_string(),
+    }
 }
 
 pub fn mb(bytes: u64) -> String {
@@ -728,8 +753,8 @@ impl Core {
                 }
             }
             Input::ReclusterExit { dev, code } => self.recluster_exit(&dev, code, out),
-            Input::Convert { dev, plug, identity } => {
-                if self.convert_blocker(&dev, &plug, &identity).is_none() {
+            Input::Convert { dev, plug, identity, live } => {
+                if self.convert_blocker(&dev, &plug, &identity, live.as_deref()).is_none() {
                     self.start_convert(&dev, out);
                 }
             }
@@ -747,11 +772,15 @@ impl Core {
                     Urgency::Low,
                 ));
             }
-            Input::OfferAnswer { dev, plug, identity, answer } => {
+            Input::OfferAnswer { dev, plug, identity, live, answer } => {
                 let Some(d) = self.drives.get_mut(&dev) else { return };
-                // Only the offer of this very plug-in of this drive: another stick may have this
-                // path now (also after a daemon restart: tokens are random).
-                if !d.offering || d.plug != plug || drive_identity(&d.info) != identity {
+                // Only the offer of this very plug-in of this drive, and only while that drive is
+                // what the device at this path holds now (udev may not have told us of a swap yet).
+                if !d.offering
+                    || d.plug != plug
+                    || drive_identity(&d.info) != identity
+                    || live.as_deref() != Some(identity.as_str())
+                {
                     return;
                 }
                 d.offering = false;
@@ -763,7 +792,7 @@ impl Core {
                 };
                 self.answered.insert(key.clone());
                 out.push(Action::Remember { dev: dev.clone(), volume: key, answer: word });
-                if answer == Answer::Accept && self.convert_blocker(&dev, &plug, &identity).is_none() {
+                if answer == Answer::Accept && self.convert_blocker(&dev, &plug, &identity, live.as_deref()).is_none() {
                     self.start_convert(&dev, out);
                 }
             }
@@ -993,7 +1022,11 @@ impl Core {
                 *n += 1;
                 format!("t{n}")
             }
-            None => random_token(),
+            // No token: the drive is served as usual, but it is never offered or converted.
+            None => random_token().unwrap_or_else(|| {
+                eprintln!("flashcp drived: no random bytes for {}: no offer to make it faster", d.info.dev);
+                String::new()
+            }),
         };
         if let Some(m) = d.info.mounted_at.clone() {
             // Already served by the kernel driver (mounted before the daemon started, or by hand).
@@ -1072,6 +1105,7 @@ impl Core {
                     } else if let Some(n) = d.after_mount.take() {
                         out.push(n);
                     } else if self.offers
+                        && !d.plug.is_empty()
                         && !d.offered
                         && d.can_convert.is_some_and(|(cluster, _)| cluster >= OFFER_MIN_CLUSTER)
                         && volume_key(&d.info).is_some_and(|k| !self.answered.contains(&k))
@@ -1279,17 +1313,27 @@ impl Core {
             // Windows may not open the stick). One attempt per plug-in, before mounting.
             d.finish_tried = true;
             d.state = State::Converting(Conv::Running { finish: true });
-            out.push(Action::Recluster { dev: dev.into(), serial: d.info.uuid.clone() });
+            out.push(Action::Recluster {
+                dev: dev.into(),
+                serial: d.info.uuid.clone(),
+                hw: d.info.disk_serial.clone(),
+            });
             return;
         }
         d.can_convert = check.benefit.then_some((check.cluster, check.secs));
         to_mountpoint(d, out);
     }
 
-    /// Why a conversion of plug-in `plug` cannot start now (None: it can).
-    pub fn convert_blocker(&self, dev: &str, plug: &str, identity: &str) -> Option<&'static str> {
+    /// Why a conversion of plug-in `plug` cannot start now (None: it can). `live` is the
+    /// identity read from what is at `dev` now; it must be `identity`, as the cached one must.
+    pub fn convert_blocker(&self, dev: &str, plug: &str, identity: &str, live: Option<&str>) -> Option<&'static str> {
         let Some(d) = self.drives.get(dev) else { return Some(REPLACED) };
-        if d.plug.is_empty() || d.plug != plug || drive_identity(&d.info) != identity || d.gone {
+        if d.plug.is_empty()
+            || d.plug != plug
+            || drive_identity(&d.info) != identity
+            || live != Some(identity)
+            || d.gone
+        {
             return Some(REPLACED);
         }
         if d.info.uuid.is_none() {
@@ -1665,7 +1709,7 @@ fn handover(d: &mut Drive, outcome: Outcome, to: To, sibling_active: bool, out: 
         }
         To::Recluster => {
             d.state = State::Converting(Conv::Running { finish: false });
-            out.push(Action::Recluster { dev, serial: d.info.uuid.clone() });
+            out.push(Action::Recluster { dev, serial: d.info.uuid.clone(), hw: d.info.disk_serial.clone() });
         }
     }
 }
@@ -2351,14 +2395,15 @@ mod tests {
     /// The answer to the offer of the drive now at `dev` (its current plug-in).
     fn answer_for(core: &Core, dev: &str, answer: Answer) -> Input {
         let d = &core.drives[dev];
-        Input::OfferAnswer { dev: dev.into(), plug: d.plug.clone(), identity: drive_identity(&d.info), answer }
+        let id = drive_identity(&d.info);
+        Input::OfferAnswer { dev: dev.into(), plug: d.plug.clone(), live: Some(id.clone()), identity: id, answer }
     }
     fn answer(dev: &str, answer: Answer) -> Input {
         // Every test core starts at plug-in t1; replugs pass their own token.
-        Input::OfferAnswer { dev: dev.into(), plug: "t1".into(), identity: ID.into(), answer }
+        Input::OfferAnswer { dev: dev.into(), plug: "t1".into(), identity: ID.into(), live: Some(ID.into()), answer }
     }
     fn convert(dev: &str, plug: &str) -> Input {
-        Input::Convert { dev: dev.into(), plug: plug.into(), identity: ID.into() }
+        Input::Convert { dev: dev.into(), plug: plug.into(), identity: ID.into(), live: Some(ID.into()) }
     }
 
     type Step = (Input, &'static str, &'static str);
@@ -2461,17 +2506,17 @@ mod tests {
         // 16 KB: the check says yes, the notification does not ask; the app button can.
         let mut core = test_core(true);
         run("16 KB", &mut core, served_big(16 << 10, ""));
-        assert_eq!(core.convert_blocker(D, "t1", ID), None);
+        assert_eq!(core.convert_blocker(D, "t1", ID, Some(ID)), None);
         // The check says no (or failed): neither.
         let mut core = test_core(true);
         run("no", &mut core, serving());
-        assert!(core.convert_blocker(D, "t1", ID).is_some());
+        assert!(core.convert_blocker(D, "t1", ID, Some(ID)).is_some());
         run("no", &mut core, vec![(convert(D, "t1"), "", "ready")]);
         // The offer turned off.
         let mut core = test_core(true);
         core.offers = false;
         run("offers off", &mut core, served_big(128 << 10, ""));
-        assert_eq!(core.convert_blocker(D, "t1", ID), None);
+        assert_eq!(core.convert_blocker(D, "t1", ID, Some(ID)), None);
         // No volume serial: nothing to remember it by, so no notification.
         let mut core = test_core(true);
         let mut steps = served_big(128 << 10, "");
@@ -2486,12 +2531,12 @@ mod tests {
         steps.push((Input::Eject { dev: D.into() }, "ctl /dev/sdb1 prepare-eject", "ejecting"));
         steps.push((answer(D, Answer::Accept), "remember 1A2B-3C4D::K accepted", "ejecting"));
         run("ejecting", &mut core, steps);
-        assert!(core.convert_blocker(D, "t1", ID).is_some());
+        assert!(core.convert_blocker(D, "t1", ID, Some(ID)).is_some());
         // The CLI/app path refuses a drive that is not ready.
         let mut core = test_core(true);
         run("checking", &mut core, vec![(added(D), "check /dev/sdb1", "checking")]);
-        assert_eq!(core.convert_blocker(D, "t1", ID), Some("it is not ready (flashcp must have it mounted)"));
-        assert_eq!(core.convert_blocker("/dev/sdz1", "t1", ID), Some(REPLACED));
+        assert_eq!(core.convert_blocker(D, "t1", ID, Some(ID)), Some("it is not ready (flashcp must have it mounted)"));
+        assert_eq!(core.convert_blocker("/dev/sdz1", "t1", ID, Some(ID)), Some(REPLACED));
     }
 
     #[test]
@@ -2565,7 +2610,7 @@ mod tests {
             assert!(r.1.contains(text), "{r:?}");
             assert!(r.1.contains("works as before"), "{r:?}");
             // Still offered by the app button (the check said yes and nothing changed).
-            assert_eq!(core.convert_blocker(D, "t1", ID), None);
+            assert_eq!(core.convert_blocker(D, "t1", ID, Some(ID)), None);
         }
     }
 
@@ -2735,11 +2780,15 @@ mod tests {
                 ],
             );
             assert!(core.answered.is_empty(), "{name}: nothing remembered for B");
-            assert_eq!(core.convert_blocker(D, "t1", ID), Some(REPLACED), "{name}");
-            assert_eq!(core.convert_blocker(D, "t2", &drive_identity(&b)), None, "{name}: B's own token works");
+            assert_eq!(core.convert_blocker(D, "t1", ID, Some(ID)), Some(REPLACED), "{name}");
+            assert_eq!(
+                core.convert_blocker(D, "t2", &drive_identity(&b), Some(&drive_identity(&b))),
+                None,
+                "{name}: B's own token works"
+            );
             // B's token with A's identity (when B is another volume) is not B either.
             if drive_identity(&b) != ID {
-                assert_eq!(core.convert_blocker(D, "t2", ID), Some(REPLACED), "{name}");
+                assert_eq!(core.convert_blocker(D, "t2", ID, Some(ID)), Some(REPLACED), "{name}");
             }
             // B's own answer is B's.
             let a = answer_for(&core, D, Answer::NotNow);
@@ -2777,15 +2826,22 @@ mod tests {
                 dev: D.into(),
                 plug: old_plug.clone(),
                 identity: old_id.clone(),
+                live: Some(old_id.clone()),
                 answer: Answer::Accept,
             },
             Input::OfferAnswer {
                 dev: D.into(),
                 plug: old_plug.clone(),
                 identity: old_id.clone(),
+                live: Some(old_id.clone()),
                 answer: Answer::NotNow,
             },
-            Input::Convert { dev: D.into(), plug: old_plug.clone(), identity: old_id.clone() },
+            Input::Convert {
+                dev: D.into(),
+                plug: old_plug.clone(),
+                identity: old_id.clone(),
+                live: Some(old_id.clone()),
+            },
         ];
         for input in stale {
             let dbg = format!("{input:?}");
@@ -2793,12 +2849,93 @@ mod tests {
             assert_eq!(second.drives[D].state_name(), "ready", "{dbg}");
         }
         assert!(second.answered.is_empty(), "nothing remembered");
-        assert_eq!(second.convert_blocker(D, &old_plug, &old_id), Some(REPLACED));
+        assert_eq!(second.convert_blocker(D, &old_plug, &old_id, Some(&old_id)), Some(REPLACED));
         // The right token with the wrong identity, and the reverse, are refused too.
         let plug = second.drives[D].plug.clone();
-        assert_eq!(second.convert_blocker(D, &plug, "1A2B-3C4D:"), Some(REPLACED));
-        assert_eq!(second.convert_blocker(D, &plug, &old_id), None);
-        assert_eq!(second.convert_blocker(D, "", ""), Some(REPLACED));
+        assert_eq!(second.convert_blocker(D, &plug, "1A2B-3C4D:", Some("1A2B-3C4D:")), Some(REPLACED));
+        assert_eq!(second.convert_blocker(D, &plug, &old_id, Some(&old_id)), None);
+        assert_eq!(second.convert_blocker(D, "", "", Some("")), Some(REPLACED));
+    }
+
+    /// The cached info says stick A, but the device at the path is now a clone of A (same
+    /// volume serial, another hardware serial) and udev has not told us yet: the identity read
+    /// from the device when the answer or request comes does not match, so nothing happens.
+    #[test]
+    fn a_clone_swapped_in_before_udev_tells_us_is_refused() {
+        let a = DevInfo { disk_serial: Some("AA01".into()), ..info(D, "K") };
+        let id = drive_identity(&a);
+        let clone = "1A2B-3C4D:BB02".to_string();
+        let mut core = test_core(true);
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
+        steps[0].0 = Input::Added(a);
+        run("A", &mut core, steps);
+        for live in [Some(clone.clone()), None] {
+            let ans = Input::OfferAnswer {
+                dev: D.into(),
+                plug: "t1".into(),
+                identity: id.clone(),
+                live: live.clone(),
+                answer: Answer::Accept,
+            };
+            run("late answer", &mut core, vec![(ans, "", "ready")]);
+            let conv = Input::Convert { dev: D.into(), plug: "t1".into(), identity: id.clone(), live: live.clone() };
+            run("request", &mut core, vec![(conv, "", "ready")]);
+            assert_eq!(core.convert_blocker(D, "t1", &id, live.as_deref()), Some(REPLACED), "{live:?}");
+        }
+        assert!(core.answered.is_empty(), "nothing remembered for the clone");
+        // The real A at the path: accepted, and recluster gets A's hardware serial to check.
+        let conv = Input::Convert { dev: D.into(), plug: "t1".into(), identity: id.clone(), live: Some(id.clone()) };
+        let got: Vec<String> = core.handle(conv).iter().map(|a| a.to_string()).collect();
+        assert!(got.iter().any(|a| a == "ctl /dev/sdb1 prepare-eject"), "{got:?}");
+        let mut steps = vec![
+            (reply(D, "prepare-eject", true), "ctl /dev/sdb1 unmount", "converting"),
+            (ev(D, UNMOUNTED), "", "converting"),
+        ];
+        steps.push((exit_(D, 0), "recluster /dev/sdb1", "converting"));
+        let mut c2 = core;
+        for (input, want, state) in steps {
+            let acts = c2.handle(input);
+            let got: Vec<String> = acts.iter().map(|a| a.to_string()).collect();
+            assert_eq!(got.join("; "), want);
+            assert_eq!(c2.drives[D].state_name(), state);
+            if let Some(Action::Recluster { serial, hw, .. }) = acts.first() {
+                assert_eq!((serial.as_deref(), hw.as_deref()), (Some("1A2B-3C4D"), Some("AA01")));
+            }
+        }
+    }
+
+    /// No random bytes from the OS: the drive is served as usual, never offered or converted.
+    #[test]
+    fn no_token_means_no_offer_and_no_conversion() {
+        NO_RANDOM.with(|c| c.set(true));
+        let mut core = Core::new(true);
+        run("no token", &mut core, served_big(128 << 10, ""));
+        NO_RANDOM.with(|c| c.set(false));
+        assert_eq!(core.drives[D].plug, "");
+        assert_eq!(core.convert_blocker(D, "", ID, Some(ID)), Some(REPLACED));
+        let conv = Input::Convert { dev: D.into(), plug: String::new(), identity: ID.into(), live: Some(ID.into()) };
+        run("no token", &mut core, vec![(conv, "", "ready")]);
+    }
+
+    /// With a hardware serial the key has no label: renaming the stick does not bring the offer
+    /// back. Without one the label stays in the key (the documented fallback).
+    #[test]
+    fn a_relabelled_stick_is_not_asked_again() {
+        let k = DevInfo { disk_serial: Some("AA01".into()), ..info(D, "K") };
+        let l = DevInfo { label: Some("RENAMED".into()), ..k.clone() };
+        assert_eq!(volume_key(&k), volume_key(&l));
+        assert_eq!(volume_key(&k).as_deref(), Some("1A2B-3C4D:AA01:"));
+        assert_eq!(volume_key(&info(D, "K")).as_deref(), Some("1A2B-3C4D::K"));
+        let mut core = test_core(true);
+        core.answered.insert(volume_key(&k).unwrap());
+        let mut steps = served_big(128 << 10, "");
+        steps[0].0 = Input::Added(l);
+        steps[2].1 = "mkmp /dev/sdb1 RENAMED";
+        run("relabelled", &mut core, steps);
+        // Keys an earlier build of this branch wrote (with the label) still count.
+        assert_eq!(normalize_key("1A2B-3C4D:AA01:K"), "1A2B-3C4D:AA01:");
+        assert_eq!(normalize_key("1A2B-3C4D::K"), "1A2B-3C4D::K");
+        assert_eq!(normalize_key("1A2B-3C4D:AA01:"), "1A2B-3C4D:AA01:");
     }
 
     #[test]
@@ -2861,7 +2998,7 @@ mod tests {
     fn clones_with_different_disk_serials_are_asked_separately() {
         let one = DevInfo { disk_serial: Some("AA01".into()), ..info(D, "K") };
         let two = DevInfo { disk_serial: Some("BB02".into()), ..info(D, "K") };
-        assert_eq!(volume_key(&one).as_deref(), Some("1A2B-3C4D:AA01:K"));
+        assert_eq!(volume_key(&one).as_deref(), Some("1A2B-3C4D:AA01:"));
         assert_ne!(volume_key(&one), volume_key(&two));
         let mut core = test_core(true);
         core.answered.insert(volume_key(&one).unwrap());

@@ -200,9 +200,10 @@ the same add afterwards took **5.48 s**.
 
 Turn the offer off with `flashcp drive-mode offer off` (it writes `offer_faster=false` to
 `~/.config/flashcp/drive-mode.conf`, next to `enabled=`); `flashcp drive-mode status` shows the
-setting. Answers are kept per stick (volume serial, the stick's hardware serial when the reader
-reports one, and label) in `~/.local/state/flashcp/recluster-offers`; on a reader without a
-hardware serial, two sticks cloned from one image count as one. Without drive mode, run `flashcp recluster` yourself
+setting. Answers are kept per stick in `~/.local/state/flashcp/recluster-offers`: by its volume
+serial and hardware serial, so renaming it does not bring the question back. A stick that
+reports no hardware serial is kept by volume serial and label instead; then two sticks cloned
+from one image count as one. Without drive mode, run `flashcp recluster` yourself
 (see [Quick start](#quick-start)).
 
 ## When not to expect gains

@@ -25,7 +25,7 @@ fn rw(p: &Path) -> File {
 }
 
 fn opts(cluster: Option<u32>, fat: FatMode) -> ReclusterOpts {
-    ReclusterOpts { cluster, fat, dry_run: false, expect_serial: None }
+    ReclusterOpts { cluster, fat, dry_run: false, expect_serial: None, expect_hw: None }
 }
 
 /// `recluster` of the image at `p` through `dev` (the plain file when None).
@@ -584,6 +584,108 @@ fn a_medium_change_before_any_writing_phase_stops_the_run() {
     };
     let r = run_on(&f, len, &plain, &opts(Some(new), FatMode::Prefix), &COST, &hook, &mut |_| {});
     assert_eq!(reason(r), "wrong-volume");
+}
+
+/// The claimed device is a clone of the stick the user was asked about (same volume serial,
+/// another hardware serial), or its hardware serial cannot be read: refused before any write.
+#[test]
+fn another_physical_drive_behind_the_fd_is_refused() {
+    let img = volume("recl-hw", 32, 8192, 2, 40, 4 << 20);
+    let before = sum(&img.path);
+    let serial = boot_serial(&std::fs::read(&img.path).unwrap()[..512]);
+    let o = ReclusterOpts {
+        expect_serial: Some(serial),
+        expect_hw: Some("ORIGINAL01".into()),
+        ..opts(Some(512), FatMode::Prefix)
+    };
+    for live in [Some("CLONE02".to_string()), None] {
+        HW_SERIAL.with(|h| *h.borrow_mut() = Some(live.clone()));
+        let r = run(&img.path, &o, None);
+        HW_SERIAL.with(|h| *h.borrow_mut() = None);
+        assert_eq!(reason(r), "wrong-volume", "{live:?}");
+        assert_eq!(sum(&img.path), before, "{live:?}: written to");
+    }
+    HW_SERIAL.with(|h| *h.borrow_mut() = Some(Some("ORIGINAL01".into())));
+    let r = run(&img.path, &o, None);
+    HW_SERIAL.with(|h| *h.borrow_mut() = None);
+    assert!(r.unwrap().changed, "the right drive is converted");
+}
+
+/// The medium changes between a switch's main and backup boot-sector writes: the backup is not
+/// written onto the replacement, and a rerun on the original drive completes the switch.
+#[test]
+fn a_medium_change_between_the_two_boot_writes_writes_no_backup() {
+    let (old, new) = (8192u32, 512u32);
+    let img = volume("recl-backup-swap", 32, old, 1, 90, 9 << 20);
+    let template = img.dir.join("template.img");
+    std::fs::copy(&img.path, &template).unwrap();
+    let (_, before) = digest(&img.path);
+    let o = opts(Some(new), FatMode::Prefix);
+    let len = std::fs::metadata(&img.path).unwrap().len();
+    for step in ["relocated", "reclustered"] {
+        std::fs::copy(&template, &img.path).unwrap();
+        let f = rw(&img.path);
+        let plain = FileDev::new(Arc::new(rw(&img.path)));
+        let (switched, seen) = (std::cell::RefCell::new(None), std::cell::RefCell::new(None));
+        let mut sink = |e: &Event| {
+            if let Event::Switched { step: s, .. } = e
+                && *s == step
+            {
+                // Another medium now: sector 0 is not the one just written.
+                let dev = rw(&img.path);
+                let mut b = vec![0u8; 512];
+                dev.read_exact_at(&mut b, 0).unwrap();
+                *switched.borrow_mut() = Some(b.clone());
+                b[100] ^= 0x5a;
+                dev.write_all_at(&b, 0).unwrap();
+                *seen.borrow_mut() = Some(sum(&img.path));
+            }
+        };
+        let r = run_on(&f, len, &plain, &o, &COST, &|| Ok(()), &mut sink);
+        assert_eq!(reason(r), "wrong-volume", "{step}");
+        assert_eq!(Some(sum(&img.path)), *seen.borrow(), "{step}: written to the replacement");
+        // The original drive comes back: its main sector is the switched one, the backup owed.
+        rw(&img.path).write_all_at(switched.borrow().as_ref().unwrap(), 0).unwrap();
+        assert!(!boot_regions_agree(&img.path), "{step}: the backup is owed");
+        let s = run(&img.path, &o, None).unwrap_or_else(|e| panic!("{step}: the rerun failed: {e:#}"));
+        assert_eq!(s.cluster, new as u64, "{step}");
+        assert!(boot_regions_agree(&img.path), "{step}: the rerun completed the backup");
+        fsck(&img.path);
+        let (_, now) = digest(&img.path);
+        same(&now, &before, step);
+    }
+}
+
+/// On a block device the boot sector must be read past the page cache; when that read cannot
+/// be done there is no cached fallback: nothing is written.
+#[test]
+fn no_write_without_a_direct_read_of_the_boot_sector() {
+    let img = volume("recl-direct", 32, 8192, 3, 40, 4 << 20);
+    let before = sum(&img.path);
+    DIRECT_READ_FAILS.with(|c| c.set(true));
+    let r = run(&img.path, &opts(Some(512), FatMode::Prefix), None);
+    DIRECT_READ_FAILS.with(|c| c.set(false));
+    assert_eq!(reason(r), "wrong-volume");
+    assert_eq!(sum(&img.path), before, "written without a direct read");
+}
+
+/// The hardware serial comes from the first USB parent of the block device in sysfs.
+#[test]
+fn hardware_serial_from_sysfs() {
+    let d = std::env::temp_dir().join(format!("fcp-sysfs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let usb = d.join("devices/pci0/usb2/2-1");
+    let part = usb.join("2-1:1.0/host6/target6:0:0/6:0:0:0/block/sdb/sdb1");
+    std::fs::create_dir_all(&part).unwrap();
+    std::fs::write(usb.join("idVendor"), "0951\n").unwrap();
+    std::fs::write(usb.join("serial"), "E0D55EA5 74B5\n").unwrap();
+    std::fs::create_dir_all(d.join("dev/block")).unwrap();
+    std::os::unix::fs::symlink(&part, d.join("dev/block/8:17")).unwrap();
+    assert_eq!(hw_serial_in(&d, libc::makedev(8, 17)).as_deref(), Some("E0D55EA5_74B5"));
+    assert_eq!(hw_serial_in(&d, libc::makedev(8, 33)), None, "no such device");
+    std::fs::remove_file(usb.join("serial")).unwrap();
+    assert_eq!(hw_serial_in(&d, libc::makedev(8, 17)), None, "no serial");
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// Device offsets in the root directory: of its end-of-directory marker, and of a live entry set.
