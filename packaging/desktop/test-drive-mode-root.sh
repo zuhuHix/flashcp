@@ -10,26 +10,38 @@ fail() { echo "::error::$*"; exit 1; }
 
 sandbox() {
   local helper; helper=$(realpath "$1")
-  local w; w=$(mktemp -d)
+  local w; w=$(mktemp -d); chmod 755 "$w"
   truncate -s 64M "$w/img"; mkfs.exfat -L SANDBOX "$w/img" >/dev/null
   local loop; loop=$(losetup --find --show "$w/img")
-  trap 'losetup -d '"$loop"'; rm -rf '"$w" RETURN
+  local made_bin=""; [ -e /usr/bin/flashcp ] || { touch /usr/bin/flashcp; made_bin=1; }
+  trap 'umount /usr/bin/flashcp 2>/dev/null; [ -n "'"$made_bin"'" ] && rm -f /usr/bin/flashcp; losetup -d '"$loop"'; rm -rf '"$w" RETURN
   local uid=4242
-  echo "kernel $(uname -r), LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unknown)"
-  # A fake /usr/bin/flashcp that exits 0 only if the sandbox holds (bind-mounted in a private
-  # mount namespace, together with a fake seat0 and the user's runtime dir).
+  echo "kernel $(uname -r), LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unknown), $(systemctl --version | head -1)"
+  # The helper runs like udev runs it: in a unit with systemd-udevd.service's seccomp filter and
+  # sandbox (which deny Landlock, mount, seccomp), a fake seat0 and the user's runtime dir.
+  local udevd=(-p "SystemCallFilter=@system-service @module @raw-io bpf" -p "SystemCallFilter=~@clock"
+               -p SystemCallErrorNumber=EPERM -p LockPersonality=yes -p MemoryDenyWriteExecute=yes
+               -p RestrictRealtime=yes -p PrivateMounts=yes -p IPAddressDeny=any
+               -p "RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6"
+               -p "TemporaryFileSystem=/run/systemd/seats /run/user")
+  # Prove the stand-in really is udevd's context: Landlock is denied there.
+  systemd-run --quiet --wait --pipe "${udevd[@]}" /usr/bin/python3 -I -c \
+    'import ctypes,sys; l=ctypes.CDLL(None,use_errno=True); r=l.syscall(444,None,0,1); sys.exit(0 if r<0 and ctypes.get_errno()==1 else 1)' \
+    || fail "the udevd-like unit does not deny Landlock"
+  # A fake /usr/bin/flashcp (bind-mounted over the real path) that exits 0 only if the sandbox holds.
   cat > "$w/ok" <<EOF
 #!/bin/sh
-[ "\$(id -u)" = 65534 ] && [ "\$(id -g)" = 65534 ] && [ -z "\$(id -G | tr -d ' 65534')" ] || exit 10
-[ -z "\$HOME\$ID_FS_UUID\$PKEXEC_UID" ] || exit 11
-for fd in 4 5 6 7 8 9; do if { true >&\$fd; } 2>/dev/null; then exit 12; fi; done
-[ "\$(head -c 11 <&3 | tail -c 8)" = "EXFAT   " ] || exit 13
-# (No ">/dev/null" in here: opening it for writing is itself denied; fd 2 already is /dev/null.)
-if cat /etc/hostname >&2 2>&2; then exit 14; fi
-read -r _ < /proc/self/mountinfo || exit 17   # the check's busy test: own mountinfo and /sys
+[ "\$(id -u)" -ge 61184 ] && [ "\$(id -u)" -le 65519 ] || exit 10   # a DynamicUser uid
+[ -z "\$ID_FS_UUID\$PKEXEC_UID\$FLASHCP_UDEV_CHECK_DEBUG" ] || exit 11
+for fd in 3 4 5 6 7 8 9; do if { true >&\$fd; } 2>/dev/null; then exit 12; fi; done
+[ "\$(head -c 11 <&0 | tail -c 8)" = "EXFAT   " ] || exit 13
+if cat /etc/hostname >&2 2>&2; then exit 14; fi        # /etc is an empty tmpfs
+if [ -e /home ] && ls /home/* >&2 2>&2; then exit 20; fi
+if touch /usr/bin/x 2>/dev/null || touch /tmp/../x 2>/dev/null; then exit 21; fi
+read -r _ < /proc/self/mountinfo || exit 17            # the check's busy test: mountinfo and /sys
 ls /sys/class/block >&2 || exit 18
 [ "\$(ulimit -f)" = 0 ] || exit 15
-[ "\$1 \$2 \$3 \$4 \$5 \$6" = "mount --check --json --device-fd 3 $loop" ] || exit 16
+[ "\$1 \$2 \$3 \$4 \$5 \$6" = "mount --check --json --device-fd 0 $loop" ] || exit 16
 exit 0
 EOF
   printf '#!/bin/sh\necho %s\nexit 0\n' "'{\"event\":\"check\",\"ok\":true,\"busy_unknown\":\"EACCES\"}'" > "$w/unknown"
@@ -50,18 +62,15 @@ EOF
   chmod 755 "$w"/ok "$w"/pending "$w"/net "$w"/unknown "$w"/refuse "$w"/busy "$w"/hang
   # run <fake> <setup shell commands> -> prints the helper's stdout
   run() {
-    local ll=""; [ -n "${NO_LL:-}" ] && ll="FLASHCP_UDEV_CHECK_NO_LANDLOCK=1"
-    unshare -m sh -ec "
-      mount -t tmpfs none /run/systemd 2>/dev/null || { mkdir -p /run/systemd && mount -t tmpfs none /run/systemd; }
-      mkdir -p /run/systemd/seats; printf 'ACTIVE=c9\nACTIVE_UID=$uid\n' > /run/systemd/seats/seat0
-      mkdir -p /run/user; mount -t tmpfs none /run/user
-      mkdir -p /run/user/$uid/flashcp/kernel; touch /run/user/$uid/flashcp/drive-mode-on
-      chown -R $uid /run/user/$uid
-      touch /usr/bin/flashcp 2>/dev/null || true
-      mount --bind '$w/$1' /usr/bin/flashcp
-      $2
-      exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-   # like udev: only 0-2 open, so the device lands on fd 3
-      FLASHCP_UDEV_CHECK_DEBUG=1 ID_FS_UUID=1A2B-3C4D HOME=/root $ll '$helper' '$loop'"
+    mount --bind "$w/$1" /usr/bin/flashcp
+    systemd-run --quiet --wait --pipe --collect "${udevd[@]}" -E ID_FS_UUID=1A2B-3C4D -E FLASHCP_UDEV_CHECK_DEBUG=1 \
+      /bin/sh -ec "
+        printf 'ACTIVE=c9\nACTIVE_UID=$uid\n' > /run/systemd/seats/seat0
+        mkdir -p /run/user/$uid/flashcp/kernel; touch /run/user/$uid/flashcp/drive-mode-on
+        chown -R $uid /run/user/$uid
+        $2
+        exec '$helper' '$loop'" </dev/null || true
+    umount /usr/bin/flashcp
   }
   expect() { # name fake setup want
     local t0 got; t0=$(date +%s%N)
@@ -78,7 +87,6 @@ EOF
   python3 -c 'import socket; socket.create_connection(("127.0.0.1", 8765), 1)' || fail "listener not up"
   expect "no network" net "" "FLASHCP_DRIVE_MODE=1 FLASHCP_DRIVE_UID=$uid UDISKS_IGNORE=1 "
   kill "$listener"
-  NO_LL=1 expect "no Landlock: fail closed" ok "" ""
   expect refused refuse "" ""
   expect busy busy "" "FLASHCP_KEEP=1 "
   expect hang hang "" ""
@@ -90,8 +98,8 @@ EOF
   expect "fallback flag" ok "touch /run/user/$uid/flashcp/kernel/1A2B-3C4D; chown $uid /run/user/$uid/flashcp/kernel/1A2B-3C4D" "UDISKS_AUTO=0 "
   expect "fallback flag owned by root" ok "touch /run/user/$uid/flashcp/kernel/1A2B-3C4D" "FLASHCP_DRIVE_MODE=1 FLASHCP_DRIVE_UID=$uid UDISKS_IGNORE=1 "
   expect "no active user" ok "printf 'ACTIVE=c1\n' > /run/systemd/seats/seat0" ""
-  # The hung child was SIGKILLed, not left behind.
-  sleep 0.5; ! pgrep -u 65534 -f "sleep 30" || fail "the hung check child is still running"
+  # The hung check was ended by its unit's RuntimeMaxSec, not left behind.
+  sleep 1.5; ! pgrep -f "sleep 30" || fail "the hung check is still running"
   # Not a device path / not a block device: nothing, without running anything.
   [ -z "$("$helper" /etc/passwd)" ] && [ -z "$("$helper" "$w/img")" ] || fail "non-device input"
 }

@@ -60,7 +60,7 @@ Uninstall with `sudo apt remove flashcp-gui`.
 | `/usr/share/icons/hicolor/*/apps/flashcp-gui.png` | `gui/src-tauri/icons` | Raster icons, placed by the Tauri bundler |
 | `/usr/share/doc/flashcp-gui/SECURITY-NOTES.md` | `SECURITY-NOTES.md` | What the privileged path can and cannot do |
 | `/usr/lib/udev/rules.d/61-flashcp-drive-mode.rules` | `61-flashcp-drive-mode.rules` | Drive mode: decides at plug-in whether flashcp or udisks gets a USB exFAT drive |
-| `/usr/libexec/flashcp-udev-check` | `gui/helper` | Run by that rule: a sandboxed `flashcp mount --check` (as nobody, ≤ 1.5 s) |
+| `/usr/libexec/flashcp-udev-check` | `gui/helper` | Run by that rule: `flashcp mount --check` in a sandboxed transient systemd service (≤ 1.5 s) |
 | `/usr/libexec/flashcp-mountpoint` | `gui/helper` | Root helper (pkexec, no password in an active session): an empty `/media/$USER/LABEL` |
 | `/usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.mountpoint.policy` | `packaging/desktop` | polkit action for it (`allow_active=yes`, nothing else) |
 | `/usr/lib/systemd/user/flashcp-drived.service` | `flashcp-drived.service` | The per-user drive daemon (`flashcp drived`) |
