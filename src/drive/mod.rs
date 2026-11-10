@@ -9,6 +9,7 @@
 //!
 //! See `docs/drive-mode-interface.md` for the command's contract and DESIGN.md for the design.
 
+pub mod check;
 pub(crate) mod commit;
 pub mod core;
 pub(crate) mod dev;
@@ -17,7 +18,7 @@ pub mod fs;
 pub(crate) mod set;
 pub(crate) mod stage;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use self::core::{Attr, Errno, Ino, ROOT, RenameFlags, SetAttr, Statfs};
 pub use fs::{Fs, FsOpts, Note, Status};

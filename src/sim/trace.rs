@@ -237,6 +237,10 @@ pub fn group() -> u32 {
 /// Runs the device op `f` and records it (see the module docs for the fields).
 #[inline(always)]
 pub fn io<T>(op: Op, off: u64, len: u64, qd: usize, grp: u32, seq: u64, f: impl FnOnce() -> T) -> T {
+    #[cfg(test)]
+    if op == Op::Read {
+        TEST_READS.with(|c| c.set(c.get() + len));
+    }
     if !on() {
         return f();
     }
@@ -258,6 +262,17 @@ pub fn io<T>(op: Op, off: u64, len: u64, qd: usize, grp: u32, seq: u64, f: impl 
         ),
     );
     r
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Tests: bytes this thread has read through the hooks so far.
+#[cfg(test)]
+pub(crate) fn test_reads() -> u64 {
+    TEST_READS.with(|c| c.get())
 }
 
 /// A serial (qd 1, group 0) device op.

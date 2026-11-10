@@ -240,7 +240,7 @@ impl Vol {
         Ok(v)
     }
 
-    fn open_rest(mut v: Vol, read_bitmap: bool) -> Result<Vol> {
+    pub(crate) fn open_rest(mut v: Vol, read_bitmap: bool) -> Result<Vol> {
         let (cs, cc, tolerate_dups) = (v.cs, v.cc, v.tolerate_dups);
         let root = le32(&v.sector0, 96);
         let root_clusters = v.chain(root, "root directory", MAX_DIR_BYTES / cs)?;
