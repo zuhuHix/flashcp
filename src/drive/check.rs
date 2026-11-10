@@ -81,7 +81,8 @@ pub fn check(dev: &File, len: u64) -> CheckReport {
             pending = super::djournal::header_state(&v, &p) == Some(true);
         }
         let v = Vol::open_rest(v, false)?;
-        let sync_journal = v.dirs[0].children.values().any(crate::volume::is_sync_journal);
+        let sync_journal =
+            v.dirs[0].children.values().any(|c| crate::volume::is_sync_journal(c) && !super::djournal::is_journal(c));
         pending |= sync_journal;
         let mut out =
             CheckReport { fallback: None, label: Some(v.label.clone()), serial: r.serial, pending_journal: pending };
@@ -232,7 +233,7 @@ mod tests {
                 let rw = File::options().read(true).write(true).open(&path).unwrap();
                 if let Ok(fs) = crate::drive::tests::open_with(
                     &path,
-                    std::sync::Arc::new(crate::drive::dev::FileDev(std::sync::Arc::new(rw))),
+                    std::sync::Arc::new(crate::drive::dev::FileDev::new(std::sync::Arc::new(rw))),
                     crate::drive::tests::manual(),
                 ) {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

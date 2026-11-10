@@ -22,6 +22,10 @@ pub struct FsOpts {
     pub auto_commit: bool,
     /// Spill directory (default: $XDG_CACHE_HOME/flashcp).
     pub spill_dir: Option<std::path::PathBuf>,
+    /// Physical-order readahead of committed data (pull's strategy for the device).
+    pub readahead: bool,
+    /// Readahead cache, bytes.
+    pub ra_cap: u64,
 }
 
 impl Default for FsOpts {
@@ -32,6 +36,8 @@ impl Default for FsOpts {
             ram_cap: 512 << 20,
             auto_commit: true,
             spill_dir: None,
+            readahead: true,
+            ra_cap: 64 << 20,
         }
     }
 }
@@ -54,6 +60,8 @@ pub struct Status {
     pub free_bytes: u64,
 }
 
+type NoteFn = Box<dyn FnMut(Note) + Send>;
+
 struct Shared {
     core: Mutex<Core>,
     /// Signalled when a commit finishes, a write lands, or state changes.
@@ -61,8 +69,32 @@ struct Shared {
     st: Mutex<Ctl>,
     dev: Arc<dyn Dev>,
     opts: FsOpts,
-    notes: Mutex<Option<Box<dyn FnMut(Note) + Send>>>,
+    notes: Mutex<Option<NoteFn>>,
+    /// Held (shared) by readers of committed data while they read outside the core lock;
+    /// a commit's planning takes it exclusively, so clusters it reuses have no reader left.
+    gate: std::sync::RwLock<()>,
+    ra: Option<Arc<super::readahead::Ra>>,
+    /// Device handle for reads outside the core lock.
+    rdev: std::fs::File,
+    track: Mutex<Track>,
 }
+
+/// What readahead knows about the readers: per directory, files whose reading started at
+/// offset 0 (and whether its remaining files were queued); per file, where a sequential
+/// reader is and how far ahead of it is queued.
+#[derive(Default)]
+struct Track {
+    dirs: std::collections::HashMap<Ino, (u32, bool)>,
+    files: std::collections::HashMap<Ino, (u64, u64)>,
+}
+
+/// Bytes of a big file queued ahead of its sequential reader.
+const RA_WINDOW: u64 = 16 << 20;
+/// A directory's files are queued up to this many bytes each (the rest follows as they are
+/// read sequentially).
+const RA_DIR_FILE_MAX: u64 = 2 << 20;
+/// Queued payload of one directory, at most.
+const RA_DIR_MAX: u64 = 1 << 30;
 
 #[derive(Default)]
 struct Ctl {
@@ -108,7 +140,7 @@ pub(crate) fn open_core(
 /// recovery first, then the in-memory state. Errors: [`super::Fallback`] (exit 3: the kernel's),
 /// [`djournal::Refused`] (exit 6), anything else (exit 1).
 pub fn mount_file(file: std::fs::File, len: u64, opts: FsOpts) -> Result<(Fs, Recovered)> {
-    let dev: Arc<dyn Dev> = Arc::new(super::dev::FileDev(Arc::new(file.try_clone().context("dup")?)));
+    let dev: Arc<dyn Dev> = Arc::new(super::dev::FileDev::new(Arc::new(file.try_clone().context("dup")?)));
     let (core, rec) = match open_core(file, len, &*dev, &opts) {
         Ok(x) => x,
         Err(e) if e.downcast_ref::<super::Fallback>().is_some() || e.downcast_ref::<djournal::Refused>().is_some() => {
@@ -123,7 +155,34 @@ pub use djournal::Recovered;
 
 impl Fs {
     pub(crate) fn new(core: Core, dev: Arc<dyn Dev>, opts: FsOpts) -> Fs {
+        let rdev = core.vol.dev.try_clone().expect("dup the device handle");
+        let ra = if opts.readahead {
+            // its own open file description: O_DIRECT is per description, and the metadata
+            // handle must stay buffered
+            use std::os::unix::io::AsRawFd;
+            let own = std::fs::File::open(format!("/proc/self/fd/{}", core.vol.dev.as_raw_fd()));
+            let f = own.unwrap_or_else(|_| core.vol.dev.try_clone().expect("dup the device handle"));
+            let strat = crate::pull::read_strategy(&f, &core.vol);
+            let separate = !std::ptr::eq(&f, &core.vol.dev)
+                && unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) & libc::O_DIRECT } == 0;
+            let direct = strat.direct
+                && separate
+                && crate::exfat::set_direct(&f, true)
+                && unsafe { libc::fcntl(core.vol.dev.as_raw_fd(), libc::F_GETFL) & libc::O_DIRECT } == 0;
+            if !direct {
+                crate::exfat::set_direct(&f, false);
+            }
+            let mut strat = strat;
+            strat.direct = direct;
+            Some(super::readahead::Ra::new(Arc::new(f), strat, opts.ra_cap))
+        } else {
+            None
+        };
         let sh = Arc::new(Shared {
+            gate: std::sync::RwLock::new(()),
+            ra,
+            rdev,
+            track: Mutex::new(Track::default()),
             core: Mutex::new(core),
             cv: Condvar::new(),
             st: Mutex::new(Ctl::default()),
@@ -251,14 +310,81 @@ impl Fs {
         c.gc(ino);
     }
     pub fn read(&self, ino: Ino, off: u64, size: u32) -> R<Vec<u8>> {
-        self.core().read(ino, off, size)
+        let (plan, pf, _gate) = {
+            let mut c = self.core();
+            let plan = c.read_plan(ino, off, size)?;
+            let pf = if self.sh.ra.is_some() { self.prefetch_ranges(&mut c, ino, off, size) } else { Vec::new() };
+            (plan, pf, self.sh.gate.read().unwrap_or_else(|e| e.into_inner()))
+        };
+        if let Some(ra) = &self.sh.ra
+            && !pf.is_empty()
+        {
+            ra.prefetch(&pf);
+        }
+        let total = plan.last().map_or(0, |p| p.0 + p.1);
+        let mut buf = vec![0u8; total];
+        super::core::exec_read(&self.sh.rdev, self.sh.ra.as_deref(), &plan, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Device ranges to queue for a read of `ino` at `off` (see [`Track`]).
+    fn prefetch_ranges(&self, c: &mut Core, ino: Ino, off: u64, size: u32) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let Ok(n) = c.ino(ino) else { return out };
+        let (parent, fsize) = (n.parent, n.size);
+        let mut tr = self.sh.track.lock().unwrap();
+        let end = off + size as u64;
+        let f = tr.files.entry(ino).or_insert((0, 0));
+        let sequential = off == 0 || off == f.0;
+        f.0 = end;
+        if sequential && fsize > RA_DIR_FILE_MAX.min(1 << 20) {
+            let target = (end + RA_WINDOW).min(fsize);
+            let from = f.1.max(end);
+            if from < target && (f.1 <= end + RA_WINDOW / 2) {
+                f.1 = target;
+                out.extend(base_ranges(c, ino, from, target));
+            }
+        }
+        if off == 0 {
+            let d = tr.dirs.entry(parent).or_insert((0, false));
+            d.0 += 1;
+            if d.0 >= 2 && !d.1 {
+                d.1 = true;
+                // the directory's remaining committed files, in its order
+                let my = c.ino(ino).ok().and_then(|n| n.disk).map_or(0, |d| d.off);
+                let mut files: Vec<(usize, Ino)> = c
+                    .ino(parent)
+                    .ok()
+                    .and_then(|p| p.kids.as_ref())
+                    .map(|k| {
+                        k.values()
+                            .filter_map(|&k| {
+                                let x = c.inodes.get(&k)?;
+                                let d = x.disk?;
+                                (!x.is_dir && d.dir == parent && d.off > my && x.ov.is_empty() && x.keep > 0)
+                                    .then_some((d.off, k))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                files.sort();
+                let mut total = 0u64;
+                for (_, k) in files {
+                    let keep = c.inodes[&k].keep.min(RA_DIR_FILE_MAX);
+                    total += keep;
+                    if total > RA_DIR_MAX {
+                        break;
+                    }
+                    out.extend(base_ranges(c, k, 0, keep));
+                    tr.files.insert(k, (0, keep));
+                }
+            }
+        }
+        out
     }
     pub fn write(&self, ino: Ino, off: u64, data: &[u8]) -> R<u32> {
         self.window(data.len() as u64)?;
-        let r = self.mutate(|c| match c.write(ino, off, data) {
-            Err(libc::ENOSPC) => Err(libc::ENOSPC),
-            r => r,
-        });
+        let r = self.mutate(|c| c.write(ino, off, data));
         let r = match r {
             Err(libc::ENOSPC) if self.has_pending_frees() => {
                 // freed space becomes usable once the commit that frees it is durable
@@ -386,7 +512,7 @@ impl Fs {
 
     fn flush_why(&self, why: &'static str) -> Result<()> {
         if !self.sh.opts.auto_commit {
-            while self.commit_now(why)? {}
+            commit_all(self, why)?;
             return Ok(());
         }
         let mut st = self.sh.st.lock().unwrap();
@@ -430,7 +556,26 @@ impl Fs {
         if let Some(t) = self.thread.lock().unwrap().take() {
             let _ = t.join();
         }
+        if let Some(ra) = &self.sh.ra {
+            ra.stop();
+        }
         r
+    }
+
+    /// Where the drive journal is (once created).
+    #[cfg(test)]
+    pub(crate) fn journal_place(&self) -> Option<Place> {
+        self.core().journal.clone()
+    }
+
+    /// Commits completed so far.
+    pub fn commits(&self) -> u64 {
+        self.core().commits
+    }
+
+    /// Readahead cache hits and misses (tests, benchmarks).
+    pub fn ra_stats(&self) -> Option<(u64, u64)> {
+        self.sh.ra.as_ref().map(|r| r.stats())
     }
 
     /// Bytes still pending (for "lost" reports).
@@ -478,7 +623,7 @@ impl Fs {
             st.committing = true;
             drop(st);
             let r = (|| -> Result<()> {
-                while self.commit_now(why)? {}
+                commit_all(self, why)?;
                 Ok(())
             })();
             let mut st = self.sh.st.lock().unwrap();
@@ -513,7 +658,26 @@ impl Fs {
             if c.journal.is_none() {
                 bootstrap(&mut c, &*self.sh.dev)?;
             }
-            let Some(plan) = commit::plan(&mut c)? else { return Ok(false) };
+            // no reader of committed data may still be reading what this plan can reuse
+            drop(self.sh.gate.write().unwrap_or_else(|e| e.into_inner()));
+            // the commit's journal must fit the journal file: plan fewer inodes until it does
+            let cap = c.journal.as_ref().map_or(0, |p| p.len);
+            let mut limit = None;
+            let plan = loop {
+                let Some(plan) = commit::plan(&mut c, limit)? else { return Ok(false) };
+                let est = djournal::encode_body(&c.vol, &plan.writes, &[])?.len() as u64
+                    + 2 * 20 * plan.segs.len() as u64
+                    + 1024;
+                if est <= cap {
+                    break plan;
+                }
+                anyhow::ensure!(plan.inodes > 1, "one change needs more journal than the volume's journal file holds");
+                limit = Some(plan.inodes / 2);
+            };
+            if let Some(ra) = &self.sh.ra {
+                let r: Vec<(u64, u64)> = plan.segs.iter().map(|s| (s.dev, s.len)).collect();
+                ra.invalidate(&r);
+            }
             commit::begin(&mut c, &plan);
             (plan, c.journal.clone().unwrap(), c.commits + 1)
         };
@@ -528,10 +692,85 @@ impl Fs {
     }
 }
 
+/// Commits until nothing is dirty (a split batch takes several commits), at most 1000.
+fn commit_all(fs: &Fs, why: &'static str) -> Result<()> {
+    for _ in 0..1000 {
+        if !fs.commit_now(why)? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("changes are still pending after 1000 commits")
+}
+
+/// Device ranges of committed bytes [a, b) of `ino` (clamped to what is still content).
+fn base_ranges(c: &mut Core, ino: Ino, a: u64, b: u64) -> Vec<(u64, u64)> {
+    let Ok(n) = c.ino(ino) else { return Vec::new() };
+    let b = b.min(n.keep);
+    if a >= b {
+        return Vec::new();
+    }
+    let Ok(runs) = c.runs(ino) else { return Vec::new() };
+    let cs = c.vol.cs;
+    let mut out = Vec::new();
+    let mut logical = 0u64;
+    for (s, cnt) in runs {
+        let rl = cnt as u64 * cs;
+        let (ra, rb) = (logical.max(a), (logical + rl).min(b));
+        if ra < rb {
+            out.push((c.vol.cluster_off(s) + (ra - logical), rb - ra));
+        }
+        logical += rl;
+        if logical >= b {
+            break;
+        }
+    }
+    out
+}
+
 /// Writes a commit: data, journal, the journaled phases, the idle header.
 pub(crate) fn execute(dev: &dyn Dev, v: &Vol, plan: &Plan, place: &Place, seq: u64) -> Result<()> {
     crate::sim::trace::phase("data");
-    let mut samples = write_data(dev, &plan.segs)?;
+    let mut samples = match dev.file() {
+        Some(f) if !plan.segs.is_empty() => {
+            let cs = v.cs;
+            let direct_ok = cs.is_multiple_of(4096) && v.heap_off.is_multiple_of(4096);
+            // one probe segment per contiguous run (whole clusters)
+            let mut probe: Vec<crate::add::ProbeSeg> = Vec::new();
+            for s in &plan.segs {
+                match probe.last_mut() {
+                    Some(l) if l.dev + l.payload == s.dev => l.payload += s.len,
+                    _ => probe.push(crate::add::ProbeSeg { dev: s.dev, len: 0, payload: s.len, file_end: true }),
+                }
+            }
+            for p in &mut probe {
+                p.len = p.payload.div_ceil(cs) * cs;
+            }
+            let pol = crate::add::choose_gap_policy(f, direct_ok, v, 0, false, &probe);
+            if std::env::var_os("FLASHCP_DEBUG_DATA").is_some() {
+                eprintln!("data: {} segments, {} runs, cs {cs}, {}", plan.segs.len(), probe.len(), pol.describe());
+            }
+            let direct = direct_ok && crate::exfat::set_direct(f, true);
+            let w = if direct {
+                crate::exfat::SeqWriter::new(f.clone())
+            } else {
+                crate::exfat::SeqWriter::with_align(f.clone(), 1)
+            };
+            let mut out = Out::Seq {
+                w: Some(w),
+                pol,
+                pre_bm: plan.pre_bm.clone(),
+                heap: v.heap_off,
+                cs,
+                align: if direct { 4096 } else { 1 },
+            };
+            let r = write_data(dev, &plan.segs, &mut out);
+            if direct {
+                crate::exfat::set_direct(f, false);
+            }
+            r?
+        }
+        _ => write_data(dev, &plan.segs, &mut Out::Dev)?,
+    };
     // Data that later metadata lands on (a directory's extension) is checked by the journal.
     samples.retain(|&(off, len, _)| {
         len > 0 && !plan.writes.iter().any(|w| w.off < off + len as u64 && off < w.off + w.post.len() as u64)
@@ -546,7 +785,66 @@ pub(crate) fn execute(dev: &dyn Dev, v: &Vol, plan: &Plan, place: &Place, seq: u
 
 /// Writes the data segments (ascending) in buffers of up to 4 MB per contiguous run, then
 /// syncs. Returns samples (head and tail ≤ 512 bytes of every run) for the journal.
-fn write_data(dev: &dyn Dev, segs: &[Seg]) -> Result<Vec<djournal::Sample>> {
+/// Where the data step's bytes go: plain device writes (tests' crash device), or add's
+/// sequential O_DIRECT writer with its gap policy (fill a gap with zeros when that is cheaper
+/// than a new request: only our own slack, or clusters the pre-commit bitmap calls free).
+#[allow(clippy::large_enum_variant)]
+enum Out {
+    Dev,
+    Seq {
+        w: Option<crate::exfat::SeqWriter>,
+        pol: crate::add::GapPolicy,
+        pre_bm: Arc<Vec<u8>>,
+        heap: u64,
+        cs: u64,
+        align: u64,
+    },
+}
+
+impl Out {
+    fn begin_run(&mut self, start: u64) -> Result<()> {
+        if let Out::Seq { w: Some(w), pol, pre_bm, heap, cs, .. } = self {
+            let cur = w.cur();
+            if start > cur {
+                let first = cur > 0;
+                let own_end = *heap + (cur.saturating_sub(*heap)).div_ceil(*cs) * *cs;
+                let foreign = (own_end - *heap) / *cs + 2..(start - *heap) / *cs + 2;
+                if first && crate::add::fill_gap(start - cur, foreign, pre_bm, pol) {
+                    w.zeros_to(start)?;
+                } else {
+                    w.skip_to(start)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn write(&mut self, dev: &dyn Dev, at: u64, buf: &[u8]) -> Result<()> {
+        match self {
+            Out::Dev => dev.write_at(buf, at).with_context(|| format!("write data at {at}")),
+            Out::Seq { w: Some(w), .. } => {
+                anyhow::ensure!(w.cur() == at, "internal error: data stream at {} not {at}", w.cur());
+                w.write(buf)
+            }
+            Out::Seq { .. } => unreachable!(),
+        }
+    }
+    fn end_run(&mut self) -> Result<()> {
+        if let Out::Seq { w: Some(w), heap, cs, align, .. } = self {
+            let cur = w.cur();
+            let cluster_end = *heap + (cur - *heap).div_ceil(*cs) * *cs;
+            w.zeros_to((cur.div_ceil(*align) * *align).min(cluster_end))?;
+        }
+        Ok(())
+    }
+    fn finish(&mut self, dev: &dyn Dev) -> Result<()> {
+        match self {
+            Out::Dev => dev.sync().context("sync"),
+            Out::Seq { w, .. } => w.take().unwrap().finish().map(|_| ()),
+        }
+    }
+}
+
+fn write_data(dev: &dyn Dev, segs: &[Seg], out: &mut Out) -> Result<Vec<djournal::Sample>> {
     const BUF: u64 = 4 << 20;
     let mut samples = Vec::new();
     if segs.is_empty() {
@@ -560,6 +858,7 @@ fn write_data(dev: &dyn Dev, segs: &[Seg]) -> Result<Vec<djournal::Sample>> {
             j += 1;
         }
         let (start, end) = (segs[k].dev, segs[j - 1].dev + segs[j - 1].len);
+        out.begin_run(start)?;
         let mut head: Vec<u8> = Vec::new();
         let mut tail: Vec<u8> = Vec::new();
         let mut at = start;
@@ -600,15 +899,16 @@ fn write_data(dev: &dyn Dev, segs: &[Seg]) -> Result<Vec<djournal::Sample>> {
             } else {
                 tail.extend_from_slice(&buf[buf.len() - tl..]);
             }
-            dev.write_at(&buf, at).with_context(|| format!("write data at {at}"))?;
+            out.write(dev, at, &buf)?;
             at += n;
         }
+        out.end_run()?;
         let tail = if tail.len() > 512 { tail[tail.len() - 512..].to_vec() } else { tail };
         samples.push((start, head.len() as u32, xxhash_rust::xxh3::xxh3_64(&head)));
         samples.push((end - tail.len() as u64, tail.len() as u32, xxhash_rust::xxh3::xxh3_64(&tail)));
         k = j;
     }
-    dev.sync().context("sync")?;
+    out.finish(dev)?;
     Ok(samples)
 }
 

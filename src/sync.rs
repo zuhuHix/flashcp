@@ -655,6 +655,7 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     let excl = Arc::new(tgt.file);
     set_direct(&excl, false);
     let mut v = Vol::open_with(excl.try_clone().context("dup target fd")?, tgt.bytes, false, true, true)?;
+    crate::drive::djournal::hide_from(&mut v)?;
     let cs = v.cs;
     let jkey = upcase(&SYNC_JOURNAL_NAME.encode_utf16().collect::<Vec<_>>(), &v.upc);
     if let Some(ch) = v.dirs[0].children.get(&jkey) {

@@ -318,12 +318,12 @@ pub(crate) fn fill_gap(gap: u64, foreign: std::ops::Range<u64>, pre_bitmap: &[u8
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProbeSeg {
     /// Partition offset and length (whole clusters).
-    dev: u64,
-    len: u64,
+    pub(crate) dev: u64,
+    pub(crate) len: u64,
     /// Bytes of content in it (the rest is slack).
-    payload: u64,
+    pub(crate) payload: u64,
     /// The last segment of a file (its write gets padded).
-    file_end: bool,
+    pub(crate) file_end: bool,
 }
 
 /// The writes the data phase issues for `segs` under `pol`, as (offset, length), contiguous
@@ -921,6 +921,7 @@ pub fn add_to(src: &Path, target: &TargetSpec, o: &AddOpts, sink: Sink<'_>) -> R
     let excl = Arc::new(tgt.file);
     set_direct(&excl, false);
     let mut v = Vol::open(excl.try_clone().context("dup target fd")?, tgt.bytes, false, true)?;
+    crate::drive::djournal::hide_from(&mut v)?;
     let cs = v.cs;
     let mut nodes = scan_tree(src, &v.upc)?;
     // Mandatory: never trust a clear bitmap bit that something still references. The walk

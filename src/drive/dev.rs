@@ -18,7 +18,13 @@ pub(crate) trait Dev: Send + Sync {
     }
 }
 
-pub(crate) struct FileDev(pub(crate) Arc<File>);
+pub(crate) struct FileDev(pub(crate) Arc<File>, std::sync::OnceLock<Option<Arc<File>>>);
+
+impl FileDev {
+    pub(crate) fn new(f: Arc<File>) -> FileDev {
+        FileDev(f, std::sync::OnceLock::new())
+    }
+}
 
 impl Dev for FileDev {
     fn read_at(&self, buf: &mut [u8], off: u64) -> io::Result<()> {
@@ -30,8 +36,20 @@ impl Dev for FileDev {
     fn sync(&self) -> io::Result<()> {
         trace::sync(|| self.0.sync_all())
     }
+    /// A second open file description of the same file (O_DIRECT is per description, and
+    /// every other handle stays buffered), for the data stream.
     fn file(&self) -> Option<&Arc<File>> {
-        Some(&self.0)
+        self.1
+            .get_or_init(|| {
+                use std::os::unix::io::AsRawFd;
+                File::options()
+                    .read(true)
+                    .write(true)
+                    .open(format!("/proc/self/fd/{}", self.0.as_raw_fd()))
+                    .ok()
+                    .map(Arc::new)
+            })
+            .as_ref()
     }
 }
 

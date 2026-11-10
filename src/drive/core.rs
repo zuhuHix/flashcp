@@ -35,12 +35,6 @@ pub(crate) struct Layout {
     pub(crate) runs: Option<Vec<(u32, u32)>>,
 }
 
-impl Layout {
-    pub(crate) fn clusters(&self, cs: u64) -> u64 {
-        self.len.div_ceil(cs)
-    }
-}
-
 /// The committed bytes of a loaded directory, exactly as on the volume.
 #[derive(Clone, Debug)]
 pub(crate) struct DirData {
@@ -156,6 +150,52 @@ pub(crate) fn used_clusters(bm: &[u8], cc: u64) -> u64 {
     used
 }
 
+/// A part of a read.
+#[derive(Clone)]
+pub(crate) enum RSrc {
+    Zero,
+    Base(u64),
+    Piece(super::stage::Piece, u64),
+}
+
+/// Executes a read plan into `buf` (sized to it): staged pieces, zeros, committed bytes
+/// (through the readahead cache when there is one).
+pub(crate) fn exec_read(
+    dev: &std::fs::File,
+    ra: Option<&super::readahead::Ra>,
+    plan: &[(usize, usize, RSrc)],
+    buf: &mut [u8],
+) -> R<()> {
+    for (o, l, src) in plan {
+        let dst = &mut buf[*o..*o + *l];
+        match src {
+            RSrc::Zero => {}
+            RSrc::Piece(p, po) => p.read(*po, dst).map_err(|_| libc::EIO)?,
+            RSrc::Base(d) => {
+                let mut pos = 0usize;
+                while pos < dst.len() {
+                    let at = d + pos as u64;
+                    let (got, direct) = match ra {
+                        Some(r) => r.read_some(at, &mut dst[pos..]),
+                        None => (0, dst.len() - pos),
+                    };
+                    if got > 0 {
+                        pos += got;
+                        continue;
+                    }
+                    let n = direct.max(1).min(dst.len() - pos);
+                    crate::sim::trace::serial(crate::sim::trace::Op::Read, at, n as u64, || {
+                        dev.read_exact_at(&mut dst[pos..pos + n], at)
+                    })
+                    .map_err(|_| libc::EIO)?;
+                    pos += n;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn now() -> RawTs {
     set::raw_ts(to_unix(SystemTime::now()))
 }
@@ -242,10 +282,6 @@ impl Core {
         let dd = DirData { clusters: root_dir.clusters, nfc: false, data: root_dir.data, end: root_dir.end };
         c.attach_children(ROOT, dd, children);
         Ok(c)
-    }
-
-    pub(crate) fn cs(&self) -> u64 {
-        self.vol.cs
     }
 
     pub(crate) fn ino(&self, i: Ino) -> R<&Inode> {
@@ -452,15 +488,6 @@ impl Core {
         Ok(())
     }
 
-    /// Clusters a file's next commit allocates, at most (it may keep committed clusters).
-    pub(crate) fn file_need(&self, n: &Inode) -> u64 {
-        let cs = self.vol.cs;
-        if !n.data_dirty {
-            return 0;
-        }
-        n.size.div_ceil(cs)
-    }
-
     pub(crate) fn create(&mut self, parent: Ino, name: &[u16], is_dir: bool) -> R<Ino> {
         self.writable()?;
         set::check_name(name)?;
@@ -598,8 +625,8 @@ impl Core {
         self.attr(i)
     }
 
-    /// Reads committed + staged content.
-    pub(crate) fn read(&mut self, i: Ino, off: u64, len: u32) -> R<Vec<u8>> {
+    /// What a read of [off, off + len) consists of: (offset in the result, length, source).
+    pub(crate) fn read_plan(&mut self, i: Ino, off: u64, len: u32) -> R<Vec<(usize, usize, RSrc)>> {
         let n = self.ino(i)?;
         if n.is_dir {
             return Err(libc::EISDIR);
@@ -608,45 +635,64 @@ impl Core {
             return Ok(Vec::new());
         }
         let end = n.size.min(off + len as u64);
-        let mut out = vec![0u8; (end - off) as usize];
         let keep = n.keep.min(end);
-        if keep > off {
-            let runs = self.runs(i)?;
-            self.read_base(&runs, off, &mut out[..(keep - off) as usize])?;
-        }
+        let runs = if keep > off { self.runs(i)? } else { Vec::new() };
+        let cs = self.vol.cs;
         let n = &self.inodes[&i];
+        let mut out: Vec<(usize, usize, RSrc)> = Vec::new();
+        let gap = |out: &mut Vec<(usize, usize, RSrc)>, a: u64, b: u64| {
+            let mut x = a;
+            while x < b {
+                if x < keep {
+                    let mut logical = 0u64;
+                    let mut placed = false;
+                    for &(s, cnt) in &runs {
+                        let rl = cnt as u64 * cs;
+                        if x >= logical && x < logical + rl {
+                            let take = (logical + rl).min(b).min(keep) - x;
+                            out.push((
+                                (x - off) as usize,
+                                take as usize,
+                                RSrc::Base(self.vol.cluster_off(s) + (x - logical)),
+                            ));
+                            x += take;
+                            placed = true;
+                            break;
+                        }
+                        logical += rl;
+                    }
+                    if !placed {
+                        return Err(libc::EIO);
+                    }
+                } else {
+                    out.push(((x - off) as usize, (b - x) as usize, RSrc::Zero));
+                    x = b;
+                }
+            }
+            Ok(())
+        };
+        let mut at = off;
         for (po, p) in n.ov.range(off, end) {
-            let a = po.max(off);
-            let b = (po + p.len).min(end);
-            p.read(a - po, &mut out[(a - off) as usize..(b - off) as usize]).map_err(|_| libc::EIO)?;
+            let (a, b) = (po.max(off), (po + p.len).min(end));
+            if a > at {
+                gap(&mut out, at, a)?;
+            }
+            out.push(((a - off) as usize, (b - a) as usize, RSrc::Piece(p.clone(), a - po)));
+            at = b;
+        }
+        if at < end {
+            gap(&mut out, at, end)?;
         }
         Ok(out)
     }
 
-    /// Reads committed bytes [off, off + out.len()) of an object stored in `runs`.
-    pub(crate) fn read_base(&self, runs: &[(u32, u32)], off: u64, out: &mut [u8]) -> R<()> {
-        let cs = self.vol.cs;
-        let mut done = 0usize;
-        let mut logical = 0u64; // file offset at the start of the current run
-        for &(s, n) in runs {
-            let rl = n as u64 * cs;
-            let (ra, rb) = (logical, logical + rl);
-            let want_a = off + done as u64;
-            if done < out.len() && want_a < rb && want_a >= ra {
-                let take = ((rb - want_a) as usize).min(out.len() - done);
-                let dev = self.vol.cluster_off(s) + (want_a - ra);
-                crate::sim::trace::serial(crate::sim::trace::Op::Read, dev, take as u64, || {
-                    self.vol.dev.read_exact_at(&mut out[done..done + take], dev)
-                })
-                .map_err(|_| libc::EIO)?;
-                done += take;
-            }
-            logical = rb;
-            if done == out.len() {
-                return Ok(());
-            }
-        }
-        if done < out.len() { Err(libc::EIO) } else { Ok(()) }
+    /// Reads committed + staged content (directly, without readahead).
+    pub(crate) fn read(&mut self, i: Ino, off: u64, len: u32) -> R<Vec<u8>> {
+        let plan = self.read_plan(i, off, len)?;
+        let total = plan.last().map_or(0, |p| p.0 + p.1);
+        let mut buf = vec![0u8; total];
+        exec_read(&self.vol.dev, None, &plan, &mut buf)?;
+        Ok(buf)
     }
 
     fn is_ancestor(&self, a: Ino, mut b: Ino) -> bool {

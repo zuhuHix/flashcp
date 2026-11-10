@@ -63,7 +63,7 @@ pub(crate) fn image(name: &str, mb: u64, cluster: u32) -> Img {
 }
 
 pub(crate) fn manual() -> FsOpts {
-    FsOpts { auto_commit: false, max_dirty: 64 << 20, ..Default::default() }
+    FsOpts { auto_commit: false, max_dirty: 64 << 20, readahead: false, ..Default::default() }
 }
 
 pub(crate) fn open_with(path: &Path, dev: Arc<dyn Dev>, opts: FsOpts) -> anyhow::Result<Fs> {
@@ -75,7 +75,7 @@ pub(crate) fn open_with(path: &Path, dev: Arc<dyn Dev>, opts: FsOpts) -> anyhow:
 
 pub(crate) fn open(path: &Path) -> Fs {
     let f = File::options().read(true).write(true).open(path).unwrap();
-    open_with(path, Arc::new(FileDev(Arc::new(f))), manual()).unwrap()
+    open_with(path, Arc::new(FileDev::new(Arc::new(f))), manual()).unwrap()
 }
 
 pub(crate) fn fsck(path: &Path) {
@@ -231,7 +231,7 @@ fn operation_families() {
     assert_eq!(snapshot(&fs2), want);
     let st = fs2.getattr(resolve(&fs2, "/dir/IN.BIN").unwrap()).unwrap();
     assert_eq!(st.mtime, when);
-    assert!(want.get("/big").is_none());
+    assert!(!want.contains_key("/big"));
     // ENOSPC: refused, nothing half-written
     let huge = fs2.create(ROOT, &n("huge"), true, false).unwrap();
     assert_eq!(fs2.write(huge.ino, 0, &vec![1u8; 40 << 20]), Err(libc::ENOSPC));
@@ -531,7 +531,7 @@ fn crash_at_every_device_op() {
                 drop(dev);
                 // recovery happens on open
                 let f = File::options().read(true).write(true).open(&img.path).unwrap();
-                let fs = match open_with(&img.path, Arc::new(FileDev(Arc::new(f))), manual()) {
+                let fs = match open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), manual()) {
                     Ok(fs) => fs,
                     Err(e) => panic!("crash at op {k}/{total} ({loss:?}, cluster {cluster}): recovery failed: {e:#}"),
                 };
@@ -551,4 +551,223 @@ fn crash_at_every_device_op() {
             k += stride;
         }
     }
+}
+
+/// Readahead: a bulk read of a directory (and a big file) is served from the cache, and
+/// commits that free and reuse clusters in between never make it serve stale bytes.
+#[test]
+fn readahead_serves_bulk_reads_and_never_stale_data() {
+    let img = image("ra", 64, 4096);
+    let fs = open(&img.path);
+    let d = fs.mkdir(ROOT, OsStr::new("d")).unwrap();
+    let mut rng = crate::util::Rng(5);
+    for k in 0..80u64 {
+        let f = fs.create(d.ino, OsStr::new(&format!("f{k:03}")), true, false).unwrap();
+        let mut b = vec![0u8; 1000 + (k as usize * 997) % 30_000];
+        rng.fill(&mut b);
+        fs.write(f.ino, 0, &b).unwrap();
+        fs.release(f.ino);
+    }
+    let big = fs.create(ROOT, OsStr::new("big"), true, false).unwrap();
+    let mut b = vec![0u8; 24 << 20];
+    rng.fill(&mut b);
+    fs.write(big.ino, 0, &b).unwrap();
+    fs.shutdown().unwrap();
+    let f = File::options().read(true).write(true).open(&img.path).unwrap();
+    let opts = FsOpts { readahead: true, ..manual() };
+    let fs = open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), opts).unwrap();
+    let want = snapshot(&open(&img.path));
+    let mut got = Tree::new();
+    let mut deleted = 0;
+    for (i, name, _) in fs.readdir(resolve(&fs, "/d").unwrap()).unwrap() {
+        let Ok(st) = fs.getattr(i) else { continue }; // deleted below
+        let size = st.size;
+        let mut data = Vec::new();
+        while (data.len() as u64) < size {
+            data.extend(fs.read(i, data.len() as u64, 128 << 10).unwrap());
+        }
+        got.insert(format!("/d/{name}"), Some(data));
+        // free a file further on and fill the space with something else, committed
+        if deleted < 10 && name.ends_with('5') {
+            let victim = format!("f{:03}", name[1..].parse::<u64>().unwrap() + 10);
+            let dd = resolve(&fs, "/d").unwrap();
+            if fs.unlink(dd, OsStr::new(&victim)).is_ok() {
+                deleted += 1;
+                fs.commit_now("t").unwrap();
+                let n = fs.create(ROOT, OsStr::new(&format!("new{deleted}")), true, false).unwrap();
+                fs.write(n.ino, 0, &vec![0xEE; 40_000]).unwrap();
+                fs.release(n.ino);
+                fs.commit_now("t").unwrap();
+            }
+        }
+    }
+    let bi = resolve(&fs, "/big").unwrap();
+    let mut data = Vec::new();
+    while data.len() < 24 << 20 {
+        data.extend(fs.read(bi, data.len() as u64, 128 << 10).unwrap());
+    }
+    got.insert("/big".into(), Some(data));
+    for (k, v) in &got {
+        if let Some(w) = want.get(k) {
+            assert!(w == v, "{k} read back wrong");
+        }
+    }
+    let (hits, misses) = fs.ra_stats().unwrap();
+    assert!(hits > misses, "readahead hits {hits}, misses {misses}");
+    fs.shutdown().unwrap();
+}
+
+/// The other commands on a volume drive mode used: sync --delete and add leave the journal
+/// file alone (and refuse while a commit is pending), pull and info skip it.
+#[test]
+fn add_sync_pull_respect_the_drive_journal() {
+    let img = image("interop", 32, 4096);
+    let fs = open(&img.path);
+    let f = fs.create(ROOT, OsStr::new("old.txt"), true, false).unwrap();
+    fs.write(f.ino, 0, b"old").unwrap();
+    fs.shutdown().unwrap();
+    let src = img.dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("new.txt"), b"new").unwrap();
+    let so = crate::sync::SyncOpts { delete: true, yes: true, readers: 1, ..Default::default() };
+    let st = crate::sync::sync(&src, &img.path, &so, &mut |_| {}).unwrap();
+    assert_eq!(st.deleted, 1, "only old.txt goes");
+    let info = crate::add::info(&img.path).unwrap();
+    assert_eq!(info.files, 1, "info counts user files only");
+    let out = img.dir.join("out");
+    crate::pull::pull(&img.path, &out, &crate::pull::PullOpts::default(), &mut |_| {}).unwrap();
+    let names: Vec<_> = std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("new.txt")]);
+    // the journal is still there and drive mode keeps working on it
+    let fs = open(&img.path);
+    let f = fs.create(ROOT, OsStr::new("again"), true, false).unwrap();
+    fs.write(f.ino, 0, b"x").unwrap();
+    fs.shutdown().unwrap();
+    fsck(&img.path);
+    // a pending commit makes add refuse
+    use std::os::unix::fs::FileExt;
+    let fs = open(&img.path);
+    let place = fs.journal_place().unwrap();
+    fs.shutdown().unwrap();
+    let rw = File::options().read(true).write(true).open(&img.path).unwrap();
+    let v = crate::volume::Vol::open(rw.try_clone().unwrap(), rw.metadata().unwrap().len(), true, false).unwrap();
+    let base = v.cluster_off(place.first);
+    let mut h = vec![0u8; 512];
+    rw.read_exact_at(&mut h, base).unwrap();
+    h[24] = 1; // ACTIVE (the header hash now fails: still "idle"), so craft a valid one
+    let body = super::djournal::encode_body(&v, &[], &[]).unwrap();
+    super::djournal::write_active(&FileDev::new(Arc::new(rw.try_clone().unwrap())), &v, &place, 9, &body).unwrap();
+    let ao = crate::add::AddOpts { readers: 1, ..Default::default() };
+    let e = crate::add::add(&src, &img.path, &ao, &mut |_| {}).unwrap_err();
+    assert!(format!("{e:#}").contains("interrupted commit of flashcp mount"), "{e:#}");
+    // mounting replays it (nothing to write) and clears it
+    let fs = open(&img.path);
+    fs.shutdown().unwrap();
+    let ao = crate::add::AddOpts { readers: 1, to: Some("sub".into()), ..Default::default() };
+    crate::add::add(&src, &img.path, &ao, &mut |_| {}).unwrap();
+    fsck(&img.path);
+}
+
+/// Benchmark harness (ignored): reads the whole volume in FLASHCP_RA_BENCH_IMG like `cp -r`
+/// does (readdir order, 128 KB reads), with readahead, under FLASHCP_TRACE when set, for
+/// `flashcp sim run`.
+#[test]
+#[ignore]
+fn ra_bench_trace() {
+    let Some(img) = std::env::var_os("FLASHCP_RA_BENCH_IMG") else { return };
+    let path = PathBuf::from(img);
+    crate::sim::trace::init_from_env("mount-read").unwrap();
+    let f = File::options().read(true).write(true).open(&path).unwrap();
+    let opts = FsOpts { readahead: std::env::var_os("FLASHCP_RA_OFF").is_none(), ..manual() };
+    let fs = open_with(&path, Arc::new(FileDev::new(Arc::new(f))), opts).unwrap();
+    let t = std::time::Instant::now();
+    let mut bytes = 0u64;
+    let mut stack = vec![ROOT];
+    while let Some(d) = stack.pop() {
+        for (i, _, is_dir) in fs.readdir(d).unwrap() {
+            if is_dir {
+                stack.push(i);
+                continue;
+            }
+            let size = fs.getattr(i).unwrap().size;
+            let mut off = 0;
+            while off < size {
+                let n = fs.read(i, off, 128 << 10).unwrap().len() as u64;
+                off += n;
+            }
+            bytes += size;
+        }
+    }
+    eprintln!("read {bytes} bytes in {:.3} s, readahead {:?}", t.elapsed().as_secs_f64(), fs.ra_stats());
+    fs.shutdown().unwrap();
+    crate::sim::trace::finish();
+}
+
+/// Benchmark harness (ignored): copies FLASHCP_WR_BENCH_SRC into the (empty) volume in
+/// FLASHCP_RA_BENCH_IMG like `cp -r` (128 KB writes), then one flush, under FLASHCP_TRACE.
+#[test]
+#[ignore]
+fn wr_bench_trace() {
+    let (Some(img), Some(src)) = (std::env::var_os("FLASHCP_RA_BENCH_IMG"), std::env::var_os("FLASHCP_WR_BENCH_SRC"))
+    else {
+        return;
+    };
+    let path = PathBuf::from(img);
+    crate::sim::trace::init_from_env("mount-write").unwrap();
+    let f = File::options().read(true).write(true).open(&path).unwrap();
+    let opts = FsOpts { max_dirty: 1 << 30, ..manual() };
+    let fs = open_with(&path, Arc::new(FileDev::new(Arc::new(f))), opts).unwrap();
+    let t = std::time::Instant::now();
+    fn copy(fs: &Fs, dir: u64, src: &Path) {
+        let mut ents: Vec<_> = std::fs::read_dir(src).unwrap().map(|e| e.unwrap()).collect();
+        ents.sort_by_key(|e| e.file_name());
+        for e in ents {
+            let p = e.path();
+            if p.is_dir() {
+                let d = fs.mkdir(dir, &e.file_name()).unwrap();
+                copy(fs, d.ino, &p);
+            } else {
+                let data = std::fs::read(&p).unwrap();
+                let a = fs.create(dir, &e.file_name(), true, false).unwrap();
+                for (k, c) in data.chunks(128 << 10).enumerate() {
+                    fs.write(a.ino, (k << 17) as u64, c).unwrap();
+                }
+                fs.release(a.ino);
+            }
+        }
+    }
+    copy(&fs, ROOT, Path::new(&src));
+    let staged = t.elapsed().as_secs_f64();
+    fs.flush().unwrap();
+    eprintln!("staged in {staged:.3} s, durable at {:.3} s", t.elapsed().as_secs_f64());
+    fs.shutdown().unwrap();
+    crate::sim::trace::finish();
+}
+
+/// A batch whose journal would not fit the journal file is committed in parts, each one
+/// complete; the tree after the last is exact.
+#[test]
+fn oversized_batches_split_into_commits() {
+    let img = image("split", 64, 4096);
+    // The hook is read when a journal file is created: set it only around this volume's
+    // first commit (another test creating its journal meanwhile just gets a small one).
+    let fs = open(&img.path);
+    unsafe { std::env::set_var(super::djournal::JOURNAL_BYTES_ENV, "65536") };
+    let d = fs.mkdir(ROOT, OsStr::new("many")).unwrap();
+    fs.commit_now("t").unwrap(); // creates the small journal
+    unsafe { std::env::remove_var(super::djournal::JOURNAL_BYTES_ENV) };
+    let mut rng = crate::util::Rng(77);
+    for _ in 0..3000 {
+        // random names: the journal compresses well otherwise
+        let name: String = (0..40).map(|_| char::from(b'a' + (rng.next() % 26) as u8)).collect();
+        let f = fs.create(d.ino, OsStr::new(&name), true, false).unwrap();
+        fs.release(f.ino);
+    }
+    let before = fs.commits();
+    fs.flush().unwrap();
+    assert!(fs.commits() > before + 1, "expected a split commit");
+    let want = snapshot(&fs);
+    fs.shutdown().unwrap();
+    fsck(&img.path);
+    same!(snapshot(&open(&img.path)), want, "after split commits");
 }

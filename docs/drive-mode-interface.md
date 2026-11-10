@@ -9,7 +9,7 @@ switch, packaging). It is versioned: a change that breaks a consumer bumps `"pro
 
 ```text
 flashcp mount <DEVICE> <MOUNTPOINT> [--json] [--control <SOCKET>] [--device-fd N]
-              [--idle-ms N] [--max-dirty-mb N] [--label-hint TEXT]
+              [--idle-ms N] [--max-dirty-mb N] [--threads N]
 flashcp mount --check <DEVICE> [--json] [--device-fd N]
 ```
 
@@ -25,8 +25,10 @@ flashcp mount --check <DEVICE> [--json] [--device-fd N]
 - The process runs in the foreground until the volume is unmounted (by `unmount` on the
   control socket, `fusermount3 -u`, or SIGTERM/SIGINT). It never daemonizes.
 - `--idle-ms` (default 1000): commit this long after the last write. `--max-dirty-mb`
-  (default: min(256 MB, 2 s of the device's write bandwidth from the probe cache), at least
-  16 MB): writers block once this much is pending.
+  (default 256): writers block once this much is staged and not yet durable (a commit starts
+  at half of it). It is also the most a yank can lose. 256 MB keeps `cp` of a typical tree
+  returning as fast as with the kernel's page cache; a smaller value shortens the eject wait
+  on slow sticks. `--threads N` (default 1): FUSE session threads.
 - Runs as the unprivileged user. It needs read-write access to the device (the uaccess ACL
   that logind gives the seat user is enough), and `/dev/fuse` + `fusermount3`.
 
@@ -36,7 +38,7 @@ Reads at most the boot region, the up-case table, the allocation bitmap's locati
 directory and the journal locations (no full walk; ≤ ~200 ms on a USB stick). It never writes:
 a pending journal is reported (`pending_journal`), not replayed; the real mount replays it.
 The busy test comes FIRST: a device that is mounted (by the kernel or anything else), has a
-mounted sibling partition, or cannot be claimed with `O_EXCL` exits **4**, never 3, whatever
+mounted partition or a holder (dm, md, LVM), or cannot be claimed with `O_EXCL` exits **4**, never 3, whatever
 its filesystem, so the daemon never mounts a volume twice. It prints one JSON line with `--json` (else a sentence) and exits with the code
 below. `0` means "flashcp would serve this volume".
 
