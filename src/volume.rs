@@ -99,6 +99,21 @@ pub(crate) struct Vol {
     pub(crate) tolerate_dups: bool,
 }
 
+/// The checks on a boot sector that everything else builds on (signature, MustBeZero, sector
+/// and cluster size, revision, one FAT); returns the sector size in bytes.
+fn boot_sector_size(s0: &[u8]) -> Result<u64> {
+    ensure!(&s0[3..11] == b"EXFAT   ", "target does not hold an exFAT volume (no EXFAT signature)");
+    ensure!(s0[11..64].iter().all(|&b| b == 0), "boot sector MustBeZero area is not zero");
+    ensure!(s0[510..512] == [0x55, 0xAA], "boot sector has no 0x55AA signature");
+    let bps_shift = s0[108] as u32;
+    ensure!((9..=12).contains(&bps_shift), "unsupported BytesPerSectorShift {bps_shift}");
+    let spc_shift = s0[109] as u32;
+    ensure!(spc_shift <= 25 - bps_shift, "unsupported SectorsPerClusterShift {spc_shift}");
+    ensure!(s0[105] == 1, "unsupported exFAT revision {}.{:02}", s0[105], s0[104]);
+    ensure!(s0[110] == 1, "volume has {} FATs (TexFAT); only single-FAT exFAT is supported", s0[110]);
+    Ok(1u64 << bps_shift)
+}
+
 pub(crate) fn le16(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
 }
@@ -173,33 +188,41 @@ impl Vol {
         let mut s0 = vec![0u8; 512];
         crate::sim::trace::serial(crate::sim::trace::Op::Read, 0, 512, || dev.read_exact_at(&mut s0, 0))
             .context("read boot sector")?;
-        ensure!(&s0[3..11] == b"EXFAT   ", "target does not hold an exFAT volume (no EXFAT signature)");
-        ensure!(s0[11..64].iter().all(|&b| b == 0), "boot sector MustBeZero area is not zero");
-        ensure!(s0[510..512] == [0x55, 0xAA], "boot sector has no 0x55AA signature");
-        let bps_shift = s0[108] as u32;
-        ensure!((9..=12).contains(&bps_shift), "unsupported BytesPerSectorShift {bps_shift}");
-        let spc_shift = s0[109] as u32;
-        ensure!(spc_shift <= 25 - bps_shift, "unsupported SectorsPerClusterShift {spc_shift}");
-        ensure!(s0[105] == 1, "unsupported exFAT revision {}.{:02}", s0[105], s0[104]);
-        ensure!(s0[110] == 1, "volume has {} FATs (TexFAT); only single-FAT exFAT is supported", s0[110]);
-        let bps = 1u64 << bps_shift;
-        let cs = bps << spc_shift;
+        let bps = boot_sector_size(&s0)?;
         ensure!(dev_len >= 12 * bps, "target is too small for its boot region");
         let mut region = vec![0u8; 12 * bps as usize];
         let rl = region.len() as u64;
         crate::sim::trace::serial(crate::sim::trace::Op::Read, 0, rl, || dev.read_exact_at(&mut region, 0))
             .context("read boot region")?;
+        Vol::from_boot_region(dev, dev_len, &region, allow_dirty, tolerate_dups)
+    }
+
+    /// [`Vol::open_boot`] of a main boot region (12 sectors) that is given instead of read: the
+    /// one on `dev`, or the one `flashcp recluster` is about to write, checked in every way
+    /// before it becomes the volume.
+    pub(crate) fn from_boot_region(
+        dev: File,
+        dev_len: u64,
+        region: &[u8],
+        allow_dirty: bool,
+        tolerate_dups: bool,
+    ) -> Result<Vol> {
+        ensure!(region.len() >= 512, "boot region is shorter than a sector");
+        let bps = boot_sector_size(region)?;
+        ensure!(region.len() as u64 == 12 * bps, "boot region is not 12 sectors");
+        let spc_shift = region[109] as u32;
+        let cs = bps << spc_shift;
         let want = checksum32(&region[..11 * bps as usize], &[106, 107, 112], 0);
         for w in region[11 * bps as usize..].as_chunks::<4>().0 {
             ensure!(u32::from_le_bytes(*w) == want, "boot region checksum mismatch; refusing to modify this volume");
         }
-        let vol_sectors = le64(&region, 72);
-        let fat_off = le32(&region, 80) as u64 * bps;
-        let fat_len = le32(&region, 84) as u64 * bps;
-        let heap_off = le32(&region, 88) as u64 * bps;
-        let cc = le32(&region, 92) as u64;
-        let root = le32(&region, 96);
-        let flags = le16(&region, 106);
+        let vol_sectors = le64(region, 72);
+        let fat_off = le32(region, 80) as u64 * bps;
+        let fat_len = le32(region, 84) as u64 * bps;
+        let heap_off = le32(region, 88) as u64 * bps;
+        let cc = le32(region, 92) as u64;
+        let root = le32(region, 96);
+        let flags = le16(region, 106);
         // Spec limits, checked before any arithmetic uses them.
         ensure!((1..=MAX_CLUSTER_COUNT).contains(&cc), "ClusterCount {cc} is outside the exFAT limit");
         ensure!(vol_sectors.checked_mul(bps).is_some_and(|b| b <= dev_len), "VolumeLength is larger than the target");
@@ -559,6 +582,8 @@ impl Vol {
     /// adjacent clusters merged. Bounded by the length, like [`Vol::object_clusters`].
     pub(crate) fn runs(&mut self, first: u32, no_fat_chain: bool, len: u64, what: &str) -> Result<Vec<(u64, u64)>> {
         let n = len.div_ceil(self.cs);
+        // A crafted DataLength must not make the walk below loop (and grow) past the heap.
+        ensure!(n <= self.cc, "{what}: DataLength {len} is larger than the volume's cluster heap; run fsck.exfat");
         if n == 0 {
             return Ok(Vec::new());
         }

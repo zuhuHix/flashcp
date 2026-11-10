@@ -20,6 +20,11 @@ walkdir = "2.5.0"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 zstd = { version = "0.14.3", features = ["zstdmt"] }
 
+[features]
+# Test hooks that stop a command at a chosen point, for CI (the xos crash-window volumes). Never
+# in a release build: with it, an environment variable can leave a stick half-switched.
+test-hooks = []
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

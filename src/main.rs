@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use flashcp::TargetSpec;
 use flashcp::events::{Event, error_json};
-use flashcp::{add, bench, copy, dataset, exfat, optimize, pack, probe, pull, util};
+use flashcp::{add, bench, copy, dataset, exfat, optimize, pack, probe, pull, recluster, util};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -261,6 +261,40 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Give an EXISTING exFAT volume on TARGET (unmounted block device or image file) smaller
+    /// clusters IN PLACE: only the metadata is rewritten (boot sector, FAT, bitmap, directories),
+    /// file data stays where it is. Small files then need much smaller writes.
+    ///
+    /// Everything is written into free space first; the volume switches over with one 512-byte
+    /// write, so an interruption at any point leaves the old volume or the new one, never a mix
+    /// (re-run to finish). It cannot be undone cheaply: bigger clusters again would mean moving
+    /// every file (`optimize` does that). Exit code 3 with a reason when the volume cannot be
+    /// converted safely (nothing is written then)
+    Recluster {
+        /// Block device or image file (or use --target-fd)
+        #[arg(required_unless_present = "target_fd", conflicts_with = "target_fd")]
+        target: Option<PathBuf>,
+        /// Use this inherited, already-open block-device fd (O_RDWR|O_EXCL; O_RDONLY for
+        /// --check) instead of opening TARGET, e.g. from a privileged helper
+        #[arg(long, value_name = "N")]
+        target_fd: Option<i32>,
+        /// New cluster size in bytes, a power of two below the current one (default: 4096)
+        #[arg(long, value_name = "SIZE")]
+        cluster: Option<u32>,
+        /// prefix: write only the FAT entries in use; full: zero the rest of the new FAT too
+        #[arg(long, value_enum, default_value = "prefix")]
+        fat: exfat::FatMode,
+        /// Only print the plan
+        #[arg(long)]
+        dry_run: bool,
+        /// Only say whether the volume would benefit (clusters of 16 KB or more, and room to
+        /// convert): read-only and quick, exit 0 = yes, 3 = no
+        #[arg(long, conflicts_with_all = ["dry_run", "cluster"])]
+        check: bool,
+        /// Print events as JSON lines on stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// Show an exFAT volume's label, size, free space and file count (read-only)
     Info {
         /// Block device or image file (or use --target-fd)
@@ -455,10 +489,20 @@ fn main() {
             | Cmd::Pull { json: true, .. }
             | Cmd::Optimize { json: true, .. }
             | Cmd::Info { json: true, .. }
+            | Cmd::Recluster { json: true, .. }
     );
     let r = run(cli.cmd);
     flashcp::sim::trace::finish();
     if let Err(e) = r {
+        // recluster's "no": a reason, nothing written, its own exit code.
+        if let Some(r) = recluster::refusal_of(&e) {
+            if json {
+                println!("{}", recluster::refused_json(r));
+            } else {
+                eprintln!("Refused: {} (nothing was written)", r.message);
+            }
+            std::process::exit(3);
+        }
         if json {
             println!("{}", error_json(&format!("{e:#}"), optimize::recovery_of(&e)));
         } else {
@@ -703,6 +747,60 @@ fn run(cmd: Cmd) -> Result<()> {
                     s.secs,
                     phases.join(", ")
                 );
+            }
+            Ok(())
+        }
+        Cmd::Recluster { target, target_fd, cluster, fat, dry_run, check, json } => {
+            let target = spec(target, target_fd);
+            if check {
+                let c = recluster::check(&target)?;
+                if json {
+                    println!("{}", c.to_json());
+                } else if c.benefit {
+                    println!("yes: {}", c.message);
+                } else {
+                    println!("no: {}", c.message);
+                }
+                if c.finish && !json {
+                    println!("an interrupted recluster left its last write to do: run `flashcp recluster` on it");
+                }
+                flashcp::sim::trace::finish();
+                std::process::exit(if c.benefit { 0 } else { 3 });
+            }
+            let o = recluster::ReclusterOpts { cluster, fat, dry_run };
+            let mut out = |e: &recluster::Event| {
+                if json {
+                    use std::io::Write;
+                    let mut o = std::io::stdout().lock();
+                    let _ = writeln!(o, "{}", e.to_json());
+                    let _ = o.flush();
+                } else if let recluster::Event::Plan(p) = e {
+                    println!("{}", p.detail);
+                }
+            };
+            let s = recluster::recluster(&target, &o, &mut out)?;
+            if !json && !dry_run {
+                if s.changed {
+                    println!(
+                        "reclustered: clusters {} → {}, {} written in {:.2}s, free space {} → {}",
+                        recluster::kb(s.old_cluster),
+                        recluster::kb(s.cluster),
+                        util::human_bytes(s.written as f64),
+                        s.secs,
+                        util::human_bytes(s.free_before as f64),
+                        util::human_bytes(s.free_after as f64)
+                    );
+                } else {
+                    println!(
+                        "nothing to do: the clusters are {} already{}",
+                        recluster::kb(s.cluster),
+                        if s.finished_switch {
+                            " (completed the backup boot sector of an interrupted run)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
             }
             Ok(())
         }

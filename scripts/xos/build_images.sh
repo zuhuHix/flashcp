@@ -7,6 +7,8 @@
 #   VOL.img  raw disk: MBR + one type-0x07 partition at LBA 2048 holding the flashcp volume
 #   VOL.vhd  the same disk as a fixed VHD (raw + 512-byte footer)
 # and OUT_DIR/superfloppy/ with the bare flashcp volume (no partition table) as .img and .vhd.
+# With passwordless sudo it also writes control-mkfs (mkfs.exfat + Linux cp) and the recl-* volumes
+# (kernel-made, then `flashcp recluster`; see recluster_images.sh).
 # Each volume is also checked here first: fsck.exfat -n, then (with sudo) a loop mount + verify.py,
 # which validates the verifier itself against the Linux kernel driver.
 set -euo pipefail
@@ -92,6 +94,14 @@ if sudo -n true 2>/dev/null; then
   cp "$WORK/manifest.json" "$OUT/control-mkfs/"
   rm -f "$vol"
   echo "::endgroup::"
+fi
+
+# Re-clustered volumes: made on loop devices (kernel mkfs.exfat + mount + fill), then
+# `flashcp recluster` on the block device. Needs sudo for losetup/mount, like control-mkfs.
+if sudo -n true 2>/dev/null; then
+  bash "$HERE/recluster_images.sh" "$FLASHCP" "$OUT" "$WORK"
+else
+  echo "no passwordless sudo: skipping the recl-* volumes (loop devices and mounts need root)"
 fi
 
 rm -rf "$WORK"

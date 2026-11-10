@@ -10,7 +10,7 @@ correctly. The layers below go from the cheapest check to the most independent o
 |---|---|---|---|---|
 | Unit tests (`src/exfat.rs`, 30 tests) | Boot checksum matches the mkfs reference, the up-case table checksum, the entry-set layout against kernel-made files and directories, timestamp encoding and clamping (1980 to 2107), name rules, geometry invariants over a sweep of sizes. | That a whole volume is valid. Nothing is mounted or read back. | `ci.yml` `test` job (Ubuntu, `FLASHCP_REQUIRE_FSCK=1`). | `cargo test --locked` |
 | Integration tests (`tests/build.rs`) | The real binary builds images that are read back by `tests/common/exfat_reader.rs`, a parser written from the Microsoft exFAT spec that shares no code with the writer. Names, types, bytes and mtimes (10 ms resolution) must match the source. `fsck.exfat -n` must be clean when it is installed. Also covers the error paths (missing `--yes-erase`, names that differ only by case, a colon in a name, a label over 11 characters, a non-block target) and that `--dry-run` leaves the image untouched. | Anything about other operating systems. The reader is only as good as our reading of the spec. | `ci.yml` `test` job. | `cargo test --locked` (install `exfatprogs` for `fsck.exfat`) |
-| Linux mount (`ci.yml` `image` job, and the root-only `mount` tests) | The Linux kernel exFAT driver mounts the volume read-only and `diff -r` finds the same content, for `--fat prefix` and `--fat full`. The mount tests build a volume and mount it through a loop device (as root) or `udisksctl loop-setup` (not as root), and check that a busy device is refused. | Windows and macOS. `diff -r` compares content, not mtimes. | `ci.yml` `image` job. The mount tests run only with `FLASHCP_MOUNT_TESTS=1` and are root-gated. | See the Linux section below. |
+| Linux mount (`ci.yml` `image` job, and the root-only `mount` tests) | The Linux kernel exFAT driver mounts the volume read-only and `diff -r` finds the same content, for `--fat prefix` and `--fat full`. The same job re-clusters kernel-made volumes in place (`flashcp recluster`) and has the kernel read and write them afterwards. The mount tests build a volume and mount it through a loop device (as root) or `udisksctl loop-setup` (not as root), and check that a busy device is refused. | Windows and macOS. `diff -r` compares content, not mtimes. | `ci.yml` `image` job. The mount tests run only with `FLASHCP_MOUNT_TESTS=1` and are root-gated. | See the Linux section below. |
 | Windows chkdsk (`xos.yml` `windows` job) | The Windows exFAT driver attaches the VHD, `chkdsk` (read-only) reports no problems before and after a write, every file matches the manifest, and Windows can write to the volume. | Behaviour of a particular USB drive or controller. Removable-media policy. | `xos.yml`, `windows-latest`, one job per volume. | Section 3, Windows. |
 | macOS fsck_exfat (`xos.yml` `macos` job) | macOS `fsck_exfat -n` is clean before and after a write, the volume mounts, every file matches, and macOS can write to it. | Behaviour of a particular USB drive. Macs with other macOS versions. | `xos.yml`, `macos-latest`, one job per volume. | Section 3, macOS. |
 
@@ -46,7 +46,7 @@ nanoseconds, and SHA-256 for files. It skips top-level junk such as `System Volu
 ### The volume matrix
 
 Every volume is labelled `XOSTEST`. The matrix comes from `VOLUMES` in `build_images.sh`, plus
-two more volumes:
+eight more volumes (`control-mkfs`, the six `recl-*` ones and `control-mkfs-superfloppy`, described below):
 
 | Name | Built with | Notes |
 |---|---|---|
@@ -57,11 +57,106 @@ two more volumes:
 | `prefix-1g` | 1 GiB, `--fat prefix` | |
 | `superfloppy` | The `prefix-auto` volume with no partition table | Raw volume as `.img` and `.vhd`. flashcp's default output, so it gates the workflow. |
 | `control-mkfs` | `mkfs.exfat -L XOSTEST`, then `sudo cp -r --preserve=timestamps` on Linux | Not written by flashcp. Report-only. |
+| `recl-32k` | 1 GiB, `mkfs.exfat -c 32K`, `cp -r`, then `flashcp recluster` | Re-clustered in place to 4 KiB. Must show `"switches":2` and `move_bytes` > 0. Gates. |
+| `recl-128k` | 2 GiB, `mkfs.exfat -c 128K`, `cp -r`, then `flashcp recluster` | Same, 128 KiB to 4 KiB. Gates. |
+| `recl-frag-32k` | 1 GiB, 32 KiB clusters, fragmented fill, `recluster --fat full` | Files are FAT chains, not contiguous runs. Gates. |
+| `recl-frag-128k` | 2 GiB, 128 KiB clusters, fragmented fill, `recluster` | Same with 128 KiB clusters and `--fat prefix` (the default). Gates. |
+| `recl-superfloppy` | 2 GiB, `flashcp build --cluster 131072` on the whole disk (no partition table), then `recluster` | Must show `"switches":2`. Gates. |
+| `recl-crash-window` | 1 GiB, 32 KiB clusters, `cp -r`, `recluster` stopped after the main boot sector | The state a crash between the two boot-sector writes leaves. Report-only. |
+| `control-mkfs-superfloppy` | 512 MiB, `mkfs.exfat -c 32K` on the whole disk (no partition table), `cp -r` | Not written and not re-clustered by flashcp. Report-only. |
 
 Before any volume is wrapped, `build_images.sh` runs `fsck.exfat -n` on it. If passwordless sudo
 is available it also loop-mounts it read-only and runs `verify.py` against the manifest. This
 checks the verifier against the Linux kernel driver before Windows and macOS are asked to agree
 with it.
+
+### The re-clustered volumes (`recl-*`)
+
+`flashcp recluster` gives an existing exFAT volume smaller clusters (4 KiB by default) in place.
+It rewrites only metadata (boot regions, FAT, bitmap, directory entries); file data stays where it
+is, except for data that lies where the larger FAT has to go, which is moved first. The six
+`recl-*` volumes are built by `scripts/xos/recluster_images.sh`, which `build_images.sh` calls after
+`control-mkfs`. They need passwordless sudo (loop devices and mounts) and are skipped with a
+message without it, like `control-mkfs`.
+
+They are made the way a user would reach this state, on real loop devices, not with the
+flashcp writer and not through `mbr_wrap.py`:
+
+1. `truncate -s SIZE disk.img`. For an MBR volume, `sfdisk` writes one partition (type `0x07`) at
+   LBA 2048, as `mbr_wrap.py` does. The superfloppy volumes have no partition table.
+2. `losetup -fP --show disk.img`. The volume is `/dev/loopNp1`, or `/dev/loopN` for a superfloppy.
+3. `mkfs.exfat -c CLUSTER -L XOSTEST`, then the Linux kernel mounts the volume and fills it with
+   `cp -r --preserve=timestamps` (or the fragmented fill below), then unmounts. `recl-superfloppy`
+   is written by `flashcp build` instead (see below).
+4. Checked before the recluster, so a fill problem is never blamed on it: `fsck.exfat -n`, and a
+   read-only kernel mount with `verify.py` against the manifest.
+5. `flashcp recluster --check` must exit 0. Then `flashcp recluster DEV --json` runs on the block
+   device. The log must say the new cluster size is 4096 (`done` line and `flashcp info --json`);
+   for `recl-32k`, `recl-128k` and `recl-superfloppy` the `plan` line must have `"switches":2`,
+   and for the first two also `move_bytes` > 0, which is the path where file data is moved first.
+6. `recluster --check` must now exit 3 (clusters already small), and a second `recluster` must exit
+   0 with `"changed":false`, `"written":0` and an unchanged first 64 MiB.
+7. `fsck.exfat -n` and a read-only kernel mount with `verify.py` again.
+8. The loop device is detached (an exit trap also unmounts and detaches when a step fails).
+   Zero runs are turned back into holes (`fallocate --dig-holes`), then `mkvhd.py` writes the
+   `.vhd`. The image holds exactly the bytes recluster wrote.
+
+Fragmented fill (`recl-frag-*`, and the `ci.yml` step): under the kernel mount, a `filler/`
+directory gets files of 8 clusters each (256 KiB at 32 KiB clusters, 1 MiB at 128 KiB clusters)
+until the volume is full, so no longer free run is left anywhere. `sync`, delete every other
+filler file, `sync`, then copy the tree. A file of more than 8 clusters (the 50 MiB `big.bin`
+above all) cannot fit one hole, so the kernel chains it through many of them. Then `filler/` is
+deleted. The recluster's `plan` line must count fragmented files (`"fragmented"` > 0), or the
+build fails. The same code is run by `ci.yml` as
+`sudo bash scripts/xos/recluster_images.sh fragfill MOUNTPOINT TREE CLUSTER_BYTES`.
+
+Without a partition table (`recl-superfloppy`): Windows shows such a disk image only when its
+sector 0 cannot be taken for an MBR. `mkfs.exfat` leaves zeros where an MBR has its partition
+table, which reads as an empty table, and Windows then shows no volume; `flashcp build` fills
+the boot code area with `0xF4`, and its `superfloppy` volume is accepted. So `recl-superfloppy`
+starts from a `flashcp build` volume with 128 KiB clusters, written to the whole loop device, and
+is then re-clustered there: the image is byte for byte what `recluster` left (the boot code bytes
+it tunes lie below offset 440, clear of that area, and the checksum sector is not rewritten).
+`control-mkfs-superfloppy` is `mkfs.exfat`'s own volume without a partition table, never
+re-clustered and report-only: it shows what each OS does with that layout by itself.
+
+`recl-backup-zero` and `recl-backup-badsum` (report-only) are finished re-clusters whose backup
+boot sector is then zeroed, or given one wrong byte (so its checksum no longer fits). They ask
+whether an OS mounts a volume whose main boot region is right and whose backup is invalid
+(Windows: no; it also refuses `recl-crash-window`, whose backup is valid but older).
+
+`recl-crash-window` runs the recluster with `FLASHCP_TEST_RECLUSTER_STOP=reclustered` (a hook that exists only in a
+`--features test-hooks` build, which `xos.yml` makes; release builds ignore the variable). The command
+stops with exit 1 (the build requires exactly that, and the hook's message in the output) after
+writing the main boot sector of the final switch and before the backup boot sector. The main boot
+region is the new volume, the backup is the previous one, and both are valid. The build then
+requires `recluster --check --json` to print `"finish":true` (running `flashcp recluster` again
+would write the backup boot sector) and a read-only kernel mount to pass `verify.py`. The verdict
+of `fsck.exfat -n` is printed but does not fail the build.
+
+On Windows and macOS the same `win_check.ps1` and `mac_check.sh` run on these volumes unchanged
+(`recl-superfloppy` and `control-mkfs-superfloppy` get the superfloppy flag). The five normal
+volumes gate. `recl-crash-window` is report-only (`continue-on-error`): it is an interrupted state, and the
+question it answers is what each OS says about it, not whether flashcp may leave it.
+
+### The recluster steps in `ci.yml`
+
+The `image` job has three steps after "Add onto a kernel-populated volume". They use plain image
+files, `sudo mount -o loop`, and run `./target/release/flashcp recluster IMAGE` as the normal user.
+Each removes its big image at the end so the runner's disk does not fill.
+
+1. 128 KiB clusters, 2 GiB: `mkfs.exfat -c 128K`, `sudo cp -r` of the source tree into
+   `kernel-copy`. `recluster --check` exits 0. `recluster --dry-run` leaves the image byte for byte
+   unchanged (`cmp` against a sparse copy). `recluster --json` exits 0 with `"switches":2`.
+   Then `fsck.exfat -n`, `info --json` shows cluster 4096, and a read-only mount + `diff -r`
+   matches. The kernel must also write to it: it copies the tree to `after` and removes a directory
+   of `kernel-copy`; then `fsck.exfat -n` and `diff -r` of `after`. Finally `flashcp add` writes to
+   the result (`added after`), and `fsck.exfat -n` and `diff -r` pass again.
+2. 32 KiB clusters, 1 GiB, fragmented fill (above), `recluster --fat full`, `fsck.exfat -n`,
+   read-only mount + `diff -r`.
+3. A file over 4 GiB, 128 KiB clusters, 6 GiB image: `huge.bin` has 1 MiB of random data at
+   offsets 0, 4095 MiB and 4299 MiB (the kernel fills the gaps). Its SHA-256 and `diff -r` of the
+   tree must be the same after `recluster`, and `fsck.exfat -n` must pass.
 
 ### Wrapping for Windows and macOS
 
@@ -119,7 +214,8 @@ whether a difference comes from flashcp or from the OS driver.
 
 ### Report-only entries
 
-Only `control-mkfs` uses `continue-on-error`, in both the Windows and macOS jobs. It is a
+`control-mkfs`, `control-mkfs-superfloppy` and `recl-crash-window` use `continue-on-error`, in both
+the Windows and macOS jobs. The last two are described above. `control-mkfs` is a
 reference: the same tree written by a different tool. If `control-mkfs` fails the same way a flashcp volume
 does, the cause is the OS driver, not flashcp. If only the flashcp volume fails, the cause is
 flashcp.
@@ -143,8 +239,12 @@ scripts/xos/build_images.sh target/release/flashcp out
 ```
 
 This writes `out/<volume>/<volume>.img`, `out/<volume>/<volume>.vhd` and
-`out/<volume>/manifest.json`, plus `out/superfloppy/` and `out/control-mkfs/`. Without
-passwordless sudo the script skips the Linux mount check and the control volume, and says so.
+`out/<volume>/manifest.json`, plus `out/superfloppy/`, `out/control-mkfs/` and the six `out/recl-*/`
+volumes. Without passwordless sudo the script skips the Linux mount check, the control volume and
+the `recl-*` volumes, and says so. The `recl-*` volumes also need `sfdisk` and `losetup` (util-linux)
+and use up to 2 GiB of sparse image each. To build only those, with a work directory laid out as
+`build_images.sh` leaves it (`src/` from `gen_tree.py` and `manifest.json`):
+`scripts/xos/recluster_images.sh target/release/flashcp out work`.
 
 On Windows, in an administrator PowerShell with `python` on the PATH (the script calls it):
 
@@ -152,7 +252,8 @@ On Windows, in an administrator PowerShell with `python` on the PATH (the script
 pwsh scripts/xos/win_check.ps1 -Vhd out/prefix-auto/prefix-auto.vhd -Manifest out/prefix-auto/manifest.json -Label prefix-auto -LogDir logs
 ```
 
-Add `-Superfloppy` for `out/superfloppy/superfloppy.vhd`. The write test changes the attached
+Add `-Superfloppy` for the volumes without a partition table (`superfloppy`, `recl-superfloppy`,
+`control-mkfs-superfloppy`). The write test changes the attached
 VHD, so copy the file first if you want to reuse it.
 
 On macOS:

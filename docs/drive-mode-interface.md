@@ -150,3 +150,117 @@ On failure: `{"ok":false,"error":"..."}`. Unknown commands get `{"ok":false,"err
 - Ownership is the mounting user, modes 0644/0755 (0444/0555 for the read-only attribute);
   chmod toggles only the read-only attribute; chown, symlinks, hard links, xattrs: EPERM/ENOTSUP.
 - statfs reports the real free space minus the pending allocation.
+
+## Offering `flashcp recluster` ("Make this stick faster")
+
+A stick formatted the usual way has big clusters (32 KB at 8 GB, 128 KB at 128 GB), so every
+small file takes a whole one and commits write mostly padding. `flashcp recluster` gives the
+volume 4 KB clusters in place: it rewrites only the metadata (boot sector, FAT, bitmap,
+directories); file data stays where it is, except what lies in the first ~0.1 % of the volume,
+where the bigger FAT has to go. This section is the SUGGESTED contract for the daemon and the
+GUI (the command exists; nothing calls it yet). It is never run without a click.
+
+```text
+flashcp recluster --check <DEVICE> [--json] [--target-fd N]
+flashcp recluster <DEVICE> [--cluster SIZE] [--fat prefix|full] [--dry-run] [--json] [--target-fd N]
+```
+
+### 1. Decide whether to offer: `--check`
+
+Read-only and without an exclusive claim (like `info`): it reads the boot regions, the root
+directory and the allocation bitmap, no other directory (well under a second on a stick). With
+`--target-fd` the fd may be O_RDONLY. Run it when the stick arrives, before or after
+`mount --check`; the volume must not be dirty.
+
+```text
+{"event":"check","op":"recluster","benefit":B,"reason":R,"message":"...","cluster":N,"new_cluster":N,
+ "free":N,"need_free":N,"write_bytes":N,"est_secs":F,"finish":B}
+```
+
+Exit **0**: `benefit` is true (`reason` is `"ok"`): the clusters are 16 KB or bigger and there
+is room to convert. Offer it once per stick (key the "asked" state by the volume serial plus
+the device identity): **"Make this stick faster (about N seconds)"**, N = `est_secs` rounded up,
+with **Accept** and **Not now**. `est_secs` and `write_bytes` are estimates from the device's
+cached profile and the bitmap (no directory is read, no file is walked). They hold for the
+usual stick; they can be far too low when a big FAT-chained file starts in the first ~0.1 % of
+the volume (it moves whole, from its first cluster). The real run's `plan` line is exact: show
+its `est_secs` once it arrives (and stop with SIGTERM before the first `switched` if it is
+much more than offered: nothing is changed before then). Do
+not promise a speed-up factor: what changes is that small files need smaller writes.
+Exit **3**: do not offer; `reason` says why (table below). Exit 1: an error (unreadable
+device); do not offer.
+
+`"finish":true` (with either exit code) means an earlier conversion was interrupted between
+its two last writes: the volume is complete and valid, only the backup boot sector still
+describes the previous state. Run `flashcp recluster <DEVICE>` once without asking (it is
+part of the conversion the user accepted; with small clusters already it writes that one
+sector and exits 0).
+
+### 2. On Accept
+
+The command needs the exclusive claim, so the driver must not have the volume mounted:
+`prepare-eject` → `unmount` on the control socket, then
+`flashcp recluster <DEVICE> --json` (or `--target-fd N` with an O_RDWR|O_EXCL fd), then mount
+again with `flashcp mount`. One JSON object per line on stdout:
+
+```text
+{"event":"plan","op":"recluster","cluster":N,"new_cluster":N,"files":N,"dirs":N,"bytes":N,
+ "write_bytes":N,"move_bytes":N,"est_secs":F,"free":N,"free_after":N,"fragmented":N,"switches":1|2}
+{"event":"progress","op":"recluster","bytes_done":N,"bytes_total":N}      at most ~10 per second
+{"event":"switched","op":"recluster","step":"relocated"|"reclustered","cluster":N}
+{"event":"done","op":"recluster","changed":B,"cluster":N,"old_cluster":N,"written":N,"free":N,
+ "secs":F,"finished_switch":B}
+{"event":"refused","op":"recluster","reason":R,"message":"..."}            exit 3, nothing was written
+{"event":"error","message":"..."}                                          exit 1
+```
+
+- `plan` comes before the first write (`--dry-run` stops after it): `bytes` is the file data
+  on the volume, `write_bytes` everything that will be written, `move_bytes` the file data
+  that has to make room for the new FAT, `est_secs` the estimate for the progress bar,
+  `fragmented` the files that are in more than one piece (they stay so).
+- `switched` marks a commit point. After `"step":"reclustered"` the volume has the new cluster
+  size; `"relocated"` (only when `switches` is 2) is the intermediate one: still the old
+  cluster size, the room for the new FAT is free.
+- `done` with `"changed":false`: the clusters already had the wanted size.
+- Exit 0 = done, 3 = refused (a `refused` line, nothing written, except that an interrupted
+  run's backup boot sector is always completed first: its message then says so), 1 = error,
+  2 = usage.
+
+**If it is interrupted** (yanked, power loss, killed): the volume is the old one or the new
+one, complete and fsck-clean, never a mix: every write goes to free space until one 512-byte
+write of the boot sector switches over. Nothing has to be cleaned up and nothing is kept on the
+host. One exception, measured: a yank in the few milliseconds between the main and the backup
+boot sector write (once per switch) leaves a volume that Linux and macOS mount but **Windows
+does not** (it wants both boot regions equal, and may offer to format the stick). The data is
+intact; plugging it into a machine with flashcp completes it (`--check` reports `finish`, run
+`flashcp recluster` once). So: run it only from drive mode, never ask the user to unplug
+during it, and say "do not unplug" in the progress UI. On the next arrival run `--check` again: `finish` → complete it as above; `benefit`
+still true → the conversion did not happen (or got halfway: the second run is then shorter);
+offer or resume it as the product decides.
+
+It cannot be undone cheaply (bigger clusters again mean moving every file: `optimize`). The
+label, the serial number (`UUID`), every file's name, attributes and timestamps stay. Four
+bytes of the boot code area of the boot sector change (that is what makes the switch one
+sector; they lie below offset 440, clear of where a partition table would be); nothing reads
+them unless a BIOS boots from the stick's exFAT boot code. Drive mode's
+idle journal file is not carried over; `flashcp mount` creates a new one at its first commit.
+
+### Reasons (`--check` and `refused`)
+
+| reason | meaning | integration should |
+|---|---|---|
+| `ok` | (`--check` only) worth offering | offer |
+| `small-clusters` | (`--check` only) clusters below 16 KB | nothing |
+| `dirty` | VolumeDirty is set | nothing (the mount path already deals with it) |
+| `not-exfat`, `invalid-volume` | no exFAT volume, or the validation the other commands apply failed (the message says what) | nothing |
+| `unsupported-sector-size` | sectors are not 512 bytes | nothing |
+| `unsupported-entry` | TexFAT, or a vendor entry that owns clusters | nothing |
+| `pending-commit` | an interrupted drive-mode commit: `flashcp mount` replays it | mount first, check again later |
+| `pending-sync` | an interrupted `flashcp sync` (its journal file is on the volume) | nothing until that sync is finished |
+| `backup-boot-mismatch` | the backup boot region differs from the main one in a way a recluster does not leave | nothing (`fsck.exfat` territory) |
+| `no-space`, `no-contiguous-space` | too little free space behind the first ~0.1 % of the volume, or it is too fragmented | nothing; may be worth asking again when files were deleted |
+| `geometry`, `too-many-clusters`, `too-many-files`, `checksum` | the volume cannot be described with clusters that small (or is too large to plan in memory) | nothing |
+| `bad-clusters` | clusters are marked bad in the FAT; a recluster would lose the marks | nothing |
+| `bad-cluster-size` | `--cluster` is not a power of two below the current size | bug in the caller |
+
+A reason the integration does not know means "do not offer".

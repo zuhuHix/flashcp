@@ -20,6 +20,7 @@ pub mod optimize;
 pub mod pack;
 pub mod probe;
 pub mod pull;
+pub mod recluster;
 pub mod sync;
 pub mod util;
 pub(crate) mod verify;

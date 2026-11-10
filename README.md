@@ -413,6 +413,26 @@ and only then deletes the copy.
 On the USB 2.0 stick with 20k small files, `optimize` took 81–103 s once; afterwards, pulling the
 files back took 16.0 s instead of 28.9 s and adding 20k more took 36.5 s instead of 84.1 s.
 
+**Smaller clusters without moving the files: `recluster`**
+
+```sh
+sudo flashcp recluster /dev/sdX1 --dry-run    # see the plan
+sudo flashcp recluster /dev/sdX1              # 4 KB clusters, in place
+```
+
+A stick formatted the usual way has big clusters (32 KB at 8 GB, 128 KB at 128 GB), so every
+small file takes a whole one and adding small files means writing mostly padding. `recluster`
+describes the same data with 4 KB clusters: it rewrites only the tables (boot sector, FAT, bitmap,
+directories) into free space and switches over with one 512-byte write, so an interruption at any
+point leaves the old volume or the new one, never a mix; run it again to finish. File data stays
+where it is, except what lies in the first 0.1 % of the stick, where the bigger FAT goes. Unlike
+`optimize` it needs no local copy and takes seconds, and it does not reorder the files (they read
+as fast as before; small files written afterwards need much smaller writes). It refuses, writing
+nothing, when it cannot do it safely (exit code 3 and a reason: a dirty volume, too little free
+space, ...). Going back to bigger clusters would mean moving every file. One caveat: if the stick is pulled in
+the few milliseconds between its last two writes, Windows will not open it (Linux and macOS
+will) until `flashcp recluster` runs on it once more; the files are intact either way.
+
 **Automatic tuning.** flashcp measures each drive once (about a second, inside free space) and
 remembers it in `~/.cache/flashcp/devices/`. It uses that to decide how to write: whether to
 zero-fill or skip gaps when adding files, how many writes to keep in flight, and which cluster size
@@ -832,6 +852,8 @@ flashcp sync  <src> <device|image> [--to DIR] [--delete --yes] [--checksum] [--d
 flashcp sync  --recover <device|image>                 # finish an interrupted sync
 flashcp optimize <device|image> --yes [--temp DIR] [--force]
                                                        # rewrite a stick into the fast layout, files kept
+flashcp recluster <device|image> [--cluster SIZE] [--dry-run] [--check]
+                                                       # smaller clusters in place (only the tables are rewritten)
 flashcp info  <device|image> [--json]                  # label, size, free space, file count (read-only)
 flashcp probe <mounted-dir>                            # measure the drive (temp file, no raw writes)
 flashcp gen   <dir> --profile small|mixed|large|tiny   # reproducible test data
