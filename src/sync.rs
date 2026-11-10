@@ -122,6 +122,7 @@ use crate::exfat::{
     Node, TargetSpec, checksum16, entry_set, finish_set, scan_tree, set_bytes, set_direct, ts, validate_name,
 };
 use crate::journal::{self, JWrite, Journal, MoveRec};
+use crate::sim::trace::{self, Op as TOp};
 use crate::util::human_bytes;
 use crate::volume::*;
 use anyhow::{Context, Result, bail, ensure};
@@ -485,7 +486,8 @@ fn vol_fingerprints(v: &mut Vol, files: &[&Child]) -> Result<Vec<u128>> {
         }
         pieces.sort();
         for (dev, b, at, n) in pieces {
-            v.dev.read_exact_at(&mut bufs[b][at..at + n], dev).with_context(|| format!("read {n} bytes at {dev}"))?;
+            trace::serial(TOp::Read, dev, n as u64, || v.dev.read_exact_at(&mut bufs[b][at..at + n], dev))
+                .with_context(|| format!("read {n} bytes at {dev}"))?;
         }
         for (b, &k) in batch.iter().enumerate() {
             out[k] = xxhash_rust::xxh3::xxh3_128(&bufs[b]);
@@ -611,7 +613,7 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
     }
     {
         let mut s0 = [0u8; 512];
-        tgt.file.read_exact_at(&mut s0, 0).context("read boot sector")?;
+        trace::serial(TOp::Read, 0, 512, || tgt.file.read_exact_at(&mut s0, 0)).context("read boot sector")?;
         ensure!(
             &s0[3..11] != b"EXFAT   " || u16::from_le_bytes([s0[106], s0[107]]) & FLAG_DIRTY == 0,
             "volume is marked dirty and there is no sync journal for it (still mounted, not cleanly unmounted, or a \
@@ -1653,16 +1655,19 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
 
     // ── 1: dirty ──
     journal::trace(|| "dirty".into());
+    trace::note("gap_policy", || crate::events::json_str(&pol.describe()));
+    trace::phase("dirty");
     let flags = v.flags;
     write_flags(&mut v, working_flags(flags), None)?;
     stop_after("dirty")?;
 
     // ── 2: data, one ascending stream (with the journal's text and the root's extension) ──
+    trace::phase("data");
     let done0 = files - file_order.len() as u64;
     tick.progress(done0, 0, true);
     let reads: Vec<(PathBuf, u64)> = file_order.iter().map(|&i| (nodes[i].src.clone(), nodes[i].size)).collect();
     write_data(&excl, direct, &v, &segs, &mems, reads, &pol, o.readers, &mut tick, done0)?;
-    excl.sync_all().context("sync")?;
+    trace::sync(|| excl.sync_all()).context("sync")?;
     stop_after("data")?;
 
     // ── 3..: alloc, fat, journal (from here the volume carries the journal), unlink, link,
@@ -1672,6 +1677,7 @@ pub fn sync_to(src: &Path, target: &TargetSpec, o: &SyncOpts, sink: Sink<'_>) ->
         by_phase.entry(w.phase.as_str()).or_default().push(w.clone());
     }
     for phase in META_PHASES {
+        trace::phase(phase);
         journal::apply(&v.dev, by_phase.get(phase).map_or(&[][..], |w| &w[..]))?;
         if phase == "link" && torn_test {
             torn_write(&v, &new_sets, &pre_link)?;
@@ -1706,9 +1712,10 @@ fn torn_write(v: &Vol, new_sets: &[(usize, usize, usize)], pre: &HashMap<usize, 
         let mut p = Patches::default();
         p.object(v, &v.dirs[d].clusters, a, &pre[&d][a..b]);
         for (at, bytes) in p.into_inner() {
-            v.dev.write_all_at(&bytes, at).context("torn write")?;
+            trace::serial(TOp::Write, at, bytes.len() as u64, || v.dev.write_all_at(&bytes, at))
+                .context("torn write")?;
         }
-        v.dev.sync_all().context("sync")?;
+        trace::sync(|| v.dev.sync_all()).context("sync")?;
     }
     bail!("simulated torn write of a relocated entry set ({TORN_ENV})")
 }
