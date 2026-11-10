@@ -240,7 +240,7 @@ pub(crate) fn apply(dev: &dyn Dev, writes: &[JW], mut on_phase: impl FnMut(&str)
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Recovered {
+pub enum Recovered {
     Nothing,
     /// An interrupted commit was replayed (writes of it).
     Replayed(usize),
@@ -248,7 +248,7 @@ pub(crate) enum Recovered {
 
 /// Why recovery refused to write anything.
 #[derive(Debug)]
-pub(crate) struct Refused(pub(crate) String);
+pub struct Refused(pub String);
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
