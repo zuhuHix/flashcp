@@ -92,7 +92,8 @@ jobs:
     # control-mkfs-superfloppy (mkfs.exfat's own volume without a partition table, never
     # re-clustered). The other recl-* volumes (re-clustered in place, see TESTING.md) gate.
     # recl-superfloppy and control-mkfs-superfloppy have no partition table.
-    continue-on-error: ${{ contains(fromJSON('["control-mkfs","control-mkfs-superfloppy","recl-crash-window","recl-backup-zero","recl-backup-badsum"]'), matrix.vol) }}
+    # Report-only volumes: the check step below may fail without failing the job (a warning is
+    # raised instead), so a known OS behaviour does not show as a red check on every PR.
     defaults:
       run:
         shell: pwsh
@@ -103,9 +104,15 @@ jobs:
       # A non-UTC zone makes a mishandled exFAT UTC-offset field show up as a 5:30 h mtime error.
       - run: Set-TimeZone -Id "India Standard Time"; Get-TimeZone
       - name: Attach, chkdsk, verify, write test, chkdsk, dismount
+        id: check
+        continue-on-error: ${{ contains(fromJSON('["control-mkfs","control-mkfs-superfloppy","recl-crash-window","recl-backup-zero","recl-backup-badsum"]'), matrix.vol) }}
         run: >
           scripts/xos/win_check.ps1 -Vhd "vol/${{ matrix.vol }}.vhd" -Manifest vol/manifest.json
           -Label "${{ matrix.vol }}" -LogDir logs ${{ contains(fromJSON('["superfloppy","recl-superfloppy","control-mkfs-superfloppy"]'), matrix.vol) && '-Superfloppy' || '' }}
+      - name: Report-only volume failed its check
+        if: steps.check.outcome == 'failure' && steps.check.conclusion == 'success'
+        shell: bash
+        run: echo "::warning title=report-only ${{ matrix.vol }}::the check failed on this report-only volume (see TESTING.md and the logs artifact)"
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: "logs-windows-${{ matrix.vol }}", path: logs, retention-days: 14 }
@@ -118,7 +125,6 @@ jobs:
       fail-fast: false
       matrix:
         vol: [prefix-auto, full-auto, prefix-512, prefix-1k, prefix-2k, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs, recl-32k, recl-128k, recl-frag-32k, recl-frag-128k, recl-superfloppy, recl-crash-window, control-mkfs-superfloppy, recl-backup-zero, recl-backup-badsum]
-    continue-on-error: ${{ contains(fromJSON('["control-mkfs","control-mkfs-superfloppy","recl-crash-window","recl-backup-zero","recl-backup-badsum"]'), matrix.vol) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -126,9 +132,15 @@ jobs:
       - name: Use a non-UTC time zone
         run: sudo ln -sf /usr/share/zoneinfo/Asia/Kolkata /etc/localtime && date
       - name: Attach, fsck_exfat, mount, verify, write test, unmount, fsck_exfat
+        id: check
+        continue-on-error: ${{ contains(fromJSON('["control-mkfs","control-mkfs-superfloppy","recl-crash-window","recl-backup-zero","recl-backup-badsum"]'), matrix.vol) }}
         run: >
           scripts/xos/mac_check.sh "vol/${{ matrix.vol }}.img" vol/manifest.json "${{ matrix.vol }}" logs
           ${{ contains(fromJSON('["superfloppy","recl-superfloppy","control-mkfs-superfloppy"]'), matrix.vol) && 'superfloppy' || '' }}
+      - name: Report-only volume failed its check
+        if: steps.check.outcome == 'failure' && steps.check.conclusion == 'success'
+        shell: bash
+        run: echo "::warning title=report-only ${{ matrix.vol }}::the check failed on this report-only volume (see TESTING.md and the logs artifact)"
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: "logs-macos-${{ matrix.vol }}", path: logs, retention-days: 14 }
