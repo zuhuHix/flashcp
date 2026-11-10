@@ -67,6 +67,7 @@ EOF
       /bin/sh -ec "
         printf 'ACTIVE=c9\nACTIVE_UID=$uid\n' > /run/systemd/seats/seat0
         mkdir -p /run/user/$uid/flashcp/kernel; touch /run/user/$uid/flashcp/drive-mode-on
+        python3 -I -c 'import socket; socket.socket(socket.AF_UNIX).bind(\"/run/user/$uid/flashcp/drived.sock\")'
         chown -R $uid /run/user/$uid
         $2
         exec '$helper' '$loop'" </dev/null || true
@@ -91,8 +92,10 @@ EOF
   expect busy busy "" "FLASHCP_KEEP=1 "
   expect hang hang "" ""
   expect "daemon off" ok "rm /run/user/$uid/flashcp/drive-mode-on" ""
-  expect "daemon off, pending journal: recovery first" pending "rm /run/user/$uid/flashcp/drive-mode-on" \
+  expect "drive mode off, pending journal: recovery first" pending "rm /run/user/$uid/flashcp/drive-mode-on" \
     "FLASHCP_DRIVE_MODE=1 FLASHCP_DRIVE_UID=$uid UDISKS_IGNORE=1 FLASHCP_RECOVER=1 "
+  expect "no daemon, pending journal: left to udisks" pending \
+    "rm /run/user/$uid/flashcp/drive-mode-on /run/user/$uid/flashcp/drived.sock" ""
   expect "marker is a symlink" ok "rm /run/user/$uid/flashcp/drive-mode-on; ln -s /etc/passwd /run/user/$uid/flashcp/drive-mode-on" ""
   expect "marker owned by root" ok "chown 0 /run/user/$uid/flashcp/drive-mode-on" ""
   expect "fallback flag" ok "touch /run/user/$uid/flashcp/kernel/1A2B-3C4D; chown $uid /run/user/$uid/flashcp/kernel/1A2B-3C4D" "UDISKS_AUTO=0 "

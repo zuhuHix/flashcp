@@ -215,7 +215,8 @@ only a read-only kernel mount at most, plus a persistent "flashcp couldn't finis
 Plug it in again to recover." The interrupted commit's journal is on the volume, and the udev
 check sees it (`pending_journal`), so the next plug-in goes to flashcp's recovery first, even
 with drive mode off (the daemon mounts it once, then hands it to the kernel driver). If no
-daemon runs, such a volume stays hidden rather than being mounted unrecovered.
+daemon runs for the seat user, udisks gets it as usual: the volume is consistent without the
+replay, and the journal's pre-state checks protect a later one.
 
 **Robustness.** A driver that dies is restarted once (its recovery runs); a second failure
 falls back to the kernel driver with a notification. systemd restarts the daemon itself

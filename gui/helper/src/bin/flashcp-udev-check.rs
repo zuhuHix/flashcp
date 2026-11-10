@@ -49,7 +49,12 @@ fn decide(args: &[String]) -> Option<String> {
         0 if out.contains("busy_unknown") => None,
         // An interrupted flashcp commit: flashcp's recovery first, even with drive mode off (the
         // daemon mounts it once, then hands it over); never the kernel driver before that.
-        0 if out.contains("\"pending_journal\":true") => Some(format!("{takeover}FLASHCP_RECOVER=1\n")),
+        // Only while the seat user's daemon runs (its socket exists): with nobody to mount it, a
+        // hidden stick would just be invisible; the kernel may mount it (the volume stays
+        // consistent, and the journal's pre-state checks protect a later replay).
+        0 if out.contains("\"pending_journal\":true") && daemon_running(uid) => {
+            Some(format!("{takeover}FLASHCP_RECOVER=1\n"))
+        }
         0 if wants == Some(true) => Some(takeover),
         _ => None,
     }
@@ -63,6 +68,16 @@ fn active_uid(seat: &str) -> Option<u32> {
 
 fn valid_key(s: &str) -> bool {
     !s.is_empty() && s.len() <= 36 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// The seat user's `flashcp drived` runs: its control socket exists (lstat, owned by `uid`).
+fn daemon_running(uid: u32) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    let base = format!("/run/user/{uid}/flashcp");
+    let owned = |p: &str| fs::symlink_metadata(p).is_ok_and(|m| m.uid() == uid);
+    owned(&base)
+        && fs::symlink_metadata(format!("{base}/drived.sock"))
+            .is_ok_and(|m| m.uid() == uid && m.file_type().is_socket())
 }
 
 /// lstat only (never follows), everything must be owned by `uid`. Some(false): a per-drive
@@ -105,7 +120,9 @@ const SANDBOX: &[&str] = &[
     "ProtectControlGroups=yes",
     "ProtectClock=yes",
     "ProtectHostname=yes",
-    "RestrictAddressFamilies=none",
+    // "none" is not accepted for transient units (D-Bus: Invalid argument); AF_UNIX only, and the
+    // private network, /run and IPC leave nothing to connect to.
+    "RestrictAddressFamilies=AF_UNIX",
     "IPAddressDeny=any",
     "RestrictNamespaces=yes",
     "RestrictRealtime=yes",
@@ -148,6 +165,8 @@ fn check(dev: &str) -> Option<(i32, String)> {
     argp.push(std::ptr::null());
     let envp: [*const libc::c_char; 1] = [std::ptr::null()];
     let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    // Debug runs (by hand) see systemd-run's own errors; under udev its stderr is /dev/null.
+    let err = if std::env::var_os("FLASHCP_UDEV_CHECK_DEBUG").is_some() { 2 } else { null };
     let mut pipe = [-1; 2];
     if null < 0 || unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return None;
@@ -159,7 +178,7 @@ fn check(dev: &str) -> Option<(i32, String)> {
     if pid == 0 {
         unsafe {
             // 0 = the device, 1 = the pipe, 2 = /dev/null; nothing else survives the exec.
-            if libc::dup2(fd, 0) < 0 || libc::dup2(pipe[1], 1) < 0 || libc::dup2(null, 2) < 0 {
+            if libc::dup2(fd, 0) < 0 || libc::dup2(pipe[1], 1) < 0 || libc::dup2(err, 2) < 0 {
                 libc::_exit(121);
             }
             if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0 {
