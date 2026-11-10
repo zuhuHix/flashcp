@@ -1,9 +1,10 @@
 /* flashcp site. Plain browser JS, no libraries.
    Benchmark numbers are the measured tables from README.md (merged work only), taken on
    2026-11-09, Linux 7.0, on an MSI DATAMAG 20Gbps USB SSD and a SanDisk Cruzer Blade 8 GB
-   USB 2.0 stick, and 2026-11-10 on a Kingston DataTraveler 3.0 128 GB USB 3 stick (#18; its
-   speedups are the published figures, carried as xLabel). Times are seconds, medians of 3 unless a case says
-   otherwise (single runs and the stick's mkfs + cp range are labelled). Every speedup shown is computed below from these times, except where a case
+   USB 2.0 stick, and 2026-11-10 on a Kingston DataTraveler 3.0 128 GB USB 3 stick (#18, #22 and
+   the afternoon session; its speedups are the published figures, carried as xLabel). Times are
+   seconds, medians of 3 unless a case says otherwise (single runs and ranges are labelled). A case
+   whose two sides used different cluster sizes says so and carries no multiplier. Every speedup shown is computed below from these times, except where a case
    carries `x`: the published figure from the unrounded medians (5.58 / 0.38 s rounds to 14.7x; measured 14.6x). */
 (function () {
   'use strict';
@@ -50,6 +51,7 @@
       try { localStorage.setItem(STORAGE_KEY, next); } catch (e) { /* storage blocked: still switches for this visit */ }
       setThemeToggleUI();
       drawStrip(); // canvas colours come from CSS variables
+      setThemedVideos();
     });
     if (darkQuery) {
       var onSystemChange = function () {
@@ -57,6 +59,7 @@
         if (forced !== 'light' && forced !== 'dark') {
           setThemeToggleUI();
           drawStrip();
+          setThemedVideos();
         }
       };
       if (darkQuery.addEventListener) darkQuery.addEventListener('change', onSystemChange);
@@ -80,6 +83,7 @@
     stick: ['small'], // the stick was measured on the 20k-file dataset only
     usb3: ['small', 'many']
   };
+  var NO_X = 'formats differ'; // shown instead of a multiplier when the cluster sizes are not the same
 
   var BENCH = {
     ssd: {
@@ -97,6 +101,11 @@
         small: { kernel: { base: 6.01, flash: 0.66 }, built: { base: 5.58, flash: 0.38, x: 14.6 } }, // x: published speedup, computed from unrounded medians
         many:  { kernel: { base: 27.02, flash: 2.27 }, built: { base: 31.39, flash: 1.17 } },
         mixed: { kernel: { base: 5.39, flash: 1.82 }, built: { base: 5.44, flash: 1.68 } }
+      },
+      mode: {
+        small: { cases: [
+          { sub: 'Copy until the drive is safe to remove · medians of 3', base: 1.80, flash: 1.26 }
+        ] }
       }
     },
     stick: {
@@ -106,9 +115,8 @@
       },
       add: {
         small: { cases: [
-          { sub: 'Onto a stick holding 20k files (mkfs default, 32 KB clusters) · single run', base: 209.8, baseLabel: '209.8 s', flash: 84.1, flashLabel: '84.1 s' },
-          { sub: 'Same, onto a stick after flashcp optimize (4 KB clusters) · single run; baseline measured on the mkfs-default stick', base: 209.8, baseLabel: '209.8 s', flash: 36.5, flashLabel: '36.5 s' },
-          { sub: 'First copy onto an empty, freshly formatted stick (written as a build) · median of 3', base: 104.3, baseLabel: '104.3 s', flash: 34.9, flashLabel: '34.9 s' }
+          { sub: 'Onto a stick holding 20k files, 32 KB clusters on both sides · single runs; flashcp took 96–114 s in other runs', base: 209.8, baseLabel: '209.8 s', flash: 84.1, flashLabel: '84.1–114 s', xLabel: '1.8–2.5×' },
+          { sub: 'The same add onto a stick after flashcp optimize (4 KB clusters) · single run; the kernel was only timed on the 32 KB stick', base: 209.8, baseLabel: '209.8 s (32 KB)', flash: 36.5, flashLabel: '36.5 s (4 KB)', xLabel: NO_X }
         ] }
       },
       pull: {
@@ -117,12 +125,21 @@
     },
     usb3: {
       build: {
-        // mkfs + cp: one run. build of `many` has no baseline (not run, ≈25 min), so it is not shown.
-        small: { base: 304, baseLabel: '304 s (1 run)', flash: 9.02, xLabel: '34×' }
+        // Afternoon session, single runs. build of `many` has no baseline (not run, ≈25 min), so it is not shown.
+        small: { cases: [
+          { sub: 'Like for like: 4 KB clusters on both sides (mkfs.exfat -c 4K + cp + unmount) · single runs; the build took 2.72 s in the afternoon and 9.02 s in the morning', base: 74.0, baseLabel: '74.0 s', flash: 2.72, flashLabel: '2.72–9.02 s', xLabel: '8–27×' },
+          { sub: 'If you just format and copy: the kernel on the default 128 KB clusters (259 s ending with unmount, 371 s with sync + unmount), flashcp build on 4 KB', base: 258.8, baseLabel: '259–371 s (128 KB)', flash: 2.72, flashLabel: '2.72–9.02 s (4 KB)', xLabel: NO_X }
+        ] }
       },
       add: {
         small: { cases: [
-          { sub: 'Onto a kernel-filled stick · single run each; flashcp’s probe chose to zero-fill gaps (skipping took 144 s)', base: 527, baseLabel: '527 s', flash: 93.3, flashLabel: '93.3 s', xLabel: '5.7×' }
+          { sub: 'Onto a kernel-filled stick, 128 KB clusters on both sides · single run each; flashcp’s probe chose to zero-fill gaps (skipping took 144 s)', base: 527, baseLabel: '527 s', flash: 93.3, flashLabel: '93.3 s', xLabel: '5.7×' }
+        ] }
+      },
+      mode: {
+        small: { cases: [
+          { sub: 'Copy until safe to remove, 4 KB clusters on both sides · single runs', base: 74.0, baseLabel: '74.0 s', flash: 5.31, flashLabel: '5.31 s', xLabel: '13.9×' },
+          { sub: 'Copy until safe to remove, default 128 KB clusters on both sides · single runs; the kernel took 259 s ending with unmount and 371 s with sync + unmount', base: 258.8, baseLabel: '259–371 s', flash: 93.8, flashLabel: '93.8 s', xLabel: '2.8–4.0×' }
         ] }
       },
       pull: {
@@ -135,10 +152,11 @@
   var NORMAL_LABEL = {
     build: 'Normal copy: mkfs + cp',
     add: 'Normal copy: mount + cp',
-    pull: 'Normal copy: mount + cp'
+    pull: 'Normal copy: mount + cp',
+    mode: 'Linux kernel driver: cp + unmount'
   };
-  var FLASH_LABEL = { build: 'flashcp build', add: 'flashcp add', pull: 'flashcp pull' };
-  var KERNEL_STICK_NOTE = 'on par: the stick’s measured ≈11 MB/s sequential read is the limit';
+  var FLASH_LABEL = { build: 'flashcp build', add: 'flashcp add', pull: 'flashcp pull', mode: 'flashcp drive mode' };
+  var KERNEL_STICK_NOTE = 'on par: the stick’s measured 13.8 MB/s sequential read is the limit';
 
   // Table B: copies onto an existing mounted volume. Speedup vs naive cp.
   var DATA_B = [
@@ -248,13 +266,18 @@
       return explorer.dataset === 'all' || ds === explorer.dataset;
     });
 
+    var shown = 0;
     sets.forEach(function (ds) {
       var ops = BENCH[drive][op];
       var c = ops && ops[ds];
       if (!c) {
-        if (explorer.dataset !== 'all') box.appendChild(el('p', 'note', 'Not measured on this drive for this dataset.'));
+        if (explorer.dataset !== 'all') {
+          box.appendChild(el('p', 'note', 'Not measured on this drive for this dataset.'));
+          shown++;
+        }
         return;
       }
+      shown++;
 
       box.appendChild(el('h3', 'bar-group-title', DATASET_LABEL[ds]));
 
@@ -270,6 +293,7 @@
       }
     });
 
+    if (!shown) box.appendChild(el('p', 'note', 'Not measured on this drive.'));
     box.appendChild(el('p', 'note', 'Shorter bar = faster. Speedup is baseline time ÷ method time, for the same dataset and drive layout.'));
   }
 
@@ -303,7 +327,7 @@
         note.textContent = 'The stick was measured only on the 20k-file dataset, so the other sizes are not offered.';
         note.hidden = false;
       } else if (drive === 'usb3') {
-        note.textContent = 'The Kingston stick was measured on the 20k and 100k-file datasets. On 100k files only a pull from a flashcp-built stick has a baseline; add was measured on 20k files only.';
+        note.textContent = 'The Kingston stick was measured on the 20k and 100k-file datasets, mostly as single runs. On 100k files only a pull from a flashcp-built stick has a baseline; build, add and drive mode have baselines on 20k files only.';
         note.hidden = false;
       } else {
         note.textContent = '';
@@ -697,7 +721,26 @@
   // ---------------------------------------------------------------
   // Hero video fallback
   // ---------------------------------------------------------------
+  // Section videos come in a light and a dark version: <video data-light="…" data-dark="…">.
+  // The one matching the current theme is loaded; with reduced motion it does not autoplay.
+  function setThemedVideos() {
+    var dark = currentIsDark();
+    var still = !!(reduceQuery && reduceQuery.matches);
+    Array.prototype.forEach.call(document.querySelectorAll('video[data-light][data-dark]'), function (v) {
+      var want = v.getAttribute(dark ? 'data-dark' : 'data-light');
+      if (v.getAttribute('src') !== want) v.setAttribute('src', want);
+      v.controls = still;
+      if (still) v.pause();
+      else { var p = v.play(); if (p && p.catch) p.catch(function (e) { if (e && e.name === 'NotAllowedError') v.controls = true; }); }
+    });
+  }
+
   function initVideo() {
+    setThemedVideos();
+    if (reduceQuery) {
+      if (reduceQuery.addEventListener) reduceQuery.addEventListener('change', setThemedVideos);
+      else if (reduceQuery.addListener) reduceQuery.addListener(setThemedVideos);
+    }
     var video = document.querySelector('.hero-media video');
     var fallback = $('video-fallback');
     if (!video || !fallback) return;

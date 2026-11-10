@@ -1,48 +1,44 @@
 import React from 'react';
 import {AbsoluteFill, Sequence} from 'remotion';
-import {AddNoErase} from './AddNoErase';
-import {BenchmarkChart} from './BenchmarkChart';
+import {BENCH_FRAMES, BenchmarkChart} from './BenchmarkChart';
+import {CLUSTER_SLACK_FRAMES, ClusterSlack} from './ClusterSlack';
 import {CopyVsBuild} from './CopyVsBuild';
+import {DRIVE_MODE_FRAMES, DriveMode} from './DriveMode';
 import {PullSweep} from './PullSweep';
 import {PALETTES} from './shared';
-import {TwoDrives} from './TwoDrives';
+import {SYNC_FRAMES, SyncOnlyChanged} from './SyncOnlyChanged';
 
-// 1200 x 640 reel, dark theme only, about 54 s. Scenes are centred vertically in the frame.
-// Order: copy -> add -> pull -> two drives -> benchmark. Each scene keeps its own duration.
-const Scene: React.FC<{h: number; children: React.ReactNode}> = ({h, children}) => (
-  <AbsoluteFill>
-    <div style={{position: 'absolute', left: 0, top: (640 - h) / 2, width: 1200, height: h, overflow: 'hidden'}}>
-      {children}
-    </div>
-  </AbsoluteFill>
-);
+// 1200 x 640 reel for the Pages site, dark theme only, no audio. Scenes are centred vertically
+// and each keeps its own duration:
+// drive mode -> cluster size -> sync -> build -> pull -> the USB 3 stick's chart.
+const SCENES: {h: number; frames: number; node: React.ReactNode}[] = [
+  {h: 600, frames: DRIVE_MODE_FRAMES, node: <DriveMode theme="dark" />},
+  {h: 600, frames: CLUSTER_SLACK_FRAMES, node: <ClusterSlack theme="dark" />},
+  {h: 600, frames: SYNC_FRAMES, node: <SyncOnlyChanged theme="dark" />},
+  {h: 600, frames: 330, node: <CopyVsBuild theme="dark" />},
+  {h: 600, frames: 330, node: <PullSweep theme="dark" />},
+  {h: 640, frames: BENCH_FRAMES, node: <BenchmarkChart theme="dark" page="usb3" />},
+];
 
-export const Showreel: React.FC = () => (
-  <AbsoluteFill style={{background: PALETTES.dark.bg}}>
-    <Sequence from={0} durationInFrames={330}>
-      <Scene h={600}>
-        <CopyVsBuild theme="dark" />
-      </Scene>
-    </Sequence>
-    <Sequence from={330} durationInFrames={270}>
-      <Scene h={600}>
-        <AddNoErase theme="dark" />
-      </Scene>
-    </Sequence>
-    <Sequence from={600} durationInFrames={330}>
-      <Scene h={600}>
-        <PullSweep theme="dark" />
-      </Scene>
-    </Sequence>
-    <Sequence from={930} durationInFrames={300}>
-      <Scene h={600}>
-        <TwoDrives theme="dark" />
-      </Scene>
-    </Sequence>
-    <Sequence from={1230} durationInFrames={390}>
-      <Scene h={640}>
-        <BenchmarkChart theme="dark" />
-      </Scene>
-    </Sequence>
-  </AbsoluteFill>
-);
+export const SHOWREEL_FRAMES = SCENES.reduce((a, s) => a + s.frames, 0);
+
+export const Showreel: React.FC = () => {
+  let from = 0;
+  return (
+    <AbsoluteFill style={{background: PALETTES.dark.bg}}>
+      {SCENES.map((s, i) => {
+        const start = from;
+        from += s.frames;
+        return (
+          <Sequence key={i} from={start} durationInFrames={s.frames}>
+            <AbsoluteFill>
+              <div style={{position: 'absolute', left: 0, top: (640 - s.h) / 2, width: 1200, height: s.h, overflow: 'hidden'}}>
+                {s.node}
+              </div>
+            </AbsoluteFill>
+          </Sequence>
+        );
+      })}
+    </AbsoluteFill>
+  );
+};

@@ -1,167 +1,122 @@
 import React from 'react';
-import {AbsoluteFill, Easing, spring, useCurrentFrame, useVideoConfig} from 'remotion';
-import {FONT, MONO, Palette, PALETTES, Theme, ramp} from './shared';
+import {AbsoluteFill, useCurrentFrame, useVideoConfig} from 'remotion';
+import {BENCH_PAGES, BenchPage, BenchPageId} from './data/benchmarks';
+import {EASE_OUT, FONT, MONO, PALETTES, Theme, pop, ramp, scaleAt} from './shared';
 
-// 1200 x 640, 30 fps, 390 frames (13 s). Two pages in sequence with an eased slide:
-// the USB SSD, then the cheap USB 2.0 stick. Each page has its own seconds axis.
-// Every number comes from the measured tables (README / merged PR bodies).
+// 1200 x 640, 30 fps, 240 frames (8 s). One drive per composition: paired bars (kernel driver vs
+// flashcp) on a shared seconds axis, a range drawn as a fainter extension, and the speed-up pill.
+// Every number and label comes from src/data/benchmarks.ts; the layout adapts to 3 or 4 rows.
 const W = 1200;
 const H = 640;
-const X0 = 300; // x of 0 s
-const X_END = 930; // x of the longest bar on a page
-const ROW_TOPS = [150, 290, 430];
-const ROW_DELAY = [14, 50, 86]; // frames after the page's own start
-const SLIDE_A = 196;
-const SLIDE_B = 222;
-const PAGE2_T0 = 222;
-const FADE_A = 368;
-const FADE_B = 389;
+const X0 = 340; // x of 0 s
+const X_END = 830; // x of the longest bar
+const ROWS_TOP = 128;
+const ROWS_BOTTOM = 512;
+const FADE_A = 222;
+const FADE_B = 239;
+export const BENCH_FRAMES = 240;
 
-type Row = {name: string; sub: string; base: number; baseMax?: number; flash: number; baseLabel: string; flashLabel: string; pill: string};
-type Page = {title: string; axisMax: number; xEnd?: number; ticks: number[]; rows: Row[]; note: string; t0: number};
-
-const PAGES: Page[] = [
-  {
-    title: 'USB SSD (MSI DATAMAG 20Gbps, UAS) · 20k small files',
-    axisMax: 6.01,
-    ticks: [0, 2, 4, 6],
-    rows: [
-      {name: 'build', sub: 'erase + format', base: 2.8, flash: 0.42, baseLabel: '2.80', flashLabel: '0.42', pill: '6.7×'},
-      {name: 'add', sub: 'existing drive', base: 1.72, flash: 0.48, baseLabel: '1.72', flashLabel: '0.48', pill: '3.6×'},
-      {name: 'pull', sub: 'copy off the drive', base: 6.01, flash: 0.66, baseLabel: '6.01', flashLabel: '0.66', pill: '9.1×'},
-    ],
-    note: 'up to 10.3× (build, 100k files) and 26.8× (pull, 100k files, flashcp-built)',
-    t0: 0,
-  },
-  {
-    title: 'Cheap USB 2.0 stick (SanDisk Cruzer Blade, BOT) · 20k small files',
-    axisMax: 179.6,
-    xEnd: 770,
-    ticks: [0, 50, 100, 150],
-    rows: [
-      // mkfs + cp varied from 110.4 s to 179.6 s across runs on this stick: drawn as a solid bar plus a faint range
-      {name: 'build', sub: 'erase + format', base: 110.4, baseMax: 179.6, flash: 33.6, baseLabel: '110.4–179.6', flashLabel: '33.6', pill: '3.3–5.3×'},
-      {name: 'pull', sub: 'kernel-filled stick', base: 30.86, flash: 29.52, baseLabel: '30.86', flashLabel: '29.52', pill: '1.05× on par'},
-      {name: 'pull', sub: 'flashcp-built stick', base: 32.78, flash: 16.38, baseLabel: '32.78', flashLabel: '16.38', pill: '2.0×'},
-    ],
-    note: "the stick's flash chip is the ceiling (measured: 6.5 MB/s write, ≈11 MB/s read)",
-    t0: PAGE2_T0,
-  },
-];
-
-
-const PageView: React.FC<{page: Page; f: number; P: Palette; fps: number}> = ({page, f: fAbs, P, fps}) => {
-  const f = fAbs - page.t0;
-  const px = ((page.xEnd ?? X_END) - X0) / page.axisMax;
-  return (
-    <g>
-      <text x={60} y={58} fontSize={28} fontWeight={700} fill={P.text}>
-        {page.title}
-      </text>
-      <rect x={60} y={84} width={18} height={18} rx={3} fill={P.coral} />
-      <text x={88} y={99} fontSize={22} fill={P.text}>
-        normal copy (mount/mkfs + cp)
-      </text>
-      <rect x={470} y={84} width={18} height={18} rx={3} fill={P.teal} />
-      <text x={498} y={99} fontSize={22} fill={P.text}>
-        flashcp
-      </text>
-
-      {page.ticks.map((t) => (
-        <g key={t}>
-          <line x1={X0 + t * px} y1={124} x2={X0 + t * px} y2={516} stroke={P.grid} strokeWidth={1.5} />
-          <text x={X0 + t * px} y={544} textAnchor="middle" fontSize={22} fill={P.muted}>
-            {`${t} s`}
-          </text>
-        </g>
-      ))}
-
-      {page.rows.map((row, r) => {
-        const top = ROW_TOPS[r];
-        const s = ROW_DELAY[r];
-        const coralP = ramp(f, s, s + 40, 0, 1, Easing.out(Easing.cubic));
-        const tealP = ramp(f, s + 6, s + 46, 0, 1, Easing.out(Easing.cubic));
-        const pillStart = s + 40;
-        const pillScale =
-          f < pillStart ? 0 : spring({frame: f - pillStart, fps, config: {damping: 12, stiffness: 200, mass: 0.7}});
-        const pillW = Math.max(100, row.pill.length * 15 + 36);
-        const pillCx = 1170 - pillW / 2;
-        const pillCy = top + 40;
-        const cLen = row.base * px * coralP;
-        const rLen = (row.baseMax ?? row.base) * px * coralP;
-        const tLen = row.flash * px * tealP;
-        return (
-          <g key={r}>
-            <text x={60} y={top + 26} fontSize={26} fontWeight={700} fill={P.text}>
-              {row.name}
-            </text>
-            <text x={60} y={top + 52} fontSize={18} fill={P.muted}>
-              {row.sub}
-            </text>
-
-            {row.baseMax ? <rect x={X0} y={top} width={rLen} height={36} rx={4} fill={P.coral} opacity={0.35} /> : null}
-            <rect x={X0} y={top} width={cLen} height={36} rx={4} fill={P.coral} />
-            <text
-              x={X0 + rLen + 12}
-              y={top + 26}
-              fontFamily={MONO}
-              fontSize={24}
-              fill={P.text}
-              opacity={ramp(coralP, 0.9, 1)}
-              style={{fontVariantNumeric: 'tabular-nums'}}
-            >
-              {`${row.baseLabel} s`}
-            </text>
-
-            <rect x={X0} y={top + 44} width={tLen} height={36} rx={4} fill={P.teal} />
-            <text
-              x={X0 + tLen + 12}
-              y={top + 70}
-              fontFamily={MONO}
-              fontSize={24}
-              fill={P.text}
-              opacity={ramp(tealP, 0.9, 1)}
-              style={{fontVariantNumeric: 'tabular-nums'}}
-            >
-              {`${row.flashLabel} s`}
-            </text>
-
-            <g transform={`translate(${pillCx} ${pillCy}) scale(${pillScale}) translate(${-pillCx} ${-pillCy})`}>
-              <rect x={pillCx - pillW / 2} y={pillCy - 26} width={pillW} height={52} rx={26} fill={P.teal} />
-              <text x={pillCx} y={pillCy + 9} textAnchor="middle" fontSize={26} fontWeight={700} fill={P.pillText}>
-                {row.pill}
-              </text>
-            </g>
-          </g>
-        );
-      })}
-
-      <text x={60} y={572} fontSize={22} fill={P.muted}>
-        {page.note}
-      </text>
-      <text x={60} y={614} fontSize={22} fill={P.muted}>
-        baselines include mkfs or mount/unmount · medians of 3 · Linux 7.0
-      </text>
-    </g>
-  );
-};
-
-export const BenchmarkChart: React.FC<{theme: Theme}> = ({theme}) => {
+export const BenchmarkChart: React.FC<{theme: Theme; page: BenchPageId}> = ({theme, page: pageId}) => {
   const f = useCurrentFrame();
   const {fps} = useVideoConfig();
   const P = PALETTES[theme];
-  const keep = 1 - ramp(f, FADE_A, FADE_B);
-  const fadeIn = ramp(f, 0, 12);
-  const e = ramp(f, SLIDE_A, SLIDE_B, 0, 1, Easing.inOut(Easing.cubic));
+  const page: BenchPage = BENCH_PAGES[pageId];
+  const n = page.rows.length;
+  const pitch = (ROWS_BOTTOM - ROWS_TOP) / n;
+  const barH = n > 3 ? 32 : 36;
+  const barGap = n > 3 ? 6 : 8;
+  const rowH = 2 * barH + barGap;
+  const px = (X_END - X0) / page.axisMax;
+  const show = ramp(f, 0, 12) * (1 - ramp(f, FADE_A, FADE_B));
+  const flashLegendX = 60 + 28 + page.baseLegend.length * 11.6 + 36;
 
   return (
     <AbsoluteFill style={{background: P.bg}}>
       <svg width={W} height={H} style={{display: 'block', fontFamily: FONT}}>
-        <g transform={`translate(${-W * e} 0)`} opacity={fadeIn * keep}>
-          <PageView page={PAGES[0]} f={f} P={P} fps={fps} />
-        </g>
-        <g transform={`translate(${W * (1 - e)} 0)`} opacity={fadeIn * keep}>
-          <PageView page={PAGES[1]} f={f} P={P} fps={fps} />
+        <g opacity={show}>
+          <text x={60} y={56} fontSize={28} fontWeight={700} fill={P.text}>
+            {page.title}
+          </text>
+          <rect x={60} y={82} width={18} height={18} rx={3} fill={P.coral} />
+          <text x={88} y={98} fontSize={22} fill={P.text}>
+            {page.baseLegend}
+          </text>
+          <rect x={flashLegendX} y={82} width={18} height={18} rx={3} fill={P.teal} />
+          <text x={flashLegendX + 28} y={98} fontSize={22} fill={P.text}>
+            {page.flashLegend}
+          </text>
+
+          {page.ticks.map((t) => (
+            <g key={t}>
+              <line x1={X0 + t * px} y1={ROWS_TOP - 6} x2={X0 + t * px} y2={ROWS_BOTTOM + 6} stroke={P.grid} strokeWidth={1.5} />
+              <text x={X0 + t * px} y={ROWS_BOTTOM + 34} textAnchor="middle" fontSize={22} fill={P.muted}>
+                {`${t} s`}
+              </text>
+            </g>
+          ))}
+
+          {page.rows.map((row, r) => {
+            const top = ROWS_TOP + r * pitch + (pitch - rowH) / 2;
+            const s = 14 + r * 30;
+            const baseP = ramp(f, s, s + 40, 0, 1, EASE_OUT);
+            const flashP = ramp(f, s + 6, s + 46, 0, 1, EASE_OUT);
+            const pillScale = pop(f, s + 38, fps);
+            const pillW = Math.max(104, row.pill.length * 15 + 40);
+            const pillCx = 1170 - pillW / 2;
+            const pillCy = top + rowH / 2;
+            const bars = [
+              {bar: row.base, p: baseP, y: top, color: P.coral},
+              {bar: row.flash, p: flashP, y: top + barH + barGap, color: P.teal},
+            ];
+            return (
+              <g key={r}>
+                <text x={60} y={top + barH - 8} fontSize={24} fontWeight={700} fill={P.text}>
+                  {row.name}
+                </text>
+                <text x={60} y={top + barH + barGap + barH - 10} fontSize={22} fill={P.muted}>
+                  {row.sub}
+                </text>
+                {bars.map(({bar, p, y, color}, i) => {
+                  const len = Math.max(3, bar.value * px) * p;
+                  const rangeLen = Math.max(3, (bar.max ?? bar.value) * px) * p;
+                  return (
+                    <g key={i}>
+                      {bar.max ? <rect x={X0} y={y} width={rangeLen} height={barH} rx={4} fill={color} opacity={0.38} /> : null}
+                      <rect x={X0} y={y} width={len} height={barH} rx={Math.min(4, len / 2)} fill={color} />
+                      <text
+                        x={X0 + rangeLen + 12}
+                        y={y + barH / 2 + 8}
+                        fontFamily={MONO}
+                        fontSize={24}
+                        fill={P.text}
+                        stroke={P.bg}
+                        strokeWidth={7}
+                        strokeLinejoin="round"
+                        paintOrder="stroke"
+                        opacity={ramp(p, 0.9, 1)}
+                        style={{fontVariantNumeric: 'tabular-nums'}}
+                      >
+                        {`${bar.label} s`}
+                      </text>
+                    </g>
+                  );
+                })}
+                <g transform={scaleAt(pillCx, pillCy, pillScale)}>
+                  <rect x={pillCx - pillW / 2} y={pillCy - 26} width={pillW} height={52} rx={26} fill={P.teal} />
+                  <text x={pillCx} y={pillCy + 9} textAnchor="middle" fontSize={26} fontWeight={700} fill={P.pillText}>
+                    {row.pill}
+                  </text>
+                </g>
+              </g>
+            );
+          })}
+
+          <text x={60} y={584} fontSize={22} fill={P.muted}>
+            {page.notes[0]}
+          </text>
+          <text x={60} y={616} fontSize={22} fill={P.muted}>
+            {page.notes[1]}
+          </text>
         </g>
       </svg>
     </AbsoluteFill>
