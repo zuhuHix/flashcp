@@ -771,3 +771,88 @@ fn oversized_batches_split_into_commits() {
     fsck(&img.path);
     same!(snapshot(&open(&img.path)), want, "after split commits");
 }
+
+/// Review regressions: a committed directory renamed and retimed right after mount (never
+/// loaded); a big split batch of deletes, moves out of a removed directory and a replaced
+/// target; flush while a writer keeps writing.
+#[test]
+fn review_regressions() {
+    let img = image("regress", 64, 4096);
+    let fs = open(&img.path);
+    let n = |s: &str| OsStr::new(s).to_owned();
+    let d = fs.mkdir(ROOT, &n("olddir")).unwrap();
+    let keep = fs.create(d.ino, &n("keep.txt"), true, false).unwrap();
+    fs.write(keep.ino, 0, b"kept").unwrap();
+    let mut rng = crate::util::Rng(9);
+    let big = fs.mkdir(ROOT, &n("big")).unwrap();
+    for _ in 0..1500 {
+        let name: String = (0..40).map(|_| char::from(b'a' + (rng.next() % 26) as u8)).collect();
+        let f = fs.create(big.ino, &n(&name), true, false).unwrap();
+        fs.release(f.ino);
+    }
+    let t = fs.create(ROOT, &n("target"), true, false).unwrap();
+    fs.write(t.ino, 0, b"old target").unwrap();
+    fs.shutdown().unwrap();
+    // 1: rename + utimens of a directory nobody listed since the mount
+    let fs = open(&img.path);
+    fs.rename(ROOT, &n("olddir"), ROOT, &n("newdir"), RenameFlags::default()).unwrap();
+    let nd = fs.lookup(ROOT, &n("newdir")).unwrap();
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000);
+    fs.setattr(nd.ino, &SetAttr { mtime: Some(when), ..Default::default() }).unwrap();
+    fs.flush().unwrap();
+    fs.shutdown().unwrap();
+    // 2: on a volume with a small journal (split commits): delete everything in big/, move
+    //    keep.txt out of a directory that goes, replace a target
+    let img2 = image("regress-split", 64, 4096);
+    let fs = open(&img2.path);
+    unsafe { std::env::set_var(super::djournal::JOURNAL_BYTES_ENV, "12288") };
+    let nd = fs.mkdir(ROOT, &n("newdir")).unwrap().ino;
+    fs.commit_now("t").unwrap();
+    unsafe { std::env::remove_var(super::djournal::JOURNAL_BYTES_ENV) };
+    let keep = fs.create(nd, &n("keep.txt"), true, false).unwrap();
+    fs.write(keep.ino, 0, b"kept").unwrap();
+    let b = fs.mkdir(ROOT, &n("big")).unwrap().ino;
+    for _ in 0..1500 {
+        let name: String = (0..40).map(|_| char::from(b'a' + (rng.next() % 26) as u8)).collect();
+        let f = fs.create(b, &n(&name), true, false).unwrap();
+        fs.release(f.ino);
+    }
+    let t = fs.create(ROOT, &n("target"), true, false).unwrap();
+    fs.write(t.ino, 0, b"old target").unwrap();
+    fs.flush().unwrap();
+    let before = fs.commits();
+    // all but one (removing a whole directory needs no entry writes inside it)
+    for (_, name, _) in fs.readdir(b).unwrap().into_iter().skip(1) {
+        fs.unlink(b, &n(&name)).unwrap();
+    }
+    fs.rename(nd, &n("keep.txt"), ROOT, &n("target"), RenameFlags::default()).unwrap();
+    fs.rmdir(ROOT, &n("newdir")).unwrap();
+    let want = snapshot(&fs);
+    fs.flush().unwrap();
+    assert!(fs.commits() > before + 1, "expected split commits");
+    fs.shutdown().unwrap();
+    fsck(&img2.path);
+    same!(snapshot(&open(&img2.path)), want, "after deletes and moves");
+    assert_eq!(want.get("/target").cloned().flatten().as_deref(), Some(&b"kept"[..]));
+    // 3: flush returns while another thread keeps writing
+    let f = File::options().read(true).write(true).open(&img.path).unwrap();
+    let opts = FsOpts { auto_commit: true, idle: std::time::Duration::from_millis(50), readahead: false, ..manual() };
+    let fs = open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), opts).unwrap();
+    let w = fs.create(ROOT, &n("stream"), true, false).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (fs2, stop2) = (fs.clone(), stop.clone());
+    let writer = std::thread::spawn(move || {
+        let mut off = 0u64;
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            fs2.write(w.ino, off, &[7u8; 4096]).unwrap();
+            off = (off + 4096) % (4 << 20);
+        }
+    });
+    for _ in 0..5 {
+        fs.flush().unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    fs.shutdown().unwrap();
+    fsck(&img.path);
+}

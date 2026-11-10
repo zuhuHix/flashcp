@@ -87,6 +87,10 @@ pub(crate) struct Plan {
     pub(crate) pre_bm: Arc<Vec<u8>>,
     /// Inodes planned.
     pub(crate) inodes: usize,
+    /// Everything dirty at planning time is in it (not a split part).
+    pub(crate) full: bool,
+    /// The change counter at planning time.
+    pub(crate) seq: u64,
     pub(crate) free_runs: Vec<(u64, u64)>,
     pub(crate) files: u64,
     pub(crate) bytes: u64,
@@ -161,11 +165,12 @@ impl Planner<'_> {
                 } else {
                     self.free.remove(k);
                 }
+                self.alloc_runs.push((s, take));
                 let mut runs = vec![(s, take)];
                 if take < n {
+                    // records its own runs
                     runs.extend(self.alloc(n - take, None)?);
                 }
-                self.alloc_runs.extend(runs.iter().copied());
                 return Ok(runs);
             }
         }
@@ -458,6 +463,78 @@ impl Planner<'_> {
     }
 }
 
+/// At least `n` of the dirty inodes `all`, closed under what must commit together:
+/// - unlinked ones deepest first (a directory's entries go before or with it), then linked
+///   ones by depth (a new directory goes with or before its entries);
+/// - with an unlinked directory, every dirty inode whose committed set lies in it (its
+///   unlinked entries, and whatever moved out of it: their only committed set is in there);
+/// - with an unlinked inode, the inode that took its name (a replaced target and its
+///   replacement change together: the name never disappears);
+/// - with an inode that took over a name, the unlinked inode that had it.
+fn subset(c: &Core, mut all: Vec<Ino>, n: usize) -> Vec<Ino> {
+    let linked = |i: &Ino| c.inodes.get(i).is_some_and(|x| x.linked);
+    all.sort_by_cached_key(|&i| {
+        let d = depth(c, i) as i64;
+        (linked(&i), if linked(&i) { d } else { -d }, i)
+    });
+    let dirty: HashSet<Ino> = all.iter().copied().collect();
+    let mut in_dir: HashMap<Ino, Vec<Ino>> = HashMap::new();
+    for &i in &all {
+        if let Some(d) = c.inodes.get(&i).and_then(|x| x.disk) {
+            in_dir.entry(d.dir).or_default().push(i);
+        }
+    }
+    // name → (unlinked holder, new holder) pairs, by (parent, up-cased name)
+    let mut by_name: HashMap<(Ino, Vec<u16>), Vec<Ino>> = HashMap::new();
+    for &i in &all {
+        if let Some(x) = c.inodes.get(&i) {
+            by_name.entry((x.parent, super::set::key(&x.name, &c.vol.upc))).or_default().push(i);
+            if let Some(d) = x.disk {
+                // its committed name too (a rename away from it)
+                if let Some(dd) = c.inodes.get(&d.dir).and_then(|p| p.dd.as_ref()) {
+                    let f = super::set::decode(&dd.data[d.off..d.off + d.len]);
+                    by_name.entry((d.dir, super::set::key(&f.name, &c.vol.upc))).or_default().push(i);
+                }
+            }
+        }
+    }
+    let mut take: HashSet<Ino> = HashSet::new();
+    let mut out: Vec<Ino> = Vec::new();
+    let mut stack: Vec<Ino> = Vec::new();
+    for &i in &all {
+        if out.len() >= n {
+            break;
+        }
+        stack.push(i);
+        while let Some(j) = stack.pop() {
+            if !dirty.contains(&j) || !take.insert(j) {
+                continue;
+            }
+            out.push(j);
+            let Some(x) = c.inodes.get(&j) else { continue };
+            if !x.linked && x.is_dir {
+                stack.extend(in_dir.get(&j).into_iter().flatten().copied());
+            }
+            if let Some(v) = by_name.get(&(x.parent, super::set::key(&x.name, &c.vol.upc))) {
+                stack.extend(v.iter().copied());
+            }
+            if let Some(d) = x.disk
+                && let Some(dd) = c.inodes.get(&d.dir).and_then(|p| p.dd.as_ref())
+            {
+                let f = super::set::decode(&dd.data[d.off..d.off + d.len]);
+                if let Some(v) = by_name.get(&(d.dir, super::set::key(&f.name, &c.vol.upc))) {
+                    stack.extend(v.iter().copied());
+                }
+            }
+            // a new directory needs its parent committed with or before it
+            if x.linked && x.disk.is_none() {
+                stack.push(x.parent);
+            }
+        }
+    }
+    out
+}
+
 /// Depth of an inode in the desired tree.
 fn depth(c: &Core, mut i: Ino) -> usize {
     let mut d = 0;
@@ -502,10 +579,9 @@ pub(crate) fn plan(c: &mut Core, limit: Option<usize>) -> Result<Option<Plan>> {
         return Ok(None);
     }
     let mut batch: Vec<Ino> = c.dirty.iter().copied().collect();
+    let full = limit.is_none_or(|n| n >= batch.len());
     if let Some(n) = limit.filter(|&n| n < batch.len()) {
-        batch.sort_by_cached_key(|&i| (c.inodes.get(&i).is_some_and(|x| x.linked), depth(c, i), i));
-        let unlinked = batch.iter().take_while(|&&i| c.inodes.get(&i).is_none_or(|x| !x.linked)).count();
-        batch.truncate(n.max(unlinked));
+        batch = subset(c, batch, n);
     }
     // Unlinked inodes that never reached the volume: nothing to write.
     let mut work: Vec<Ino> = Vec::new();
@@ -527,12 +603,16 @@ pub(crate) fn plan(c: &mut Core, limit: Option<usize>) -> Result<Option<Plan>> {
     // Every directory a set is written into or removed from must be loaded.
     for &i in &work {
         let n = &c.inodes[&i];
-        let (p, old) = (n.parent, n.disk.map(|d| d.dir));
-        if n.linked {
+        let (p, old, linked, own) = (n.parent, n.disk.map(|d| d.dir), n.linked, n.is_dir && n.disk.is_some());
+        if linked {
             c.load(p).map_err(|e| anyhow::anyhow!("load {}: errno {e}", c.path(p)))?;
         }
         if let Some(o) = old {
             c.load(o).map_err(|e| anyhow::anyhow!("load {}: errno {e}", c.path(o)))?;
+        }
+        // a committed directory whose own set changes (renamed, moved, retimed) or that goes
+        if own {
+            c.load(i).map_err(|e| anyhow::anyhow!("load {}: errno {e}", c.path(i)))?;
         }
     }
     let free = crate::add::free_extents(&c.bm, c.vol.cc);
@@ -717,11 +797,11 @@ pub(crate) fn plan(c: &mut Core, limit: Option<usize>) -> Result<Option<Plan>> {
     }
     // Directories extended but not otherwise dirty were queued above; the root has no set.
     let n_inodes = work.len();
-    finish(p, n_inodes).map(Some)
+    finish(p, n_inodes, full, seq).map(Some)
 }
 
 /// Turns the planner's state into the journaled writes.
-fn finish(mut p: Planner<'_>, n_inodes: usize) -> Result<Plan> {
+fn finish(mut p: Planner<'_>, n_inodes: usize, full: bool, plan_seq: u64) -> Result<Plan> {
     let mut writes: Vec<JW> = Vec::new();
     // dirty
     let s0 = p.c.vol.sector0.clone();
@@ -869,6 +949,8 @@ fn finish(mut p: Planner<'_>, n_inodes: usize) -> Result<Plan> {
         alloc_runs,
         pre_bm: Arc::new(p.c.bm.clone()),
         inodes: n_inodes,
+        full,
+        seq: plan_seq,
         free_runs,
         files: p.files,
         bytes: p.bytes,
@@ -967,6 +1049,9 @@ pub(crate) fn finalize(c: &mut Core, p: Plan) {
         }
     }
     c.commits += 1;
+    if p.full {
+        c.durable_seq = c.durable_seq.max(p.seq);
+    }
     let _ = Inode::clone;
 }
 
