@@ -619,6 +619,93 @@ fn readahead_serves_bulk_reads_and_never_stale_data() {
     }
     let (hits, misses) = fs.ra_stats().unwrap();
     assert!(hits > misses, "readahead hits {hits}, misses {misses}");
+    // inode numbers follow the on-disk order (tree copiers open files in inode order)
+    let listing = fs.readdir(resolve(&fs, "/d").unwrap()).unwrap();
+    assert!(listing.windows(2).all(|w| w[0].0 < w[1].0), "inode numbers are not in on-disk order");
+    // a second pass over the directory, later, is prefetched again (re-armed)
+    std::thread::sleep(std::time::Duration::from_millis(3200));
+    let (h1, _) = fs.ra_stats().unwrap();
+    for (i, _, _) in &listing {
+        let size = fs.getattr(*i).unwrap().size;
+        let mut off = 0;
+        while off < size {
+            off += fs.read(*i, off, 128 << 10).unwrap().len() as u64;
+        }
+    }
+    let (h2, _) = fs.ra_stats().unwrap();
+    assert!(h2 - h1 >= listing.len() as u64 / 2, "second pass: only {} hits for {} files", h2 - h1, listing.len());
+    fs.shutdown().unwrap();
+}
+
+/// Counts that would show a regression without timing anything: one fsync of a small file
+/// costs 7 device writes (data, journal, VolumeDirty, bitmap, entry set, clean, journal
+/// IDLE); a commit onto a volume full of holes writes its batch as one stream; a reader
+/// taking 64 KB heads of 2 MB files makes the readahead read heads, not whole files.
+#[test]
+fn device_op_counts() {
+    // fsync: device writes and syncs of one small file's commit
+    let img = image("counts", 64, 4096);
+    let f = File::options().read(true).write(true).open(&img.path).unwrap();
+    let dev = Arc::new(CrashDev::new(f, None));
+    let fs = open_with(&img.path, dev.clone(), manual()).unwrap();
+    let a = fs.create(ROOT, OsStr::new("warm"), true, false).unwrap();
+    fs.write(a.ino, 0, b"journal file created").unwrap();
+    fs.flush().unwrap();
+    let before = dev.ops();
+    let b = fs.create(ROOT, OsStr::new("one.txt"), true, false).unwrap();
+    fs.write(b.ino, 0, &[1u8; 8192]).unwrap();
+    fs.fsync(b.ino).unwrap();
+    let ops = dev.ops() - before; // writes + syncs
+    eprintln!("count: fsync of one small file: {ops} device writes + syncs");
+    assert!(ops <= 14, "one fsync took {ops} device writes and syncs (7 + 7 expected)");
+    fs.shutdown().unwrap();
+    // a volume full of holes: 600 files, every other one deleted, then 300 new files
+    let img = image("holes", 64, 4096);
+    let fs = open(&img.path);
+    let d = fs.mkdir(ROOT, OsStr::new("old")).unwrap();
+    for k in 0..600 {
+        let f = fs.create(d.ino, OsStr::new(&format!("o{k:03}")), true, false).unwrap();
+        fs.write(f.ino, 0, &[7u8; 4096]).unwrap();
+    }
+    fs.flush().unwrap();
+    for k in (0..600).step_by(2) {
+        fs.unlink(d.ino, OsStr::new(&format!("o{k:03}"))).unwrap();
+    }
+    fs.flush().unwrap();
+    fs.shutdown().unwrap();
+    let f = File::options().read(true).write(true).open(&img.path).unwrap();
+    let dev = Arc::new(CrashDev::new(f, None));
+    let fs = open_with(&img.path, dev.clone(), manual()).unwrap();
+    let n = fs.mkdir(ROOT, OsStr::new("new")).unwrap();
+    for k in 0..300 {
+        let f = fs.create(n.ino, OsStr::new(&format!("n{k:03}")), true, false).unwrap();
+        fs.write(f.ino, 0, &[9u8; 4096]).unwrap();
+    }
+    let before = dev.ops();
+    fs.flush().unwrap();
+    let ops = dev.ops() - before;
+    eprintln!("count: 300-file commit onto 300 holes: {ops} device ops");
+    assert!(ops < 40, "a 300-file commit onto a holey volume took {ops} device ops (one per hole before)");
+    fs.shutdown().unwrap();
+    fsck(&img.path);
+    // heads: 64 KB of each of 40 files of 2 MB
+    let img = image("heads", 128, 4096);
+    let fs = open(&img.path);
+    let d = fs.mkdir(ROOT, OsStr::new("photos")).unwrap();
+    for k in 0..40 {
+        let f = fs.create(d.ino, OsStr::new(&format!("p{k:02}.jpg")), true, false).unwrap();
+        fs.write(f.ino, 0, &vec![k as u8; 2 << 20]).unwrap();
+    }
+    fs.shutdown().unwrap();
+    let f = File::options().read(true).write(true).open(&img.path).unwrap();
+    let fs = open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), FsOpts { readahead: true, ..manual() }).unwrap();
+    let dir = resolve(&fs, "/photos").unwrap();
+    for (i, _, _) in fs.readdir(dir).unwrap() {
+        assert_eq!(fs.read(i, 0, 64 << 10).unwrap().len(), 64 << 10);
+    }
+    let read = fs.ra_bytes();
+    eprintln!("count: 64 KB heads of 40 x 2 MB files: readahead read {read} bytes");
+    assert!(read < 16 << 20, "a head reader made the readahead read {read} bytes of 80 MB");
     fs.shutdown().unwrap();
 }
 

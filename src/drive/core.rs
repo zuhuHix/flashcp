@@ -300,7 +300,10 @@ impl Core {
         self.inodes.get_mut(&i).ok_or(libc::ENOENT)
     }
 
-    fn attach_children(&mut self, dir: Ino, dd: DirData, children: Vec<Child>) {
+    fn attach_children(&mut self, dir: Ino, dd: DirData, mut children: Vec<Child>) {
+        // inode numbers in on-disk order: `cp -r` and other tree copiers open files in inode
+        // order, and the prefetcher queues them in on-disk order
+        children.sort_by_key(|c| c.set_off);
         let mut kids = HashMap::with_capacity(children.len());
         for ch in children {
             if dir == ROOT && super::djournal::is_journal(&ch) {
@@ -517,6 +520,7 @@ impl Core {
         if p.kids.as_ref().unwrap().contains_key(&k) {
             return Err(libc::EEXIST);
         }
+        self.dir_writable(parent)?;
         if parent == ROOT && super::djournal::reserved_name(&k, &self.vol.upc) {
             return Err(libc::EINVAL);
         }
@@ -587,6 +591,14 @@ impl Core {
         Ok(())
     }
 
+    /// Access checks the kernel's `default_permissions` made before (the driver mounts without
+    /// it, which saves a GETATTR per created file): a directory with the read-only attribute
+    /// (mode 0555) takes no new, removed or renamed entries.
+    pub(crate) fn dir_writable(&self, d: Ino) -> R<()> {
+        let n = self.ino(d)?;
+        if n.is_dir && d != ROOT && n.attrs & ATTR_RO != 0 { Err(libc::EACCES) } else { Ok(()) }
+    }
+
     pub(crate) fn truncate(&mut self, i: Ino, size: u64) -> R<()> {
         self.writable()?;
         let n = self.ino(i)?;
@@ -613,6 +625,10 @@ impl Core {
 
     pub(crate) fn setattr(&mut self, i: Ino, a: &SetAttr) -> R<Attr> {
         if let Some(s) = a.size {
+            // the read-only attribute forbids any truncation, by path or through a handle
+            if self.ino(i)?.attrs & ATTR_RO != 0 {
+                return Err(libc::EACCES);
+            }
             self.truncate(i, s)?;
         }
         if a.mtime.is_some() || a.atime.is_some() || a.crtime.is_some() || a.mode.is_some() {
@@ -736,6 +752,7 @@ impl Core {
     pub(crate) fn unlink(&mut self, parent: Ino, name: &[u16], dir: bool) -> R<()> {
         self.writable()?;
         let i = self.lookup(parent, name)?;
+        self.dir_writable(parent)?;
         let n = self.ino(i)?;
         if dir && !n.is_dir {
             return Err(libc::ENOTDIR);
@@ -761,6 +778,8 @@ impl Core {
         set::check_name(n2)?;
         let src = self.lookup(p1, n1)?;
         self.load(p2)?;
+        self.dir_writable(p1)?;
+        self.dir_writable(p2)?;
         if !self.ino(p2)?.is_dir {
             return Err(libc::ENOTDIR);
         }

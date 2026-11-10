@@ -24,6 +24,22 @@ fn writable(flags: i32) -> bool {
     flags & libc::O_ACCMODE != libc::O_RDONLY
 }
 
+/// FUSE requests served, by operation (the control socket's `stats`).
+static OPS: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn count(op: &'static str) {
+    *OPS.lock().unwrap_or_else(|e| e.into_inner()).entry(op).or_default() += 1;
+}
+
+/// The request counts as one JSON object.
+pub fn stats_json() -> String {
+    let m = OPS.lock().unwrap_or_else(|e| e.into_inner());
+    let total: u64 = m.values().sum();
+    let parts: Vec<String> = m.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect();
+    format!("{{\"ok\":true,\"requests\":{total},\"ops\":{{{}}}}}", parts.join(","))
+}
+
 const TTL: Duration = Duration::from_secs(1);
 
 type Snap = Arc<Vec<(u64, String, bool)>>;
@@ -78,7 +94,9 @@ impl Adapter {
         cfg.mount_options = vec![
             MountOption::FSName("flashcp".into()),
             MountOption::Subtype("exfat".into()),
-            MountOption::DefaultPermissions,
+            // no DefaultPermissions: it costs a GETATTR of the parent per created file; the
+            // driver makes the same checks itself (read-only attribute, access(2)), and only the
+            // mounting user can reach the mount anyway (no allow_other)
             MountOption::NoAtime,
             MountOption::NoDev,
             MountOption::NoSuid,
@@ -120,15 +138,18 @@ impl Filesystem for Adapter {
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        count("lookup");
         let a = tri!(self.fs.lookup(parent.0, name), reply);
         reply.entry(&TTL, &self.fattr(&a), Generation(0));
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        count("forget");
         self.fs.forget(ino.0, nlookup);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        count("getattr");
         let a = tri!(self.fs.getattr(ino.0), reply);
         reply.attr(&TTL, &self.fattr(&a));
     }
@@ -151,6 +172,7 @@ impl Filesystem for Adapter {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        count("setattr");
         if uid.is_some_and(|u| u != self.uid) || gid.is_some_and(|g| g != self.gid) {
             return reply.error(err(libc::EPERM));
         }
@@ -170,6 +192,7 @@ impl Filesystem for Adapter {
     }
 
     fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+        count("mkdir");
         let a = tri!(self.fs.mkdir(parent.0, name), reply);
         reply.entry(&TTL, &self.fattr(&a), Generation(0));
     }
@@ -184,6 +207,7 @@ impl Filesystem for Adapter {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        count("create");
         let excl = flags & libc::O_EXCL != 0;
         let trunc = flags & libc::O_TRUNC != 0;
         let a = tri!(self.fs.create_handle(parent.0, name, excl, trunc, writable(flags)), reply);
@@ -191,6 +215,7 @@ impl Filesystem for Adapter {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        count("open");
         let write = writable(flags.0);
         let trunc = flags.0 & libc::O_TRUNC != 0;
         tri!(self.fs.open(ino.0, write, trunc), reply);
@@ -209,6 +234,7 @@ impl Filesystem for Adapter {
         _lock: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        count("read");
         let d = tri!(self.fs.read(ino.0, offset, size), reply);
         reply.data(&d);
     }
@@ -225,11 +251,13 @@ impl Filesystem for Adapter {
         _lock: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        count("write");
         let n = tri!(self.fs.write(ino.0, offset, data), reply);
         reply.written(n);
     }
 
     fn flush(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _lock: LockOwner, reply: ReplyEmpty) {
+        count("flush");
         // ENOSYS makes the kernel stop sending FLUSH (a round trip per close saved). Nothing is
         // committed on close anyway: durability is fsync, idle, or the control socket.
         reply.error(err(libc::ENOSYS));
@@ -245,21 +273,25 @@ impl Filesystem for Adapter {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        count("release");
         self.fs.release_handle(ino.0, writable(flags.0));
         reply.ok();
     }
 
     fn fsync(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        count("fsync");
         tri!(self.fs.fsync(ino.0), reply);
         reply.ok();
     }
 
     fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        count("fsyncdir");
         tri!(self.fs.flush().map_err(|_| libc::EIO), reply);
         reply.ok();
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        count("opendir");
         let v = tri!(self.fs.readdir(ino.0), reply);
         let mut g = self.next_dir.lock().unwrap();
         g.0 += 1;
@@ -269,6 +301,7 @@ impl Filesystem for Adapter {
     }
 
     fn readdir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+        count("readdir");
         let Some(snap) = self.next_dir.lock().unwrap().1.get(&fh.0).cloned() else {
             return reply.error(err(libc::EBADF));
         };
@@ -292,6 +325,7 @@ impl Filesystem for Adapter {
     }
 
     fn readdirplus(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, mut reply: ReplyDirectoryPlus) {
+        count("readdirplus");
         let Some(snap) = self.next_dir.lock().unwrap().1.get(&fh.0).cloned() else {
             return reply.error(err(libc::EBADF));
         };
@@ -322,16 +356,19 @@ impl Filesystem for Adapter {
     }
 
     fn releasedir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
+        count("releasedir");
         self.next_dir.lock().unwrap().1.remove(&fh.0);
         reply.ok();
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        count("unlink");
         tri!(self.fs.unlink(parent.0, name), reply);
         reply.ok();
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        count("rmdir");
         tri!(self.fs.rmdir(parent.0, name), reply);
         reply.ok();
     }
@@ -346,6 +383,7 @@ impl Filesystem for Adapter {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        count("rename");
         if flags.contains(RenameFlags::RENAME_WHITEOUT) {
             return reply.error(err(libc::EINVAL));
         }
@@ -357,7 +395,22 @@ impl Filesystem for Adapter {
         reply.ok();
     }
 
+    fn access(&self, _req: &Request, ino: INodeNo, mask: fuser::AccessFlags, reply: ReplyEmpty) {
+        count("access");
+        // what default_permissions checked against the modes the driver reports (0644/0755,
+        // 0444/0555 with the read-only attribute): write needs the attribute clear, execute
+        // a directory (regular files are never executable)
+        let a = tri!(self.fs.getattr(ino.0), reply);
+        if mask.contains(fuser::AccessFlags::W_OK) && a.read_only
+            || mask.contains(fuser::AccessFlags::X_OK) && !a.is_dir
+        {
+            return reply.error(err(libc::EACCES));
+        }
+        reply.ok();
+    }
+
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        count("statfs");
         let s = self.fs.statfs();
         reply.statfs(s.blocks, s.bfree, s.bfree, s.files, s.files, s.bsize, s.namelen, s.bsize);
     }
@@ -386,18 +439,22 @@ impl Filesystem for Adapter {
         _position: u32,
         reply: ReplyEmpty,
     ) {
+        count("setxattr");
         reply.error(err(libc::ENOSYS));
     }
 
     fn getxattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, _size: u32, reply: ReplyXattr) {
+        count("getxattr");
         reply.error(err(libc::ENOSYS));
     }
 
     fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
+        count("listxattr");
         reply.error(err(libc::ENOSYS));
     }
 
     fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        count("removexattr");
         reply.error(err(libc::ENOSYS));
     }
 }

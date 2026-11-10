@@ -550,3 +550,119 @@ fn sync_is_not_forwarded_but_closing_commits() {
     m.unmount();
     fsck(&img);
 }
+
+fn errno<T>(r: std::io::Result<T>) -> Option<i32> {
+    r.err().and_then(|e| e.raw_os_error())
+}
+
+/// The mount runs without `default_permissions` (which cost a GETATTR per created file), so
+/// the driver makes the checks the kernel made against the modes it reports (0644/0755,
+/// 0444/0555 with the read-only attribute). One assertion per check.
+#[test]
+fn permission_checks_without_default_permissions() {
+    if !gate() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let d = Dir::new("perm");
+    let img = image(&d, 64);
+    let m = Mount::start(&d, &img, &[]);
+    let (f, rd) = (m.mnt.join("ro.txt"), m.mnt.join("rodir"));
+    std::fs::write(&f, b"read only").unwrap();
+    std::fs::create_dir(&rd).unwrap();
+    std::fs::write(rd.join("inside"), b"x").unwrap();
+    std::fs::create_dir(rd.join("sub")).unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+    std::fs::set_permissions(&rd, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let eacces = Some(libc::EACCES);
+    // 1. open for writing a read-only file
+    assert_eq!(errno(std::fs::OpenOptions::new().write(true).open(&f)), eacces);
+    // 2. truncate by path a read-only file
+    let c = std::ffi::CString::new(f.clone().into_os_string().into_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::truncate(c.as_ptr(), 0) }, -1);
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), eacces);
+    // 2b. O_RDONLY|O_TRUNC, O_CREAT|O_TRUNC on the existing file, and ftruncate through a handle
+    //     opened for writing before the attribute was set: no truncation in any of them
+    let raw = |flags: i32| unsafe { libc::open(c.as_ptr(), flags, 0o644) };
+    assert_eq!(raw(libc::O_RDONLY | libc::O_TRUNC), -1);
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), eacces);
+    assert_eq!(raw(libc::O_RDONLY | libc::O_CREAT | libc::O_TRUNC), -1);
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), eacces);
+    let g = m.mnt.join("held-open.txt");
+    let held = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&g).unwrap();
+    std::io::Write::write_all(&mut &held, b"keep me").unwrap();
+    std::fs::set_permissions(&g, std::fs::Permissions::from_mode(0o444)).unwrap();
+    assert_eq!(errno(held.set_len(0)), eacces);
+    drop(held);
+    assert_eq!(std::fs::read(&g).unwrap(), b"keep me");
+    assert_eq!(std::fs::read(&f).unwrap(), b"read only");
+    // 3. create and 4. mkdir in a read-only directory
+    assert_eq!(errno(std::fs::write(rd.join("new"), b"n")), eacces);
+    assert_eq!(errno(std::fs::create_dir(rd.join("newdir"))), eacces);
+    // 5. unlink and 6. rmdir in it
+    assert_eq!(errno(std::fs::remove_file(rd.join("inside"))), eacces);
+    assert_eq!(errno(std::fs::remove_dir(rd.join("sub"))), eacces);
+    // 7. rename out of it and into it
+    assert_eq!(errno(std::fs::rename(rd.join("inside"), m.mnt.join("out"))), eacces);
+    std::fs::write(m.mnt.join("w.txt"), b"w").unwrap();
+    assert_eq!(errno(std::fs::rename(m.mnt.join("w.txt"), rd.join("w.txt"))), eacces);
+    // 8. access(2): W_OK on read-only objects, X_OK on files
+    let acc = |p: &Path, mode| {
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        unsafe { libc::access(c.as_ptr(), mode) }
+    };
+    assert_eq!(acc(&f, libc::W_OK), -1);
+    assert_eq!(acc(&rd, libc::W_OK), -1);
+    assert_eq!(acc(&m.mnt.join("w.txt"), libc::W_OK), 0);
+    assert_eq!(acc(&m.mnt.join("w.txt"), libc::X_OK), -1);
+    assert_eq!(acc(&rd, libc::X_OK), 0);
+    // 9. executing a file (never executable): the kernel still refuses that itself
+    assert_eq!(errno(Command::new(m.mnt.join("w.txt")).status()), eacces);
+    // 10. chown to someone else
+    let c = std::ffi::CString::new(m.mnt.join("w.txt").into_os_string().into_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::chown(c.as_ptr(), 0, 0) }, -1);
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+    // reads still work, and the attribute comes off again
+    assert_eq!(std::fs::read(&f).unwrap(), b"read only");
+    std::fs::set_permissions(&rd, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(rd.join("new"), b"n").unwrap();
+    m.unmount();
+    fsck(&img);
+}
+
+/// FUSE requests per file, from the driver's own counters (`stats`): creating files costs
+/// LOOKUP, CREATE, WRITE, RELEASE (no GETATTR since default_permissions is gone); reading
+/// them back OPEN, READ, RELEASE.
+#[test]
+fn fuse_requests_per_file() {
+    if !gate() {
+        return;
+    }
+    let d = Dir::new("reqs");
+    let img = image(&d, 64);
+    let src = d.p("src/tree");
+    std::fs::create_dir_all(&src).unwrap();
+    for k in 0..300 {
+        std::fs::write(src.join(format!("f{k:03}")), vec![k as u8; 3000]).unwrap();
+    }
+    let total = |m: &Mount| -> f64 {
+        let s = m.ctl("stats");
+        let k = s.find("\"requests\":").unwrap() + 11;
+        s[k..].split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap()
+    };
+    let m = Mount::start(&d, &img, &[]);
+    let base = total(&m);
+    run(Command::new("cp").arg("-r").arg(&src).arg(&m.mnt));
+    let per_create = (total(&m) - base) / 300.0;
+    let s = m.ctl("stats");
+    m.unmount();
+    assert!(per_create <= 4.2, "{per_create:.2} requests per created file (was 5.04): {s}");
+    let m = Mount::start(&d, &img, &[]);
+    let base = total(&m);
+    let out = d.p("out");
+    run(Command::new("cp").arg("-r").arg(m.mnt.join("tree")).arg(&out));
+    let per_read = (total(&m) - base) / 300.0;
+    m.unmount();
+    assert!(per_read <= 3.2, "{per_read:.2} requests per file read");
+    eprintln!("requests per created file {per_create:.2}, per read file {per_read:.2}");
+}

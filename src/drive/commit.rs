@@ -127,6 +127,11 @@ struct Planner<'a> {
     dead_dirs: HashSet<Ino>,
     files: u64,
     bytes: u64,
+    /// Free extents reserved for everything this commit allocates without a preferred
+    /// position (one extent that holds the whole batch when there is one, else the fewest
+    /// large ones), carved in order: the batch's data is one sequential stream instead of
+    /// one hole per file.
+    arena: VecDeque<(u64, u64)>,
 }
 
 fn holes_of(data: &[u8], end: usize) -> Vec<(usize, usize)> {
@@ -173,6 +178,17 @@ impl Planner<'_> {
                 }
                 return Ok(runs);
             }
+        }
+        // the commit's arena first: its new data goes out as one stream
+        if self.arena.iter().map(|e| e.1).sum::<u64>() >= n {
+            let runs = crate::add::carve(&mut self.arena, n);
+            self.alloc_runs.extend(runs.iter().copied());
+            return Ok(runs);
+        }
+        // the estimate was short: what is left of the arena is free space again
+        if !self.arena.is_empty() {
+            self.free.extend(self.arena.drain(..));
+            self.free.sort_unstable();
         }
         let chosen = crate::add::choose_extents(&self.free, n)
             .ok_or_else(|| anyhow::anyhow!("no space left on the volume ({n} clusters needed)"))?;
@@ -628,6 +644,7 @@ pub(crate) fn plan(c: &mut Core, limit: Option<usize>) -> Result<Option<Plan>> {
         dead_dirs: HashSet::new(),
         files: 0,
         bytes: 0,
+        arena: VecDeque::new(),
     };
     let seq = p.c.seq;
     // ── removals (unlinked) and moves away (the old set goes) ──
@@ -670,6 +687,29 @@ pub(crate) fn plan(c: &mut Core, limit: Option<usize>) -> Result<Option<Plan>> {
         .filter(|i| p.c.inodes[i].linked && !p.c.inodes[i].is_dir && p.c.inodes[i].data_dirty)
         .collect();
     files.sort_by_cached_key(|&i| p.c.path(i));
+    // reserve the arena: an upper bound of what the batch allocates (changed files whole, new
+    // directories with their entries); only clusters free before the commit, as always
+    let cs = p.cs();
+    let mut total: u64 = files.iter().map(|i| p.c.inodes[i].size.div_ceil(cs)).sum();
+    let mut new_dirs: HashMap<Ino, u64> = HashMap::new();
+    for &i in &work {
+        let n = &p.c.inodes[&i];
+        if n.linked && n.is_dir && n.disk.is_none() {
+            new_dirs.entry(i).or_insert(0);
+        }
+        if n.linked && p.c.inodes.get(&n.parent).is_some_and(|d| d.disk.is_none() && n.parent != ROOT) {
+            *new_dirs.entry(n.parent).or_insert(0) += set::set_bytes(n.name.len()) as u64;
+        }
+    }
+    total += new_dirs.values().map(|b| b.div_ceil(cs).max(1)).sum::<u64>();
+    if total > 0
+        && let Some(ch) = crate::add::choose_extents(&p.free, total)
+    {
+        for &(s, l) in &ch {
+            ensure!(crate::add::take_exact(&mut p.free, s, l), "internal error: arena outside free space");
+        }
+        p.arena = ch.into_iter().collect();
+    }
     for i in files {
         let l = p.plan_file(i)?;
         lays.insert(i, l);
