@@ -14,7 +14,7 @@ sandbox() {
   truncate -s 64M "$w/img"; mkfs.exfat -L SANDBOX "$w/img" >/dev/null
   local loop; loop=$(losetup --find --show "$w/img")
   local made_bin=""; [ -e /usr/bin/flashcp ] || { touch /usr/bin/flashcp; made_bin=1; }
-  trap 'umount /usr/bin/flashcp 2>/dev/null; [ -n "'"$made_bin"'" ] && rm -f /usr/bin/flashcp; losetup -d '"$loop"'; rm -rf '"$w" RETURN
+  trap 'umount /usr/bin/flashcp 2>/dev/null || true; if [ -n "'"$made_bin"'" ]; then rm -f /usr/bin/flashcp; fi; losetup -d '"$loop"' || true; rm -rf '"$w" RETURN
   local uid=4242
   echo "kernel $(uname -r), LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unknown), $(systemctl --version | head -1)"
   # The helper runs like udev runs it: in a unit with systemd-udevd.service's seccomp filter and
