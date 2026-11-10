@@ -110,6 +110,33 @@ pub(crate) fn le64(b: &[u8], o: usize) -> u64 {
 }
 
 impl Vol {
+    /// A copy of the geometry with its own handle on the device (no caches, bitmap,
+    /// directories or up-case table), for reads and offsets on another thread.
+    pub(crate) fn view(&self) -> Result<Vol> {
+        Ok(Vol {
+            dev: self.dev.try_clone().context("dup the device handle")?,
+            dev_len: self.dev_len,
+            bps: self.bps,
+            cs: self.cs,
+            fat_off: self.fat_off,
+            heap_off: self.heap_off,
+            cc: self.cc,
+            flags: self.flags,
+            sector0: self.sector0.clone(),
+            vol_bytes: self.vol_bytes,
+            fat_cache: HashMap::new(),
+            fat_order: Default::default(),
+            kept: HashMap::new(),
+            bitmap: Vec::new(),
+            bitmap_clusters: self.bitmap_clusters.clone(),
+            upcase_clusters: Vec::new(),
+            upc: Vec::new(),
+            label: String::new(),
+            dirs: Vec::new(),
+            tolerate_dups: self.tolerate_dups,
+        })
+    }
+
     pub(crate) fn read_at(&self, off: u64, len: u64) -> Result<Vec<u8>> {
         ensure!(
             off.checked_add(len).is_some_and(|e| e <= self.dev_len),
@@ -136,6 +163,12 @@ impl Vol {
         read_bitmap: bool,
         tolerate_dups: bool,
     ) -> Result<Vol> {
+        let v = Vol::open_boot(dev, dev_len, allow_dirty, tolerate_dups)?;
+        Vol::open_rest(v, read_bitmap)
+    }
+
+    /// Parses and validates the boot region only (no directory is read).
+    pub(crate) fn open_boot(dev: File, dev_len: u64, allow_dirty: bool, tolerate_dups: bool) -> Result<Vol> {
         ensure!(dev_len >= 24 * 512, "target is too small to hold an exFAT volume");
         let mut s0 = vec![0u8; 512];
         crate::sim::trace::serial(crate::sim::trace::Op::Read, 0, 512, || dev.read_exact_at(&mut s0, 0))
@@ -182,7 +215,7 @@ impl Vol {
             allow_dirty || flags & FLAG_DIRTY == 0,
             "volume is marked dirty (still mounted, or not cleanly unmounted); unmount it or run fsck.exfat first"
         );
-        let mut v = Vol {
+        let v = Vol {
             dev,
             dev_len,
             bps,
@@ -204,6 +237,12 @@ impl Vol {
             dirs: Vec::new(),
             tolerate_dups,
         };
+        Ok(v)
+    }
+
+    fn open_rest(mut v: Vol, read_bitmap: bool) -> Result<Vol> {
+        let (cs, cc, tolerate_dups) = (v.cs, v.cc, v.tolerate_dups);
+        let root = le32(&v.sector0, 96);
         let root_clusters = v.chain(root, "root directory", MAX_DIR_BYTES / cs)?;
         ensure!(root_clusters.len() as u64 * cs <= MAX_DIR_BYTES, "root directory is larger than 256 MB");
         let data = v.read_clusters(&root_clusters, root_clusters.len() as u64 * cs)?;
