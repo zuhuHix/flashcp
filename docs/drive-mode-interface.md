@@ -201,7 +201,7 @@ again with `flashcp mount`. One JSON object per line on stdout:
 
 ```text
 {"event":"plan","op":"recluster","cluster":N,"new_cluster":N,"files":N,"dirs":N,"bytes":N,
- "write_bytes":N,"move_bytes":N,"est_secs":F,"free":N,"free_after":N,"switches":1|2}
+ "write_bytes":N,"move_bytes":N,"est_secs":F,"free":N,"free_after":N,"fragmented":N,"switches":1|2}
 {"event":"progress","op":"recluster","bytes_done":N,"bytes_total":N}      at most ~10 per second
 {"event":"switched","op":"recluster","step":"relocated"|"reclustered","cluster":N}
 {"event":"done","op":"recluster","changed":B,"cluster":N,"old_cluster":N,"written":N,"free":N,
@@ -212,7 +212,8 @@ again with `flashcp mount`. One JSON object per line on stdout:
 
 - `plan` comes before the first write (`--dry-run` stops after it): `bytes` is the file data
   on the volume, `write_bytes` everything that will be written, `move_bytes` the file data
-  that has to make room for the new FAT, `est_secs` the estimate for the progress bar.
+  that has to make room for the new FAT, `est_secs` the estimate for the progress bar,
+  `fragmented` the files that are in more than one piece (they stay so).
 - `switched` marks a commit point. After `"step":"reclustered"` the volume has the new cluster
   size; `"relocated"` (only when `switches` is 2) is the intermediate one: still the old
   cluster size, the room for the new FAT is free.

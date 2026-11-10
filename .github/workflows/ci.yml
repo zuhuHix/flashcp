@@ -115,6 +115,103 @@ jobs:
           sudo diff -r src-tree /mnt/flashcp/kernel-copy
           sudo diff -r src-tree "/mnt/flashcp/added/by flashcp"
           sudo umount /mnt/flashcp
+      - name: Recluster a kernel-populated 128 KB volume in place; the kernel must read, write and accept it
+        run: |
+          set -eux
+          F=./target/release/flashcp
+          rm -f recl.img recl.before
+          truncate -s 2G recl.img
+          mkfs.exfat -c 128K recl.img
+          sudo mkdir -p /mnt/flashcp
+          sudo mount -o loop recl.img /mnt/flashcp
+          sudo cp -r src-tree /mnt/flashcp/kernel-copy
+          sudo umount /mnt/flashcp
+          # --check says yes (exit 0); --dry-run must not touch the image
+          $F recluster --check recl.img
+          cp --sparse=always recl.img recl.before
+          $F recluster --dry-run recl.img
+          cmp recl.img recl.before
+          rm -f recl.before
+          # the real run: file data lay where the bigger FAT has to go, so it moves first (2 switches)
+          $F recluster recl.img --json | tee recl.log
+          grep -q '"switches":2' recl.log
+          grep -q '"event":"done".*"changed":true' recl.log
+          fsck.exfat -n recl.img
+          $F info recl.img --json | tee recl-info.json
+          grep -q '"cluster":4096' recl-info.json
+          sudo mount -o loop,ro recl.img /mnt/flashcp
+          sudo diff -r src-tree /mnt/flashcp/kernel-copy
+          sudo umount /mnt/flashcp
+          # the kernel writes to it: add a copy, remove a directory, check again
+          sudo mount -o loop recl.img /mnt/flashcp
+          sudo cp -r src-tree /mnt/flashcp/after
+          sudo rm -r "/mnt/flashcp/kernel-copy/ünïcødé 日本語"
+          sudo umount /mnt/flashcp
+          fsck.exfat -n recl.img
+          sudo mount -o loop,ro recl.img /mnt/flashcp
+          sudo diff -r src-tree /mnt/flashcp/after
+          sudo umount /mnt/flashcp
+          # flashcp itself accepts the result
+          $F add src-tree recl.img --to "added after"
+          fsck.exfat -n recl.img
+          sudo mount -o loop,ro recl.img /mnt/flashcp
+          sudo diff -r src-tree "/mnt/flashcp/added after"
+          sudo diff -r src-tree /mnt/flashcp/after
+          sudo umount /mnt/flashcp
+          rm -f recl.img recl.log recl-info.json
+      - name: Recluster a fragmented 32 KB volume (FAT chains) with --fat full
+        run: |
+          set -eux
+          F=./target/release/flashcp
+          rm -f frag.img
+          truncate -s 1G frag.img
+          mkfs.exfat -c 32K frag.img
+          sudo mkdir -p /mnt/flashcp
+          sudo mount -o loop frag.img /mnt/flashcp
+          # the volume filled with 8-cluster files, every other one deleted, the tree copied into the holes
+          sudo bash scripts/xos/recluster_images.sh fragfill /mnt/flashcp src-tree 32768
+          sudo umount /mnt/flashcp
+          fsck.exfat -n frag.img
+          sudo mount -o loop,ro frag.img /mnt/flashcp
+          sudo diff -r src-tree /mnt/flashcp
+          sudo umount /mnt/flashcp
+          $F recluster --check frag.img
+          $F recluster frag.img --fat full --json | tee frag.log
+          grep -q '"event":"done".*"changed":true' frag.log
+          grep -q '"fragmented":[1-9]' frag.log
+          fsck.exfat -n frag.img
+          $F info frag.img --json | grep -q '"cluster":4096'
+          sudo mount -o loop,ro frag.img /mnt/flashcp
+          sudo diff -r src-tree /mnt/flashcp
+          sudo umount /mnt/flashcp
+          rm -f frag.img frag.log
+      - name: Recluster a volume that holds a file over 4 GiB
+        run: |
+          set -eux
+          F=./target/release/flashcp
+          rm -f huge.img
+          truncate -s 6G huge.img
+          mkfs.exfat -c 128K huge.img
+          sudo mkdir -p /mnt/flashcp
+          sudo mount -o loop huge.img /mnt/flashcp
+          sudo cp -r src-tree /mnt/flashcp/tree
+          # real data at the start, across the 4 GiB mark and at the end; the kernel fills the gaps
+          for seek in 0 4095 4299; do
+            sudo dd if=/dev/urandom of=/mnt/flashcp/huge.bin bs=1M count=1 seek="$seek" conv=notrunc
+          done
+          sudo ls -l /mnt/flashcp/huge.bin
+          before=$(sudo sha256sum /mnt/flashcp/huge.bin | cut -d' ' -f1)
+          sudo umount /mnt/flashcp
+          $F recluster --check huge.img
+          $F recluster huge.img --json | tee huge.log
+          grep -q '"event":"done".*"changed":true' huge.log
+          fsck.exfat -n huge.img
+          sudo mount -o loop,ro huge.img /mnt/flashcp
+          after=$(sudo sha256sum /mnt/flashcp/huge.bin | cut -d' ' -f1)
+          [ "$before" = "$after" ]
+          sudo diff -r src-tree /mnt/flashcp/tree
+          sudo umount /mnt/flashcp
+          rm -f huge.img huge.log
       - name: Pull from the built and the kernel-populated volumes, diff
         run: |
           set -eux

@@ -167,6 +167,8 @@ pub struct Plan {
     pub est_secs: f64,
     pub free_before: u64,
     pub free_after: u64,
+    /// Files that are in more than one piece (they keep their FAT chains).
+    pub fragmented: u64,
     /// Two switches (data has to move out of the zone first) instead of one.
     pub relocate: bool,
     pub detail: String,
@@ -209,7 +211,7 @@ impl Event {
     pub fn to_json(&self) -> String {
         match self {
             Event::Plan(p) => format!(
-                r#"{{"event":"plan","op":"recluster","cluster":{},"new_cluster":{},"files":{},"dirs":{},"bytes":{},"write_bytes":{},"move_bytes":{},"est_secs":{:.1},"free":{},"free_after":{},"switches":{}}}"#,
+                r#"{{"event":"plan","op":"recluster","cluster":{},"new_cluster":{},"files":{},"dirs":{},"bytes":{},"write_bytes":{},"move_bytes":{},"est_secs":{:.1},"free":{},"free_after":{},"fragmented":{},"switches":{}}}"#,
                 p.old_cluster,
                 p.cluster,
                 p.files,
@@ -220,6 +222,7 @@ impl Event {
                 p.est_secs,
                 p.free_before,
                 p.free_after,
+                p.fragmented,
                 if p.relocate { 2 } else { 1 }
             ),
             Event::Progress { bytes_done, bytes_total } => format!(
@@ -1746,6 +1749,7 @@ pub(crate) fn run_on(
         est_secs,
         free_before,
         free_after,
+        fragmented: t.objs.iter().filter(|o| !o.is_dir && o.runs.len() > 1).count() as u64,
         relocate,
         detail,
     }));
