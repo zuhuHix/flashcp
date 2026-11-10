@@ -429,7 +429,7 @@ impl Io {
         }
     }
 
-    fn start_driver(&mut self, dev: String, mountpoint: String, label: String) {
+    fn start_driver(&mut self, dev: String, mountpoint: String, _label: String) {
         // A driver that died leaves its FUSE mount behind ("transport endpoint is not connected").
         if is_mountpoint(Path::new(&mountpoint)) {
             let _ = run_ok("fusermount3", &["-u", "-z", &mountpoint]);
@@ -438,7 +438,6 @@ impl Io {
         let spawned = Command::new(&self.env.flashcp)
             .args(["mount", &dev, &mountpoint, "--json", "--control"])
             .arg(&sock)
-            .args(["--label-hint", &label])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn();
