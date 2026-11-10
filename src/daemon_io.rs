@@ -382,8 +382,9 @@ impl Io {
             Action::KernelEject { dev, disk } => {
                 let u = self.env.udisksctl.clone();
                 self.send_later(move || match run_ok(&u, &["unmount", "-b", &dev, "--no-user-interaction"]) {
-                    Err(error) => Input::KernelUnmountFailed { dev, error },
-                    Ok(_) => {
+                    // Not mounted (the eject of a drive nobody serves): straight to power-off.
+                    Err(error) if !error.contains("NotMounted") => Input::KernelUnmountFailed { dev, error },
+                    _ => {
                         let ok = run_ok(&u, &["power-off", "-b", &disk, "--no-user-interaction"]).is_ok();
                         Input::PoweredOff { dev, ok }
                     }

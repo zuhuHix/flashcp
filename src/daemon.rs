@@ -291,6 +291,8 @@ pub enum State {
     Done {
         safe: bool,
     },
+    /// Eject of a drive nobody of ours serves: `--check` looks for holders and mounts first.
+    EjectChecking,
     Failed {
         message: String,
     },
@@ -338,7 +340,7 @@ impl Drive {
             State::MakingMountpoint | State::Starting => "starting",
             State::Mounted if self.dirty() => "saving",
             State::Mounted => "ready",
-            State::Ejecting | State::Unmounting => "ejecting",
+            State::Ejecting | State::Unmounting | State::EjectChecking => "ejecting",
             State::Stopping(_) => "stopping",
             State::KernelMounting { .. } => "mounting",
             State::Kernel { read_only: true } => "read_only",
@@ -396,9 +398,11 @@ impl Core {
                             out.push(Action::StopDriver { dev: d.info.dev.clone() });
                         }
                         // Hidden from udisks but not served: hand it back now.
-                        State::Checking | State::BusyWait { .. } | State::MakingMountpoint | State::Failed { .. } => {
-                            out.push(Action::Rescan { dev: d.info.dev.clone() })
-                        }
+                        State::Checking
+                        | State::BusyWait { .. }
+                        | State::MakingMountpoint
+                        | State::EjectChecking
+                        | State::Failed { .. } => out.push(Action::Rescan { dev: d.info.dev.clone() }),
                         _ => {}
                     }
                 }
@@ -462,13 +466,12 @@ impl Core {
                         d.state = State::Done { safe: true };
                         out.push(Action::KernelEject { dev, disk: d.info.disk.clone() });
                     }
-                    // Nothing of ours is mounted: just power it off (not while busy: someone
-                    // else holds the device and may be writing).
+                    // Nothing of ours is mounted, but someone else may hold the device (the busy
+                    // retries ran out) or have mounted it since: re-check holders and mounts first,
+                    // then eject through udisks (unmount + power off), never a bare power-off.
                     State::Done { .. } | State::Failed { .. } if !sibling_active => {
-                        if d.state != (State::Done { safe: true }) {
-                            d.state = State::Done { safe: false };
-                        }
-                        out.push(Action::PowerOff { dev, disk: d.info.disk.clone() });
+                        d.state = State::EjectChecking;
+                        out.push(Action::Check { dev });
                     }
                     _ => {}
                 }
@@ -567,6 +570,22 @@ impl Core {
     fn check_exit(&mut self, dev: &str, code: i32, reason: Option<String>, out: &mut Vec<Action>) {
         let enabled = self.enabled && !self.shutting_down;
         let Some(d) = self.drives.get_mut(dev) else { return };
+        if d.state == State::EjectChecking {
+            if code == exit::BUSY {
+                out.push(notify(
+                    d,
+                    "removed",
+                    format!("{} is in use by another program", d.info.name()),
+                    "It was not ejected. Close the program using it, then try again.".into(),
+                    Urgency::Normal,
+                ));
+                d.state = State::Failed { message: "in use by another program".into() };
+            } else {
+                d.state = State::Done { safe: true };
+                out.push(Action::KernelEject { dev: dev.into(), disk: d.info.disk.clone() });
+            }
+            return;
+        }
         if d.state != State::Checking {
             return;
         }
@@ -1176,6 +1195,12 @@ mod tests {
                     (check(D, 4), "timer 10000", "busy"),
                     (Input::Timer { dev: D.into(), seq: 3 }, "check /dev/sdb1", "checking"),
                     (check(D, 4), "notify /dev/sdb1:failed", "failed"),
+                    // Eject after the retries ran out: re-check first; still held → refused.
+                    (Input::Eject { dev: D.into() }, "check /dev/sdb1", "ejecting"),
+                    (check(D, 4), "notify /dev/sdb1:removed", "failed"),
+                    // Released since: the udisks path (unmount + power off), never a bare power-off.
+                    (Input::Eject { dev: D.into() }, "check /dev/sdb1", "ejecting"),
+                    (check(D, 0), "kernel-eject /dev/sdb1 /dev/sdb", "safe_to_remove"),
                 ],
             ),
             (
