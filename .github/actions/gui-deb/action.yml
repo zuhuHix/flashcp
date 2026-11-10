@@ -68,12 +68,18 @@ runs:
           ./usr/share/kio/servicemenus/flashcp.desktop \
           ./usr/share/kio/servicemenus/flashcp-pull.desktop \
           ./usr/share/nautilus-python/extensions/flashcp_nautilus.py \
+          ./usr/libexec/flashcp-mountpoint \
+          ./usr/libexec/flashcp-udev-check \
+          ./usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.mountpoint.policy \
+          ./usr/lib/udev/rules.d/61-flashcp-drive-mode.rules \
+          ./usr/lib/systemd/user/flashcp-drived.service \
+          ./usr/lib/systemd/user-preset/80-flashcp-drived.preset \
           ./usr/bin/flashcp-gui; do
           # Tauri's tar lists paths without a leading "./"; accept both spellings.
           awk '{print $NF}' contents.txt | sed 's#^\./##' | grep -qxF "${path#./}" || { echo "::error::missing $path"; exit 1; }
         done
         # The helper runs as root through pkexec, so it must be root-owned and not writable by others.
-        for bin in flashcp-helper flashcp-trust; do
+        for bin in flashcp-helper flashcp-trust flashcp-mountpoint flashcp-udev-check; do
           grep -qE "^-rwxr-xr-x (root/root|0/0) .* (\./)?usr/libexec/$bin\$" contents.txt
         done
         # The packaged helper knows optimize and refuses a caller-chosen temp dir.
@@ -86,7 +92,16 @@ runs:
         echo "$ok" | grep -q "must be started via pkexec"
         test "$bad_code" -eq 3
         echo "$bad" | grep -q "unexpected argument for optimize"
-        rm -rf pkg contents.txt
+        # Drive mode: the maintainer scripts are there and the root helpers refuse odd input.
+        for script in postinst prerm postrm; do
+          dpkg-deb --ctrl-tarfile "$deb" | tar -t | grep -qE "^(\./)?$script\$" || { echo "::error::no $script"; exit 1; }
+        done
+        test -z "$(pkg/usr/libexec/flashcp-udev-check /etc/passwd)"
+        set +e
+        pkg/usr/libexec/flashcp-mountpoint create X > mp.out; mp_code=$?
+        set -e
+        test "$mp_code" -eq 3
+        rm -rf pkg contents.txt mp.out
         # The package must pull in the CLI.
         dpkg-deb -f "$deb" Depends | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -qx 'flashcp'
         echo "deb=$deb" >> "$GITHUB_OUTPUT"

@@ -1,12 +1,15 @@
 # flashcp desktop: security notes
 
-`flashcp-gui` runs as the logged-in user. Writing a block device needs more than that, so two
-small programs run as root via pkexec. Source for both: `gui/helper/`.
+`flashcp-gui` runs as the logged-in user. Writing a block device needs more than that, so a few
+small programs run as root via pkexec, and drive mode adds one that udev runs. Source for all:
+`gui/helper/`.
 
 | Program | polkit action | Defaults (any / inactive / active) |
 | --- | --- | --- |
 | `/usr/libexec/flashcp-helper` | `io.github.zuhuhix.flashcp.helper` | `auth_admin` / `auth_admin` / `auth_admin_keep` |
 | `/usr/libexec/flashcp-trust` | `io.github.zuhuhix.flashcp.trust` | `auth_admin` / `auth_admin` / `auth_admin` |
+| `/usr/libexec/flashcp-mountpoint` | `io.github.zuhuhix.flashcp.mountpoint` | `no` / `no` / `yes` |
+| `/usr/libexec/flashcp-udev-check` | none (run by udev, `61-flashcp-drive-mode.rules`) | — |
 
 ## The guarantee
 
@@ -22,6 +25,15 @@ disk behind a USB bridge (some laptops and NAS boards wire card readers or even 
 is a USB device. So is a malicious USB device that copies the serial, model and size of a
 drive that was trusted. Such a disk is blocked by the trust step and the defence-in-depth
 checks below, not by the USB check. See "Residual risks".
+
+**Drive mode changes this for USB exFAT drives.** While the logged-in seat user's
+`flashcp-drived` runs with "Speed up USB drives" on, every USB exFAT partition that flashcp can
+serve is handed to that user read-write (udev's `uaccess` ACL on the device node), without the
+trust step: the FUSE driver runs as the user. This is the same reach the user already has
+through udisks for such a drive (mount it read-write, or reformat it, with no password in an
+active session), but it is raw block access. Internal disks, non-USB disks, non-exFAT
+partitions, and every drive while drive mode is off (per user, or `flashcp drive-mode off
+--system`) keep the guarantee above. See "Drive mode: flashcp-udev-check".
 
 ## Assets
 
@@ -291,6 +303,89 @@ LSMs) for another user. Instead:
 
 The GUI refuses a destination inside the drive's own mount point, and runs the
 not-empty/skip/overwrite dialog as the user, but none of that is a security boundary.
+
+## flashcp-mountpoint (drive mode)
+
+Drive mode serves a USB exFAT partition through a per-user FUSE mount and wants it at
+`/media/$USER/<LABEL>`, where udisks puts drives and file managers look. `/media/$USER` is
+`root:root 0750` with an ACL for the user, so the user cannot create the directory. Source:
+`gui/helper/src/mountpoint.rs`. Polkit allows it for an active local session without a
+password (`allow_active=yes`, the level of udisks' own `filesystem-mount`); remote and
+inactive sessions are refused.
+
+**What it can do.** `create <NAME>` and `remove <NAME>`, nothing else: make an empty `0700`
+directory owned by the caller at `/media/<caller>/<NAME>` (or `NAME1`..`NAME99` if taken, as
+udisks does), create `/media/<caller>` (`0750`, `root:<caller's primary group>`) if missing,
+and `rmdir` such a directory. It never writes files, mounts, runs programs or reads the
+environment other than `PKEXEC_UID`.
+
+**Checks.**
+
+- Refused with exit 3 unless euid is 0 and `PKEXEC_UID` is a plain non-zero decimal uid with a
+  passwd entry. `SUDO_UID` is not accepted. The user name and directory come from that uid,
+  never from the caller's input.
+- `NAME` is one path component: 1 to 255 bytes, UTF-8, no `/`, NUL or control characters, not
+  `.`/`..`, no leading dot. Invalid names touch nothing.
+- `/media` and `/media/<caller>` are opened with `O_DIRECTORY|O_NOFOLLOW`. An existing
+  `/media/<caller>` must be a real directory owned by root and not group/other writable.
+- An existing entry is reused or removed only if it is a real directory (not a symlink), owned
+  by the caller, empty, and not a mountpoint (its `st_dev` differs from the parent's). Anything
+  else is skipped (`create`) or refused with nothing removed (`remove`).
+- Everything is `openat`/`mkdirat`/`unlinkat` relative to those directory fds, and ownership
+  is set with `fchown`/`fchmod` on the opened entry's fd, never by path. The user cannot write
+  to `/media/<caller>`, and a symlink swapped in anywhere during the run cannot redirect an
+  operation. `remove` is `unlinkat(AT_REMOVEDIR)`, which the kernel itself refuses for a
+  non-empty directory or an active mount.
+
+**Residual risk.** Any process of the logged-in user can create up to 100 empty directories
+per name under their own `/media/<user>` and remove their own empty ones, with no password. A
+process can therefore squat a label (`create STICK`) so that a drive mounts as `STICK1`; this
+is cosmetic. A root-owned `/media/<caller>` that was made group- or world-writable by someone
+else is refused, not repaired. The group ownership of a created `/media/<caller>` is a
+stand-in for udisks' ACL: members of the user's primary group (usually private) can list it.
+
+## Drive mode: flashcp-udev-check
+
+`61-flashcp-drive-mode.rules` runs `/usr/libexec/flashcp-udev-check $devnode` (as root, from
+udev's `IMPORT{program}`) for `SUBSYSTEM=block`, `ID_BUS=usb`, `ID_FS_TYPE=exfat`,
+`ID_FS_USAGE=filesystem` and `DEVTYPE=partition` (or a whole disk without a partition table),
+unless `/etc/flashcp/drive-mode-disabled` exists. Its output decides whether udisks may see the
+device (`UDISKS_IGNORE=1`) and whether the seat user gets the `uaccess` ACL
+(`FLASHCP_DRIVE_MODE=1`). Source: `gui/helper/src/bin/flashcp-udev-check.rs` (about 200 lines).
+
+**Threat model.** The input is a hostile USB stick: an arbitrary exFAT image built to crash,
+hang or exploit the parser, possibly also stalling I/O (a device that never answers). The
+helper itself parses nothing from the device; `flashcp mount --check` does, in a child:
+
+- The child gets only the device opened **read-only** (as fd 3) and `/dev/null` as 0–2;
+  everything else is closed (`close_range`). It runs as `nobody:nogroup` with no supplementary
+  groups, `PR_SET_NO_NEW_PRIVS`, `RLIMIT_CPU` 2 s, `RLIMIT_AS` 256 MB, `RLIMIT_NOFILE` 16,
+  `RLIMIT_FSIZE` 0, no core dumps, an empty environment, and `/usr/bin/flashcp` executed by
+  absolute path. If the kernel has Landlock, the child can only read and execute below `/usr`
+  and `/lib*` and read `/etc/ld.so.cache`; nothing else on the filesystem.
+- So a parser bug gives the attacker code execution as `nobody` with a read-only fd of their
+  own stick, no writable files, no network-relevant privilege beyond what `nobody` has, and two
+  seconds of CPU. The worst outcome of a wrong answer is cosmetic or a fallback: "serve it" means
+  the user's own FUSE driver opens it (and its own checks run again), "don't" means udisks does.
+- **udev is never stalled:** the parent waits at most 1.5 s for the child's exit, then
+  SIGKILLs it and does not wait for it (a child stuck in D state on a bad device cannot hold the
+  udev worker). No answer, a crash, a timeout, or any oddity prints nothing: the device is left
+  to udisks exactly as without flashcp.
+
+**The active user.** The helper reads `ACTIVE_UID` of `/run/systemd/seats/seat0` (logind's
+state file; no D-Bus). uid 0 or none: nothing. It then looks under `/run/user/<uid>/flashcp/`
+with `lstat` only (never following a link), and every entry must be owned by that uid:
+`drive-mode-on` (a regular file the user's daemon creates while it runs with drive mode on) and
+`kernel/<UUID or device name>` (the daemon handed this drive back to the kernel driver, so the
+helper prints `UDISKS_AUTO=0`: visible, mounted by the daemon through udisks). The only thing a
+user controls here is whether files exist in their own runtime dir, and the only effect is
+whether *their own* seat gets their drive through flashcp or through udisks.
+
+**Residual risk.** The ACL that `uaccess` applies stays on the device node until it is
+unplugged or the seat changes hands (logind moves the ACLs then), also after the daemon hands
+the drive back to the kernel driver. A drive whose label or contents change while plugged is
+re-checked on udev's change events; a busy answer keeps the previous decision
+(`FLASHCP_KEEP=1`, `IMPORT{db}`).
 
 ## Why flashcp runs as the user
 

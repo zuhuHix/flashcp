@@ -19,6 +19,9 @@
 #   optimize-interrupt  real run: pull 1/5, verify 2/5, build 3/5 and progress, then an error with a
 #                       recovery text, exit 1
 #   optimize-nospace    before any plan: "no place for the temporary copy" error, exit 1
+# drive-mode status|on|off|eject <device> (always JSON, one line): status shows one flashcp drive
+# saving and one kernel drive. FAKE_DRIVEMODE_RUNNING=0 reports the daemon as not running,
+# FAKE_DRIVEMODE_ENABLED=0 reports the switch as off, FAKE_FLASHCP_FAIL=1 fails the command.
 # FAKE_FLASHCP_FAIL=1 is an alias for FAKE_FLASHCP_MODE=error.
 # FAKE_FLASHCP_LOG=<file> appends the received argv (one arg per line, then "--").
 # FAKE_FLASHCP_DELAY=<seconds> between progress lines (default 0.05).
@@ -29,6 +32,37 @@ if [ -n "$FAKE_FLASHCP_LOG" ]; then
 fi
 
 op="$1"
+
+drive_mode() {
+  if [ "$FAKE_FLASHCP_FAIL" = "1" ]; then
+    echo '{"ok":false,"error":"fake failure: drive service unreachable"}'
+    return 1
+  fi
+  running=true; enabled=true
+  if [ "$FAKE_DRIVEMODE_RUNNING" = "0" ]; then running=false; fi
+  if [ "$FAKE_DRIVEMODE_ENABLED" = "0" ]; then enabled=false; fi
+  case "$2" in
+    status)
+      if [ "$running" = false ]; then
+        echo '{"ok":true,"running":false,"enabled":'"$enabled"',"drives":[]}'
+      else
+        echo '{"ok":true,"running":true,"enabled":'"$enabled"',"drives":[{"device":"/dev/sdb1","label":"KINGSTON","mode":"flashcp","state":"saving","mountpoint":"/media/u/KINGSTON","dirty_bytes":12000000,"dirty_files":3,"safe_to_remove":false},{"device":"/dev/sdc1","label":"BACKUP","mode":"kernel","state":"kernel","mountpoint":"/media/u/BACKUP","dirty_bytes":0,"dirty_files":0,"safe_to_remove":true}]}'
+      fi ;;
+    on) echo '{"ok":true,"enabled":true,"running":'"$running"'}' ;;
+    off) echo '{"ok":true,"enabled":false,"running":'"$running"'}' ;;
+    eject)
+      case "$3" in
+        /dev/*) echo '{"ok":true}' ;;
+        *) echo '{"ok":false,"error":"not a device"}'; return 1 ;;
+      esac ;;
+    *) echo '{"ok":false,"error":"unknown drive-mode command"}'; return 2 ;;
+  esac
+}
+
+case "$op" in
+  drive-mode) drive_mode "$@"; exit $? ;;
+esac
+
 case "$op" in
   info)
     echo '{"label":"FAKEUSB","cluster":32768,"size":32010928128,"free":30000000000,"files":12,"dirs":3,"dirty":false}'

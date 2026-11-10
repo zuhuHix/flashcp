@@ -59,6 +59,12 @@ Uninstall with `sudo apt remove flashcp-gui`.
 | `/usr/share/icons/hicolor/scalable/apps/flashcp-gui.svg` | `flashcp-gui.svg` | Scalable icon |
 | `/usr/share/icons/hicolor/*/apps/flashcp-gui.png` | `gui/src-tauri/icons` | Raster icons, placed by the Tauri bundler |
 | `/usr/share/doc/flashcp-gui/SECURITY-NOTES.md` | `SECURITY-NOTES.md` | What the privileged path can and cannot do |
+| `/usr/lib/udev/rules.d/61-flashcp-drive-mode.rules` | `61-flashcp-drive-mode.rules` | Drive mode: decides at plug-in whether flashcp or udisks gets a USB exFAT drive |
+| `/usr/libexec/flashcp-udev-check` | `gui/helper` | Run by that rule: a sandboxed `flashcp mount --check` (as nobody, ≤ 1.5 s) |
+| `/usr/libexec/flashcp-mountpoint` | `gui/helper` | Root helper (pkexec, no password in an active session): an empty `/media/$USER/LABEL` |
+| `/usr/share/polkit-1/actions/io.github.zuhuhix.flashcp.mountpoint.policy` | `packaging/desktop` | polkit action for it (`allow_active=yes`, nothing else) |
+| `/usr/lib/systemd/user/flashcp-drived.service` | `flashcp-drived.service` | The per-user drive daemon (`flashcp drived`) |
+| `/usr/lib/systemd/user-preset/80-flashcp-drived.preset` | `80-flashcp-drived.preset` | Enables it for every user |
 
 Check the real file list with `dpkg -c gui/target/release/bundle/deb/flashcp-gui_*.deb`.
 
@@ -158,3 +164,64 @@ imports the `packaging` pip library instead of this directory on some systems.
 An AppImage cannot install the polkit policy, the root helper, or the file
 manager actions into the system locations they need. Without those, copying to
 a drive would not work from an AppImage. The `.deb` is the supported installer.
+
+## Drive mode ("Speed up USB drives", on by default)
+
+Every USB exFAT drive is served by flashcp's FUSE driver (`flashcp mount`) instead of the
+kernel exfat driver, so copies from any program go through flashcp. A drive flashcp can't
+serve (not exFAT, not clean, damaged, unsupported, in use) is mounted normally by udisks.
+
+**How a drive is taken over.**
+
+1. The kernel announces the partition; udev runs its rules. `61-flashcp-drive-mode.rules`
+   matches USB + exFAT + filesystem partitions (or an exFAT disk without a partition table)
+   and runs `flashcp-udev-check`, which answers yes only if the active seat user's
+   `flashcp-drived` runs with drive mode on (`/run/user/<uid>/flashcp/drive-mode-on`) and a
+   sandboxed `flashcp mount --check` accepts the volume within 1.5 s.
+2. Yes: the rule sets `UDISKS_IGNORE=1` (udisks neither mounts nor shows the partition) and
+   tags it `uaccess` (the seat user gets rw on the node). No, or no answer: nothing is set, and
+   udisks and the desktop automount it as they always did.
+3. udev broadcasts the finished event. `flashcp-drived` sees `FLASHCP_DRIVE_MODE=1`, runs
+   `--check` again (for exit codes like busy), creates `/media/$USER/LABEL` through
+   `flashcp-mountpoint`, and runs `flashcp mount` there. File managers list it under that
+   label like any drive.
+
+**Why both drivers never touch the device.** The decision is part of udev's rule processing,
+which finishes before udisks, the desktop's automounter or the daemon receive the event, so
+nothing can mount the partition before it is decided. After the decision, udisks has been told
+to ignore it, and `flashcp mount` holds the device exclusively (`O_EXCL` + `flock`) while it
+serves it, so even a manual kernel mount fails with "busy" instead of mounting it twice. In the
+other direction, a partition that something already mounted makes `--check` answer busy, and
+the daemon never mounts over it (it retries after 1, 3 and 10 s, then only notifies). When
+the daemon hands a drive back to the kernel driver (the driver failed twice, recovery refused,
+drive mode turned off), it waits for the driver to exit first, then flags the drive in its
+runtime dir, has udisks re-run the rules (`Block.Rescan`), and only then mounts it through
+udisks (read-only if recovery was refused).
+
+**Eject.** The tray, `flashcp drive-mode eject /dev/sdX1`, or the file manager's
+eject/unmount button. The first two ask the driver to `prepare-eject` (commit everything, refuse
+new writes), then unmount; the file manager's button unmounts first and the driver commits
+afterwards. Either way, a notification shows "Saving N MB to LABEL…" while data is pending, then
+"LABEL can be removed", and the drive is powered off like udisks does. Pulling it out while
+data is pending shows what may be missing. On the next plug-in the driver's journal recovery
+completes or rolls back the interrupted commit, and a notification says so.
+
+**Robustness.** A driver that dies is restarted once (its recovery runs); a second failure
+falls back to the kernel driver with a notification. systemd restarts the daemon itself
+(`Restart=on-failure`). While data is pending the daemon holds a logind *delay* inhibitor for
+sleep and shutdown. On `PrepareForSleep` it flushes every drive and releases the lock once
+nothing is pending. Logout or `systemctl --user stop` sends SIGTERM: every drive is flushed and
+unmounted before the daemon exits.
+
+**Switches.**
+
+| Command | Effect |
+| --- | --- |
+| the app's "Speed up USB drives" / `flashcp drive-mode on\|off` | Per user, persisted in `~/.config/flashcp/drive-mode.conf`. Off: current flashcp drives are flushed and remounted by the kernel driver; new drives go to udisks. |
+| `flashcp drive-mode status [--json]` | Mode, state and pending bytes per drive |
+| `sudo flashcp drive-mode off --system` | For every user (`/etc/flashcp/drive-mode-disabled`); re-runs the rules so plugged drives go back to udisks. `on --system` undoes it. |
+| `systemctl --user disable --now flashcp-drived` | Stop the daemon for one user (its drives are flushed and unmounted; new drives get udisks) |
+| `sudo apt remove flashcp-gui` | Stops every user's daemon, removes the rule, re-runs the rules: normal automount |
+
+Manual rollback without the package tools: `sudo rm /usr/lib/udev/rules.d/61-flashcp-drive-mode.rules
+&& sudo udevadm control --reload && sudo udevadm trigger -s block -c change`.

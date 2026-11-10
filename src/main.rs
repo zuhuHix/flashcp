@@ -308,6 +308,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: flashcp::sim::cli::SimCmd,
     },
+    /// Drive mode: USB exFAT drives served by flashcp in every app (status | on | off | eject)
+    DriveMode {
+        #[command(subcommand)]
+        cmd: flashcp::daemon_cli::DriveModeCmd,
+    },
+    /// The drive-mode daemon (run by the flashcp-drived systemd user service)
+    #[command(hide = true)]
+    Drived,
     /// Benchmark every method against DEST
     Bench {
         src: PathBuf,
@@ -664,6 +672,8 @@ fn run(cmd: Cmd) -> Result<()> {
         }
         Cmd::Mount { .. } => unreachable!("handled in main"),
         Cmd::Sim { cmd } => flashcp::sim::cli::run(cmd),
+        Cmd::DriveMode { cmd } => flashcp::daemon_cli::drive_mode(cmd),
+        Cmd::Drived => flashcp::daemon_cli::run_drived(),
         Cmd::Bench { src, dest, methods, runs } => {
             let ms: Vec<String> = methods.split(',').map(|s| s.trim().to_string()).collect();
             std::fs::create_dir_all(&dest)?;
