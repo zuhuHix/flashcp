@@ -166,7 +166,15 @@ file onto a 4 KB-cluster stick in 86.0 s, against 107.7 s onto a default-format 
 > In the next release (merged, not released yet).
 
 When drive mode serves a stick that was formatted the usual way (clusters of 32 KB or more),
-flashcp asks once, with a notification:
+flashcp offers once to give it small clusters in place: a few seconds, nothing erased, the files
+stay where they are.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/recluster-dark.gif">
+  <img alt="Re-clustering a stick in place, drawn with the stick's index at the front and ten 128 KB clusters behind it. On the default format every file owns a whole cluster: eight small files are added, each a few squares of file data and the rest padding, and adding 20,000 small files (169 MB) to the stick takes 98.0 s. Then the stick is re-clustered from 128 KB to 4 KB in place. The new index is bigger, so the two files in its way are carried to free clusters and the index grows into that room; every other cluster splits into 32 squares of 4 KB, the file data stays where it is and the padding becomes free space. That takes 6.35 s and writes 137 MB, and nothing is erased. Adding 20,000 small files again now puts them side by side in the free squares and takes 5.48 s: 17.9 times faster, about 18 times, on the same stick with the files kept. Measured on a Kingston DataTraveler 3.0 with 20,000 small files, single runs." src="assets/recluster-light.gif" width="800">
+</picture>
+
+The offer is a notification:
 
 > **Make KINGSTON faster for small files?**
 > flashcp can change how KINGSTON stores files so that small files copy much faster. Nothing is

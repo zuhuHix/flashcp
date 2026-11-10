@@ -387,7 +387,8 @@ fn offer_accept_converts_the_image_and_remounts() {
     let st = r.status();
     assert!(st.contains("\"convert_result\":\"done\"") && st.contains("\"can_convert\":false"), "{st}");
     assert!(st.contains(&format!("\"mountpoint\":\"{}\"", r.dir.join(MP).display())), "same mountpoint: {st}");
-    assert_eq!(fs::read_to_string(format!("{dev}.starts")).unwrap(), "2", "flashcp mounted it again");
+    // The daemon's log, not the stand-in's `.starts` file: this also runs with the real driver.
+    assert_eq!(r.log("daemon").matches("-> start ").count(), 2, "flashcp mounted it again: {}", r.log("daemon"));
     let c = recluster_check(&img);
     assert!(c.contains("\"cluster\":4096") && c.contains("\"finish\":false"), "{c}");
     let saved = fs::read_to_string(r.dir.join("state/flashcp/recluster-offers")).unwrap();
