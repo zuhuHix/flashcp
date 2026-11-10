@@ -355,6 +355,28 @@ fn spec(target: Option<PathBuf>, fd: Option<i32>) -> TargetSpec {
     }
 }
 
+/// Every path and fd a command is given (sources, targets, destinations).
+fn operands(cmd: &Cmd) -> (Vec<PathBuf>, Vec<i32>) {
+    let o = |p: &Option<PathBuf>| p.iter().cloned().collect::<Vec<_>>();
+    match cmd {
+        Cmd::Gen { dir, .. } | Cmd::Probe { dir, .. } => (vec![dir.clone()], vec![]),
+        Cmd::Copy { src, dst, .. } => (vec![src.clone(), dst.clone()], vec![]),
+        Cmd::Pack { src, out, .. } => (vec![src.clone(), out.clone()], vec![]),
+        Cmd::Build { src, target, target_fd, .. } | Cmd::Add { src, target, target_fd, .. } => {
+            ([vec![src.clone()], o(target)].concat(), target_fd.iter().copied().collect())
+        }
+        Cmd::Sync { paths, target_fd, .. } | Cmd::Pull { paths, target_fd, .. } => {
+            (paths.clone(), target_fd.iter().copied().collect())
+        }
+        Cmd::Optimize { target, target_fd, temp, .. } => {
+            ([o(target), o(temp)].concat(), target_fd.iter().copied().collect())
+        }
+        Cmd::Info { target, target_fd, .. } => (o(target), target_fd.iter().copied().collect()),
+        Cmd::Bench { src, dest, .. } => (vec![src.clone(), dest.clone()], vec![]),
+        _ => (vec![], vec![]),
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let mut args = std::env::args().skip(1);
@@ -387,8 +409,14 @@ fn main() {
             flashcp::drive::mount::run_check(&device, device_fd, json)
         } else {
             // the mount itself is traced like every other command (FLASHCP_TRACE); --check is not
-            if let Err(e) = flashcp::sim::trace::init_from_env("mount") {
+            let forbid = flashcp::sim::trace::identities(&[&device], &device_fd.into_iter().collect::<Vec<_>>());
+            let traced = match &cli.trace_out {
+                Some(p) => flashcp::sim::trace::init_guarded(p, "mount", &forbid),
+                None => flashcp::sim::trace::init_from_env_guarded("mount", &forbid),
+            };
+            if let Err(e) = traced {
                 eprintln!("Error: {e:#}");
+                std::process::exit(2);
             }
             flashcp::drive::mount::run_mount(flashcp::drive::mount::MountArgs {
                 device,
@@ -405,10 +433,15 @@ fn main() {
         flashcp::sim::trace::finish();
         std::process::exit(code);
     }
+    // the trace file must never be one of the command's own files (a target image, a device)
+    let forbid = {
+        let (paths, fds) = operands(&cli.cmd);
+        flashcp::sim::trace::identities(&paths.iter().map(|p| p.as_path()).collect::<Vec<_>>(), &fds)
+    };
     let traced = match (&cli.trace_out, &cli.cmd) {
         (_, Cmd::Sim { .. }) => Ok(()),
-        (Some(p), _) => flashcp::sim::trace::init(p, &cmd_name),
-        (None, _) => flashcp::sim::trace::init_from_env(&cmd_name),
+        (Some(p), _) => flashcp::sim::trace::init_guarded(p, &cmd_name, &forbid),
+        (None, _) => flashcp::sim::trace::init_from_env_guarded(&cmd_name, &forbid),
     };
     if let Err(e) = traced {
         eprintln!("Error: {e:#}");

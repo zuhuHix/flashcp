@@ -214,3 +214,36 @@ fn a_panicking_run_leaves_a_trace_that_is_rejected_by_default() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("truncated"), "{}", String::from_utf8_lossy(&out.stderr));
     assert_success(&run(&["--allow-truncated"]), "sim run --allow-truncated");
 }
+
+/// A trace path that names the command's own target (here the volume image) is refused with
+/// exit 2 before anything is written to it: the image stays byte-identical. Same for `mount`,
+/// whose trace starts before it opens the device, and for `--trace`.
+#[test]
+fn trace_onto_the_target_is_refused_and_writes_nothing() {
+    let dir = std::env::temp_dir().join(format!("fcp-trace-target-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("mnt")).unwrap();
+    let img = dir.join("v.img");
+    std::fs::File::create(&img).unwrap().set_len(32 << 20).unwrap();
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let bin = env!("CARGO_BIN_EXE_flashcp");
+    let st = std::process::Command::new(bin).arg("build").arg(&src).arg(&img).arg("--yes-erase").output().unwrap();
+    assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+    let before = std::fs::read(&img).unwrap();
+    let runs: Vec<Vec<std::ffi::OsString>> =
+        vec![vec!["mount".into(), img.clone().into(), dir.join("mnt").into()], vec!["info".into(), img.clone().into()]];
+    for args in runs {
+        let out = std::process::Command::new(bin).args(&args).env("FLASHCP_TRACE", &img).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("refusing to write"), "{args:?}");
+        assert!(std::fs::read(&img).unwrap() == before, "{args:?} wrote to the image");
+    }
+    let out = std::process::Command::new(bin).arg("--trace").arg(&img).arg("info").arg(&img).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(std::fs::read(&img).unwrap() == before, "--trace wrote to the image");
+    // a block-device-like path is not a regular file: refused too (/dev/null stands in)
+    let out = std::process::Command::new(bin).arg("info").arg(&img).env("FLASHCP_TRACE", "/dev/null").output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
