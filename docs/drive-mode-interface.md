@@ -269,7 +269,7 @@ A reason the integration does not know means "do not offer".
 
 ### What the daemon does with it
 
-(In the next release.) After `flashcp mount --check` said 0, and only with drive mode on:
+(From 0.4.0.) After `flashcp mount --check` said 0, and only with drive mode on:
 
 1. `flashcp recluster --check --json DEV` (10 s timeout; a failure or no `check` line = "no").
    - `"finish":true`, first time for this plug-in: `flashcp recluster --json DEV` BEFORE
