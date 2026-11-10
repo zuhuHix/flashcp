@@ -130,25 +130,39 @@ PY
 }
 
 attach() { # $1 disk image, $2 part|whole: sets LOOP and DEV
-  local i
-  if [ "$2" = part ]; then
-    LOOP=$(sudo losetup -fP --show "$1")
-    DEV=${LOOP}p1
-    for i in $(seq 1 50); do
-      [ -b "$DEV" ] && break
-      sudo udevadm settle 2>/dev/null || true
-      sleep 0.2
-    done
-    [ -b "$DEV" ] || die "$DEV did not appear (partition scan of $LOOP)"
-  else
+  local i try
+  if [ "$2" != part ]; then
     LOOP=$(sudo losetup -f --show "$1")
     DEV=$LOOP
+    echo "attached $1 as $LOOP (volume $DEV)"
+    return
   fi
-  echo "attached $1 as $LOOP (volume $DEV)"
+  # The partition node comes from the kernel's partition scan and udev. Now and then it does
+  # not show up (a loop device reused right after a detach): ask again, then attach afresh.
+  for try in 1 2 3; do
+    LOOP=$(sudo losetup -fP --show "$1")
+    DEV=${LOOP}p1
+    for i in $(seq 1 40); do
+      [ -b "$DEV" ] && break
+      [ "$i" = 10 ] && { sudo partx -u "$LOOP" 2>/dev/null || sudo partprobe "$LOOP" 2>/dev/null || true; }
+      sudo udevadm settle 2>/dev/null || true
+      sleep 0.25
+    done
+    if [ -b "$DEV" ]; then
+      echo "attached $1 as $LOOP (volume $DEV)"
+      return
+    fi
+    echo "$DEV did not appear (attempt $try); attaching again"
+    sudo losetup -d "$LOOP"
+    LOOP=""
+    sleep 1
+  done
+  die "the partition of $1 did not appear on a loop device"
 }
 
 detach() {
   sync
+  sudo udevadm settle 2>/dev/null || true
   sudo losetup -d "$LOOP"
   LOOP=""
   DEV=""
