@@ -138,6 +138,10 @@ pub(crate) struct Core {
     pub(crate) journal: Option<super::djournal::Place>,
     /// Commits so far.
     pub(crate) commits: u64,
+    /// Open handles (sum of `Inode::opens`).
+    pub(crate) opened: u64,
+    /// Every change up to this `seq` is durable (a full commit planned at it finished).
+    pub(crate) durable_seq: u64,
 }
 
 /// Clusters a bitmap marks used (padding bits past ClusterCount ignored).
@@ -275,6 +279,8 @@ impl Core {
             label,
             journal: None,
             commits: 0,
+            opened: 0,
+            durable_seq: 0,
         };
         c.inodes.insert(ROOT, root);
         let children: Vec<Child> = root_dir.children.into_values().collect();
@@ -458,7 +464,10 @@ impl Core {
         }
     }
 
+    /// Marks `i` changed; every change takes a new `seq` (flushes wait for a full commit
+    /// planned at or after theirs).
     pub(crate) fn mark(&mut self, i: Ino) {
+        self.seq += 1;
         self.dirty.insert(i);
     }
 

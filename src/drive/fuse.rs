@@ -368,6 +368,8 @@ impl Filesystem for Adapter {
         reply.error(err(libc::EPERM));
     }
 
+    // xattrs: ENOSYS (not ENOTSUP) makes the kernel stop asking. It would otherwise send a
+    // getxattr("security.capability") before every write; callers still get EOPNOTSUPP.
     fn setxattr(
         &self,
         _req: &Request,
@@ -378,18 +380,18 @@ impl Filesystem for Adapter {
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        reply.error(err(libc::ENOTSUP));
+        reply.error(err(libc::ENOSYS));
     }
 
     fn getxattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, _size: u32, reply: ReplyXattr) {
-        reply.error(err(libc::ENOTSUP));
+        reply.error(err(libc::ENOSYS));
     }
 
     fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
-        reply.error(err(libc::ENOTSUP));
+        reply.error(err(libc::ENOSYS));
     }
 
     fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(err(libc::ENOTSUP));
+        reply.error(err(libc::ENOSYS));
     }
 }

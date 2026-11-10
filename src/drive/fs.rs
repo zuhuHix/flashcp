@@ -148,7 +148,32 @@ pub fn mount_file(file: std::fs::File, len: u64, opts: FsOpts) -> Result<(Fs, Re
         }
         Err(e) => return Err(anyhow::Error::new(super::check::classify(&e)).context(format!("{e:#}"))),
     };
+    let mut core = core;
+    if let Some(why) = cannot_bootstrap(&core) {
+        // never accept writes that no commit could make durable
+        eprintln!("flashcp mount: read-only: {why}");
+        core.read_only = Some(libc::EROFS);
+    }
     Ok((Fs::new(core, dev, opts), rec))
+}
+
+/// Why the first commit could not create the journal file (None: it can, or it exists).
+pub(crate) fn cannot_bootstrap(c: &Core) -> Option<String> {
+    if c.journal.is_some() {
+        return None;
+    }
+    let cs = c.vol.cs;
+    let cap = djournal::capacity(c.vol.vol_bytes, cs);
+    let free = crate::add::free_extents(&c.bm, c.vol.cc);
+    if !free.iter().any(|e| e.1 >= cap / cs) {
+        return Some(format!("no contiguous free space for the drive journal ({cap} bytes)"));
+    }
+    let root = c.inodes.get(&super::core::ROOT)?.dd.as_ref()?;
+    let n = djournal::NAME.encode_utf16().count();
+    if djournal::one_sector_slot(&root.data, root.end, super::set::set_bytes(n)).is_none() {
+        return Some("the root directory has no room for the drive journal's entry".into());
+    }
+    None
 }
 
 pub use djournal::Recovered;
@@ -233,7 +258,7 @@ impl Fs {
     }
     pub fn setattr(&self, ino: Ino, a: &SetAttr) -> R<Attr> {
         let r = self.mutate(|c| c.setattr(ino, a));
-        if a.size.is_some() {
+        if r.is_ok() && a.size.is_some() {
             self.wrote();
         }
         r
@@ -273,6 +298,7 @@ impl Fs {
             let n = c.ino_mut(i)?;
             n.nlookup += 1;
             n.opens += 1;
+            c.opened += 1;
             c.attr(i)
         })?;
         self.wrote();
@@ -296,6 +322,7 @@ impl Fs {
             c.truncate(ino, 0)?;
         }
         c.ino_mut(ino)?.opens += 1;
+        c.opened += 1;
         drop(c);
         if trunc {
             self.wrote();
@@ -304,23 +331,27 @@ impl Fs {
     }
     pub fn release(&self, ino: Ino) {
         let mut c = self.core();
-        if let Some(n) = c.inodes.get_mut(&ino) {
-            n.opens = n.opens.saturating_sub(1);
+        if let Some(n) = c.inodes.get_mut(&ino)
+            && n.opens > 0
+        {
+            n.opens -= 1;
+            c.opened -= 1;
         }
         c.gc(ino);
     }
     pub fn read(&self, ino: Ino, off: u64, size: u32) -> R<Vec<u8>> {
-        let (plan, pf, _gate) = {
+        let (plan, _gate) = {
             let mut c = self.core();
             let plan = c.read_plan(ino, off, size)?;
-            let pf = if self.sh.ra.is_some() { self.prefetch_ranges(&mut c, ino, off, size) } else { Vec::new() };
-            (plan, pf, self.sh.gate.read().unwrap_or_else(|e| e.into_inner()))
+            if let Some(ra) = &self.sh.ra {
+                // queued under the lock: a commit's invalidation cannot slip in between
+                let pf = self.prefetch_ranges(&mut c, ino, off, size);
+                if !pf.is_empty() {
+                    ra.prefetch(&pf);
+                }
+            }
+            (plan, self.sh.gate.read().unwrap_or_else(|e| e.into_inner()))
         };
-        if let Some(ra) = &self.sh.ra
-            && !pf.is_empty()
-        {
-            ra.prefetch(&pf);
-        }
         let total = plan.last().map_or(0, |p| p.0 + p.1);
         let mut buf = vec![0u8; total];
         super::core::exec_read(&self.sh.rdev, self.sh.ra.as_deref(), &plan, &mut buf)?;
@@ -466,22 +497,25 @@ impl Fs {
         }
     }
 
+    /// Lock order everywhere: `core` before `st`, never `core` while holding `st`.
     fn wrote(&self) {
+        let staged = self.core().stager.staged;
         let mut st = self.sh.st.lock().unwrap();
         st.last_write = Some(Instant::now());
         // Pipelining: past half the window, start committing.
-        let staged = self.core().stager.staged;
+        // (No wakeup otherwise: the commit thread polls the idle deadline every 250 ms, and a
+        // wakeup per write would cost the writer more than the write.)
         if staged > self.sh.opts.max_dirty / 2 && st.want == st.done && !st.committing {
             st.want += 1;
             st.reason = "pressure";
+            self.sh.cv.notify_all();
         }
-        self.sh.cv.notify_all();
     }
 
     pub fn status(&self) -> Status {
         let c = self.core();
         let st = self.sh.st.lock().unwrap();
-        let open = c.inodes.values().filter(|n| n.opens > 0).count() as u64;
+        let open = c.opened;
         Status {
             state: if st.fatal.is_some() || c.read_only.is_some() && !st.ejecting {
                 "read_only"
@@ -649,6 +683,9 @@ impl Fs {
 
     /// Plans, executes and finalizes one commit. Ok(false) when there was nothing to do.
     pub(crate) fn commit_now(&self, why: &'static str) -> Result<bool> {
+        if let Some(m) = &self.sh.st.lock().unwrap().fatal {
+            anyhow::bail!("an earlier commit failed: {m}");
+        }
         let t0 = Instant::now();
         let (plan, place, seq) = {
             let mut c = self.core();
@@ -671,8 +708,9 @@ impl Fs {
                 if est <= cap {
                     break plan;
                 }
-                anyhow::ensure!(plan.inodes > 1, "one change needs more journal than the volume's journal file holds");
-                limit = Some(plan.inodes / 2);
+                let next = limit.unwrap_or(plan.inodes).min(plan.inodes) / 2;
+                anyhow::ensure!(next >= 1, "one change needs more journal than the volume's journal file holds");
+                limit = Some(next);
             };
             if let Some(ra) = &self.sh.ra {
                 let r: Vec<(u64, u64)> = plan.segs.iter().map(|s| (s.dev, s.len)).collect();
@@ -686,20 +724,29 @@ impl Fs {
         let vol_view = { self.core().vol.view()? };
         execute(&*self.sh.dev, &vol_view, &plan, &place, seq)?;
         let (bytes, files) = (plan.bytes, plan.files);
-        commit::finalize(&mut self.core(), plan);
+        let mut c = self.core();
+        if let Some(ra) = &self.sh.ra {
+            // chunks read or queued while the commit ran may hold what was there before
+            let r: Vec<(u64, u64)> = plan.segs.iter().map(|s| (s.dev, s.len)).collect();
+            ra.invalidate(&r);
+        }
+        commit::finalize(&mut c, plan);
+        drop(c);
         self.note(Note::Committed { bytes, files, secs: t0.elapsed().as_secs_f64() });
         Ok(true)
     }
 }
 
-/// Commits until nothing is dirty (a split batch takes several commits), at most 1000.
+/// Commits until every change made before the call is durable (a split batch takes several
+/// commits; changes made meanwhile may wait for the next request).
 fn commit_all(fs: &Fs, why: &'static str) -> Result<()> {
-    for _ in 0..1000 {
+    let target = fs.core().seq;
+    while fs.core().durable_seq < target {
         if !fs.commit_now(why)? {
             return Ok(());
         }
     }
-    anyhow::bail!("changes are still pending after 1000 commits")
+    Ok(())
 }
 
 /// Device ranges of committed bytes [a, b) of `ino` (clamped to what is still content).
