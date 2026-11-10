@@ -69,6 +69,8 @@ jobs:
         with: { name: xos-recl-superfloppy, path: out/recl-superfloppy, retention-days: 3, compression-level: 1 }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: xos-recl-crash-window, path: out/recl-crash-window, retention-days: 3, compression-level: 1 }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: xos-control-mkfs-superfloppy, path: out/control-mkfs-superfloppy, retention-days: 3, compression-level: 1 }
 
   windows:
     name: windows chkdsk (${{ matrix.vol }})
@@ -77,14 +79,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        vol: [prefix-auto, full-auto, prefix-512, prefix-1k, prefix-2k, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs, recl-32k, recl-128k, recl-frag-32k, recl-frag-128k, recl-superfloppy, recl-crash-window]
+        vol: [prefix-auto, full-auto, prefix-512, prefix-1k, prefix-2k, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs, recl-32k, recl-128k, recl-frag-32k, recl-frag-128k, recl-superfloppy, recl-crash-window, control-mkfs-superfloppy]
     # superfloppy (no partition table) is flashcp's default output, so it gates like the others.
     # control-mkfs (the same tree written by mkfs.exfat + Linux) is a reference for attributing
     # failures to flashcp or to the OS, so it is report-only. So is recl-crash-window, the state a
-    # crash between the two boot-sector writes of `flashcp recluster` leaves. The other recl-*
-    # volumes (re-clustered in place, see TESTING.md) gate. recl-superfloppy and recl-crash-window
-    # have no partition table.
-    continue-on-error: ${{ matrix.vol == 'control-mkfs' || matrix.vol == 'recl-crash-window' }}
+    # crash between the two boot-sector writes of `flashcp recluster` leaves, and
+    # control-mkfs-superfloppy (mkfs.exfat's own volume without a partition table, never
+    # re-clustered). The other recl-* volumes (re-clustered in place, see TESTING.md) gate.
+    # recl-superfloppy and control-mkfs-superfloppy have no partition table.
+    continue-on-error: ${{ contains(fromJSON('["control-mkfs","control-mkfs-superfloppy","recl-crash-window"]'), matrix.vol) }}
     defaults:
       run:
         shell: pwsh
@@ -97,7 +100,7 @@ jobs:
       - name: Attach, chkdsk, verify, write test, chkdsk, dismount
         run: >
           scripts/xos/win_check.ps1 -Vhd "vol/${{ matrix.vol }}.vhd" -Manifest vol/manifest.json
-          -Label "${{ matrix.vol }}" -LogDir logs ${{ contains(fromJSON('["superfloppy","recl-superfloppy","recl-crash-window"]'), matrix.vol) && '-Superfloppy' || '' }}
+          -Label "${{ matrix.vol }}" -LogDir logs ${{ contains(fromJSON('["superfloppy","recl-superfloppy","control-mkfs-superfloppy"]'), matrix.vol) && '-Superfloppy' || '' }}
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: "logs-windows-${{ matrix.vol }}", path: logs, retention-days: 14 }
@@ -109,8 +112,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        vol: [prefix-auto, full-auto, prefix-512, prefix-1k, prefix-2k, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs, recl-32k, recl-128k, recl-frag-32k, recl-frag-128k, recl-superfloppy, recl-crash-window]
-    continue-on-error: ${{ matrix.vol == 'control-mkfs' || matrix.vol == 'recl-crash-window' }}
+        vol: [prefix-auto, full-auto, prefix-512, prefix-1k, prefix-2k, prefix-4k, prefix-128k, prefix-1g, superfloppy, control-mkfs, recl-32k, recl-128k, recl-frag-32k, recl-frag-128k, recl-superfloppy, recl-crash-window, control-mkfs-superfloppy]
+    continue-on-error: ${{ contains(fromJSON('["control-mkfs","control-mkfs-superfloppy","recl-crash-window"]'), matrix.vol) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -120,7 +123,7 @@ jobs:
       - name: Attach, fsck_exfat, mount, verify, write test, unmount, fsck_exfat
         run: >
           scripts/xos/mac_check.sh "vol/${{ matrix.vol }}.img" vol/manifest.json "${{ matrix.vol }}" logs
-          ${{ contains(fromJSON('["superfloppy","recl-superfloppy","recl-crash-window"]'), matrix.vol) && 'superfloppy' || '' }}
+          ${{ contains(fromJSON('["superfloppy","recl-superfloppy","control-mkfs-superfloppy"]'), matrix.vol) && 'superfloppy' || '' }}
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: "logs-macos-${{ matrix.vol }}", path: logs, retention-days: 14 }

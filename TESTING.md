@@ -46,7 +46,7 @@ nanoseconds, and SHA-256 for files. It skips top-level junk such as `System Volu
 ### The volume matrix
 
 Every volume is labelled `XOSTEST`. The matrix comes from `VOLUMES` in `build_images.sh`, plus
-seven more volumes (`control-mkfs` and the six `recl-*` ones described below):
+eight more volumes (`control-mkfs`, the six `recl-*` ones and `control-mkfs-superfloppy`, described below):
 
 | Name | Built with | Notes |
 |---|---|---|
@@ -61,8 +61,9 @@ seven more volumes (`control-mkfs` and the six `recl-*` ones described below):
 | `recl-128k` | 2 GiB, `mkfs.exfat -c 128K`, `cp -r`, then `flashcp recluster` | Same, 128 KiB to 4 KiB. Gates. |
 | `recl-frag-32k` | 1 GiB, 32 KiB clusters, fragmented fill, `recluster --fat full` | Files are FAT chains, not contiguous runs. Gates. |
 | `recl-frag-128k` | 2 GiB, 128 KiB clusters, fragmented fill, `recluster` | Same with 128 KiB clusters and `--fat prefix` (the default). Gates. |
-| `recl-superfloppy` | 2 GiB, 128 KiB clusters, no partition table, `recluster` | Must show `"switches":2`. Gates. |
-| `recl-crash-window` | 1 GiB, 32 KiB clusters, no partition table, `recluster` stopped after the main boot sector | The state a crash between the two boot-sector writes leaves. Report-only. |
+| `recl-superfloppy` | 2 GiB, `flashcp build --cluster 131072` on the whole disk (no partition table), then `recluster` | Must show `"switches":2`. Gates. |
+| `recl-crash-window` | 1 GiB, 32 KiB clusters, `cp -r`, `recluster` stopped after the main boot sector | The state a crash between the two boot-sector writes leaves. Report-only. |
+| `control-mkfs-superfloppy` | 512 MiB, `mkfs.exfat -c 32K` on the whole disk (no partition table), `cp -r` | Not written and not re-clustered by flashcp. Report-only. |
 
 Before any volume is wrapped, `build_images.sh` runs `fsck.exfat -n` on it. If passwordless sudo
 is available it also loop-mounts it read-only and runs `verify.py` against the manifest. This
@@ -85,7 +86,8 @@ flashcp writer and not through `mbr_wrap.py`:
    LBA 2048, as `mbr_wrap.py` does. The superfloppy volumes have no partition table.
 2. `losetup -fP --show disk.img`. The volume is `/dev/loopNp1`, or `/dev/loopN` for a superfloppy.
 3. `mkfs.exfat -c CLUSTER -L XOSTEST`, then the Linux kernel mounts the volume and fills it with
-   `cp -r --preserve=timestamps` (or the fragmented fill below), then unmounts.
+   `cp -r --preserve=timestamps` (or the fragmented fill below), then unmounts. `recl-superfloppy`
+   is written by `flashcp build` instead (see below).
 4. Checked before the recluster, so a fill problem is never blamed on it: `fsck.exfat -n`, and a
    read-only kernel mount with `verify.py` against the manifest.
 5. `flashcp recluster --check` must exit 0. Then `flashcp recluster DEV --json` runs on the block
@@ -108,6 +110,16 @@ deleted. The recluster's `plan` line must count fragmented files (`"fragmented"`
 build fails. The same code is run by `ci.yml` as
 `sudo bash scripts/xos/recluster_images.sh fragfill MOUNTPOINT TREE CLUSTER_BYTES`.
 
+Without a partition table (`recl-superfloppy`): Windows shows such a disk image only when its
+sector 0 cannot be taken for an MBR. `mkfs.exfat` leaves zeros where an MBR has its partition
+table, which reads as an empty table, and Windows then shows no volume; `flashcp build` fills
+the boot code area with `0xF4`, and its `superfloppy` volume is accepted. So `recl-superfloppy`
+starts from a `flashcp build` volume with 128 KiB clusters, written to the whole loop device, and
+is then re-clustered there: the image is byte for byte what `recluster` left (the boot code bytes
+it tunes lie below offset 440, clear of that area, and the checksum sector is not rewritten).
+`control-mkfs-superfloppy` is `mkfs.exfat`'s own volume without a partition table, never
+re-clustered and report-only: it shows what each OS does with that layout by itself.
+
 `recl-crash-window` runs the recluster with `FLASHCP_TEST_RECLUSTER_STOP=reclustered`. The command
 stops with exit 1 (the build requires exactly that, and the hook's message in the output) after
 writing the main boot sector of the final switch and before the backup boot sector. The main boot
@@ -117,8 +129,8 @@ would write the backup boot sector) and a read-only kernel mount to pass `verify
 of `fsck.exfat -n` is printed but does not fail the build.
 
 On Windows and macOS the same `win_check.ps1` and `mac_check.sh` run on these volumes unchanged
-(`recl-superfloppy` and `recl-crash-window` get the superfloppy flag). The five normal volumes
-gate. `recl-crash-window` is report-only (`continue-on-error`): it is an interrupted state, and the
+(`recl-superfloppy` and `control-mkfs-superfloppy` get the superfloppy flag). The five normal
+volumes gate. `recl-crash-window` is report-only (`continue-on-error`): it is an interrupted state, and the
 question it answers is what each OS says about it, not whether flashcp may leave it.
 
 ### The recluster steps in `ci.yml`
@@ -196,8 +208,8 @@ whether a difference comes from flashcp or from the OS driver.
 
 ### Report-only entries
 
-`control-mkfs` and `recl-crash-window` use `continue-on-error`, in both the Windows and macOS jobs.
-`recl-crash-window` is described above. `control-mkfs` is a
+`control-mkfs`, `control-mkfs-superfloppy` and `recl-crash-window` use `continue-on-error`, in both
+the Windows and macOS jobs. The last two are described above. `control-mkfs` is a
 reference: the same tree written by a different tool. If `control-mkfs` fails the same way a flashcp volume
 does, the cause is the OS driver, not flashcp. If only the flashcp volume fails, the cause is
 flashcp.
@@ -234,7 +246,8 @@ On Windows, in an administrator PowerShell with `python` on the PATH (the script
 pwsh scripts/xos/win_check.ps1 -Vhd out/prefix-auto/prefix-auto.vhd -Manifest out/prefix-auto/manifest.json -Label prefix-auto -LogDir logs
 ```
 
-Add `-Superfloppy` for `out/superfloppy/superfloppy.vhd`, `out/recl-superfloppy/recl-superfloppy.vhd` and `out/recl-crash-window/recl-crash-window.vhd`. The write test changes the attached
+Add `-Superfloppy` for the volumes without a partition table (`superfloppy`, `recl-superfloppy`,
+`control-mkfs-superfloppy`). The write test changes the attached
 VHD, so copy the file first if you want to reuse it.
 
 On macOS:

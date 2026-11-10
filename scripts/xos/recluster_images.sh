@@ -60,17 +60,26 @@ for tool in sfdisk losetup mkfs.exfat fsck.exfat python3 sudo; do
   command -v "$tool" >/dev/null || { echo "::error::$tool is required for the recl-* volumes"; exit 1; }
 done
 
-# name  size  mkfs cluster  layout (part|whole)  fill (cp|frag)  --fat (default|prefix|full)  expect
+# name  size  cluster  layout (part|whole)  fill (cp|frag|build)  --fat (default|prefix|full)  expect
+# fill: cp / frag = mkfs.exfat, then the kernel copies the tree (plainly, or fragmented); build =
+# `flashcp build` writes the volume (no mkfs, no mount).
 # expect: moves = "switches":2 and move_bytes > 0, sw2 = "switches":2, frag = the plan counts
 # fragmented files, crash = stop after the main boot sector of the final switch (see
-# FLASHCP_TEST_RECLUSTER_STOP).
+# FLASHCP_TEST_RECLUSTER_STOP), control = no recluster at all.
+#
+# The two volumes without a partition table: Windows only shows such a disk image when its
+# sector 0 cannot be taken for an MBR. mkfs.exfat leaves zeros where an MBR has its partition
+# table (an empty table: Windows shows no volume), flashcp fills the boot code area with 0xF4.
+# So recl-superfloppy starts from a `flashcp build` volume, and control-mkfs-superfloppy (never
+# re-clustered, report-only) shows what Windows does with mkfs.exfat's own.
 VOLUMES=(
   "recl-32k 1G 32K part cp default moves"
   "recl-128k 2G 128K part cp default moves"
   "recl-frag-32k 1G 32K part frag full frag"
   "recl-frag-128k 2G 128K part frag default frag"
-  "recl-superfloppy 2G 128K whole cp default sw2"
-  "recl-crash-window 1G 32K whole cp default crash"
+  "recl-superfloppy 2G 128K whole build default sw2"
+  "recl-crash-window 1G 32K part cp default crash"
+  "control-mkfs-superfloppy 512M 32K whole cp default control"
 )
 
 MP=""    # current mount point, if any
@@ -178,24 +187,32 @@ build_one() { # name size cluster layout fill fat expect
     printf 'label: dos\nlabel-id: 0x20240517\nstart=2048, type=7\n' | sfdisk --quiet "$disk"
   fi
   attach "$disk" "$layout"
-  sudo mkfs.exfat -c "$cluster" -L XOSTEST "$DEV"
-  mount_dev "$DEV"
-  if [ "$fill" = frag ]; then
-    # filler files are 8 clusters long
-    sudo bash "$HERE/recluster_images.sh" fragfill "$MP" "$WORK/src" "$(cluster_bytes "$cluster")"
+  if [ "$fill" = build ]; then
+    sudo "$FLASHCP" build "$WORK/src" "$DEV" --cluster "$(cluster_bytes "$cluster")" --label XOSTEST --yes-erase
   else
-    sudo cp -r --preserve=timestamps "$WORK/src/." "$MP/"
+    sudo mkfs.exfat -c "$cluster" -L XOSTEST "$DEV"
+    mount_dev "$DEV"
+    if [ "$fill" = frag ]; then
+      # filler files are 8 clusters long
+      sudo bash "$HERE/recluster_images.sh" fragfill "$MP" "$WORK/src" "$(cluster_bytes "$cluster")"
+    else
+      sudo cp -r --preserve=timestamps "$WORK/src/." "$MP/"
+    fi
+    umount_dev
   fi
-  umount_dev
 
   # The volume must be right BEFORE the recluster, so a fill problem is never blamed on it.
   sudo fsck.exfat -n "$DEV"
   verify_dev "$DEV" "linux-before:$name"
 
-  run_rc sudo "$FLASHCP" recluster --check "$DEV"
-  expect_eq "$name: recluster --check before" "$RC" 0
+  if [ "$want" != control ]; then
+    run_rc sudo "$FLASHCP" recluster --check "$DEV"
+    expect_eq "$name: recluster --check before" "$RC" 0
+  fi
 
-  if [ "$want" = crash ]; then
+  if [ "$want" = control ]; then
+    echo "$name: a control, not re-clustered"
+  elif [ "$want" = crash ]; then
     # The state a crash at the worst moment leaves: main boot region = new volume, backup = old.
     run_rc sudo env FLASHCP_TEST_RECLUSTER_STOP=reclustered "$FLASHCP" recluster "$DEV" "${fatargs[@]}" --json >"$log" 2>&1
     cat "$log"
