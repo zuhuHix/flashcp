@@ -2,10 +2,8 @@
 
 # flashcp
 
-**Copy thousands of small files to and from a USB drive as normal loose files.
-Measured up to 10.3× faster writes and up to 26.8× faster reads than `mount` + `cp` on a USB SSD
-under Linux, and 2.5–5.7× on a cheap USB 2.0 stick (writing a blank stick 2.5–5.3×; adding to an optimized stick 5.7×, single run).
-On a Kingston DataTraveler 3.0 USB 3 stick, writing 20k small files to a blank stick took 9.02 s against 304 s for `mkfs` + `cp` (34×, baseline single run).** Results vary by drive; see the [benchmarks](#benchmarks).
+**Copying thousands of small files to a USB stick is slow. flashcp makes it fast, and the drive
+stays a normal exFAT drive that Windows, macOS and Linux read like any other.**
 
 [![CI](https://github.com/zuhuHix/flashcp/actions/workflows/ci.yml/badge.svg)](https://github.com/zuhuHix/flashcp/actions/workflows/ci.yml)
 [![Windows + macOS checks](https://github.com/zuhuHix/flashcp/actions/workflows/xos.yml/badge.svg)](https://github.com/zuhuHix/flashcp/actions/workflows/xos.yml)
@@ -14,46 +12,184 @@ On a Kingston DataTraveler 3.0 USB 3 stick, writing 20k small files to a blank s
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-FFDD00?logo=buymeacoffee&logoColor=000)](https://buymeacoffee.com/zuhu)
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/copy-vs-build-dark.gif">
-  <img alt="Two drives drawn as grids of blocks. The normal copy's write head jumps back and forth between the metadata area and the data area for every file and takes 2.80 s. flashcp sweeps once from left to right and is done in 0.42 s, 6.7 times faster." src="assets/copy-vs-build-light.gif" width="800">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/drive-mode-dark.gif">
+  <img alt="Drive mode. A USB stick labelled KINGSTON is plugged in and flashcp's driver takes it over. Three apps (a file manager, a browser and a terminal) drop files, which land in the driver's staging area at once; the three apps are an illustration, and the 0.9 s shown is the measured return of one cp -r of all 20,000 files. The files then stream to the stick in one ordered run. Eject shows the notification 'Saving … MB to KINGSTON…' with the text 'Don't remove the drive yet: you'll be told when it can be removed.', counting down, and then 'KINGSTON can be removed' after 5.3 s. Below, on the same time scale, the Linux kernel driver does the same copy on the same stick with one metadata round trip per file, drawn at the pace of its faster run: it is about a tenth of the way at 5.3 s and needed 50 to 74 s in two runs, so drive mode is safe to remove about 9 to 14 times sooner. Measured on a Kingston DataTraveler 3.0 USB 3 stick with 20,000 files (169 MB) and 4 KB clusters, single runs." src="assets/drive-mode-light.gif" width="800">
 </picture>
 
 **[▶ Try the interactive benchmark explorer](https://zuhuhix.github.io/flashcp/)**
 
 </div>
 
-Copying a `node_modules`-sized tree to a USB drive is slow even on a fast drive, and the drive's
-bandwidth isn't the reason. Every file costs a directory entry, an allocation-table update and a
-bitmap update, all tiny writes scattered across the disk, and every one is a separate trip over USB.
-flashcp reads and writes exFAT itself, so it can turn all of that into **one sequential pass**:
+The animation is one measured copy: 20,000 small files (169 MB) onto a Kingston DataTraveler 3.0
+USB 3 stick with 4 KB clusters. Through flashcp's driver the stick could be removed after
+**5.3 s**. With the Linux kernel driver, on the same stick and the same format, copying and
+unmounting took **50 s in one run and about 72 s in another**: roughly 10× longer (single runs,
+and this stick varies). On a stick formatted the usual way the same copy took 94 s against 259–371 s, and
+[the cluster size is the reason](#why-a-normally-formatted-stick-is-slow). Photos, music and other
+big files gain little: see [when not to expect gains](#when-not-to-expect-gains). Every number, with
+its drive, dataset and baseline, is in the [benchmarks](#benchmarks).
 
-- **`flashcp build`** writes a whole new exFAT drive in one stream. **It erases the drive.**
-- **`flashcp add`** adds a folder to a drive that already has files, without erasing anything.
-- **`flashcp pull`** copies files off a drive, reading it front to back in physical order.
-  `pull --update` copies only new or changed files.
-- **`flashcp sync`** makes a folder on the drive match a local folder, writing only what changed,
-  with a crash-safe journal. See [Sync](#sync-copy-only-what-changed).
+flashcp runs on Linux, and there are two ways to use it:
 
-What you get is an ordinary exFAT drive with ordinary files on it. Windows, macOS and Linux read
-and write it like any other (checked in CI, see [Compatibility](#compatibility)). flashcp itself
-runs on Linux. There's a command-line tool and a [desktop tray app](#desktop-app).
+- **[Drive mode](#drive-mode): nothing to open.** With the desktop package installed, eligible USB
+  exFAT drives are served by flashcp's own driver, so a copy from any app (the file manager, a
+  browser download, `cp`, `rsync`) goes through it. A drive that is busy or fails the clean-volume
+  check falls back to the kernel driver. Drive mode is in the next release (0.3.0).
+- **Commands**, in the current release (0.2.0), for whole jobs on an unmounted drive:
+  - **`flashcp build`** writes a whole new exFAT drive in one stream. **It erases the drive.**
+  - **`flashcp add`** adds a folder to a drive that already has files, without erasing anything.
+  - **`flashcp pull`** copies files off a drive, reading it front to back in physical order.
+  - **`flashcp sync`** makes a folder on the drive match a local folder, writing only what
+    changed, with a crash-safe journal. See [Sync](#sync-copy-only-what-changed).
+  - **`flashcp optimize`** rewrites a stick that was filled file by file into the fast layout.
+    Your files are kept.
+
+Why it is faster: on a normal copy every file costs a directory entry, an allocation-table update
+and a bitmap update, all tiny writes scattered across the disk, and every one is a separate trip
+over USB. flashcp reads and writes exFAT itself, so it turns all of that into **one ordered pass**.
+What you get is an ordinary exFAT drive with ordinary files on it (checked on Windows and macOS in
+CI, see [Compatibility](#compatibility)). There's a command-line tool and a
+[desktop tray app](#desktop-app).
 
 ## Contents
 
-[Install](#install) · [Desktop app](#desktop-app) · [Quick start](#quick-start) ·
-[Benchmarks](#benchmarks) · [Compatibility](#compatibility) · [How it works](#how-it-works) ·
-[The journey](#the-journey) · [Command reference](#command-reference) · [Honest limits](#honest-limits) ·
-[Roadmap](#roadmap) · [Support](#support) · [Contributing](#contributing)
+[Drive mode](#drive-mode) · [Why a normally formatted stick is slow](#why-a-normally-formatted-stick-is-slow) ·
+[When not to expect gains](#when-not-to-expect-gains) · [Install](#install) · [Desktop app](#desktop-app) ·
+[Quick start](#quick-start) · [Benchmarks](#benchmarks) · [Compatibility](#compatibility) ·
+[How it works](#how-it-works) · [The journey](#the-journey) · [Command reference](#command-reference) ·
+[Honest limits](#honest-limits) · [Roadmap](#roadmap) · [Support](#support) · [Contributing](#contributing)
+
+## Drive mode
+
+> [!NOTE]
+> Drive mode is merged and ships in the next release, **0.3.0**. The current release (0.2.0)
+> does not have it. To use it today, build both packages from `main`
+> ([packaging/desktop/README.md](packaging/desktop/README.md)).
+
+**What it is.** Once the [desktop package](#desktop-app) is installed, eligible USB exFAT drives
+are served by flashcp's own exFAT driver (`flashcp mount`, a userspace FUSE driver) instead of the
+kernel's, so copies from any app (the file manager, `cp`, `rsync`) go through flashcp. A drive
+that is busy or fails the clean-volume check falls back to the kernel driver.
+Linux only.
+
+**What you see.** The drive appears as usual at `/media/<user>/<LABEL>`.
+Eject shows "Saving N MB to LABEL…" and then "LABEL can be removed". If you pull the drive out
+while data is still being saved, a warning names what may be missing, and the next plug-in
+repairs the drive from its journal. Drives that aren't clean exFAT, or that are busy, fall back
+to the normal kernel driver, exactly as without flashcp.
+
+**When your files are on the drive.** flashcp writes behind your apps: a copy lands in memory
+first and is then written to the drive in order, so an app can be done before the drive is.
+
+- **Eject is the guarantee.** Use Eject (in the file manager, the tray, or
+  `flashcp drive-mode eject <device>`) and wait for "can be removed".
+- Closing a file starts saving it 150 ms later. A `cp -r` of many files is saved as one batch,
+  150 ms after its last file. For a file that an app keeps open, saving starts within 1 s of its
+  last write.
+- A program that calls `fsync` on a file (an explicit save in most editors) waits until that
+  file is on the drive.
+- **`sync` is not a guarantee.** Linux never forwards `sync`, `sync -f` or `syncfs` to a driver
+  like this one, so `cp … && sync` returns before the data is on the drive
+  ([#24](https://github.com/zuhuHix/flashcp/pull/24)). Eject instead.
+- At most 256 MB is staged at a time. Past that, apps wait for the drive.
+
+**What it measured.** 20,000 small files (169 MB), until the drive is safe to remove:
+
+| Drive | Linux kernel driver | drive mode | |
+|---|---:|---:|---:|
+| Kingston DataTraveler 3.0 (USB 3), 4 KB clusters | 50.3 s, and about 72 s in another run (copy + unmount) | **5.31 s** (1 run) | about 9–14× sooner |
+| Kingston DataTraveler 3.0 (USB 3), default 128 KB clusters | 259–289 s ending with an unmount, up to 371 s with a final `sync` | **93.8 s** (94.7 s on a second build) | 2.8–3.1× sooner, up to 4.0× against a final `sync` |
+| MSI DATAMAG USB SSD (UAS) | 1.80 s | **1.26 s** | 1.4× sooner (medians of 3) |
+
+The Kingston rows are single runs. Its 128 KB kernel figures are whole runs, formatting and
+mounting included, which is under 1 s of them (measured 0.46 s). The animation's 0.9 s is the
+measured return of one `cp -r` of the 20,000 files; the three apps are an illustration.
+
+One cost: `cp` itself often *returns* later than with the kernel driver (about 2× in most
+tests), while the data is on the drive sooner. The baselines, the read-back times and that
+caveat are in [Drive mode benchmarks](#drive-mode-flashcp-mount-vs-the-kernel-exfat-driver).
+
+**How to turn it off.** The **Speed up USB drives** switch in the app or the tray menu, or
+`flashcp drive-mode off` (per user; current drives are saved and remounted by the kernel driver).
+For every user: `sudo flashcp drive-mode off --system`. Uninstalling the desktop package restores
+normal automount.
+
+**The safety model.**
+- Every metadata write goes through a crash-safe journal on the drive (`/.flashcp-drive-journal`).
+- After a crash or a yank, the drive holds the old tree or the new one, never a mix. A crash
+  test at every device write checks this, and so did crash tests on the real drives.
+- Data that was still waiting to be saved when the drive was yanked is lost, as with the
+  kernel's page cache. The warning says how much.
+- The plug-in check that reads an unknown drive runs sandboxed in a transient systemd unit: a
+  throwaway user, no network, no access to your files, and the device opened read-only.
+
+Details: [packaging/desktop/README.md](packaging/desktop/README.md#drive-mode-speed-up-usb-drives-on-by-default),
+[DESIGN.md](DESIGN.md), [SECURITY-NOTES.md](packaging/desktop/SECURITY-NOTES.md#drive-mode-flashcp-udev-check).
+
+## Why a normally formatted stick is slow
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/cluster-slack-dark.gif">
+  <img alt="Why cluster size matters, drawn with one square per 4 KB. On the default format a cluster is 128 KB (32 squares) and every small file owns a whole one: six files fill six clusters, a few squares of file data each and the rest padding. On flashcp's format with 4 KB clusters the same six files sit side by side in 15 squares. For the real copy of 20,000 files (169 MB) the stick has to write 2.6 GB on 128 KB clusters, which took 93.8 s, and 211 MB on 4 KB clusters, which took 5.3 s: 17.7 times faster on the same stick with the same files and the same driver. Measured on a Kingston DataTraveler 3.0 in drive mode, single runs." src="assets/cluster-slack-light.gif" width="800">
+</picture>
+
+exFAT stores files in clusters, and a file always takes whole ones. `mkfs.exfat`, Windows and
+macOS choose big clusters for big drives: 128 KB on a 128 GB stick, 32 KB on an 8 GB one. A 6 KB
+file then owns 128 KB of the stick.
+
+For the 20,000-file test set (169 MB, 8.4 KB per file on average) that turned into **2.6 GB** of
+writing on the Kingston stick (the device counted 2,525 MiB). A driver can either fill each
+file's unused space with zeros or jump over it 20,000 times, and on this stick filling is the
+faster of the two: with `flashcp add`, filling took 89.7 s, jumping 144 s, and padding each file
+to 16–64 KB 129–190 s. With 4 KB clusters the same files are 211 MB of writing.
+
+Same stick, same files, same driver (drive mode, single runs): **93.8 s** on 128 KB clusters,
+**5.31 s** on 4 KB clusters.
+
+What you can do about it:
+
+- **`flashcp build`** chooses the cluster size for your data (4 KB here), so a stick it wrote
+  stays fast afterwards. That helps the kernel driver too: it copied these files in 52–74 s onto a
+  4 KB-cluster stick, against 259–371 s onto a default-format one.
+- **`flashcp optimize`** converts a stick that already holds files. It copies them to this
+  computer, verifies the copy, rebuilds the stick and verifies again.
+- Coming next: changing the cluster size in place, without moving file data
+  ([#26](https://github.com/zuhuHix/flashcp/pull/26), not merged yet).
+
+Big files don't get slower on small clusters: on the USB 2.0 stick the kernel copied one 512 MB
+file onto a 4 KB-cluster stick in 86.0 s, against 107.7 s onto a default-format one (1 run each).
+
+## When not to expect gains
+
+flashcp removes per-file overhead. Where there is little of it, there is little to gain.
+
+- **Photos, music and video (files of about 5 MB and up): about 1.0–1.3× on the sticks.** That
+  range is an estimate from byte counts and the drives' measured rates, not a timed run (the
+  same estimate for the SSD is 1.3–2.0×, falling as files get bigger). The one timed big-file
+  case agrees: a single 512 MB file onto the USB 2.0 stick took 87.5 s with `flashcp build` and
+  86.0 s with the kernel driver on the same 4 KB format.
+- **Office documents (around 60 KB each):** estimated 1.1–1.6× on the USB 2.0 stick and about
+  2–3× on the USB 3 stick and the SSD. Also an estimate.
+- **Reading a stick that another system filled:** on par with `cp` on the USB 2.0 stick
+  (29.52 s against 30.86 s) and 1.4× on the USB 3 stick (7.96 s against 11.3 s). The files are
+  scattered, and every one needs its own read either way. `optimize` fixes the layout once.
+- **A cheap USB 2.0 stick** is limited by its flash chip (6.5 MB/s sequential writes on the
+  test stick). flashcp removes the overhead around that, not the chip.
+- **A fast SSD in drive mode:** 1.26 s against 1.80 s for the 20,000-file copy. The kernel
+  driver is already quick there; the big SSD gains are in `build`, `add` and `pull`.
+- **A default-format stick** stays [slow for small files](#why-a-normally-formatted-stick-is-slow)
+  until it is rebuilt with small clusters: drive mode was 2.8–4.0× sooner there, not 9–14×.
 
 ## Install
 
 flashcp runs on Linux (x86_64 and aarch64). The release binaries are static, so they work on any distribution.
-`fsck.exfat` from `exfatprogs` is recommended for checking volumes.
+`fsck.exfat` from `exfatprogs` is recommended for checking volumes. The current release is
+**0.2.0**; drive mode arrives with 0.3.0.
 
 **Prebuilt binary**
 
 ```sh
-VERSION=0.1.0
+VERSION=0.2.0
 ARCH=$(uname -m)   # x86_64 or aarch64
 curl -LO "https://github.com/zuhuHix/flashcp/releases/download/v$VERSION/flashcp-$VERSION-$ARCH-unknown-linux-musl.tar.gz"
 tar -xzf "flashcp-$VERSION-$ARCH-unknown-linux-musl.tar.gz"
@@ -66,7 +202,7 @@ Checksums are in `SHA256SUMS` on the [release page](https://github.com/zuhuHix/f
 **Debian / Ubuntu (.deb)**
 
 ```sh
-VERSION=0.1.0
+VERSION=0.2.0
 ARCH=$(dpkg --print-architecture)   # amd64 or arm64
 curl -LO "https://github.com/zuhuHix/flashcp/releases/download/v$VERSION/flashcp_${VERSION}_$ARCH.deb"
 sudo apt install "./flashcp_${VERSION}_$ARCH.deb"
@@ -88,14 +224,23 @@ cargo install --locked --git https://github.com/zuhuHix/flashcp
 
 ## Desktop app
 
-On Linux Mint, Ubuntu and Debian you can install a small tray app alongside the CLI. Build its
-`.deb` with the steps in [packaging/desktop/README.md](packaging/desktop/README.md), then install both packages together:
+On Linux Mint, Ubuntu and Debian (amd64) you can install a small tray app alongside the CLI.
+Download both packages from the [release page](https://github.com/zuhuHix/flashcp/releases) and
+install them together:
 
 ```sh
-sudo apt install ./flashcp_*.deb ./flashcp-gui_*.deb
+VERSION=0.2.0
+BASE="https://github.com/zuhuHix/flashcp/releases/download/v$VERSION"
+curl -LO "$BASE/flashcp_${VERSION}_amd64.deb" -LO "$BASE/flashcp-gui_${VERSION}_amd64.deb"
+sudo apt install "./flashcp_${VERSION}_amd64.deb" "./flashcp-gui_${VERSION}_amd64.deb"
 ```
 
-It starts at login and shows a notification when you plug in a USB exFAT drive. It has two modes:
+To build the packages yourself, see [packaging/desktop/README.md](packaging/desktop/README.md).
+
+It starts at login and shows a notification when you plug in a USB exFAT drive. From 0.3.0 it
+also turns on [drive mode](#drive-mode): its **USB drives** section shows each drive's mode, what
+is still being saved and **Safe to remove**, next to the **Speed up USB drives** switch (also in
+the tray menu). For explicit fast copies it has two modes:
 
 - **Copy to USB.** Pick files or drop them on the window, and flashcp adds them to the drive in one
   sequential pass. The app unmounts the drive, writes, remounts it and opens it in your file manager.
@@ -190,12 +335,26 @@ sudo flashcp sync ~/Music /dev/sdX1 --to Music --delete --yes   # also remove wh
 sudo flashcp pull /dev/sdX1 ~/Stick --update                    # the other way: copy off only what changed
 ```
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/sync-only-changed-dark.gif">
+  <img alt="flashcp sync, drawn as two grids of 200 squares, one square per 100 of the 20,000 files: the folder on this computer and the copy on the stick. Three repeat runs: a scan compares the two sides, the changed squares light up, and only those cross over to the stick. Nothing changed: 0.21 s, 0 MB written. 200 files changed: 1.17 s, 2 MB written. 1,800 files changed: 2.67 s, 20 MB written. For comparison, a run in which every file had to be rewritten took 8.89 s and wrote 224 MB. Measured on a Kingston DataTraveler 3.0 USB 3 stick with 4 KB clusters, single runs." src="assets/sync-only-changed-light.gif" width="800">
+</picture>
+
 `sync` makes a folder on the drive match a local folder. It compares each file's size and
 modification time with the drive (exFAT keeps times to 10 ms) and writes only new and changed files.
-On a 1 GB image file with the 20k-file small dataset, a repeat sync with nothing changed wrote
-**0 bytes**, and with 1 % / 10 % of the files changed it wrote 2.4 MB / 22.9 MB, 1.1 % / 10.8 % of
-the 212.3 MB a full build writes. (Image wall times are page-cache bound and say nothing about a
-stick; the bytes are the device-relevant number. A sync has not been timed on a real stick yet.)
+
+Timed on the Kingston USB 3 stick (4 KB clusters, the 20,000-file / 169 MB set already on it,
+single runs):
+
+| repeat sync | time | written |
+|---|---:|---:|
+| nothing changed | **0.21 s** | nothing |
+| 200 files changed (1 %) | **1.17 s** | 2 MB |
+| 1,800 files changed | **2.67 s** | 20 MB |
+| every modification time touched, so every file is rewritten | 8.89 s | 224 MB |
+| nothing changed, with `--checksum` (reads the stick) | 1.57 s | nothing |
+
+For scale, `flashcp add` of the whole set onto that stick took 4.0–8.2 s.
 
 - "Changed" means a different size or modification time. A file edited without changing its size
   whose time was preserved (`cp -p`, `rsync -t`, some tools) is skipped; pass `--checksum` to
@@ -266,20 +425,82 @@ gets build speed too.
 ## Benchmarks
 
 Three drives: the MSI SSD and the SanDisk stick on Linux 7.0 (2026-11-09), and the Kingston
-USB 3 stick on Linux (2026-11-10). Datasets come from `flashcp gen`:
+USB 3 stick on Linux (2026-11-10, two sessions). Datasets come from `flashcp gen`:
 **small** = 20k files / 169 MB, **many** = 100k files / 413 MB (`node_modules`-like),
-**mixed** = 8.4k files / 1.4 GB. Every baseline includes its `mkfs` or its mount and unmount, plus
-`cp -r` and `sync`. Every flashcp time is the whole process, including formatting for `build`.
-Volumes were checked with `fsck.exfat` and a byte-for-byte `diff -r`.
+**mixed** = 8.4k files / 1.4 GB.
+
+How to read the tables:
+
+- **The baseline is the Linux kernel exfat driver**: `mkfs.exfat` or a mount, `cp -r`, and an
+  unmount (with `sync` where a table says so). How a copy ends matters a lot on a stick, so the
+  Kingston tables say which ending was timed.
+- **Cluster size is part of every comparison.** `mkfs.exfat` picks 32 KB on the 8 GB stick and
+  128 KB on the 128 GB one; `flashcp build` picks 4 KB for these files. A row compares like with
+  like only where it says both sides used the same cluster size.
+- Every flashcp time is the whole process, including formatting for `build`.
+- Sticks vary from run to run. Single runs are marked, and where two sessions disagree both
+  numbers are given.
+- Volumes were checked with `fsck.exfat` and a byte-for-byte `diff -r`.
+
+### USB 3 stick: Kingston DataTraveler 3.0 128 GB (USB 3.0 5 Gbps, usb-storage / BOT)
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmark-dark.gif">
-  <img alt="Two bar charts. USB SSD, 20k small files: build 2.80 s vs 0.42 s (6.7×), add 1.72 s vs 0.48 s (3.6×), pull 6.01 s vs 0.66 s (9.1×). Cheap USB 2.0 stick, 20k small files: build 110.4–179.6 s vs 33.6 s (3.3–5.3×), pull from a kernel-filled stick 30.86 s vs 29.52 s (1.05×, on par), pull from a flashcp-built stick 32.78 s vs 16.38 s (2.0×)." src="assets/benchmark-light.gif" width="800">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmark-usb3-dark.gif">
+  <img alt="Bar chart for the Kingston DataTraveler 3.0 USB 3 stick, 20,000 small files, Linux kernel driver against flashcp, single runs. Drive mode copy onto a 4 KB-cluster stick: 50–74 s (two kernel runs) against 5.31 s (9–14×). Build of a blank stick, 4 KB clusters for both: 52–74 s against 2.72–9.02 s (6–27×). Drive mode copy onto a stick with the default 128 KB clusters: 259–371 s against 93.8 s (2.8–4.0×). The 128 KB kernel copies took 259–289 s ending with an unmount and up to 371 s with a final sync." src="assets/benchmark-usb3-light.gif" width="800">
 </picture>
+
+**Afternoon and evening sessions (2026-11-10), the small dataset, single runs.** Every write
+passed `fsck.exfat`, and each group was compared file by file.
+
+| what | cluster size | Linux kernel driver | **flashcp** | |
+|---|---|---:|---:|---:|
+| copy until safe to remove | 4 KB, both | 50.3 s (`cp` + unmount); another run took 74.0 s including ≈2 s of formatting and mounting | **5.31 s** (drive mode: `cp` + unmount + final commit; `cp` returned after 0.93 s) | about 9–14× |
+| write a blank stick, formatting included | 4 KB, both | 52.2 s and 74.0 s (`mkfs.exfat -c 4K` + mount + `cp` + unmount) | **2.72 s** (`build`; 9.02 s in the morning) | 6–27× |
+| add 20k more files to a stick holding 20k | 4 KB | not run | **4.01 s** (`add`; 8.20 s in a second setup) | – |
+| copy until safe to remove | 128 KB, both | unmount only: 258.8 s and 288.7 s; `sync -f` + unmount: 315.5 s; `sync` + unmount: 370.7 s | **93.8 s** (drive mode; 94.7 s on a second build), **89.7 s** (`add`) | 2.8–3.1× (unmount only), up to 4.0× (final `sync`) |
+
+- **Formatting and mounting are not what the kernel's time is made of.** Timed by phase, one
+  4 KB run was `mkfs` 1.53 s, mount 0.38 s, `cp` 0.73 s and unmount 49.56 s; one 128 KB run was
+  `mkfs` 0.08 s, mount 0.38 s, `cp` 0.61 s and unmount 287.65 s. The 128 KB kernel figures above
+  are whole runs, so formatting and mounting are 0.46 s of them.
+- **The spread is the stick.** The same 4 KB kernel copy took 52.2 s in one run and 74.0 s in
+  another, which is why the comparisons are ranges.
+- **Like for like, flashcp is about 6–27× faster on this stick, and the cluster size alone is
+  another 3.5–5.5×** (the kernel driver ending with an unmount: 52–74 s on 4 KB clusters,
+  259–289 s on 128 KB).
+- **If you just format the stick the usual way and copy**, the kernel driver needs 259–371 s for
+  these files. `flashcp build` needs 2.7–9.0 s, but that compares 128 KB clusters with 4 KB ones:
+  most of the gap is the format, which is why the like-for-like row is the headline.
+- The three kernel runs were made in a fixed order, so some of their spread may be the stick
+  drifting. An earlier README quoted the `sync -f` ending (304 s) against the morning build
+  (9.02 s) as 34×.
+- **Small builds depend on the stick's state.** It writes 80–90 MB/s for roughly the first
+  800 MB and 21–33 MB/s after that, and recovers after a short pause (raw `dd` shows the same).
+  A 1.43 GB mixed build, twice back to back, averaged 48.2 and 45.4 MB/s.
+
+**Morning session (2026-11-10).** Medians of 3 unless noted. Kernel baselines are timed with
+mount, `sync` and unmount, on the default 128 KB format. Every build and add passed
+`fsck.exfat -n`, and the pulls matched byte for byte.
+
+| operation | dataset | Linux kernel driver | **flashcp** | speed-up | runs |
+|---|---|---:|---:|---:|---|
+| `build` | many | not run (≈25 min) | **22.3 s** | – | |
+| `add` 20k files onto a kernel-filled stick (128 KB, both) | small | 527 s | **93.3 s** | 5.7× | 1 run each |
+| `pull` from a kernel-filled stick | small | 11.3 s | **7.96 s** | 1.4× | median of 3 |
+| `pull` from a flashcp-built stick | small | 7.2 s | **1.15 s** | 6.2× | median of 3 |
+| | many | 38.6 s | **3.60 s** | 10.7× | median of 3 |
 
 ### Fast drive: MSI DATAMAG 20Gbps USB SSD (UAS, 10 Gb/s link, 1 TB)
 
-Medians of 3.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmark-ssd-dark.gif">
+  <img alt="Bar chart for the MSI DATAMAG USB SSD, 20,000 small files, Linux kernel driver against flashcp, medians of 3. Build: 2.80 s against 0.42 s (6.7×). Add to an existing drive: 1.72 s against 0.48 s (3.6×). Pull: 6.01 s against 0.66 s (9.1×). Drive mode copy until safe to remove: 1.80 s against 1.26 s (1.4×). With 100,000 files, build is 10.3× and pull from a flashcp-built drive 26.8×." src="assets/benchmark-ssd-light.gif" width="800">
+</picture>
+
+Medians of 3. The baselines include `mkfs` (for build) or the mount and unmount, plus `sync`.
+flashcp works on the unmounted drive, so on an auto-mounted drive add an unmount and a remount
+(a cycle took 0.5 s on the USB 2.0 stick), which these times do not include. That only matters
+at SSD speeds.
 
 | operation | dataset | normal copy | **flashcp** | speed-up |
 |---|---|---:|---:|---:|
@@ -312,43 +533,38 @@ raw bandwidth is the limit for both methods, so the gap shrinks.
 
 ### Cheap drive: SanDisk Cruzer Blade 8 GB (USB 2.0, usb-storage / BOT)
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmark-usb2-dark.gif">
+  <img alt="Bar chart for the SanDisk Cruzer Blade USB 2.0 stick, 20,000 small files, Linux kernel driver against flashcp. Build against a default-format copy: 110.4–179.6 s against 33.6 s (3.3–5.3×). Add onto the same 32 KB-cluster stick: 209.8 s against 84.1–114 s (1.8–2.5×). Pull from a kernel-filled stick: 30.86 s against 29.52 s (1.05×). Pull from a flashcp-built stick: 32.78 s against 16.38 s (2.0×). The flash chip is the ceiling: 6.5 MB/s sequential write and 13.8 MB/s read, measured. Build and pull are medians of 3, add is single runs." src="assets/benchmark-usb2-light.gif" width="800">
+</picture>
+
 The small dataset (20k files / 169 MB). Kernel baselines include mount and unmount. This stick
 varies a lot from run to run (its controller does its own housekeeping): the same `mkfs` + `cp`
 took 110.4 s in one run and 179.6 s in another, so the build row shows that range. An earlier session on the
 same stick measured 86.3 s (`mkfs` + `cp`) against 34.6 s for `build`, which is 2.5×, so expect 2.5–5.3× there.
 
-| operation | normal copy | **flashcp** | speed-up | runs |
-|---|---:|---:|---:|---|
-| `build` (auto → 4 KB clusters) vs `mkfs.exfat` + `cp` | 110.4–179.6 s (earlier session: 86.3 s) | **33.6 s** (earlier: 34.6 s) | 2.5–5.3× | median of 3 |
-| first copy onto an empty, freshly formatted stick (`add`, written as a build) | 104.3 s | **34.9 s** | ≈3× | median of 3 |
-| `add` 20k more files onto a stick holding 20k (`mkfs` default, 32 KB clusters) | 209.8 s | **84.1 s** | 2.5× | 1 |
-| same, onto a stick after `flashcp optimize` (4 KB clusters) | 209.8 s¹ | **36.5 s** | 5.7× | 1 |
-| `pull` from a kernel-filled stick | 30.86 s | **29.52 s** | 1.05× (on par) | median of 3 |
-| `pull` from a flashcp-built stick | 32.78 s | **16.38 s** | 2.0× | median of 3 |
-| `flashcp pull` of the same stick, before → after `optimize` | 28.9 s | **16.0 s** | 1.8× | median of 3 |
-| `flashcp optimize` itself (one-time; the stick is read once) | | 81–103 s | | |
+| operation | cluster size | Linux kernel driver | **flashcp** | speed-up | runs |
+|---|---|---:|---:|---:|---|
+| `build` vs `mkfs.exfat` + `cp` | kernel 32 KB (default), flashcp 4 KB | 110.4–179.6 s (earlier session: 86.3 s) | **33.6 s** (earlier: 34.6 s) | 2.5–5.3× | median of 3 |
+| `add` 20k more files onto a stick holding 20k | 32 KB, both | 209.8 s | **84.1 s** (96–114 s in other runs) | 1.8–2.5× | 1 run each |
+| the same `add` onto a stick after `flashcp optimize` | 4 KB | not run | **36.5 s** | – | 1 |
+| `pull` from a kernel-filled stick | 32 KB | 30.86 s | **29.52 s** | 1.05× (on par) | median of 3 |
+| `pull` from a flashcp-built stick | 4 KB | 32.78 s | **16.38 s** | 2.0× | median of 3 |
 
-¹ The kernel baseline was measured on the `mkfs`-default stick.
+flashcp against its own earlier versions on this stick:
+
+| | before | after | runs |
+|---|---:|---:|---|
+| `pull` of the same stick, before → after `optimize` | 28.9 s | **16.0 s** | median of 3 |
+| `add` onto an empty, freshly formatted stick: plain `add` → written as a build | 104.3 s | **34.9 s** | median of 3 (after) |
+| `flashcp optimize` itself (one-time; the stick is read once) | | 81–103 s | |
+
+No kernel copy was timed on a 4 KB-cluster SanDisk, so there is no like-for-like build figure for
+this stick. The `add` row is the like-for-like one: same stick, same 32 KB clusters.
 
 Big files don't get slower on flashcp's small clusters: the kernel copied one 512 MB file onto an
 optimized stick in 86.0 s, against 107.7 s onto a `mkfs`-default one. The automatic tuning cost
 nothing on the SSD (build 0.31 s, pull 0.36 s, add 0.42 s on the 20k-file dataset).
-
-### USB 3 stick: Kingston DataTraveler 3.0 128 GB (USB 3.0 5 Gbps, usb-storage / BOT)
-
-Measured 2026-11-10. Medians of 3 unless noted. Kernel baselines are timed with mount, `sync` and
-unmount. Every build and add passed `fsck.exfat -n`, and the pulls matched byte for byte.
-
-| operation | dataset | normal copy | **flashcp** | speed-up | runs |
-|---|---|---:|---:|---:|---|
-| `build` vs `mkfs.exfat` + `cp` | small | 304 s | **9.02 s** | 34× | baseline 1 run |
-| `build` | many | not run (≈25 min) | **22.3 s** | – | |
-| `add` 20k files onto a kernel-filled stick | small | 527 s | **93.3 s** | 5.7× | 1 run each |
-| `pull` from a kernel-filled stick | small | 11.3 s | **7.96 s** | 1.4× | median of 3 |
-| `pull` from a flashcp-built stick | small | 7.2 s | **1.15 s** | 6.2× | median of 3 |
-| | many | 38.6 s | **3.60 s** | 10.7× | median of 3 |
-
-On the `add` row, flashcp's write probe chose to zero-fill gaps; skipping them took 144 s.
 
 ### Two kinds of drives
 
@@ -358,9 +574,11 @@ On the `add` row, flashcp's write probe chose to zero-fill gaps; skipping them t
 </picture>
 
 The gains differ because the bottleneck differs. The stick measured 6.5 MB/s for sequential 8 MB
-writes (6.2 MB/s at 64 KB, 2.5 MB/s at 4 KB, 48 random 4 KB IOPS) and about 11 MB/s for sequential
-reads; a model fit puts its write ceiling at an estimated ≈6.9 MB/s. No software gets past that. flashcp removes the per-file
-overhead (and, after `optimize`, the scattered layout), so copies get 2–5.7× faster, but the chip is the ceiling. On a fast SSD the per-file
+writes (6.2 MB/s at 64 KB, 2.5 MB/s at 4 KB, 48 random 4 KB IOPS) and 13.8 MB/s for sequential
+reads (single probes read 11–14 MB/s); a model fit puts its write ceiling at an estimated ≈6.9 MB/s.
+No software gets past that. flashcp removes the per-file overhead (and, after `optimize`, the
+scattered layout): a build is 2.5–5.3× faster than a default-format copy and an `add` onto the
+same 32 KB stick 1.8–2.5×, but the chip is the ceiling. On a fast SSD the per-file
 overhead is most of the time, so removing it gives up to 10.3× on writes and 26.8× on reads with
 many small files (2.0–3.2× on the mixed 1.4 GB dataset, where bandwidth is the limit again).
 
@@ -368,6 +586,50 @@ Pulling from a stick that the kernel filled is on par with `cp`: both are bound 
 speed, and every scattered file needs its own read either way. A stick written by `flashcp build`
 has every file contiguous, and `pull` is 2× faster there; `optimize` turns a kernel-filled stick into
 one. Treat single numbers on cheap sticks as rough: they are noisy.
+
+### Drive mode: `flashcp mount` vs the kernel exfat driver
+
+The small dataset (20k files / 169 MB). The first table is from
+[#22](https://github.com/zuhuHix/flashcp/pull/22): a fresh default-format filesystem each run
+(128 KB clusters on the Kingston), median of 3 unless marked. Kernel = the udisks mount of the kernel exfat
+driver. **Durable** = `cp` until the data is on the drive and it is unmounted (kernel: `cp` + `sync -f` +
+unmount; flashcp: `cp` + unmount + the final commit). **cp returns** = when `cp` itself exits.
+**Read back** = a cold `cp -r` of what each one wrote, byte-checked. `fsck.exfat` was clean after
+every flashcp run.
+
+| Drive | | kernel exfat | flashcp mount | |
+|---|---|---:|---:|---:|
+| Kingston DataTraveler 3.0 (USB 3, BOT) | small, durable | 315.1 s (1 run) | **73.8 s** | 4.3× faster |
+| | small, `cp` returns | 0.61 s (1 run) | 1.22 s | 2.0× slower |
+| | small, read back | 10.81 s | **8.29 s** | 1.30× faster |
+| | 20k empty files in one dir, durable | 24.8 s | **0.83 s** | 30× faster |
+| MSI DATAMAG 20Gbps (USB SSD, UAS) | small, durable | 1.80 s | **1.26 s** | 1.43× faster |
+| | small, `cp` returns | 0.53 s | 1.01 s | 1.9× slower |
+| | small, read back | 4.85 s | **2.84 s** | 1.71× faster |
+| | 20k empty files in one dir, durable | 22.9 s | **0.49 s** | 47× faster |
+
+The Kingston again in the afternoon session, single runs, with the cluster size as the variable
+(see [why a normally formatted stick is slow](#why-a-normally-formatted-stick-is-slow)):
+
+| Kingston DataTraveler 3.0, small, durable | kernel exfat | flashcp mount | |
+|---|---:|---:|---:|
+| 4 KB clusters, both | 50.3 s (`cp` + unmount; `cp` returned after 0.73 s). Another run: 74.0 s including ≈2 s of formatting and mounting (`cp` returned after 1.69 s) | **5.31 s** (`cp` returned after 0.93 s) | about 9–14× faster |
+| default 128 KB clusters, both | whole runs, formatting and mounting under 1 s of them: 258.8 s and 288.7 s (unmount only), 315.5 s (`sync -f` + unmount), 370.7 s (`sync` + unmount) | **93.8 s** (`cp` returned after 0.93 s) | 2.8–3.1× faster (unmount only), up to 4.0× (final `sync`) |
+
+On the 128 KB stick the morning median was 73.8 s and the afternoon run 93.8 s (94.7 s with
+[#24](https://github.com/zuhuHix/flashcp/pull/24)'s close-commit build, so that change costs
+nothing here). The two sessions differ, as small builds on this stick do.
+
+**The honest caveat:** in #22's runs `cp` returned about 2× later with drive mode, while the data
+was on the drive sooner. The kernel lets `cp` return once the data is in RAM; through FUSE every
+file costs about four round trips to the driver (~40 µs per file here). That is the FUSE protocol
+itself, and the durable time, the one that matters for "safe to remove", is better on both drives.
+Crash tests on both drives (SIGKILL and aborts between commit phases) remounted to the old or the
+new tree with `fsck.exfat` clean.
+
+**`sync` does not wait for drive mode.** The kernel does not forward `sync` or `syncfs` to a FUSE
+driver. Closing a file starts its commit 150 ms later; on an image, the copy was durable 0.28 s
+after `cp` returned ([#24](https://github.com/zuhuHix/flashcp/pull/24)). Eject is the guarantee.
 
 ### Simulating a drive: `flashcp sim`
 
@@ -411,6 +673,11 @@ macOS driver, and it does the same on volumes made by `mkfs.exfat`.
 ## How it works
 
 ### `build`: one pass for the whole drive
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/copy-vs-build-dark.gif">
+  <img alt="Two drives drawn as grids of blocks. The normal copy (mkfs + cp) moves its write head back and forth between the metadata area and the data area for every file and takes 2.80 s. flashcp build sweeps once from left to right and is done in 0.42 s, 6.7 times faster. 20,000 files, 169 MB, measured on a USB SSD; the flashcp time includes formatting." src="assets/copy-vs-build-light.gif" width="800">
+</picture>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/volume-layout-dark.gif">
@@ -498,7 +765,7 @@ I started by measuring the SSD with `flashcp probe`:
    SSD but real. The first `pull`, though, was
    **1.8× slower than `cp`** (62.9 s vs 35.2 s). It was using the SSD's tuning: 32 parallel 8 MB
    reads only interleave on a transport that runs one command at a time, and reading through gaps
-   of up to 32 KB meant reading 650 MB instead of 208 MB at the stick's ~11 MB/s. The fix was
+   of up to 32 KB meant reading 650 MB instead of 208 MB at the stick's 11–14 MB/s. The fix was
    **adaptive reads**: detect BOT, keep 2 reads in flight, and let a half-second probe decide whether
    reading through a gap is cheaper than a new request. Now `pull` is on par with `cp` on a
    kernel-filled stick and 2× faster on a flashcp-built one.
@@ -509,7 +776,16 @@ I started by measuring the SSD with `flashcp probe`:
    only once, the first copy onto an empty stick runs as a build (104.3 s → 34.9 s), and `optimize`
    itself turns a kernel-filled stick into a fast one. Their conclusion: on the stick, the flash chip
    sets the pace, so the next big win isn't physics. It's **not re-sending data you already copied**
-   last time, which is what [`sync`](#sync-copy-only-what-changed) is for.
+   last time, which is what [`sync`](#sync-copy-only-what-changed) is for. On the USB 3 stick a
+   repeat sync with nothing changed takes 0.21 s.
+8. **Stop asking people to open a tool** ([drive mode](#drive-mode)). All of the above needs an
+   unmounted drive and a command. So flashcp got its own read-write exFAT driver: copies from any
+   app are staged, journaled and written in order. On the default-format Kingston stick the data
+   was safe after 73.8 s instead of 315 s. The price is that `cp` itself returns about 2× later.
+9. **The cluster-size discovery.** Research into why that was still 74 s found one cause: on a
+   stick formatted the usual way every small file owns a 128 KB cluster, so 169 MB of files became
+   2.6 GB of writing. On the same stick with 4 KB clusters the same copy took 5.3 s
+   ([why](#why-a-normally-formatted-stick-is-slow)). Changing the cluster size in place is next.
 
 <details>
 <summary><b>Earlier experiment results: copying onto an existing volume</b></summary>
@@ -563,6 +839,11 @@ flashcp bench <src> <mounted-dir> --runs 3             # the early copy methods,
 flashcp copy  <src> <dst> [--writers N] [--verify]     # pipelined, ordered loose-file copy (experiment)
 flashcp pack  <src> <out.tar> --compress auto|zstd|none  # one tar stream (experiment)
 flashcp sim   run|sweep|calibrate|profiles               # trace-driven drive simulator (SIMULATION.md)
+flashcp mount <device|image> <mountpoint>              # drive mode's FUSE exFAT driver, read-write
+flashcp mount --check <device|image>                   # would drive mode serve it? 0 = yes, 3 = no, 4 = busy
+flashcp drive-mode status [--json]                     # drive mode on/off, and how each USB drive is served
+flashcp drive-mode on|off [--system]                   # "Speed up USB drives" (--system: every user, root)
+flashcp drive-mode eject <device>                      # save everything, unmount, power off
 flashcp --version
 ```
 
@@ -572,6 +853,10 @@ flashcp --version
 - `sync`: `--yes-many` (confirm more than 1000 deletions), `--fast-moves` (trust a sampled
   fingerprint for moves instead of a full comparison; risky), `--readers <n>`.
 - `pull`: with `--delete-extraneous`, `--yes-many` confirms more than 1000 deletions.
+- `mount`: `--json` (events as JSON lines), `--control <socket>` (status, flush, prepare-eject,
+  resume, unmount), `--close-ms <n>` (save this long after the last file is closed; default 150,
+  0 turns it off). You normally don't run it yourself: `flashcp drived`, the per-user service the
+  desktop package enables, does. The contract is [docs/drive-mode-interface.md](docs/drive-mode-interface.md).
 - `build`, `add`, `sync`, `pull` and `info` take `--target-fd N` instead of a path, to use an already-open
   block device (for example from a privileged helper; that's how the desktop app works).
 
@@ -597,6 +882,14 @@ The same operations are available as a Rust library: `flashcp::build`, `flashcp:
   itself doesn't run there yet (see [Roadmap](#roadmap)).
 - **exFAT only.** `build` creates exFAT; `add` and `pull` read exFAT. FAT32 and NTFS drives aren't supported.
 - **`build` erases the target.** Use `add` to keep what's on the drive.
+- **Drive mode** is not in a release yet (0.3.0 is next) and needs the desktop package (systemd,
+  udisks2, FUSE 3). `cp` returns about 2× later than with the kernel driver (see
+  [the caveat](#drive-mode-flashcp-mount-vs-the-kernel-exfat-driver)). `sync` does not wait for it:
+  only Eject and a program's own `fsync` do. It doesn't support symlinks, hard links, xattrs or
+  ownership. Data still being saved when the drive is yanked is lost, as with the kernel's page cache.
+- **Big files gain little** (about 1.0–1.3× for photos and music on a stick, an estimate), and a
+  default-format stick stays slow for small files until it has small clusters. See
+  [when not to expect gains](#when-not-to-expect-gains).
 - **The drive must be unmounted** for `build` and `add` (the desktop app unmounts and remounts for you).
   `pull` works on a mounted drive but warns, because it can't see writes the kernel hasn't flushed.
 - **`add` is cautious.** It refuses TexFAT, two FATs, dirty or media-failure volumes, and volumes it
@@ -604,25 +897,34 @@ The same operations are available as a Rust library: `flashcp::build`, `flashcp:
   (`sync --delete` can).
 - **`pull`** restores modification times only (not attributes or creation/access times), and doesn't
   cross-check the volume against its allocation bitmap the way `add` does.
-- **Cheap sticks are chip-bound.** Expect about 2–5× on a USB 2.0 stick, and no gain when pulling
-  from a stick that another system filled file by file (run `optimize` once to fix that).
+- **Cheap sticks are chip-bound.** On the USB 2.0 test stick a build was 2.5–5.3× faster than a
+  default-format `mkfs` + `cp`, an `add` onto the same stick 1.8–2.5×, and pulling from a stick
+  that another system filled file by file gained nothing (run `optimize` once to fix that).
 - **`optimize` needs local disk space** for a full copy of the stick, and an interrupted run must be
   finished on Linux (see the warning in [Quick start](#quick-start)).
-- **`sync` decides "changed" by size and modification time** unless you pass `--checksum`, and its
-  speed has been measured on image files only, not yet on a real stick.
+- **`sync` decides "changed" by size and modification time** unless you pass `--checksum`, so
+  a tree whose times were all touched is rewritten in full. Its speed has been timed on one
+  stick (the Kingston, single runs).
 - **Measured on three drives.** One fast UAS SSD, one cheap USB 2.0 stick and one USB 3 stick (both
-  BOT). Other drives will differ;
+  BOT), and many stick numbers are single runs. Other drives will differ;
   please [send results](#contributing).
 - **Cross-OS checks use disk images** on GitHub's runners, not yet physical USB drives on Windows and macOS.
 
 ## Roadmap
 
 **Planned**
-- [ ] **Drive mode** *(in progress for v0.3.0)*: a native FUSE mount, so every app's copies to the
-  drive get faster automatically, not just flashcp's.
-- [ ] **Write-behind and one-click jobs:** copies that finish in the background, and repeatable
-  copy jobs you start with one click.
+- [ ] **Smaller clusters in place:** give a default-format stick 4 KB clusters without moving
+  file data ([#26](https://github.com/zuhuHix/flashcp/pull/26), in review, not merged).
+- [ ] **One-click jobs:** repeatable copy jobs you start with one click.
 - [ ] **Windows and macOS versions** of flashcp. [Supporters](#support) get them first.
+
+**Coming in 0.3.0 (merged, not released yet):** [drive mode](#drive-mode). `flashcp mount`, a
+crash-safe read-write exFAT driver in userspace with write-behind
+([#22](https://github.com/zuhuHix/flashcp/pull/22)), saving when files are closed
+([#24](https://github.com/zuhuHix/flashcp/pull/24)), a round of commit and read-ahead fixes
+([#25](https://github.com/zuhuHix/flashcp/pull/25)), and the always-on integration: the udev
+takeover, `flashcp drived`, the eject guard, the **Speed up USB drives** switch and
+`flashcp drive-mode` ([#20](https://github.com/zuhuHix/flashcp/pull/20)).
 
 **Shipped in 0.2.0:** `flashcp sync` and `pull --update` / `--delete-extraneous`
 ([#14](https://github.com/zuhuHix/flashcp/pull/14)), the desktop app's **Optimize this stick**

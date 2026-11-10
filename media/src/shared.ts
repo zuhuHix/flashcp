@@ -1,4 +1,5 @@
-import {interpolate} from 'remotion';
+import {Easing, interpolate} from 'remotion';
+import {springStep} from './motion';
 
 export type Theme = 'light' | 'dark';
 
@@ -17,6 +18,12 @@ export type Palette = {
   tealAlt: string;
   amber: string;
   pillText: string;
+  /** card / panel background, one step off the page background */
+  panel: string;
+  /** card outline */
+  border: string;
+  /** a file that is simply there (staged, or already in sync) */
+  tile: string;
 };
 
 export const PALETTES: Record<Theme, Palette> = {
@@ -31,6 +38,9 @@ export const PALETTES: Record<Theme, Palette> = {
     tealAlt: '#7dcfc2',
     amber: '#d4a72c',
     pillText: '#ffffff',
+    panel: '#f6f8fa',
+    border: '#d0d7de',
+    tile: '#8c959f',
   },
   dark: {
     bg: '#0d1117',
@@ -43,6 +53,9 @@ export const PALETTES: Record<Theme, Palette> = {
     tealAlt: '#178f80',
     amber: '#e3b341',
     pillText: '#0d1117',
+    panel: '#161b22',
+    border: '#3d444d',
+    tile: '#7d8590',
   },
 };
 
@@ -75,3 +88,26 @@ export const mulberry32 = (seed: number) => {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 };
+
+// Easing vocabulary shared by the newer compositions (one curve per job).
+/** Something enters or arrives: fast start, long settle. */
+export const EASE_OUT = Easing.bezier(0.16, 1, 0.3, 1);
+/** Something already on screen moves from A to B. */
+export const EASE_IO = Easing.bezier(0.45, 0, 0.2, 1);
+/** Something leaves or launches. */
+export const EASE_IN = Easing.bezier(0.5, 0, 0.9, 0.4);
+
+/** Pop-in scale: 0 before `start`, springs to 1 with a small overshoot. Pure function of the frame. */
+export const pop = (f: number, start: number, fps = FPS): number =>
+  springStep((f - start) / fps, {stiffness: 190, damping: 15, mass: 0.7});
+
+/** Soft settle without overshoot (critically damped), for opacity and positions. */
+export const settle = (f: number, start: number, fps = FPS): number =>
+  springStep((f - start) / fps, {stiffness: 170, damping: 200});
+
+/** SVG transform that scales around a point. */
+export const scaleAt = (cx: number, cy: number, s: number): string =>
+  `translate(${cx} ${cy}) scale(${s}) translate(${-cx} ${-cy})`;
+
+/** 12.34 -> "12.3" with a fixed number of decimals (no locale dependence). */
+export const fmt = (n: number, decimals = 1): string => n.toFixed(decimals);

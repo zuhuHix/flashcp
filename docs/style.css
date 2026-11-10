@@ -580,3 +580,23 @@ code { font-size: 0.92em; }
     scroll-behavior: auto !important;
   }
 }
+
+/* Section animations (a light and a dark video; app.js loads the one for the theme) */
+.media { margin: 1.4em 0; max-width: 900px; }
+.media video {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 2 / 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+/* Drive-mode results table */
+.table-wrap { overflow-x: auto; margin: 1.2em 0; }
+table.results { border-collapse: collapse; width: 100%; font-size: 0.95rem; }
+table.results caption { caption-side: bottom; text-align: left; color: var(--muted); font-size: 0.85rem; padding-top: 0.5em; }
+table.results th, table.results td { padding: 0.4em 0.6em; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+table.results th[scope="row"] { font-weight: 600; }
+table.results .num { text-align: right; white-space: nowrap; }
