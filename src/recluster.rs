@@ -69,7 +69,7 @@ use crate::drive::dev::{Dev, FileDev};
 use crate::events::json_str;
 use crate::exfat::{FatMode, TargetSpec, checksum16, checksum32, set_direct};
 use crate::util::human_bytes;
-use crate::volume::{Child, Dir, EOC, FLAG_DIRTY, MAX_CLUSTER_COUNT, Vol, cluster_set, le16, le32, le64, mark_range};
+use crate::volume::{Child, EOC, FLAG_DIRTY, MAX_CLUSTER_COUNT, Vol, cluster_set, le16, le32, le64, mark_range};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -101,6 +101,9 @@ const ROOT_SLACK: u64 = 2048;
 const STOP_ENV: &str = "FLASHCP_TEST_RECLUSTER_STOP";
 /// More files and directories than this are refused (the plan keeps them all in memory).
 const MAX_OBJECTS: usize = 8 << 20;
+/// ... and more directory bytes, or more file fragments, than these.
+const MAX_META: usize = 1 << 30;
+const MAX_PIECES: usize = 16 << 20;
 
 #[derive(Clone, Debug)]
 pub struct ReclusterOpts {
@@ -407,12 +410,6 @@ fn load(v: &mut Vol) -> Result<Tree> {
             format!("the volume holds the journal of {}; finish that first", crate::volume::SYNC_HINT),
         ));
     }
-    let upcase_len = {
-        let n = v.upcase_clusters.len() as u64 * v.cs;
-        // The entry's exact length is not kept by the parser: take it from the root's entry.
-        let at = find_root_entry(&root, 0x82).ok_or_else(|| anyhow!("no up-case table entry"))?;
-        le64(&root.data, at + 24).min(n)
-    };
     let mut t = Tree {
         cs: v.cs,
         heap: v.heap_off,
@@ -427,7 +424,7 @@ fn load(v: &mut Vol) -> Result<Tree> {
         bitmap: std::mem::take(&mut v.bitmap),
         bitmap_runs: runs_of(&v.bitmap_clusters),
         upcase_runs: runs_of(&v.upcase_clusters),
-        upcase_raw: v.read_clusters(&v.upcase_clusters, upcase_len)?,
+        upcase_raw: Vec::new(),
         upc: v.upc.clone(),
         label: v.label.clone(),
         files: 0,
@@ -437,8 +434,14 @@ fn load(v: &mut Vol) -> Result<Tree> {
     claim(&mut refd, &t.bitmap, &t.dirs[0].runs, &|| "the root directory".into())?;
     claim(&mut refd, &t.bitmap, &t.bitmap_runs, &|| "the allocation bitmap".into())?;
     claim(&mut refd, &t.bitmap, &t.upcase_runs, &|| "the up-case table".into())?;
-    let mut queue: VecDeque<(usize, Dir)> = VecDeque::from([(0, root)]);
-    while let Some((di, d)) = queue.pop_front() {
+    // One directory's raw data at a time: a child is read when its turn comes.
+    let mut queue: VecDeque<(usize, Option<(Child, String)>)> = VecDeque::from([(0, None)]);
+    let (mut root, mut kept, mut pieces) = (Some(root), 0usize, 0usize);
+    while let Some((di, child)) = queue.pop_front() {
+        let d = match child {
+            Some((ch, parent)) => v.read_child(0, &parent, &ch)?,
+            None => root.take().ok_or_else(|| anyhow!("internal error: the root is walked once"))?,
+        };
         let by_off: HashMap<usize, &Child> = d.children.values().map(|c| (c.set_off, c)).collect();
         let shown = if d.path.is_empty() { "/" } else { &d.path };
         let mut content = Vec::with_capacity(d.end);
@@ -465,7 +468,11 @@ fn load(v: &mut Vol) -> Result<Tree> {
             let set = &d.data[i..i + n];
             match ty {
                 0x81 => t.bitmap_at = content.len(),
-                0x82 => t.upcase_at = content.len(),
+                0x82 => {
+                    t.upcase_at = content.len();
+                    let len = le64(set, 24).min(t.upcase_runs.iter().map(|r| r.1).sum::<u64>() * t.cs);
+                    t.upcase_raw = v.read_clusters(&v.upcase_clusters, len)?;
+                }
                 0x83 => {}
                 0x85 => {
                     // Not among the parsed children: flashcp's own idle journal, left behind.
@@ -494,15 +501,14 @@ fn load(v: &mut Vol) -> Result<Tree> {
                         ));
                     }
                     let (runs, dir) = if ch.is_dir {
-                        let sub = v.read_child(0, &d.path, ch)?;
-                        let runs = runs_of(&sub.clusters);
+                        let runs = runs_of(&v.object_clusters(ch.first, ch.no_fat_chain, ch.len, &what())?);
                         t.dirs.push(DirNode {
                             content: Vec::new(),
                             runs: runs.clone(),
                             kids: Vec::new(),
                             obj: Some(oi as u32),
                         });
-                        queue.push_back((t.dirs.len() - 1, sub));
+                        queue.push_back((t.dirs.len() - 1, Some(((*ch).clone(), d.path.clone()))));
                         (runs, t.dirs.len() as u32 - 1)
                     } else {
                         t.files += 1;
@@ -510,6 +516,7 @@ fn load(v: &mut Vol) -> Result<Tree> {
                         (v.runs(ch.first, ch.no_fat_chain, ch.len, &what())?, u32::MAX)
                     };
                     claim(&mut refd, &t.bitmap, &runs, &what)?;
+                    pieces += runs.len();
                     t.objs.push(Obj {
                         parent: di as u32,
                         at: content.len() as u32,
@@ -538,15 +545,17 @@ fn load(v: &mut Vol) -> Result<Tree> {
             content.extend_from_slice(set);
             i += n;
         }
+        kept += content.len();
+        if kept > MAX_META || pieces > MAX_PIECES {
+            return Err(refused(
+                "too-many-files",
+                "the volume's directories or file fragments are more than recluster plans in memory",
+            ));
+        }
         t.dirs[di].content = content;
     }
     ensure!(t.bitmap_at != usize::MAX && t.upcase_at != usize::MAX, "the root directory lost its system entries");
     Ok(t)
-}
-
-/// Offset of the first in-use root entry of type `ty` (the parser has checked there is one).
-fn find_root_entry(root: &Dir, ty: u8) -> Option<usize> {
-    (0..root.end / 32).map(|k| k * 32).find(|&i| root.data[i] == ty)
 }
 
 // ───────────────────────── the new geometry ─────────────────────────
