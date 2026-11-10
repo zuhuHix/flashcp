@@ -939,6 +939,30 @@ button.folder .arrow {
   color: var(--error-text);
 }
 
+.usb-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--accent-soft);
+}
+
+.usb-confirm[hidden] {
+  display: none;
+}
+
+.usb-confirm-title {
+  margin: 0;
+  font-weight: 600;
+}
+
+.usb-confirm .hint {
+  margin: 0;
+}
+
 .usb-safe {
   color: var(--success-text);
   font-weight: 600;

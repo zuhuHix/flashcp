@@ -6,6 +6,10 @@ import {
   drivePendingText,
   driveModeButtons,
   driveModeNote,
+  canMakeFaster,
+  makeFasterTexts,
+  makeFasterProgress,
+  secondsText,
   formatBytes,
   formatSpeed,
   formatDuration,
@@ -1236,5 +1240,27 @@ describe("USB drive mode", () => {
     assert.equal(driveModeNote(null, null), "");
     assert.equal(driveModeNote({ running: false }, false), "Turning off…");
     assert.equal(driveModeNote({ running: true }, true), "Turning on…");
+  });
+  test("Make faster: when it shows, its words, its progress", () => {
+    assert.equal(canMakeFaster(d({ canConvert: true })), true);
+    assert.equal(canMakeFaster(d({ canConvert: true, state: "saving" })), true);
+    assert.equal(canMakeFaster(d()), false);
+    assert.equal(canMakeFaster(d({ canConvert: true, state: "converting" })), false);
+    assert.equal(canMakeFaster(d({ canConvert: true, mode: "kernel", state: "kernel" })), false);
+    const t = makeFasterTexts(d({ label: "KINGSTON", convertSecs: 7 }));
+    assert.equal(t.title, "Make KINGSTON faster for small files?");
+    assert.match(t.body, /Nothing is erased\. It takes about 7 seconds and you must not unplug it/);
+    assert.match(t.windows, /Windows/);
+    assert.doesNotMatch(`${t.title} ${t.body} ${t.windows}`, /cluster/i);
+    assert.equal(secondsText(0), "a second");
+    assert.equal(secondsText(100), "a minute and a half");
+    assert.equal(secondsText(200), "4 minutes");
+    const run = d({ label: "K", state: "converting", convertDone: 50, convertTotal: 200 });
+    assert.equal(makeFasterProgress(run), "Making K faster… don't unplug it (25 %)");
+    assert.equal(makeFasterProgress({ ...run, convertTotal: 0 }), "Making K faster… don't unplug it");
+    assert.equal(makeFasterProgress(d()), "");
+    assert.deepEqual(driveModeBadge(run), { text: "Making faster…", tone: "neutral" });
+    assert.equal(driveModeButtons(run).ejectDisabled, true);
+    assert.deepEqual(driveModeBadge(d({ mode: "none", state: "unmounted" })), { text: "Not mounted", tone: "neutral" });
   });
 });

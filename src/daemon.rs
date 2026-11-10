@@ -24,6 +24,12 @@
 //!   drive is remounted by the kernel driver; new drives get the kernel driver.
 //! - sleep/shutdown: a delay inhibitor is held while anything is pending; on PrepareForSleep
 //!   every dirty drive is flushed before the inhibitor is released.
+//! - "Make this stick faster" (`flashcp recluster`): after a good `--check`, `recluster --check`
+//!   says whether the volume would gain from smaller clusters. It is never run without a click:
+//!   once per volume (key [`volume_key`]) a notification with Accept / Not now offers it, and the
+//!   app and `flashcp drive-mode recluster` can ask for it any time. Accepted: `prepare-eject` →
+//!   `unmount` → a Clean [`handover`] → `flashcp recluster` → flashcp mounts it again. An
+//!   interrupted conversion (`"finish":true`) is completed once, before mounting, without asking.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -40,6 +46,85 @@ pub mod exit {
 
 /// Delays before re-checking a busy device, in ms. After the last one the daemon only notifies.
 pub const BUSY_RETRY_MS: [u64; 3] = [1000, 3000, 10_000];
+
+/// The notification offers a conversion only from this cluster size up. `mkfs.exfat`, Windows
+/// and macOS give every stick from 256 MB to 32 GB 32 KB clusters and bigger ones 128 KB, so
+/// this covers every stick formatted the usual way; 16 KB (which `recluster --check` also
+/// accepts) is a deliberate choice somebody made, and gains less: the app and the CLI still
+/// offer it there.
+pub const OFFER_MIN_CLUSTER: u64 = 32 << 10;
+
+/// What `flashcp recluster --check --json` said.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ReclusterCheck {
+    /// Exit 0 and `"benefit":true`: a conversion can run.
+    pub benefit: bool,
+    pub reason: String,
+    pub cluster: u64,
+    /// `est_secs` rounded up.
+    pub secs: u64,
+    /// An interrupted conversion left its last write to do.
+    pub finish: bool,
+}
+
+impl ReclusterCheck {
+    /// Parse the `check` line (None if it is not one).
+    pub fn parse(line: &str, code: Option<i32>) -> Option<ReclusterCheck> {
+        let o = json::parse_flat(line)?;
+        if o.get("event").map(String::as_str) != Some("check") || o.get("op").map(String::as_str) != Some("recluster") {
+            return None;
+        }
+        let num = |k: &str| o.get(k).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        Some(ReclusterCheck {
+            benefit: code == Some(0) && o.get("benefit").is_some_and(|v| v == "true"),
+            reason: o.get("reason").cloned().unwrap_or_default(),
+            cluster: num("cluster") as u64,
+            secs: (num("est_secs").ceil() as u64).max(1),
+            finish: o.get("finish").is_some_and(|v| v == "true"),
+        })
+    }
+}
+
+/// A JSON line from `flashcp recluster --json`, reduced to what the daemon uses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReclusterEvent {
+    Plan { secs: u64 },
+    Progress { done: u64, total: u64 },
+    Done,
+    Refused { reason: String, message: String },
+    Error { message: String },
+    Other,
+}
+
+impl ReclusterEvent {
+    pub fn parse(line: &str) -> ReclusterEvent {
+        let Some(o) = json::parse_flat(line) else { return ReclusterEvent::Other };
+        let num = |k: &str| o.get(k).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        let text = |k: &str| o.get(k).cloned().unwrap_or_default();
+        match o.get("event").map(String::as_str) {
+            Some("plan") => ReclusterEvent::Plan { secs: num("est_secs").ceil() as u64 },
+            Some("progress") => {
+                ReclusterEvent::Progress { done: num("bytes_done") as u64, total: num("bytes_total") as u64 }
+            }
+            Some("done") => ReclusterEvent::Done,
+            Some("refused") => ReclusterEvent::Refused { reason: text("reason"), message: text("message") },
+            Some("error") => ReclusterEvent::Error { message: text("message") },
+            _ => ReclusterEvent::Other,
+        }
+    }
+}
+
+/// The user's answer to the offer notification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    Accept,
+    NotNow,
+    /// Closed without a choice (dismissed, or it expired).
+    Dismissed,
+    /// No answer: the server cannot show buttons, there is no notification server, or the
+    /// daemon closed it itself (the drive was removed). Nothing is remembered.
+    None,
+}
 
 /// What udev told us about a partition (or superfloppy disk) that the rule marked for drive mode.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -163,6 +248,36 @@ pub enum Input {
     },
     /// logind's PrepareForSleep / PrepareForShutdown: true before, false after resume.
     Sleep(bool),
+    /// `flashcp recluster --check` finished (None: it failed to run or said nothing usable).
+    ReclusterChecked {
+        dev: String,
+        check: Option<ReclusterCheck>,
+    },
+    Recluster {
+        dev: String,
+        ev: ReclusterEvent,
+    },
+    /// `flashcp recluster` exited (None: killed by a signal).
+    ReclusterExit {
+        dev: String,
+        code: Option<i32>,
+    },
+    /// "Make faster" from the app or `flashcp drive-mode recluster`.
+    Convert {
+        dev: String,
+    },
+    OfferAnswer {
+        dev: String,
+        answer: Answer,
+    },
+    /// The offer notification on or off (`flashcp drive-mode offer on|off`).
+    SetOffers(bool),
+    /// Where the kernel driver has the drive mounted now (None: not mounted any more, e.g. after
+    /// `udisksctl unmount`). Only looked at for drives in the kernel state.
+    KernelMountSeen {
+        dev: String,
+        at: Option<String>,
+    },
     /// SIGTERM to the daemon (logout, systemctl stop).
     Shutdown,
 }
@@ -238,6 +353,30 @@ pub enum Action {
     Rescan {
         dev: String,
     },
+    /// `flashcp recluster --check --json DEV`.
+    ReclusterCheck {
+        dev: String,
+    },
+    /// `flashcp recluster --json DEV` (the driver is not running; recluster takes the claim).
+    Recluster {
+        dev: String,
+    },
+    /// A notification with Accept / Not now buttons; the answer comes back as
+    /// [`Input::OfferAnswer`].
+    Offer {
+        dev: String,
+        title: String,
+        body: String,
+    },
+    /// Close the offer notification if it is still up.
+    CloseOffer {
+        dev: String,
+    },
+    /// Persist the answer for this volume (`$XDG_STATE_HOME/flashcp/recluster-offers`).
+    Remember {
+        volume: String,
+        answer: &'static str,
+    },
     /// Every driver has stopped after `Shutdown`: exit the daemon.
     Exit,
 }
@@ -263,6 +402,11 @@ impl fmt::Display for Action {
             Action::Timer { ms, .. } => write!(f, "timer {ms}"),
             Action::Inhibit(on) => write!(f, "inhibit {}", if *on { "on" } else { "off" }),
             Action::Rescan { dev } => write!(f, "rescan {dev}"),
+            Action::ReclusterCheck { dev } => write!(f, "recluster-check {dev}"),
+            Action::Recluster { dev } => write!(f, "recluster {dev}"),
+            Action::Offer { dev, .. } => write!(f, "offer {dev}"),
+            Action::CloseOffer { dev } => write!(f, "close-offer {dev}"),
+            Action::Remember { volume, answer } => write!(f, "remember {volume} {answer}"),
             Action::Exit => write!(f, "exit"),
         }
     }
@@ -277,9 +421,26 @@ pub enum Then {
     Exit,
 }
 
+/// Where a conversion (`flashcp recluster`) is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conv {
+    /// `prepare-eject` sent: writes are refused, everything pending is being committed.
+    Flushing,
+    /// `unmount` sent: waiting for the driver's clean exit.
+    Stopping,
+    /// `flashcp recluster` runs (`finish`: completing an interrupted one before mounting).
+    Running { finish: bool },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
     Checking,
+    /// `flashcp recluster --check` runs (after a good `mount --check`).
+    ReclusterChecking,
+    /// Making the volume faster; the volume is not mounted from `Stopping` on.
+    Converting(Conv),
+    /// It was kernel-mounted and someone unmounted it (`udisksctl unmount`, a file manager).
+    Unmounted,
     /// Busy: waiting for retry `tries` (1-based) of [`BUSY_RETRY_MS`].
     BusyWait {
         tries: usize,
@@ -329,6 +490,25 @@ pub struct Drive {
     clean_unmount: bool,
     /// A driver reported `mounted` for this plug-in at least once.
     ever_mounted: bool,
+    /// `recluster --check` said a conversion can run: (cluster size, about how many seconds).
+    pub can_convert: Option<(u64, u64)>,
+    /// The offer notification was shown for this plug-in / is still up.
+    offered: bool,
+    offering: bool,
+    /// The interrupted conversion was completed (or tried) for this plug-in.
+    finish_tried: bool,
+    /// Progress of a running conversion (bytes done, bytes in total) and its estimate.
+    pub conv_done: u64,
+    pub conv_total: u64,
+    pub conv_secs: u64,
+    /// An eject came while converting: power off afterwards instead of mounting again.
+    eject_after: bool,
+    /// The last conversion's message from `flashcp recluster` (refusal or error text).
+    conv_message: Option<(String, String)>,
+    /// "done" | "refused" | "failed" and the text the user was shown, for the app and the CLI.
+    pub conv_result: Option<(&'static str, String)>,
+    /// The notification to show once the driver has mounted it again.
+    after_mount: Option<Action>,
 }
 
 impl Drive {
@@ -338,20 +518,36 @@ impl Drive {
     fn driver_running(&self) -> bool {
         matches!(
             self.state,
-            State::Starting | State::Mounted | State::Ejecting | State::Unmounting | State::Stopping(_)
+            State::Starting
+                | State::Mounted
+                | State::Ejecting
+                | State::Unmounting
+                | State::Stopping(_)
+                | State::Converting(Conv::Flushing | Conv::Stopping)
         )
+    }
+    /// A process of ours (the driver or `flashcp recluster`) works on the device.
+    fn busy(&self) -> bool {
+        self.driver_running() || matches!(self.state, State::Converting(_))
     }
     /// "flashcp", "kernel" or "none": who serves the volume right now.
     pub fn mode(&self) -> &'static str {
         match self.state {
-            State::Starting | State::Mounted | State::Ejecting | State::Unmounting | State::Stopping(_) => "flashcp",
+            State::Starting
+            | State::Mounted
+            | State::Ejecting
+            | State::Unmounting
+            | State::Stopping(_)
+            | State::Converting(_) => "flashcp",
             State::Kernel { .. } | State::KernelMounting { .. } => "kernel",
             _ => "none",
         }
     }
     pub fn state_name(&self) -> &'static str {
         match self.state {
-            State::Checking => "checking",
+            State::Checking | State::ReclusterChecking => "checking",
+            State::Converting(_) => "converting",
+            State::Unmounted => "unmounted",
             State::BusyWait { .. } => "busy",
             State::MakingMountpoint | State::Starting => "starting",
             State::Mounted if self.dirty() => "saving",
@@ -376,6 +572,18 @@ pub struct Core {
     /// PrepareForSleep(true) seen: flushes are in flight; release the inhibitor when done.
     sleeping: bool,
     shutting_down: bool,
+    /// The offer notification is on (`offer_faster=false` in drive-mode.conf turns it off).
+    pub offers: bool,
+    /// Volumes ([`volume_key`]) whose offer was answered: never offered by notification again.
+    pub answered: std::collections::BTreeSet<String>,
+}
+
+/// The identity the offer is remembered by: the volume serial plus the label (both survive a
+/// conversion; a reformat gives a new serial). None without a serial.
+pub fn volume_key(info: &DevInfo) -> Option<String> {
+    let clean = |s: &str| s.chars().filter(|c| !c.is_control()).collect::<String>();
+    let uuid = info.uuid.as_deref().filter(|u| !u.trim().is_empty())?;
+    Some(format!("{}:{}", clean(uuid), clean(info.label.as_deref().unwrap_or(""))))
 }
 
 pub fn mb(bytes: u64) -> String {
@@ -385,7 +593,15 @@ pub fn mb(bytes: u64) -> String {
 
 impl Core {
     pub fn new(enabled: bool) -> Core {
-        Core { enabled, drives: BTreeMap::new(), inhibiting: false, sleeping: false, shutting_down: false }
+        Core {
+            enabled,
+            drives: BTreeMap::new(),
+            inhibiting: false,
+            sleeping: false,
+            shutting_down: false,
+            offers: true,
+            answered: Default::default(),
+        }
     }
 
     /// Feed one input, get the actions to perform (in order).
@@ -393,7 +609,7 @@ impl Core {
         let mut out = Vec::new();
         self.step(input, &mut out);
         self.update_inhibitor(&mut out);
-        if self.shutting_down && !self.drives.values().any(Drive::driver_running) && !out.contains(&Action::Exit) {
+        if self.shutting_down && !self.drives.values().any(Drive::busy) && !out.contains(&Action::Exit) {
             out.push(Action::Exit);
         }
         out
@@ -415,6 +631,7 @@ impl Core {
                         }
                         // Hidden from udisks but not served: hand it back now.
                         State::Checking
+                        | State::ReclusterChecking
                         | State::BusyWait { .. }
                         | State::MakingMountpoint
                         | State::EjectChecking
@@ -424,6 +641,58 @@ impl Core {
                 }
             }
             Input::Removed { dev } => self.removed(&dev, out),
+            Input::ReclusterChecked { dev, check } => self.recluster_checked(&dev, check, out),
+            Input::Recluster { dev, ev } => {
+                let Some(d) = self.drives.get_mut(&dev) else { return };
+                match ev {
+                    ReclusterEvent::Plan { secs } => d.conv_secs = secs.max(1),
+                    ReclusterEvent::Progress { done, total } => (d.conv_done, d.conv_total) = (done, total),
+                    ReclusterEvent::Refused { reason, message } => d.conv_message = Some((reason, message)),
+                    ReclusterEvent::Error { message } => d.conv_message = Some((String::new(), message)),
+                    ReclusterEvent::Done | ReclusterEvent::Other => {}
+                }
+            }
+            Input::ReclusterExit { dev, code } => self.recluster_exit(&dev, code, out),
+            Input::Convert { dev } => {
+                if self.convert_blocker(&dev).is_none() {
+                    self.start_convert(&dev, out);
+                }
+            }
+            Input::OfferAnswer { dev, answer } => {
+                let Some(d) = self.drives.get_mut(&dev) else { return };
+                if !d.offering {
+                    return;
+                }
+                d.offering = false;
+                let Some(key) = volume_key(&d.info) else { return };
+                let word = match answer {
+                    Answer::Accept => "accepted",
+                    Answer::NotNow | Answer::Dismissed => "declined",
+                    Answer::None => return,
+                };
+                self.answered.insert(key.clone());
+                out.push(Action::Remember { volume: key, answer: word });
+                if answer == Answer::Accept && self.convert_blocker(&dev).is_none() {
+                    self.start_convert(&dev, out);
+                }
+            }
+            Input::SetOffers(on) => self.offers = on,
+            Input::KernelMountSeen { dev, at } => {
+                let Some(d) = self.drives.get_mut(&dev) else { return };
+                match (&d.state, at) {
+                    (State::Kernel { .. }, None) => {
+                        d.state = State::Unmounted;
+                        d.mountpoint = None;
+                    }
+                    (State::Kernel { .. } | State::Unmounted, Some(path)) => {
+                        if d.state == State::Unmounted {
+                            d.state = State::Kernel { read_only: d.kernel_ro };
+                        }
+                        d.mountpoint = Some(path);
+                    }
+                    _ => {}
+                }
+            }
             Input::CheckExit { dev, code, reason } => self.check_exit(&dev, code, reason, out),
             Input::MountpointReady { dev, result } => {
                 let Some(d) = self.drives.get_mut(&dev) else { return };
@@ -481,12 +750,14 @@ impl Core {
                         d.kernel_ro = read_only;
                         handover(d, Outcome::NotServed, To::KernelEject { checked: false }, false, out);
                     }
+                    // Eject waits for the conversion; then the drive is powered off, not remounted.
+                    State::Converting(_) => d.eject_after = true,
                     // flashcp couldn't finish: nothing is mounted, no power-off, say so again.
                     State::Done { safe: false } => handover(d, Outcome::Unclean, To::PowerOff, false, out),
                     // Nothing of ours is mounted, but someone else may hold the device (the busy
                     // retries ran out) or have mounted it since: re-check holders and mounts first,
                     // then eject through udisks (unmount + power off), never a bare power-off.
-                    State::Done { .. } | State::Failed { .. } if !sibling_active => {
+                    State::Done { .. } | State::Failed { .. } | State::Unmounted if !sibling_active => {
                         d.state = State::EjectChecking;
                         out.push(Action::Check { dev });
                     }
@@ -507,6 +778,20 @@ impl Core {
                             format!("{} Nothing was lost; it is still in use.", error.unwrap_or_default()),
                             Urgency::Normal,
                         ));
+                    }
+                    ("prepare-eject", State::Converting(Conv::Flushing)) if ok => {
+                        d.state = State::Converting(Conv::Stopping);
+                        out.push(Action::Control { dev, cmd: "unmount" });
+                    }
+                    ("prepare-eject", State::Converting(Conv::Flushing)) => {
+                        d.state = State::Mounted;
+                        out.push(Action::Control { dev: dev.clone(), cmd: "resume" });
+                        let name = d.info.name();
+                        let body = format!(
+                            "It is in use ({}). Nothing was changed. Close the files on it and try again.",
+                            error.unwrap_or_else(|| "it could not be paused".into())
+                        );
+                        out.push(conv_finished(d, "failed", format!("{name} was not changed"), body));
                     }
                     // The control socket is gone (the driver is exiting): its exit decides.
                     ("unmount", _) => {}
@@ -579,6 +864,17 @@ impl Core {
             kernel_ro: false,
             clean_unmount: false,
             ever_mounted: false,
+            can_convert: None,
+            offered: false,
+            offering: false,
+            finish_tried: false,
+            conv_done: 0,
+            conv_total: 0,
+            conv_secs: 0,
+            eject_after: false,
+            conv_message: None,
+            conv_result: None,
+            after_mount: None,
         };
         if let Some(m) = d.info.mounted_at.clone() {
             // Already served by the kernel driver (mounted before the daemon started, or by hand).
@@ -632,10 +928,12 @@ impl Core {
             exit::OK if reason.as_deref() == Some("busy_unknown") => refused(d, exit::BUSY, reason, out),
             // Exit 0 without a proper `check` answer: not trusted, the kernel driver gets it.
             exit::OK if reason.is_some() => refused(d, exit::FALLBACK, reason, out),
-            exit::OK => {
-                d.state = State::MakingMountpoint;
-                out.push(Action::MakeMountpoint { dev: dev.into(), name: mountpoint_name(&d.info) });
+            // Drive mode on: does it want a conversion, or the end of an interrupted one?
+            exit::OK if enabled => {
+                d.state = State::ReclusterChecking;
+                out.push(Action::ReclusterCheck { dev: dev.into() });
             }
+            exit::OK => to_mountpoint(d, out),
             _ => refused(d, code, reason, out),
         }
     }
@@ -652,6 +950,16 @@ impl Core {
                         // Mounted only to recover (drive mode off): hand it to the kernel now.
                         d.state = State::Stopping(Then::Kernel);
                         out.push(Action::StopDriver { dev: dev.into() });
+                    } else if let Some(n) = d.after_mount.take() {
+                        out.push(n);
+                    } else if self.offers
+                        && !d.offered
+                        && d.can_convert.is_some_and(|(cluster, _)| cluster >= OFFER_MIN_CLUSTER)
+                        && volume_key(&d.info).is_some_and(|k| !self.answered.contains(&k))
+                    {
+                        d.offered = true;
+                        d.offering = true;
+                        out.push(offer(d));
                     }
                 }
                 if let Some(r) = recovered {
@@ -813,13 +1121,220 @@ impl Core {
                 d.mountpoint = None;
                 handover(d, outcome, To::Release, false, out);
             }
+            // Stopped for a conversion: only a Clean end may go on to `flashcp recluster`. The
+            // mountpoint stays for the remount (same path for the user's windows).
+            (State::Converting(Conv::Flushing | Conv::Stopping), _) => {
+                let to = if self.shutting_down {
+                    To::Release
+                } else if !enabled {
+                    To::Kernel { read_only: false }
+                } else {
+                    To::Recluster
+                };
+                if to != To::Recluster || outcome != Outcome::Clean {
+                    rm(out);
+                    d.mountpoint = None;
+                }
+                if outcome != Outcome::Clean {
+                    d.conv_result =
+                        Some(("failed", "It was not changed: flashcp could not finish saving to it.".into()));
+                }
+                handover(d, outcome, to, false, out);
+            }
             _ => {}
+        }
+    }
+
+    fn recluster_checked(&mut self, dev: &str, check: Option<ReclusterCheck>, out: &mut Vec<Action>) {
+        let enabled = self.enabled && !self.shutting_down;
+        let Some(d) = self.drives.get_mut(dev) else { return };
+        if d.state != State::ReclusterChecking {
+            return;
+        }
+        if !enabled {
+            return kernel(d, false, out);
+        }
+        let check = check.unwrap_or_default();
+        if check.finish && !d.finish_tried {
+            // The user accepted this conversion earlier; its last write is missing (until then
+            // Windows may not open the stick). One attempt per plug-in, before mounting.
+            d.finish_tried = true;
+            d.state = State::Converting(Conv::Running { finish: true });
+            out.push(Action::Recluster { dev: dev.into() });
+            return;
+        }
+        d.can_convert = check.benefit.then_some((check.cluster, check.secs));
+        to_mountpoint(d, out);
+    }
+
+    /// Why a conversion cannot start now (None: it can).
+    pub fn convert_blocker(&self, dev: &str) -> Option<&'static str> {
+        let Some(d) = self.drives.get(dev) else { return Some("no such drive") };
+        if !self.enabled || self.shutting_down {
+            return Some("drive mode is off");
+        }
+        if matches!(d.state, State::Converting(_)) {
+            return Some("it is being converted already");
+        }
+        if d.state != State::Mounted || d.gone {
+            return Some("it is not ready (flashcp must have it mounted)");
+        }
+        if d.can_convert.is_none() {
+            return Some("it would not get faster (its clusters are small already, or it cannot be converted)");
+        }
+        None
+    }
+
+    fn start_convert(&mut self, dev: &str, out: &mut Vec<Action>) {
+        let Some(d) = self.drives.get_mut(dev) else { return };
+        if d.offering {
+            d.offering = false;
+            out.push(Action::CloseOffer { dev: dev.into() });
+            if let Some(key) = volume_key(&d.info)
+                && self.answered.insert(key.clone())
+            {
+                out.push(Action::Remember { volume: key, answer: "accepted" });
+            }
+        }
+        d.state = State::Converting(Conv::Flushing);
+        d.conv_secs = d.can_convert.map(|(_, s)| s).unwrap_or(1);
+        (d.conv_done, d.conv_total) = (0, 0);
+        d.conv_message = None;
+        d.conv_result = None;
+        d.eject_after = false;
+        let name = d.info.name();
+        out.push(notify(
+            d,
+            "convert",
+            format!("Making {name} faster…"),
+            format!("Don't unplug it. This takes about {}.", secs_text(d.conv_secs)),
+            Urgency::Normal,
+        ));
+        out.push(Action::Control { dev: dev.into(), cmd: "prepare-eject" });
+    }
+
+    fn recluster_exit(&mut self, dev: &str, code: Option<i32>, out: &mut Vec<Action>) {
+        let enabled = self.enabled && !self.shutting_down;
+        let shutting_down = self.shutting_down;
+        let Some(d) = self.drives.get_mut(dev) else { return };
+        let State::Converting(Conv::Running { finish }) = d.state else { return };
+        let message = d.conv_message.take();
+        if d.gone {
+            if let Some(path) = d.mountpoint.clone() {
+                out.push(Action::RemoveMountpoint { path });
+            }
+            self.drives.remove(dev);
+            return;
+        }
+        let name = d.info.name();
+        if finish {
+            match code {
+                Some(exit::OK) => out.push(notify(
+                    d,
+                    "convert",
+                    format!("{name} was repaired"),
+                    "A change to make it faster had been interrupted; it is now complete. Nothing was lost.".into(),
+                    Urgency::Normal,
+                )),
+                // Refused: it wrote nothing (or only the missing sector); mount it as usual.
+                Some(exit::FALLBACK) => {}
+                _ => {
+                    out.push(notify(
+                        d,
+                        "convert",
+                        format!("{name} is read-only for now"),
+                        format!(
+                            "flashcp could not complete an earlier change to it{}. Your files are there: copy \
+                             them off, or plug it in again to retry.",
+                            message.map(|(_, m)| format!(" ({m})")).unwrap_or_default()
+                        ),
+                        Urgency::Critical,
+                    ));
+                    return kernel(d, true, out);
+                }
+            }
+            if !enabled {
+                return kernel(d, false, out);
+            }
+            return to_mountpoint(d, out);
+        }
+        let (word, title, body) = match code {
+            Some(exit::OK) => {
+                ("done", format!("{name} is ready"), "Small files now copy to it much faster.".to_string())
+            }
+            Some(exit::FALLBACK) => {
+                let why = match message.as_ref().map(|(r, _)| r.as_str()) {
+                    Some("no-space" | "no-contiguous-space") => {
+                        "There is not enough free space on it. Delete some files and try again.".to_string()
+                    }
+                    _ => format!(
+                        "flashcp found something it does not change safely ({}).",
+                        message.as_ref().map(|(_, m)| m.as_str()).unwrap_or("no reason given")
+                    ),
+                };
+                (
+                    "refused",
+                    format!("{name} was not changed"),
+                    format!("{why} Nothing was written; it works as before."),
+                )
+            }
+            _ => (
+                "failed",
+                format!("Could not make {name} faster"),
+                format!(
+                    "{} Your files are safe and it works as before.",
+                    message.map(|(_, m)| format!("{m}.")).unwrap_or_else(|| "flashcp recluster stopped.".into())
+                ),
+            ),
+        };
+        let note = conv_finished(d, word, title, body);
+        if d.eject_after || shutting_down || !enabled {
+            out.push(note);
+            if let Some(path) = d.mountpoint.take() {
+                out.push(Action::RemoveMountpoint { path });
+            }
+            // recluster leaves the volume complete and consistent whatever its exit code.
+            let to = if d.eject_after {
+                To::PowerOff
+            } else if shutting_down {
+                To::Release
+            } else {
+                To::Kernel { read_only: false }
+            };
+            return handover(d, Outcome::Clean, to, false, out);
+        }
+        d.after_mount = Some(note);
+        match d.mountpoint.clone() {
+            Some(mountpoint) => {
+                d.state = State::Starting;
+                out.push(Action::StartDriver { dev: dev.into(), mountpoint, label: name });
+            }
+            None => to_mountpoint(d, out),
         }
     }
 
     fn removed(&mut self, dev: &str, out: &mut Vec<Action>) {
         let Some(d) = self.drives.get_mut(dev) else { return };
-        if !d.driver_running() {
+        if d.offering {
+            d.offering = false;
+            out.push(Action::CloseOffer { dev: dev.into() });
+        }
+        if d.state == State::Converting(Conv::Running { finish: false }) {
+            // recluster gets I/O errors and exits; its exit forgets the drive.
+            d.gone = true;
+            let name = d.info.name();
+            out.push(notify(
+                d,
+                "convert",
+                format!("{name} was unplugged while it was being changed"),
+                "Your files are safe. Plug it in here again before using it on Windows: flashcp checks it and \
+                 finishes the change if needed."
+                    .into(),
+                Urgency::Critical,
+            ));
+            return;
+        }
+        if !d.busy() {
             if let (State::Kernel { .. } | State::Failed { .. }, Some(_)) = (&d.state, &d.mountpoint) {
                 // udisks cleans its own mounts up.
             }
@@ -885,7 +1400,10 @@ impl Core {
     /// Hold the delay inhibitor while any driver has pending data, except after PrepareForSleep
     /// once nothing is pending any more (or the flush was answered).
     fn update_inhibitor(&mut self, out: &mut Vec<Action>) {
-        let dirty = self.drives.values().any(|d| d.driver_running() && d.dirty() && !d.gone);
+        let dirty = self
+            .drives
+            .values()
+            .any(|d| (d.driver_running() && d.dirty() || matches!(d.state, State::Converting(_))) && !d.gone);
         let want = dirty && !self.sleeping;
         // Before sleep: keep the lock until the flushes have drained the dirty data.
         let want = want || (self.sleeping && dirty && self.inhibiting);
@@ -898,24 +1416,37 @@ impl Core {
     /// The status the tray and `flashcp drive-mode status --json` show.
     pub fn status_json(&self) -> String {
         use crate::events::json_str;
+        let opt = |s: Option<&str>| s.map(json_str).unwrap_or_else(|| "null".into());
         let drives: Vec<String> = self
             .drives
             .values()
             .map(|d| {
                 format!(
-                    r#"{{"device":{},"label":{},"mode":{},"state":{},"mountpoint":{},"dirty_bytes":{},"dirty_files":{},"safe_to_remove":{}}}"#,
+                    r#"{{"device":{},"label":{},"mode":{},"state":{},"mountpoint":{},"dirty_bytes":{},"dirty_files":{},"safe_to_remove":{},"can_convert":{},"cluster":{},"convert_secs":{},"convert_done":{},"convert_total":{},"convert_result":{},"convert_message":{}}}"#,
                     json_str(&d.info.dev),
                     json_str(&d.info.name()),
                     json_str(d.mode()),
                     json_str(d.state_name()),
-                    d.mountpoint.as_deref().map(json_str).unwrap_or_else(|| "null".into()),
+                    opt(d.mountpoint.as_deref()),
                     d.dirty_bytes,
                     d.dirty_files,
-                    (d.mode() == "flashcp" && !d.dirty()) || d.state == State::Done { safe: true },
+                    (d.mode() == "flashcp" && !d.dirty() && !matches!(d.state, State::Converting(_)))
+                        || d.state == State::Done { safe: true },
+                    d.can_convert.is_some(),
+                    d.can_convert.map(|(c, _)| c).unwrap_or(0),
+                    if matches!(d.state, State::Converting(_)) {
+                        d.conv_secs
+                    } else {
+                        d.can_convert.map(|(_, s)| s).unwrap_or(0)
+                    },
+                    d.conv_done,
+                    d.conv_total,
+                    opt(d.conv_result.as_ref().map(|r| r.0)),
+                    opt(d.conv_result.as_ref().map(|r| r.1.as_str())),
                 )
             })
             .collect();
-        format!(r#"{{"ok":true,"enabled":{},"drives":[{}]}}"#, self.enabled, drives.join(","))
+        format!(r#"{{"ok":true,"enabled":{},"offers":{},"drives":[{}]}}"#, self.enabled, self.offers, drives.join(","))
     }
 }
 
@@ -945,6 +1476,8 @@ pub enum To {
     },
     /// The daemon is going away: Rescan so the udev rule hands it to udisks.
     Release,
+    /// Stopped for a conversion: run `flashcp recluster` (only after a Clean end).
+    Recluster,
 }
 
 /// THE choke point: the only place that powers a drive off, mounts it with the kernel driver or
@@ -958,7 +1491,8 @@ fn handover(d: &mut Drive, outcome: Outcome, to: To, sibling_active: bool, out: 
     let disk = d.info.disk.clone();
     if outcome == Outcome::Unclean {
         let name = d.info.name();
-        let meanwhile = if matches!(to, To::Kernel { .. }) { " Until then it is opened read-only." } else { "" };
+        let to_kernel = matches!(to, To::Kernel { .. } | To::Recluster);
+        let meanwhile = if to_kernel { " Until then it is opened read-only." } else { "" };
         out.push(notify(
             d,
             "unclean",
@@ -966,7 +1500,7 @@ fn handover(d: &mut Drive, outcome: Outcome, to: To, sibling_active: bool, out: 
             format!("Plug it in again to recover.{meanwhile}"),
             Urgency::Critical,
         ));
-        if let To::Kernel { .. } = to {
+        if to_kernel {
             d.state = State::KernelMounting { read_only: true };
             out.push(Action::KernelMount { dev, read_only: true });
         } else {
@@ -1001,7 +1535,52 @@ fn handover(d: &mut Drive, outcome: Outcome, to: To, sibling_active: bool, out: 
             d.state = State::Done { safe: outcome == Outcome::Clean };
             out.push(Action::Rescan { dev });
         }
+        To::Recluster => {
+            d.state = State::Converting(Conv::Running { finish: false });
+            out.push(Action::Recluster { dev });
+        }
     }
+}
+
+fn to_mountpoint(d: &mut Drive, out: &mut Vec<Action>) {
+    d.state = State::MakingMountpoint;
+    out.push(Action::MakeMountpoint { dev: d.info.dev.clone(), name: mountpoint_name(&d.info) });
+}
+
+/// "about 7 seconds", "about a minute", "about 3 minutes".
+pub fn secs_text(secs: u64) -> String {
+    match secs {
+        0..=1 => "a second".into(),
+        2..=89 => format!("{secs} seconds"),
+        90..=119 => "a minute and a half".into(),
+        _ => format!("{} minutes", secs.div_ceil(60)),
+    }
+}
+
+/// The offer: what it does, how long, not to unplug. No jargon (no "clusters").
+pub fn offer_texts(name: &str, secs: u64) -> (String, String) {
+    (
+        format!("Make {name} faster for small files?"),
+        format!(
+            "flashcp can change how {name} stores files so that small files copy much faster. Nothing is \
+             erased. It takes about {} and you must not unplug it meanwhile.",
+            secs_text(secs)
+        ),
+    )
+}
+
+fn offer(d: &Drive) -> Action {
+    let (title, body) = offer_texts(&d.info.name(), d.can_convert.map(|(_, s)| s).unwrap_or(1));
+    Action::Offer { dev: d.info.dev.clone(), title, body }
+}
+
+/// The end of a conversion: remembered for the app / CLI, and the notification saying so.
+fn conv_finished(d: &mut Drive, word: &'static str, title: String, body: String) -> Action {
+    d.conv_result = Some((word, format!("{title}. {body}")));
+    if word == "done" {
+        d.can_convert = None;
+    }
+    notify(d, "convert", title, body, if word == "done" { Urgency::Normal } else { Urgency::Critical })
 }
 
 fn kernel(d: &mut Drive, read_only: bool, out: &mut Vec<Action>) {
@@ -1224,6 +1803,10 @@ mod tests {
     fn added(dev: &str) -> Input {
         Input::Added(info(dev, "K"))
     }
+    /// `recluster --check` failed or said "no".
+    fn no_gain(dev: &str) -> Input {
+        Input::ReclusterChecked { dev: dev.into(), check: None }
+    }
     const D: &str = "/dev/sdb1";
     const MOUNTED: &str = r#"{"event":"mounted","proto":1,"device":"/dev/sdb1","recovered":null}"#;
     const DIRTY: &str = r#"{"event":"dirty_bytes","bytes":5000000,"files":3}"#;
@@ -1234,7 +1817,8 @@ mod tests {
     fn serving() -> Vec<(Input, &'static str, &'static str)> {
         vec![
             (added(D), "check /dev/sdb1", "checking"),
-            (check(D, 0), "mkmp /dev/sdb1 K", "starting"),
+            (check(D, 0), "recluster-check /dev/sdb1", "checking"),
+            (no_gain(D), "mkmp /dev/sdb1 K", "starting"),
             (mp(D), "start /dev/sdb1 /media/u/K", "starting"),
             (ev(D, MOUNTED), "", "ready"),
         ]
@@ -1333,7 +1917,8 @@ mod tests {
                 true,
                 vec![
                     (added(D), "check /dev/sdb1", "checking"),
-                    (check(D, 0), "mkmp /dev/sdb1 K", "starting"),
+                    (check(D, 0), "recluster-check /dev/sdb1", "checking"),
+                    (no_gain(D), "mkmp /dev/sdb1 K", "starting"),
                     (mp(D), "start /dev/sdb1 /media/u/K", "starting"),
                     (exit_(D, 3), "rmmp /media/u/K; kernel /dev/sdb1 rw", "mounting"),
                 ],
@@ -1343,7 +1928,8 @@ mod tests {
                 true,
                 vec![
                     (added(D), "check /dev/sdb1", "checking"),
-                    (check(D, 0), "mkmp /dev/sdb1 K", "starting"),
+                    (check(D, 0), "recluster-check /dev/sdb1", "checking"),
+                    (no_gain(D), "mkmp /dev/sdb1 K", "starting"),
                     (
                         Input::MountpointReady { dev: D.into(), result: Err("no".into()) },
                         "kernel /dev/sdb1 rw",
@@ -1450,7 +2036,8 @@ mod tests {
                 true,
                 vec![
                     (added(D), "check /dev/sdb1", "checking"),
-                    (check(D, 0), "mkmp /dev/sdb1 K", "starting"),
+                    (check(D, 0), "recluster-check /dev/sdb1", "checking"),
+                    (no_gain(D), "mkmp /dev/sdb1 K", "starting"),
                     (mp(D), "start /dev/sdb1 /media/u/K", "starting"),
                     (exit_(D, 1), "start /dev/sdb1 /media/u/K", "starting"),
                     (exit_(D, 1), "rmmp /media/u/K; notify /dev/sdb1:failed; kernel /dev/sdb1 rw", "mounting"),
@@ -1607,6 +2194,394 @@ mod tests {
             let s = core.status_json();
             assert!(json::parse_flat(&s).is_some(), "{name}: status is JSON: {s}");
         }
+    }
+
+    fn gain(dev: &str, cluster: u64) -> Input {
+        let c = ReclusterCheck { benefit: true, reason: "ok".into(), cluster, secs: 7, finish: false };
+        Input::ReclusterChecked { dev: dev.into(), check: Some(c) }
+    }
+    fn finish(dev: &str) -> Input {
+        let c =
+            ReclusterCheck { benefit: false, reason: "small-clusters".into(), cluster: 4096, secs: 1, finish: true };
+        Input::ReclusterChecked { dev: dev.into(), check: Some(c) }
+    }
+    fn rexit(dev: &str, code: i32) -> Input {
+        Input::ReclusterExit { dev: dev.into(), code: Some(code) }
+    }
+    fn rev(dev: &str, line: &str) -> Input {
+        Input::Recluster { dev: dev.into(), ev: ReclusterEvent::parse(line) }
+    }
+    fn answer(dev: &str, answer: Answer) -> Input {
+        Input::OfferAnswer { dev: dev.into(), answer }
+    }
+
+    type Step = (Input, &'static str, &'static str);
+
+    fn run(name: &str, core: &mut Core, steps: Vec<Step>) {
+        for (i, (input, want, state)) in steps.into_iter().enumerate() {
+            let dbg = format!("{input:?}");
+            let got: Vec<String> = core.handle(input).iter().map(|a| a.to_string()).collect();
+            assert_eq!(got.join("; "), want, "{name}: step {i} ({dbg})");
+            let st = core.drives.get(D).map(Drive::state_name).unwrap_or("-");
+            assert_eq!(st, state, "{name}: state after step {i} ({dbg})");
+            assert!(json::parse_flat(&core.status_json()).is_some(), "{name}: status is JSON");
+        }
+    }
+
+    /// Plug in a stick with big clusters (or `cluster`), up to "mounted" (the offer, if any, is
+    /// the last step's action).
+    fn served_big(cluster: u64, mounted: &'static str) -> Vec<Step> {
+        vec![
+            (added(D), "check /dev/sdb1", "checking"),
+            (check(D, 0), "recluster-check /dev/sdb1", "checking"),
+            (gain(D, cluster), "mkmp /dev/sdb1 K", "starting"),
+            (mp(D), "start /dev/sdb1 /media/u/K", "starting"),
+            (ev(D, MOUNTED), mounted, "ready"),
+        ]
+    }
+
+    /// From "ready" to `flashcp recluster` running: pause, clean stop, then recluster.
+    fn stop_for_convert(first: Input, first_out: &'static str) -> Vec<Step> {
+        vec![
+            (first, first_out, "converting"),
+            (reply(D, "prepare-eject", true), "ctl /dev/sdb1 unmount", "converting"),
+            (ev(D, UNMOUNTED), "", "converting"),
+            (exit_(D, 0), "recluster /dev/sdb1", "converting"),
+        ]
+    }
+
+    const ACCEPTED: &str =
+        "remember 1A2B-3C4D:K accepted; notify /dev/sdb1:convert; ctl /dev/sdb1 prepare-eject; inhibit on";
+
+    #[test]
+    fn offer_accept_convert_remount() {
+        let mut core = Core::new(true);
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
+        steps.extend(stop_for_convert(answer(D, Answer::Accept), ACCEPTED));
+        steps.extend(vec![
+            (rev(D, r#"{"event":"plan","op":"recluster","est_secs":6.2,"switches":2}"#), "", "converting"),
+            (rev(D, r#"{"event":"progress","op":"recluster","bytes_done":50,"bytes_total":200}"#), "", "converting"),
+            (rev(D, r#"{"event":"done","op":"recluster","changed":true}"#), "", "converting"),
+            // Same mountpoint again; "ready" only once flashcp has it mounted.
+            (rexit(D, 0), "start /dev/sdb1 /media/u/K; inhibit off", "starting"),
+            (ev(D, MOUNTED), "notify /dev/sdb1:convert", "ready"),
+        ]);
+        run("accept", &mut core, steps);
+        let d = &core.drives[D];
+        assert_eq!(d.conv_result.as_ref().map(|r| r.0), Some("done"));
+        assert!(d.conv_result.as_ref().unwrap().1.contains("K is ready. Small files now copy"));
+        assert_eq!((d.conv_done, d.conv_total, d.conv_secs), (50, 200, 7));
+        assert!(d.can_convert.is_none(), "no second offer, no button after the conversion");
+        assert!(core.answered.contains("1A2B-3C4D:K"));
+        // Plugged in again (the check says no now): no offer.
+        run(
+            "replug",
+            &mut core,
+            vec![(Input::Removed { dev: D.into() }, "stop /dev/sdb1", "ready"), (exit_(D, 1), "rmmp /media/u/K", "-")],
+        );
+        run("replug", &mut core, served_big(128 << 10, ""));
+    }
+
+    #[test]
+    fn not_now_and_dismissed_are_remembered_no_answer_is_not() {
+        for (a, remembered) in [(Answer::NotNow, true), (Answer::Dismissed, true), (Answer::None, false)] {
+            let name = format!("{a:?}");
+            let mut core = Core::new(true);
+            let mut steps = served_big(32 << 10, "offer /dev/sdb1");
+            steps.push((answer(D, a), if remembered { "remember 1A2B-3C4D:K declined" } else { "" }, "ready"));
+            // A second answer (or a stale one) does nothing.
+            steps.push((answer(D, Answer::Accept), "", "ready"));
+            steps.push((Input::Removed { dev: D.into() }, "stop /dev/sdb1", "ready"));
+            steps.push((exit_(D, 1), "rmmp /media/u/K", "-"));
+            run(&name, &mut core, steps);
+            // Plugged in again: asked again only if there was no answer.
+            run(&name, &mut core, served_big(32 << 10, if remembered { "" } else { "offer /dev/sdb1" }));
+            // The app button works either way (and closes an offer still on screen).
+            let want = if remembered {
+                &ACCEPTED[31..]
+            } else {
+                "close-offer /dev/sdb1; remember 1A2B-3C4D:K accepted; notify /dev/sdb1:convert; ctl /dev/sdb1 prepare-eject; inhibit on"
+            };
+            run(&name, &mut core, vec![(Input::Convert { dev: D.into() }, want, "converting")]);
+        }
+        // An answer persisted by an earlier daemon.
+        let mut core = Core::new(true);
+        core.answered.insert("1A2B-3C4D:K".into());
+        run("loaded", &mut core, served_big(128 << 10, ""));
+    }
+
+    #[test]
+    fn no_offer_unless_it_is_worth_it() {
+        // 16 KB: the check says yes, the notification does not ask; the app button can.
+        let mut core = Core::new(true);
+        run("16 KB", &mut core, served_big(16 << 10, ""));
+        assert_eq!(core.convert_blocker(D), None);
+        // The check says no (or failed): neither.
+        let mut core = Core::new(true);
+        run("no", &mut core, serving());
+        assert!(core.convert_blocker(D).is_some());
+        run("no", &mut core, vec![(Input::Convert { dev: D.into() }, "", "ready")]);
+        // The offer turned off.
+        let mut core = Core::new(true);
+        core.offers = false;
+        run("offers off", &mut core, served_big(128 << 10, ""));
+        assert_eq!(core.convert_blocker(D), None);
+        // No volume serial: nothing to remember it by, so no notification.
+        let mut core = Core::new(true);
+        let mut steps = served_big(128 << 10, "");
+        steps[0].0 = Input::Added(DevInfo { uuid: None, ..info(D, "K") });
+        run("no serial", &mut core, steps);
+        // Drive mode off: the kernel driver, no check at all.
+        let mut core = Core::new(false);
+        run("off", &mut core, vec![(added(D), "kernel /dev/sdb1 rw", "mounting")]);
+        // A drive being saved / ejected cannot start one.
+        let mut core = Core::new(true);
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
+        steps.push((Input::Eject { dev: D.into() }, "ctl /dev/sdb1 prepare-eject", "ejecting"));
+        steps.push((answer(D, Answer::Accept), "remember 1A2B-3C4D:K accepted", "ejecting"));
+        run("ejecting", &mut core, steps);
+        assert!(core.convert_blocker(D).is_some());
+        // The CLI/app path refuses a drive that is not ready.
+        let mut core = Core::new(true);
+        run("checking", &mut core, vec![(added(D), "check /dev/sdb1", "checking")]);
+        assert_eq!(core.convert_blocker(D), Some("it is not ready (flashcp must have it mounted)"));
+        assert_eq!(core.convert_blocker("/dev/sdz1"), Some("no such drive"));
+    }
+
+    #[test]
+    fn only_a_clean_stop_leads_to_recluster() {
+        // The driver dies while flushing: no recluster, the kernel gets it read-only.
+        let mut core = Core::new(true);
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
+        steps.push((ev(D, DIRTY), "inhibit on", "saving"));
+        steps.push((
+            answer(D, Answer::Accept),
+            "remember 1A2B-3C4D:K accepted; notify /dev/sdb1:convert; ctl /dev/sdb1 prepare-eject",
+            "converting",
+        ));
+        steps.push((
+            exit_(D, 1),
+            "rmmp /media/u/K; notify /dev/sdb1:unclean; kernel /dev/sdb1 ro; inhibit off",
+            "mounting",
+        ));
+        run("crash", &mut core, steps);
+        assert_eq!(core.drives[D].conv_result.as_ref().map(|r| r.0), Some("failed"));
+        // Exit 0 without a clean `unmounted`: not Clean either.
+        let mut core = Core::new(true);
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
+        steps.push((answer(D, Answer::Accept), ACCEPTED, "converting"));
+        steps.push((reply(D, "prepare-eject", true), "ctl /dev/sdb1 unmount", "converting"));
+        steps.push((ev(D, r#"{"event":"unmounted","clean":false}"#), "", "converting"));
+        steps.push((
+            exit_(D, 0),
+            "rmmp /media/u/K; notify /dev/sdb1:unclean; kernel /dev/sdb1 ro; inhibit off",
+            "mounting",
+        ));
+        run("unclean exit 0", &mut core, steps);
+        // The driver refuses to pause (files in use): resumed, nothing changed.
+        let mut core = Core::new(true);
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
+        steps.push((answer(D, Answer::Accept), ACCEPTED, "converting"));
+        steps.push((
+            reply(D, "prepare-eject", false),
+            "ctl /dev/sdb1 resume; notify /dev/sdb1:convert; inhibit off",
+            "ready",
+        ));
+        run("pause refused", &mut core, steps);
+    }
+
+    #[test]
+    fn refusal_and_failure_remount_as_before() {
+        for (code, line, word, text) in [
+            (
+                3,
+                r#"{"event":"refused","op":"recluster","reason":"no-space","message":"not enough free space"}"#,
+                "refused",
+                "K was not changed. There is not enough free space on it.",
+            ),
+            (
+                3,
+                r#"{"event":"refused","op":"recluster","reason":"bad-clusters","message":"clusters marked bad"}"#,
+                "refused",
+                "flashcp found something it does not change safely (clusters marked bad)",
+            ),
+            (1, r#"{"event":"error","message":"read /dev/sdb1: I/O error"}"#, "failed", "Could not make K faster."),
+        ] {
+            let mut core = Core::new(true);
+            let mut steps = served_big(128 << 10, "offer /dev/sdb1");
+            steps.extend(stop_for_convert(answer(D, Answer::Accept), ACCEPTED));
+            steps.push((rev(D, line), "", "converting"));
+            steps.push((rexit(D, code), "start /dev/sdb1 /media/u/K; inhibit off", "starting"));
+            steps.push((ev(D, MOUNTED), "notify /dev/sdb1:convert", "ready"));
+            run(word, &mut core, steps);
+            let r = core.drives[D].conv_result.clone().unwrap();
+            assert_eq!(r.0, word);
+            assert!(r.1.contains(text), "{r:?}");
+            assert!(r.1.contains("works as before"), "{r:?}");
+            // Still offered by the app button (the check said yes and nothing changed).
+            assert_eq!(core.convert_blocker(D), None);
+        }
+    }
+
+    #[test]
+    fn yank_eject_shutdown_and_off_during_a_conversion() {
+        let to_running = || {
+            let mut s = served_big(128 << 10, "offer /dev/sdb1");
+            s.extend(stop_for_convert(answer(D, Answer::Accept), ACCEPTED));
+            s
+        };
+        // Yanked: a warning; recluster's exit forgets the drive and removes the mountpoint.
+        let mut core = Core::new(true);
+        let mut steps = to_running();
+        steps.push((Input::Removed { dev: D.into() }, "notify /dev/sdb1:convert; inhibit off", "converting"));
+        steps.push((rexit(D, 1), "rmmp /media/u/K", "-"));
+        run("yank", &mut core, steps);
+        // Eject waits for the end, then powers off instead of remounting.
+        let mut core = Core::new(true);
+        let mut steps = to_running();
+        steps.push((Input::Eject { dev: D.into() }, "", "converting"));
+        steps.push((
+            rexit(D, 0),
+            "notify /dev/sdb1:convert; rmmp /media/u/K; poweroff /dev/sdb; inhibit off",
+            "safe_to_remove",
+        ));
+        run("eject", &mut core, steps);
+        // An eject during the pause also waits.
+        let mut core = Core::new(true);
+        let mut steps = served_big(128 << 10, "offer /dev/sdb1");
+        steps.push((answer(D, Answer::Accept), ACCEPTED, "converting"));
+        steps.push((Input::Eject { dev: D.into() }, "", "converting"));
+        run("eject while pausing", &mut core, steps);
+        assert!(core.drives[D].eject_after);
+        // The daemon is stopped: it waits for recluster, then hands the drive back.
+        let mut core = Core::new(true);
+        let mut steps = to_running();
+        steps.push((Input::Shutdown, "", "converting"));
+        steps.push((
+            rexit(D, 0),
+            "notify /dev/sdb1:convert; rmmp /media/u/K; rescan /dev/sdb1; inhibit off; exit",
+            "safe_to_remove",
+        ));
+        run("shutdown", &mut core, steps);
+        // Drive mode turned off meanwhile: the kernel driver afterwards.
+        let mut core = Core::new(true);
+        let mut steps = to_running();
+        steps.push((Input::SetEnabled(false), "", "converting"));
+        steps.push((
+            rexit(D, 0),
+            "notify /dev/sdb1:convert; rmmp /media/u/K; kernel /dev/sdb1 rw; inhibit off",
+            "mounting",
+        ));
+        run("off", &mut core, steps);
+    }
+
+    #[test]
+    fn interrupted_conversion_is_finished_once_before_mounting() {
+        let start = || -> Vec<Step> {
+            vec![
+                (added(D), "check /dev/sdb1", "checking"),
+                (check(D, 0), "recluster-check /dev/sdb1", "checking"),
+                (finish(D), "recluster /dev/sdb1; inhibit on", "converting"),
+            ]
+        };
+        let mut core = Core::new(true);
+        let mut steps = start();
+        steps.push((rexit(D, 0), "notify /dev/sdb1:convert; mkmp /dev/sdb1 K; inhibit off", "starting"));
+        steps.push((mp(D), "start /dev/sdb1 /media/u/K", "starting"));
+        // No offer: it has small clusters now (the finish check said benefit false).
+        steps.push((ev(D, MOUNTED), "", "ready"));
+        run("finished", &mut core, steps);
+        // Refused (e.g. a pending drive-mode commit): mounted as usual, the mount replays it.
+        let mut core = Core::new(true);
+        let mut steps = start();
+        steps.push((rexit(D, 3), "mkmp /dev/sdb1 K; inhibit off", "starting"));
+        run("refused", &mut core, steps);
+        // Failed: one attempt, then the kernel read-only with a message; no loop.
+        let mut core = Core::new(true);
+        let mut steps = start();
+        steps.push((rexit(D, 1), "notify /dev/sdb1:convert; kernel /dev/sdb1 ro; inhibit off", "mounting"));
+        steps.push((Input::KernelMounted { dev: D.into(), result: Ok("/media/u/K".into()) }, "", "read_only"));
+        run("failed", &mut core, steps);
+        assert!(core.drives[D].finish_tried);
+        // Yanked meanwhile: forgotten.
+        let mut core = Core::new(true);
+        let mut steps = start();
+        steps.push((Input::Removed { dev: D.into() }, "inhibit off", "converting"));
+        steps.push((rexit(D, 1), "", "-"));
+        run("yank", &mut core, steps);
+        // Drive mode off before the recluster check answered: the kernel, nothing run.
+        let mut core = Core::new(true);
+        let mut steps = start();
+        steps.truncate(2);
+        steps.push((Input::SetEnabled(false), "", "checking"));
+        steps.push((finish(D), "kernel /dev/sdb1 rw", "mounting"));
+        run("off", &mut core, steps);
+    }
+
+    #[test]
+    fn kernel_mount_unmounted_by_hand_is_not_listed_as_mounted() {
+        let mut core = Core::new(true);
+        run(
+            "unmount by hand",
+            &mut core,
+            vec![
+                (added(D), "check /dev/sdb1", "checking"),
+                (check(D, 3), "kernel /dev/sdb1 rw", "mounting"),
+                (Input::KernelMounted { dev: D.into(), result: Ok("/media/u/K".into()) }, "", "kernel"),
+                (Input::KernelMountSeen { dev: D.into(), at: None }, "", "unmounted"),
+            ],
+        );
+        let s = core.status_json();
+        assert!(s.contains(r#""mode":"none","state":"unmounted","mountpoint":null"#), "{s}");
+        run(
+            "mounted again by hand",
+            &mut core,
+            vec![(Input::KernelMountSeen { dev: D.into(), at: Some("/media/u/K1".into()) }, "", "kernel")],
+        );
+        assert_eq!(core.drives[D].mountpoint.as_deref(), Some("/media/u/K1"));
+        // Eject of an unmounted one: re-check holders first, then the udisks path.
+        run(
+            "eject",
+            &mut core,
+            vec![
+                (Input::KernelMountSeen { dev: D.into(), at: None }, "", "unmounted"),
+                (Input::Eject { dev: D.into() }, "check /dev/sdb1", "ejecting"),
+                (check(D, 0), "kernel-eject /dev/sdb1 /dev/sdb checked", "safe_to_remove"),
+            ],
+        );
+        // A flashcp mount is not affected.
+        let mut core = Core::new(true);
+        run("flashcp", &mut core, serving());
+        run("flashcp", &mut core, vec![(Input::KernelMountSeen { dev: D.into(), at: None }, "", "ready")]);
+    }
+
+    #[test]
+    fn recluster_lines_parse() {
+        let c = ReclusterCheck::parse(
+            r#"{"event":"check","op":"recluster","benefit":true,"reason":"ok","message":"x","cluster":131072,"new_cluster":4096,"free":1,"need_free":1,"write_bytes":1,"est_secs":3.2,"finish":false}"#,
+            Some(0),
+        )
+        .unwrap();
+        assert_eq!(c, ReclusterCheck { benefit: true, reason: "ok".into(), cluster: 131072, secs: 4, finish: false });
+        // Exit 3 is never a benefit, whatever the line says; finish is read with either code.
+        let c = ReclusterCheck::parse(
+            r#"{"event":"check","op":"recluster","benefit":true,"reason":"ok","cluster":4096,"est_secs":0.0,"finish":true}"#,
+            Some(3),
+        )
+        .unwrap();
+        assert!(!c.benefit && c.finish && c.secs == 1);
+        assert_eq!(ReclusterCheck::parse(r#"{"event":"check","ok":true}"#, Some(0)), None, "mount --check's line");
+        assert_eq!(ReclusterCheck::parse("garbage", Some(0)), None);
+        assert_eq!(
+            ReclusterEvent::parse(r#"{"event":"refused","op":"recluster","reason":"dirty","message":"m"}"#),
+            ReclusterEvent::Refused { reason: "dirty".into(), message: "m".into() }
+        );
+        assert_eq!(secs_text(7), "7 seconds");
+        assert_eq!(secs_text(200), "4 minutes");
+        let (t, b) = offer_texts("KINGSTON", 7);
+        assert_eq!(t, "Make KINGSTON faster for small files?");
+        assert!(b.contains("Nothing is erased") && b.contains("about 7 seconds") && !b.contains("cluster"), "{b}");
+        assert_eq!(volume_key(&info(D, "K\tX")).as_deref(), Some("1A2B-3C4D:KX"));
     }
 
     #[test]

@@ -128,8 +128,15 @@ flashcp drive-mode off</code></pre>
       <ul class="plain-list">
         <li><strong>What it costs.</strong> For the 20,000-file test set (169&nbsp;MB) the Kingston stick had to write 2.6&nbsp;GB on 128&nbsp;KB clusters and 211&nbsp;MB on 4&nbsp;KB clusters. Same stick, same files, same driver (drive mode, single runs): 93.8&nbsp;s against 5.31&nbsp;s.</li>
         <li><strong>What helps.</strong> <code>flashcp build</code> picks the cluster size for your data, and <code>flashcp optimize</code> converts a stick that already holds files. The kernel driver gains too: it copied these files in 52&ndash;74&nbsp;s onto a 4&nbsp;KB-cluster stick, against 259&ndash;371&nbsp;s onto a default-format one.</li>
-        <li><strong>Coming next.</strong> Changing the cluster size in place, without moving file data (<a href="https://github.com/zuhuHix/flashcp/pull/26">#26</a>, not merged yet).</li>
+        <li><strong>Make faster (in the next release).</strong> Smaller clusters in place, in seconds, without moving your files (<a href="https://github.com/zuhuHix/flashcp/pull/26">#26</a>). See below.</li>
         <li><strong>Big files don't suffer.</strong> On the USB 2.0 stick the kernel copied one 512&nbsp;MB file onto a 4&nbsp;KB-cluster stick in 86.0&nbsp;s, against 107.7&nbsp;s onto a default-format one.</li>
+      </ul>
+      <h3 id="make-faster">Make a normally formatted stick fast</h3>
+      <p><em>In the next release (merged, not released yet).</em> When drive mode serves a stick formatted the usual way (clusters of 32&nbsp;KB or more), flashcp asks once, with a notification: <strong>&ldquo;Make KINGSTON faster for small files?&rdquo;</strong> Nothing is erased, it takes a few seconds, and you must not unplug the stick meanwhile. <strong>Accept</strong> saves everything, gives the stick 4&nbsp;KB clusters in place and mounts it again. Nothing happens without a click. <strong>Not now</strong> (or closing the notification) means that stick is never asked about again; the app&rsquo;s <em>Make faster</em> button and <code>flashcp drive-mode recluster /dev/sdX1</code> still do it any time.</p>
+      <ul class="plain-list">
+        <li><strong>Single runs on the Kingston DataTraveler 3.0 128&nbsp;GB.</strong> Adding 20,000 small files took 98.0&nbsp;s on its 128&nbsp;KB clusters. The conversion took 6.35&nbsp;s (137&nbsp;MB written), and the same add afterwards 5.48&nbsp;s.</li>
+        <li><strong>One caveat.</strong> If the stick loses power in the few milliseconds between the conversion&rsquo;s last two writes, Windows shows it as unformatted (decline any offer to format it). Linux and macOS still open it and the files are intact; plugged into a computer with flashcp, drive mode completes it with one write before mounting it.</li>
+        <li><strong>Turn the offer off</strong> with <code>flashcp drive-mode offer off</code> (<code>offer_faster=false</code> in <code>~/.config/flashcp/drive-mode.conf</code>). Without drive mode: <code>flashcp recluster /dev/sdX1</code>.</li>
       </ul>
       <h3>When not to expect gains</h3>
       <ul class="plain-list">
@@ -415,7 +422,7 @@ flashcp drive-mode off</code></pre>
         <li><span class="tag tag-shipped">Shipped</span> <code>flashcp optimize</code> (rewrites a stick into the fast layout, files kept: copy, verify, rebuild, verify; resumable), automatic cluster size, a per-device speed profile, the device-aware add gap policy, and the first copy onto an empty stick running as a build.</li>
         <li><span class="tag tag-shipped">Shipped</span> <code>flashcp sync</code> and <code>pull --update</code> / <code>--delete-extraneous</code> (only what changed, with a crash-safe journal), the desktop app's Optimize button, <code>flashcp --version</code>, and the trace-driven simulator <code>flashcp sim</code>.</li>
         <li><span class="tag tag-shipped">Shipped</span> Drive mode (0.3.0): <code>flashcp mount</code>, a crash-safe exFAT driver in userspace with write-behind, plus the always-on integration (udev takeover, <code>flashcp drived</code>, the eject guard, the <em>Speed up USB drives</em> switch, <code>flashcp drive-mode</code>).</li>
-        <li><span class="tag">Planned</span> Smaller clusters in place, without moving file data (<a href="https://github.com/zuhuHix/flashcp/pull/26">#26</a>, in review).</li>
+        <li><span class="tag">Next release</span> Smaller clusters in place, without moving file data (<a href="https://github.com/zuhuHix/flashcp/pull/26">#26</a>, merged), offered once per stick by drive mode and the app&rsquo;s <em>Make faster</em> button.</li>
         <li><span class="tag">Planned</span> One-click jobs.</li>
         <li><span class="tag">Planned</span> Windows and macOS versions. Buy Me a Coffee supporters get them first.</li>
       </ul>

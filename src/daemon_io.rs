@@ -3,7 +3,14 @@
 //! Event sources (one thread each, into one channel): `udevadm monitor` (block devices), the
 //! drivers' stdout and exit, `--check` runs, control-socket replies, timers, logind's
 //! PrepareForSleep/PrepareForShutdown (`gdbus monitor`), SIGTERM, and the daemon's own control
-//! socket (`$XDG_RUNTIME_DIR/flashcp/drived.sock`: `status`, `enable`, `disable`, `eject DEV`).
+//! socket (`$XDG_RUNTIME_DIR/flashcp/drived.sock`: `status`, `enable`, `disable`, `eject DEV`,
+//! `recluster DEV`, `offers on|off`).
+//!
+//! The offer to make a stick faster is a notification with two buttons, sent through
+//! `org.freedesktop.Notifications` with `gdbus` (`Notify` with actions, then `ActionInvoked` /
+//! `NotificationClosed` from `gdbus monitor`). A server without the "actions" capability (or no
+//! server) gets no offer at all; the app's button still offers it. The answers live in
+//! `$XDG_STATE_HOME/flashcp/recluster-offers`, one `<serial>:<label>\t<answer>` line per volume.
 //!
 //! The udev side (`flashcp-udev-check`, run by the drive-mode rule) only hides a partition from
 //! udisks while `$XDG_RUNTIME_DIR/flashcp/drive-mode-on` exists, and leaves it to udisks again
@@ -14,9 +21,10 @@
 //! (create mountpoints directly in this directory instead of through the pkexec helper),
 //! `FLASHCP_DRIVED_FLASHCP` (the `flashcp` binary for `mount`), `FLASHCP_DRIVED_UDISKSCTL`,
 //! `FLASHCP_DRIVED_GDBUS`, `FLASHCP_DRIVED_NOTIFY` (replacements for udisksctl, gdbus and
-//! notify-send), `FLASHCP_DRIVED_NO_LOGIN1=1` (no inhibitor, no sleep monitor).
+//! notify-send), `FLASHCP_DRIVED_NO_LOGIN1=1` (no inhibitor, no sleep monitor),
+//! `FLASHCP_DRIVED_MOUNTINFO` (read kernel mounts from this file instead of /proc/self/mountinfo).
 
-use crate::daemon::{Action, Core, DevInfo, DriverEvent, Input, Urgency};
+use crate::daemon::{Action, Answer, Core, DevInfo, DriverEvent, Input, ReclusterCheck, ReclusterEvent, Urgency};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::collections::{BTreeMap, HashMap};
@@ -26,12 +34,51 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub enum Msg {
     In(Input),
     /// A request on the daemon's control socket, with where to send the one-line reply.
     Req(String, Sender<String>),
+    /// The mount table changed.
+    Mounts,
+}
+
+/// Tell the core where the kernel has its drives mounted now (it only looks at kernel ones).
+fn refresh_kernel_mounts(core: &mut Core) {
+    let devs: Vec<(String, Option<String>)> = core
+        .drives
+        .values()
+        .filter(|d| matches!(d.state, crate::daemon::State::Kernel { .. } | crate::daemon::State::Unmounted))
+        .map(|d| (d.info.dev.clone(), d.mountpoint.clone()))
+        .collect();
+    for (dev, was) in devs {
+        let at = kernel_mountpoint(&dev);
+        if at != was {
+            let a = core.handle(Input::KernelMountSeen { dev, at });
+            debug_assert!(a.is_empty());
+        }
+    }
+}
+
+fn watch_mounts(tx: &Sender<Msg>) {
+    let Ok(f) = std::fs::File::open("/proc/self/mountinfo") else { return };
+    use std::os::fd::AsRawFd;
+    loop {
+        let mut p = libc::pollfd { fd: f.as_raw_fd(), events: libc::POLLPRI, revents: 0 };
+        if unsafe { libc::poll(&mut p, 1, -1) } < 0 {
+            return;
+        }
+        // Re-arm: read it from the start.
+        let mut s = String::new();
+        let _ = (&f).read_to_string(&mut s);
+        unsafe { libc::lseek(f.as_raw_fd(), 0, libc::SEEK_SET) };
+        if tx.send(Msg::Mounts).is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Paths and replaceable programs (see the module docs for the test hooks).
@@ -39,6 +86,10 @@ pub enum Msg {
 pub struct Env {
     pub runtime: PathBuf,
     pub config: PathBuf,
+    /// `$XDG_STATE_HOME/flashcp/recluster-offers`: the offer answers.
+    pub offers_state: PathBuf,
+    /// This program, for `flashcp recluster` (`flashcp` may be replaced for `mount` in tests).
+    pub me: PathBuf,
     pub media: Option<PathBuf>,
     pub flashcp: PathBuf,
     pub udisksctl: String,
@@ -55,6 +106,8 @@ impl Env {
         Ok(Env {
             runtime,
             config: config_path(),
+            offers_state: offers_state_path(),
+            me: std::env::current_exe()?,
             media: var("FLASHCP_DRIVED_MEDIA").map(PathBuf::from),
             flashcp: var("FLASHCP_DRIVED_FLASHCP").map(PathBuf::from).unwrap_or(std::env::current_exe()?),
             udisksctl: var("FLASHCP_DRIVED_UDISKSCTL").unwrap_or_else(|| "udisksctl".into()),
@@ -84,18 +137,74 @@ pub fn config_path() -> PathBuf {
     base.join("flashcp").join("drive-mode.conf")
 }
 
-pub fn read_enabled(config: &Path) -> bool {
-    std::fs::read_to_string(config).map(|s| !s.lines().any(|l| l.trim() == "enabled=false")).unwrap_or(true)
+/// `$XDG_STATE_HOME/flashcp/recluster-offers` (default `~/.local/state/...`).
+pub fn offers_state_path() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"));
+    base.join("flashcp").join("recluster-offers")
 }
 
-pub fn write_enabled(config: &Path, on: bool) -> Result<()> {
+/// The config key that turns the offer notification off (`offer_faster=false`).
+pub const OFFER_KEY: &str = "offer_faster";
+
+/// A boolean key of drive-mode.conf; every key defaults to true.
+fn read_flag(config: &Path, key: &str) -> bool {
+    let off = format!("{key}=false");
+    std::fs::read_to_string(config).map(|s| !s.lines().any(|l| l.trim() == off)).unwrap_or(true)
+}
+
+/// Set one key, keeping the other lines.
+fn write_flag(config: &Path, key: &str, on: bool) -> Result<()> {
     if let Some(d) = config.parent() {
         std::fs::create_dir_all(d)?;
     }
+    let old = std::fs::read_to_string(config).unwrap_or_default();
+    let mut lines: Vec<String> = old
+        .lines()
+        .filter(|l| !l.trim().starts_with(&format!("{key}=")) && !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    if lines.is_empty() {
+        lines.push("# flashcp drive mode (\"Speed up USB drives\")".into());
+    }
+    lines.push(format!("{key}={on}"));
     let tmp = config.with_extension("tmp");
-    std::fs::write(&tmp, format!("# flashcp drive mode (\"Speed up USB drives\")\nenabled={on}\n"))?;
+    std::fs::write(&tmp, lines.join("\n") + "\n")?;
     std::fs::rename(&tmp, config)?;
     Ok(())
+}
+
+pub fn read_enabled(config: &Path) -> bool {
+    read_flag(config, "enabled")
+}
+
+pub fn write_enabled(config: &Path, on: bool) -> Result<()> {
+    write_flag(config, "enabled", on)
+}
+
+/// The offer notification ("Make KINGSTON faster for small files?"): on unless `offer_faster=false`.
+pub fn read_offers(config: &Path) -> bool {
+    read_flag(config, OFFER_KEY)
+}
+
+pub fn write_offers(config: &Path, on: bool) -> Result<()> {
+    write_flag(config, OFFER_KEY, on)
+}
+
+/// The volumes whose offer was answered (any answer: the offer is shown once).
+pub fn read_answered(path: &Path) -> std::collections::BTreeSet<String> {
+    let s = std::fs::read_to_string(path).unwrap_or_default();
+    s.lines().filter_map(|l| l.split_once('\t')).map(|(k, _)| k.to_string()).collect()
+}
+
+fn remember(path: &Path, volume: &str, answer: &str) -> std::io::Result<()> {
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{volume}\t{answer}")
 }
 
 static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
@@ -146,9 +255,17 @@ pub fn run(env: Env) -> Result<()> {
     std::thread::spawn(move || serve_control(listener, t));
 
     let enabled = read_enabled(&env.config) && !system_off();
-    let mut io =
-        Io { env: env.clone(), tx: tx.clone(), drivers: HashMap::new(), notes: HashMap::new(), inhibitor: None };
+    let mut io = Io {
+        env: env.clone(),
+        tx: tx.clone(),
+        drivers: HashMap::new(),
+        notes: HashMap::new(),
+        offers: Arc::default(),
+        inhibitor: None,
+    };
     let mut core = Core::new(enabled);
+    core.offers = read_offers(&env.config);
+    core.answered = read_answered(&env.offers_state);
     cleanup_stale_mounts();
 
     // udev: start the monitor first, then enumerate, so nothing falls between the two.
@@ -189,6 +306,9 @@ pub fn run(env: Env) -> Result<()> {
         let gdbus = env.gdbus.clone();
         std::thread::spawn(move || watch_login1(&gdbus, &t));
     }
+    // Kernel mounts that go away by hand (`udisksctl unmount`): mountinfo signals POLLPRI.
+    let t = tx.clone();
+    std::thread::spawn(move || watch_mounts(&t));
     // The administrator's switch (`drive-mode off --system`): looked at every 2 s.
     let t = tx.clone();
     let config = env.config.clone();
@@ -217,12 +337,24 @@ pub fn run(env: Env) -> Result<()> {
 fn main_loop(core: &mut Core, io: &mut Io, rx: &Receiver<Msg>) {
     while let Ok(msg) = rx.recv() {
         let input = match msg {
+            Msg::Mounts => {
+                refresh_kernel_mounts(core);
+                continue;
+            }
             Msg::In(i) => i,
             Msg::Req(line, reply) => {
                 let mut words = line.split_whitespace();
                 let (r, input) = match (words.next(), words.next()) {
                     (Some("status"), None) => {
+                        refresh_kernel_mounts(core);
                         (core.status_json().replacen("{\"ok\":true", "{\"ok\":true,\"running\":true", 1), None)
+                    }
+                    (Some("recluster"), Some(dev)) => match core.convert_blocker(dev) {
+                        None => ("{\"ok\":true}".into(), Some(Input::Convert { dev: dev.into() })),
+                        Some(why) => (format!("{{\"ok\":false,\"error\":{}}}", crate::events::json_str(why)), None),
+                    },
+                    (Some("offers"), Some(w @ ("on" | "off"))) => {
+                        (format!("{{\"ok\":true,\"offers\":{}}}", w == "on"), Some(Input::SetOffers(w == "on")))
                     }
                     (Some("enable"), None) => (ok_reply(true), Some(Input::SetEnabled(true))),
                     (Some("disable"), None) => (ok_reply(false), Some(Input::SetEnabled(false))),
@@ -291,6 +423,8 @@ struct Io {
     drivers: HashMap<String, u32>,
     /// Notification ids by key, to replace a notification instead of stacking a new one.
     notes: HashMap<String, u32>,
+    /// The offer notifications on screen, by device: their D-Bus id.
+    offers: Arc<Mutex<HashMap<String, u32>>>,
     inhibitor: Option<Child>,
 }
 
@@ -422,6 +556,37 @@ impl Io {
                 });
             }
             Action::Inhibit(on) => self.inhibit(on),
+            Action::ReclusterCheck { dev } => {
+                let me = self.env.me.clone();
+                self.send_later(move || {
+                    let mut c = Command::new(&me);
+                    c.args(["recluster", "--check", "--json"]).arg(&dev).stdin(Stdio::null()).stderr(Stdio::null());
+                    let check = run_with_timeout(c, Duration::from_secs(10)).ok().and_then(|(code, out)| {
+                        let out = String::from_utf8_lossy(&out).into_owned();
+                        ReclusterCheck::parse(out.lines().last().unwrap_or(""), code)
+                    });
+                    Input::ReclusterChecked { dev, check }
+                });
+            }
+            Action::Recluster { dev } => self.recluster(dev),
+            Action::Offer { dev, title, body } => {
+                let (gdbus, offers, tx) = (self.env.gdbus.clone(), self.offers.clone(), self.tx.clone());
+                std::thread::spawn(move || {
+                    let answer = offer(&gdbus, &offers, &dev, &title, &body);
+                    offers.lock().unwrap().remove(&dev);
+                    let _ = tx.send(Msg::In(Input::OfferAnswer { dev, answer }));
+                });
+            }
+            Action::CloseOffer { dev } => {
+                if let Some(id) = self.offers.lock().unwrap().get(&dev).copied() {
+                    let _ = notifications(&self.env.gdbus, "CloseNotification", &[&id.to_string()]);
+                }
+            }
+            Action::Remember { volume, answer } => {
+                if let Err(e) = remember(&self.env.offers_state, &volume, answer) {
+                    eprintln!("flashcp drived: cannot save the answer for {volume}: {e}");
+                }
+            }
             Action::Rescan { dev } => {
                 let _ = rescan(&self.env.gdbus, &dev);
             }
@@ -461,6 +626,37 @@ impl Io {
             }
             let code = child.wait().ok().and_then(|s| s.code());
             let _ = tx.send(Msg::In(Input::DriverExit { dev, code }));
+        });
+    }
+
+    /// `flashcp recluster DEV --json`: its events and exit go back to the core. It opens the
+    /// device itself (O_EXCL + flock), like `flashcp mount`: the uaccess ACL is enough.
+    fn recluster(&mut self, dev: String) {
+        let spawned = Command::new(&self.env.me)
+            .args(["recluster", "--json"])
+            .arg(&dev)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn();
+        let mut child = match spawned {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("flashcp drived: cannot start recluster: {e}");
+                self.send_later(move || Input::ReclusterExit { dev, code: Some(crate::daemon::exit::RUNTIME) });
+                return;
+            }
+        };
+        let out = child.stdout.take().unwrap();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                let ev = ReclusterEvent::parse(&line);
+                if ev != ReclusterEvent::Other {
+                    let _ = tx.send(Msg::In(Input::Recluster { dev: dev.clone(), ev }));
+                }
+            }
+            let code = child.wait().ok().and_then(|s| s.code());
+            let _ = tx.send(Msg::In(Input::ReclusterExit { dev, code }));
         });
     }
 
@@ -686,7 +882,10 @@ fn unescape_mountinfo(s: &str) -> String {
 }
 
 fn mountinfo() -> Vec<MountEntry> {
-    let s = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    parse_mountinfo(&std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default())
+}
+
+fn parse_mountinfo(s: &str) -> Vec<MountEntry> {
     s.lines()
         .filter_map(|l| {
             let (a, b) = l.split_once(" - ")?;
@@ -700,7 +899,123 @@ fn mountinfo() -> Vec<MountEntry> {
 }
 
 fn kernel_mountpoint(dev: &str) -> Option<String> {
-    mountinfo().into_iter().find(|m| m.source == dev && !m.fstype.starts_with("fuse")).map(|m| m.target)
+    let entries = match std::env::var_os("FLASHCP_DRIVED_MOUNTINFO") {
+        Some(p) => parse_mountinfo(&std::fs::read_to_string(p).unwrap_or_default()),
+        None => mountinfo(),
+    };
+    entries.into_iter().find(|m| m.source == dev && !m.fstype.starts_with("fuse")).map(|m| m.target)
+}
+
+/// A GVariant text-format string literal (for `gdbus call` arguments).
+fn gv_str(s: &str) -> String {
+    let mut o = String::from("'");
+    for c in s.chars() {
+        match c {
+            '\'' | '\\' => {
+                o.push('\\');
+                o.push(c);
+            }
+            '\n' => o.push_str("\\n"),
+            c if c.is_control() => {}
+            c => o.push(c),
+        }
+    }
+    o.push('\'');
+    o
+}
+
+const NOTIFY_ARGS: [&str; 7] = [
+    "call",
+    "--session",
+    "--dest",
+    "org.freedesktop.Notifications",
+    "--object-path",
+    "/org/freedesktop/Notifications",
+    "--method",
+];
+
+fn notifications(gdbus: &str, method: &str, args: &[&str]) -> Result<String, String> {
+    let m = format!("org.freedesktop.Notifications.{method}");
+    let mut c = Command::new(gdbus);
+    c.args(NOTIFY_ARGS).arg(m).args(args).stdin(Stdio::null()).stderr(Stdio::null());
+    match run_with_timeout(c, Duration::from_secs(5)) {
+        Ok((Some(0), out)) => Ok(String::from_utf8_lossy(&out).into_owned()),
+        Ok((code, _)) => Err(format!("gdbus exit {code:?}")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Show the offer with Accept / Not now and wait for the answer. No "actions" capability, no
+/// server, no gdbus: [`Answer::None`] (nothing is shown, nothing remembered).
+fn offer(gdbus: &str, ids: &Mutex<HashMap<String, u32>>, dev: &str, title: &str, body: &str) -> Answer {
+    match notifications(gdbus, "GetCapabilities", &[]) {
+        Ok(caps) if caps.contains("'actions'") => {}
+        _ => return Answer::None,
+    }
+    // Listen first, so the answer cannot come before we look.
+    let monitor = Command::new(gdbus)
+        .args(["monitor", "--session", "--dest", "org.freedesktop.Notifications"])
+        .args(["--object-path", "/org/freedesktop/Notifications"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut monitor) = monitor else { return Answer::None };
+    let mut lines = BufReader::new(monitor.stdout.take().unwrap()).lines();
+    // Its first line ("Monitoring signals on object ...") means it is subscribed.
+    if !matches!(lines.next(), Some(Ok(_))) {
+        let _ = monitor.kill();
+        let _ = monitor.wait();
+        return Answer::None;
+    }
+    let actions = "['accept', 'Accept', 'notnow', 'Not now']";
+    let reply = notifications(
+        gdbus,
+        "Notify",
+        &[
+            "'flashcp'",
+            "0",
+            "'drive-removable-media'",
+            &gv_str(title),
+            &gv_str(body),
+            actions,
+            "{'urgency': <byte 1>}",
+            "0",
+        ],
+    );
+    let id = reply
+        .ok()
+        .and_then(|r| r.split("uint32").nth(1)?.trim().trim_end_matches([',', ')']).trim().parse::<u32>().ok());
+    let Some(id) = id else {
+        let _ = monitor.kill();
+        let _ = monitor.wait();
+        return Answer::None;
+    };
+    ids.lock().unwrap().insert(dev.into(), id);
+    let mut answer = Answer::None;
+    for line in lines.map_while(Result::ok) {
+        let mine = line.contains(&format!("(uint32 {id},"));
+        if mine && line.contains(".ActionInvoked ") {
+            if line.contains("'accept'") {
+                answer = Answer::Accept;
+            } else if line.contains("'notnow'") {
+                answer = Answer::NotNow;
+            } else {
+                continue; // "default" (a click on the body): the server closes it next
+            }
+            let _ = notifications(gdbus, "CloseNotification", &[&id.to_string()]);
+            break;
+        }
+        if mine && line.contains(".NotificationClosed ") {
+            // Reason 1 expired, 2 dismissed by the user, 3 closed by us (the drive went away).
+            let reason = line.rsplit("uint32").next().unwrap_or("").trim().trim_end_matches(')').trim();
+            answer = if reason == "3" { Answer::None } else { Answer::Dismissed };
+            break;
+        }
+    }
+    let _ = monitor.kill();
+    let _ = monitor.wait();
+    answer
 }
 
 /// FUSE mounts of ours whose driver is gone (the daemon was killed): unmount them lazily.
@@ -832,6 +1147,26 @@ fn watch_login1(gdbus: &str, tx: &Sender<Msg>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gvariant_strings_and_config_keys() {
+        assert_eq!(gv_str("Don't unplug it\\now\n"), r"'Don\'t unplug it\\now\n'");
+        let d = tempfile_dir().join("keys");
+        let c = d.join("drive-mode.conf");
+        assert!(read_offers(&c));
+        write_enabled(&c, false).unwrap();
+        write_offers(&c, false).unwrap();
+        assert!(!read_enabled(&c) && !read_offers(&c), "{}", std::fs::read_to_string(&c).unwrap());
+        write_enabled(&c, true).unwrap();
+        assert!(read_enabled(&c) && !read_offers(&c), "the other key is kept");
+        let st = d.join("state/recluster-offers");
+        assert!(read_answered(&st).is_empty());
+        remember(&st, "1A2B-3C4D:KINGSTON", "declined").unwrap();
+        remember(&st, "5E6F-0000:", "accepted").unwrap();
+        let a = read_answered(&st);
+        assert!(a.contains("1A2B-3C4D:KINGSTON") && a.contains("5E6F-0000:") && a.len() == 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn udev_blocks_to_inputs() {

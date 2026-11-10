@@ -153,11 +153,48 @@ What you can do about it:
   4 KB-cluster stick, against 259–371 s onto a default-format one.
 - **`flashcp optimize`** converts a stick that already holds files. It copies them to this
   computer, verifies the copy, rebuilds the stick and verifies again.
-- Coming next: changing the cluster size in place, without moving file data
-  ([#26](https://github.com/zuhuHix/flashcp/pull/26), not merged yet).
+- **Make faster** (in the next release, [#26](https://github.com/zuhuHix/flashcp/pull/26)):
+  smaller clusters in place, in seconds, without moving your files. Drive mode offers it once per
+  stick; see [below](#make-a-normally-formatted-stick-fast).
 
 Big files don't get slower on small clusters: on the USB 2.0 stick the kernel copied one 512 MB
 file onto a 4 KB-cluster stick in 86.0 s, against 107.7 s onto a default-format one (1 run each).
+
+### Make a normally formatted stick fast
+
+> [!NOTE]
+> In the next release (merged, not released yet).
+
+When drive mode serves a stick that was formatted the usual way (clusters of 32 KB or more),
+flashcp asks once, with a notification:
+
+> **Make KINGSTON faster for small files?**
+> flashcp can change how KINGSTON stores files so that small files copy much faster. Nothing is
+> erased. It takes about 7 seconds and you must not unplug it meanwhile.
+> [Accept] [Not now]
+
+Accept saves everything, pauses the stick, gives it 4 KB clusters in place (`flashcp recluster`,
+[below](#quick-start)) and mounts it again: "KINGSTON is ready. Small files now copy to it much
+faster." Nothing happens without a click. "Not now", or closing the notification, means that
+stick is never asked about again; the **Make faster** button in the app's USB drives section and
+`flashcp drive-mode recluster /dev/sdX1` still do it whenever you want. Desktops whose
+notifications cannot show buttons get no notification, only the button.
+
+On the Kingston DataTraveler 3.0 128 GB (single runs): adding 20,000 small files took **98.0 s**
+on its 128 KB clusters. The conversion took **6.35 s** (137 MB written, 40,000 files on it), and
+the same add afterwards took **5.48 s**.
+
+> [!WARNING]
+> If the stick loses power in the few milliseconds between the conversion's last two writes,
+> Windows shows it as unformatted (and may offer to format it: decline). Linux and macOS still
+> open it, and the files are intact. Plug it into a computer with flashcp: drive mode completes
+> the conversion on its own before mounting it (one write) and says so.
+
+Turn the offer off with `flashcp drive-mode offer off` (it writes `offer_faster=false` to
+`~/.config/flashcp/drive-mode.conf`, next to `enabled=`); `flashcp drive-mode status` shows the
+setting. Answers are kept per stick (volume serial and label) in
+`~/.local/state/flashcp/recluster-offers`. Without drive mode, run `flashcp recluster` yourself
+(see [Quick start](#quick-start)).
 
 ## When not to expect gains
 
@@ -413,7 +450,7 @@ and only then deletes the copy.
 On the USB 2.0 stick with 20k small files, `optimize` took 81–103 s once; afterwards, pulling the
 files back took 16.0 s instead of 28.9 s and adding 20k more took 36.5 s instead of 84.1 s.
 
-**Smaller clusters without moving the files: `recluster`**
+**Smaller clusters without moving the files: `recluster`** (in the next release)
 
 ```sh
 sudo flashcp recluster /dev/sdX1 --dry-run    # see the plan
@@ -866,6 +903,8 @@ flashcp mount --check <device|image>                   # would drive mode serve 
 flashcp drive-mode status [--json]                     # drive mode on/off, and how each USB drive is served
 flashcp drive-mode on|off [--system]                   # "Speed up USB drives" (--system: every user, root)
 flashcp drive-mode eject <device>                      # save everything, unmount, power off
+flashcp drive-mode recluster <device> [--yes]          # make a served drive faster (next release)
+flashcp drive-mode offer on|off                        # the "Make … faster?" notification (next release)
 flashcp --version
 ```
 
@@ -934,9 +973,12 @@ The same operations are available as a Rust library: `flashcp::build`, `flashcp:
 
 ## Roadmap
 
+**In the next release** (merged, not released yet)
+- [x] **Smaller clusters in place:** give a default-format stick 4 KB clusters without moving
+  file data ([#26](https://github.com/zuhuHix/flashcp/pull/26)), offered once per stick by drive
+  mode and the app's **Make faster** button ([Make a normally formatted stick fast](#make-a-normally-formatted-stick-fast)).
+
 **Planned**
-- [ ] **Smaller clusters in place:** give a default-format stick 4 KB clusters without moving
-  file data ([#26](https://github.com/zuhuHix/flashcp/pull/26), in review, not merged).
 - [ ] **One-click jobs:** repeatable copy jobs you start with one click.
 - [ ] **Windows and macOS versions** of flashcp. [Supporters](#support) get them first.
 
