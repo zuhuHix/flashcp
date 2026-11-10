@@ -1121,7 +1121,7 @@ fn is_partition(p: &Path) -> Result<bool> {
 }
 
 /// First mountinfo line whose device ("maj:min", field 3) is in `devs`: (device, mount point).
-fn mounted_dev(mountinfo: &str, devs: &[String]) -> Option<(String, String)> {
+pub(crate) fn mounted_dev(mountinfo: &str, devs: &[String]) -> Option<(String, String)> {
     mountinfo.lines().find_map(|l| {
         let f: Vec<&str> = l.split(' ').collect();
         let dev = *f.get(2)?;
