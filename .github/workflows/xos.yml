@@ -6,8 +6,26 @@ name: Cross-OS
 on:
   push:
     branches: [main]
+    # Nothing below can change a volume flashcp writes: docs, media, the desktop app and packaging.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "media/**"
+      - "assets/**"
+      - "gui/**"
+      - "packaging/**"
+      - "LICENSE"
   pull_request:
     branches: [main]
+    # Nothing below can change a volume flashcp writes: docs, media, the desktop app and packaging.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "media/**"
+      - "assets/**"
+      - "gui/**"
+      - "packaging/**"
+      - "LICENSE"
   workflow_dispatch:
 
 permissions:

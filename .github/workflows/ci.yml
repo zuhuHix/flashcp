@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# A newer push to a pull request replaces the run in flight. Runs on main always finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
