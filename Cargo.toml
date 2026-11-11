@@ -1,6 +1,6 @@
 [package]
 name = "flashcp"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Fast file transfers to USB sticks and external drives: builds a whole exFAT volume in one sequential pass"
 license = "GPL-3.0-or-later"
