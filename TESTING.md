@@ -23,6 +23,11 @@ job sets it, and so does the mount step in `image`. That step also fails if its 
 `xos.yml` builds the volumes once on Linux (`scripts/xos/build_images.sh`) and uploads them as
 artifacts. The Windows and macOS jobs download one volume each and check it.
 
+It does not run for a change that touches only Markdown, `docs/`, `media/`, `assets/`, `gui/`,
+`packaging/` or `LICENSE`, since none of those can change a volume flashcp writes. It is not a
+required check, so a pull request it skips is not held up. Run it by hand from the Actions tab
+(`workflow_dispatch`) when in doubt.
+
 ### The source tree
 
 `scripts/xos/gen_tree.py` writes a deterministic tree (seed 20240517), deliberately awkward:
