@@ -101,12 +101,12 @@ details are in [How it works](#how-it-works).
 
 flashcp runs on Linux (x86_64 and aarch64). The release binaries are static, so they work on any distribution.
 `fsck.exfat` from `exfatprogs` is recommended for checking volumes. The current release is
-**0.4.0**; drive mode arrived in 0.3.0, the in-place cluster change in 0.4.0.
+**0.4.1**; drive mode arrived in 0.3.0, the in-place cluster change in 0.4.0.
 
 **Prebuilt binary**
 
 ```sh
-VERSION=0.4.0
+VERSION=0.4.1
 ARCH=$(uname -m)   # x86_64 or aarch64
 curl -LO "https://github.com/zuhuHix/flashcp/releases/download/v$VERSION/flashcp-$VERSION-$ARCH-unknown-linux-musl.tar.gz"
 tar -xzf "flashcp-$VERSION-$ARCH-unknown-linux-musl.tar.gz"
@@ -119,7 +119,7 @@ Checksums are in `SHA256SUMS` on the [release page](https://github.com/zuhuHix/f
 **Debian / Ubuntu (.deb)**
 
 ```sh
-VERSION=0.4.0
+VERSION=0.4.1
 ARCH=$(dpkg --print-architecture)   # amd64 or arm64
 curl -LO "https://github.com/zuhuHix/flashcp/releases/download/v$VERSION/flashcp_${VERSION}_$ARCH.deb"
 sudo apt install "./flashcp_${VERSION}_$ARCH.deb"
@@ -146,7 +146,7 @@ Download both packages from the [release page](https://github.com/zuhuHix/flashc
 install them together:
 
 ```sh
-VERSION=0.4.0
+VERSION=0.4.1
 BASE="https://github.com/zuhuHix/flashcp/releases/download/v$VERSION"
 curl -LO "$BASE/flashcp_${VERSION}_amd64.deb" -LO "$BASE/flashcp-gui_${VERSION}_amd64.deb"
 sudo apt install "./flashcp_${VERSION}_amd64.deb" "./flashcp-gui_${VERSION}_amd64.deb"
@@ -850,6 +850,7 @@ differ in what was on the stick:
 
 | Release | Date | What it added | What it measured |
 |---|---|---|---|
+| 0.4.1 | 2026-11-11 | Fix: drive mode no longer runs a full commit for every file an app fsyncs (lighter commits, same guarantee; [#38](https://github.com/zuhuHix/flashcp/pull/38)) | Kingston, 2,000 small files (71 MB), each fsynced: **2.29 MB/s** against 0.68 MB/s on 0.4.0 (3.4×); the kernel driver doing the same fsyncs: 3.10 MB/s (single runs) |
 | **0.4.0** | 2026-11-10 | Smaller clusters in place: [`recluster`](#make-a-normally-formatted-stick-fast) and the **Make faster** offer | Kingston: adding 20,000 small files took 98.0 s before and **5.48 s** after a 6.35 s conversion (17.9×). Drive mode on 4 KB clusters: 5.31 s, against 93.8 s on 128 KB |
 | 0.3.1 | 2026-11-10 | Fix: an upgrade from a version before 0.3.0 left drive mode off | No speed change |
 | **0.3.0** | 2026-11-10 | [Drive mode](#drive-mode): copies from any app go through flashcp's driver | 20,000 small files until safe to remove. Kingston (128 KB clusters): **73.8 s** against 315.1 s in one session (median of 3 against 1 run), 93.8–94.7 s against 259–371 s in another (single runs). MSI SSD: **1.26 s** against 1.80 s (medians of 3). 20,000 empty files in one folder: 0.49 s against 22.9 s (MSI), 0.83 s against 24.8 s (Kingston) |
