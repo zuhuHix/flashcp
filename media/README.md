@@ -39,6 +39,28 @@ checks the sources.
 | `PullSweep` | `pull-sweep` | `pull`: one sweep in physical order |
 | `TwoDrives` | `two-drives` | why a cheap stick gains less than an SSD |
 
+## Static charts
+
+The bar and dot charts in the README (`assets/chart-<name>-light.svg` and `-dark.svg`) are not
+Remotion scenes. [`charts.mjs`](charts.mjs) writes them as plain SVG, with no dependencies:
+
+```sh
+cd media
+npm run charts      # or: node charts.mjs
+```
+
+| chart | file | what it shows |
+|---|---|---|
+| speed-up overview | `chart-speedup` | every flashcp-against-kernel speed-up for the small dataset, on one logarithmic axis |
+| `cp` returns vs safe to remove | `chart-safe-to-remove` | the Kingston copy until the stick can be removed, both drivers, both cluster sizes |
+| file size and the gain | `chart-file-size` | the SSD speed-ups by dataset (mixed, small, many) |
+| the drive's own limit | `chart-drive-limit` | a build and a kernel copy against 169 MB at each drive's sequential write rate |
+| release by release | `chart-releases` | the small-file copy onto the Kingston stick, each measurement under the release its feature shipped in |
+
+The numbers are in the data blocks of `charts.mjs`, each with its source, under the same rules
+as the animations' numbers below. The script only places text by character count, so after a
+change open the SVGs in a browser, in both themes, and look for labels that collide.
+
 ## Changing a number
 
 Every measured number the newer scenes show is in [`src/data/benchmarks.ts`](src/data/benchmarks.ts),
@@ -56,7 +78,8 @@ alt text in `README.md` when a number changes: the alt text states every number 
 - 1200 px wide, 30 fps, 8–13 s loops. A README image is 800 px wide, so no text is below 22 px
   in the newer scenes.
 - Light and dark come from one component with a `theme` prop; colours are in `src/shared.ts`.
-  Coral is the kernel driver, teal is flashcp, amber is metadata or a changed file.
+  Coral is the kernel driver, teal is flashcp, amber is metadata or a changed file. The static
+  charts use the same coral and teal, and amber for a drive's own limit.
 - Motion is a pure function of the frame (no CSS transitions, no `Math.random()`), so frames can
   be rendered in any order. `src/motion.ts` has the curve helpers.
 - GIFs are 900 px wide at 20 fps with a 128-colour palette. `render.sh` steps down (15 fps,
