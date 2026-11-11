@@ -1166,10 +1166,11 @@ fn deferred_idle_header() {
     fs.write(b.ino, 0, b"b").unwrap();
     fs.fsync(b.ino).unwrap();
     let t = std::time::Instant::now();
-    while journal_active(&img.path) {
-        assert!(t.elapsed() < std::time::Duration::from_secs(30), "the header stayed ACTIVE");
+    while fs.settled_headers() == 0 {
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "the header was not marked IDLE later");
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    assert!(!journal_active(&img.path));
     fs.release(b.ino);
     fs.shutdown().unwrap();
     fsck(&img.path);
@@ -1432,6 +1433,35 @@ fn foreign_change_after_a_yank() {
         let err =
             open_core(rw.try_clone().unwrap(), len, &FileDev::new(Arc::new(rw)), &manual()).err().expect("refused");
         assert!(err.downcast_ref::<super::djournal::Refused>().is_some(), "{err:#}");
+    }
+    // a yank after `alloc`, before `link` reached the device (the new set's sector still as
+    // before the commit), then the other system retimes `a`, whose set is in that sector: the
+    // slot being filled reads 0x00 as it did before, a valid state: abandoned, not refused
+    {
+        let unl = img.dir.join("unlinked.img");
+        std::fs::copy(&img.path, &unl).unwrap();
+        let rw = File::options().read(true).write(true).open(&unl).unwrap();
+        let len = rw.metadata().unwrap().len();
+        let mut v = crate::volume::Vol::open_boot(rw.try_clone().unwrap(), len, false, false).unwrap();
+        let p = super::djournal::locate_raw(&mut v, crate::volume::MAX_DIR_BYTES).unwrap().unwrap();
+        let (light, writes) = super::djournal::pending(&v, &p).expect("an ACTIVE journal");
+        assert!(light);
+        let w = writes.iter().find(|w| w.phase == super::commit::P_LINK && new_set(w).is_some()).unwrap();
+        let mut sec = w.pre.clone();
+        let e = (0..sec.len() / 32).map(|e| e * 32).find(|&e| sec[e] == 0x85).expect("a's set in the sector");
+        let n = (sec[e + 1] as usize + 1) * 32;
+        sec[e + 12] ^= 0x01;
+        let c = crate::exfat::checksum16(&sec[e..e + n], true);
+        sec[e + 2..e + 4].copy_from_slice(&c.to_le_bytes());
+        rw.write_all_at(&sec, w.off).unwrap();
+        let (_, rec) = open_core(rw.try_clone().unwrap(), len, &FileDev::new(Arc::new(rw)), &manual()).unwrap();
+        assert_eq!(rec, super::djournal::Recovered::Abandoned);
+        let m = open(&unl);
+        let dd = m.lookup(ROOT, OsStr::new("d")).unwrap().ino;
+        assert_eq!(m.read(m.lookup(dd, OsStr::new("a")).unwrap().ino, 0, 8).unwrap(), b"a");
+        assert_eq!(m.lookup(dd, OsStr::new("b")).err(), Some(libc::ENOENT));
+        m.shutdown().unwrap();
+        fsck(&unl);
     }
     let (copy, light) = yank("light.img", true, &new_set_ts);
     assert!(light);

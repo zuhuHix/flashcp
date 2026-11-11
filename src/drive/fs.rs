@@ -113,6 +113,8 @@ struct Shared {
     serial: Mutex<()>,
     /// Commits made without VolumeDirty (see `commit::needs_no_dirty`).
     light: std::sync::atomic::AtomicU64,
+    /// Journal headers marked IDLE after their commit (deferred), for tests.
+    settled: std::sync::atomic::AtomicU64,
     /// Test hook: runs inside every mutation, after admission.
     #[cfg(test)]
     hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -358,6 +360,7 @@ impl Fs {
             ejecting: std::sync::atomic::AtomicBool::new(false),
             serial: Mutex::new(()),
             light: std::sync::atomic::AtomicU64::new(0),
+            settled: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             hook: Mutex::new(None),
             ra,
@@ -879,6 +882,12 @@ impl Fs {
         c.inodes.get(&ino)?.dd.as_ref().map(|d| d.clusters.clone())
     }
 
+    /// Journal headers marked IDLE after their commit, not by it (tests).
+    #[cfg(test)]
+    pub(crate) fn settled_headers(&self) -> u64 {
+        self.sh.settled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Commits made without VolumeDirty so far (tests).
     #[cfg(test)]
     pub(crate) fn light_commits(&self) -> u64 {
@@ -1029,6 +1038,7 @@ impl Fs {
         // under `serial` no commit replaced it meanwhile
         let mut st = self.sh.st.lock().unwrap();
         (st.idle_header, st.settle_fails) = (None, 0);
+        self.sh.settled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
