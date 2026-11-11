@@ -826,7 +826,7 @@ pairs and 2/2 Kingston pairs. Real drives remain the final judge. See [SIMULATIO
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/chart-releases-dark.svg">
-  <img alt="Bar chart: 20,000 small files (169 MB) onto a Kingston USB 3 stick, release by release, seconds until the data is on the stick; the solid part of a bar is the fastest run and the fainter part reaches the slowest. Without flashcp, the Linux kernel driver, 128 KB clusters, freshly formatted stick: 259–371 s. 0.1.0, flashcp add, a command on an unmounted stick, 128 KB clusters, stick already holding files: 90–98 s. 0.3.0, drive mode, automatic from any app, 128 KB clusters: 74–95 s. 0.4.0, after Make faster, flashcp add onto the converted stick with 4 KB clusters: 5.48 s; the one-time 6.35 s conversion is not in the bar. This is not one job run four times: the rows differ in what was on the stick, and all were timed on 2026-11-10 with that day's builds, not with each release's binary." src="assets/chart-releases-light.svg" width="800">
+  <img alt="Bar chart: 20,000 small files (169 MB) onto a Kingston USB 3 stick, release by release, seconds until the data is on the stick; the solid part of a bar is the fastest run and the fainter part reaches the slowest. Without flashcp, the Linux kernel driver, 128 KB clusters, freshly formatted stick: 259–371 s. 0.1.0, flashcp add, a command on an unmounted stick, 128 KB clusters: 90–98 s. 0.3.0, drive mode, automatic from any app, 128 KB clusters: 74–95 s. 0.4.0, after Make faster, flashcp add onto the converted stick with 4 KB clusters: 5.48 s; the one-time 6.35 s conversion is not in the bar. This is not one job run four times: the rows differ in what was on the stick, and all were timed on 2026-11-10 with that day's builds, not with each release's binary." src="assets/chart-releases-light.svg" width="800">
 </picture>
 
 The chart puts four measurements of the same kind of copy side by side: 20,000 small files
@@ -837,8 +837,10 @@ differ in what was on the stick:
 
 - **Kernel driver:** whole runs on a freshly formatted stick (128 KB clusters) with three
   endings: 258.8 s and 288.7 s (unmount), 315.5 s (`sync -f`), 370.7 s (`sync`).
-- **`flashcp add`:** onto a 128 KB-cluster stick that already held files, in three sessions:
-  89.7 s, 93.3 s (the kernel's copy onto that stick took 527 s) and 98.0 s.
+- **`flashcp add`:** onto a 128 KB-cluster stick, in three sessions: 93.3 s onto a stick the
+  kernel had filled with 20,000 files (the kernel's copy of the same files onto it took 527 s),
+  98.0 s onto a stick holding 20,000 files, and 89.7 s in a run whose log does not say what was
+  on the stick.
 - **Drive mode:** 128 KB clusters. 73.8 s is a median of 3 from the morning session, where the
   kernel run took 315.1 s; 93.8 s and 94.7 s are single runs from the afternoon, next to the
   259–371 s kernel runs.

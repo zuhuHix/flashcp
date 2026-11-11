@@ -404,8 +404,9 @@ const RELEASES = [
   // whole runs on a freshly formatted stick: 258.8 [K] and 288.7 [K2] ending with an unmount,
   // 315.5 (sync -f) and 370.7 (sync) [K]. PR 22's own kernel run, 315.1 s, is inside this range.
   ['Without flashcp', 'the Linux kernel driver', '128 KB clusters, freshly formatted stick', 'coral', 258.8, 370.7, '259–371 s'],
-  // flashcp add onto a stick that already held files: 89.7 [K], 93.3 [#18], 98.0 [#26]
-  ['0.1.0 · flashcp add', 'a command, on an unmounted stick', '128 KB clusters, stick already holding files', 'teal', 89.7, 98.0, '90–98 s'],
+  // flashcp add: 93.3 [#18] and 98.0 [#26] onto a stick holding 20,000 files, 89.7 [K] (the log
+  // does not say what was on the stick)
+  ['0.1.0 · flashcp add', 'a command, on an unmounted stick', '128 KB clusters', 'teal', 89.7, 98.0, '90–98 s'],
   // drive mode: 73.8 (median of 3) [#22], 93.8 and 94.7 [K]
   ['0.3.0 · drive mode', 'automatic, from any app', '128 KB clusters', 'teal', 73.8, 94.7, '74–95 s'],
   // [#26]: the same stick after `recluster` (6.35 s, not in the bar), 40,000 files on it
