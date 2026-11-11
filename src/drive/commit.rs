@@ -105,6 +105,8 @@ pub(crate) struct Plan {
     pub(crate) sector0: Vec<u8>,
     /// No VolumeDirty: every crash state is a valid volume (see `needs_no_dirty`).
     pub(crate) light: bool,
+    /// Directories whose times this commit left for a later one.
+    pub(crate) deferred: Vec<Ino>,
 }
 
 /// A directory's working copy during planning.
@@ -145,6 +147,8 @@ struct Planner<'a> {
     /// large ones), carved in order: the batch's data is one sequential stream instead of
     /// one hole per file.
     arena: VecDeque<(u64, u64)>,
+    /// Directories whose times wait (`defer_times`).
+    deferred: Vec<Ino>,
 }
 
 fn holes_of(data: &[u8], end: usize) -> Vec<(usize, usize)> {
@@ -675,7 +679,11 @@ pub(crate) fn free_extents(bm: &[u8], cc: u64) -> Vec<(u64, u64)> {
     out
 }
 
-pub(crate) fn plan(c: &mut Core, limit: Option<usize>) -> Result<Option<Plan>> {
+/// Plans a commit of every dirty inode (`limit`: of at most that many). With `defer_times`
+/// (an fsync's commit), a committed directory whose set would change only in its times keeps
+/// its set and stays dirty: the next commit that is not an fsync's writes it (see
+/// [`times_only`]).
+pub(crate) fn plan(c: &mut Core, limit: Option<usize>, defer_times: bool) -> Result<Option<Plan>> {
     if c.dirty.is_empty() {
         return Ok(None);
     }
@@ -730,6 +738,7 @@ pub(crate) fn plan(c: &mut Core, limit: Option<usize>) -> Result<Option<Plan>> {
         files: 0,
         bytes: 0,
         arena: VecDeque::new(),
+        deferred: Vec::new(),
     };
     let seq = p.c.seq;
     // ── removals (unlinked) and moves away (the old set goes) ──
@@ -870,6 +879,14 @@ pub(crate) fn plan(c: &mut Core, limit: Option<usize>) -> Result<Option<Plan>> {
             dd.data[d.off..d.off + d.len].to_vec()
         });
         let new = set::encode(&f, &p.c.vol.upc, old.as_deref());
+        if defer_times
+            && is_dir
+            && disk.is_some_and(|d| d.dir == parent)
+            && old.as_deref().is_some_and(|o| o != new && times_only(o, &new))
+        {
+            p.deferred.push(i);
+            continue; // no fin: it stays dirty
+        }
         let mut grown = Vec::new();
         let new_disk = match (disk, old) {
             (Some(d), Some(old)) if d.dir == parent && old.len() == new.len() => {
@@ -923,6 +940,14 @@ pub(crate) fn plan(c: &mut Core, limit: Option<usize>) -> Result<Option<Plan>> {
     // Directories extended but not otherwise dirty were queued above; the root has no set.
     let n_inodes = work.len();
     finish(p, n_inodes, full, seq).map(Some)
+}
+
+/// Whether entry set `new` differs from `old` only in the primary entry's checksum and times
+/// (timestamps, 10 ms fields, UTC offsets: bytes 2-3 and 8-24). A directory's times are what
+/// every create, unlink and rename inside it changes: written by an fsync's commit, they cost
+/// one more sector write per file than the kernel driver makes.
+fn times_only(old: &[u8], new: &[u8]) -> bool {
+    old.len() == new.len() && (0..old.len()).all(|k| old[k] == new[k] || matches!(k, 2..=3 | 8..=24))
 }
 
 /// Bitmap bytes changed by a plan, over the committed bitmap.
@@ -1012,6 +1037,11 @@ fn finish(mut p: Planner<'_>, n_inodes: usize, full: bool, plan_seq: u64) -> Res
     writes.extend(fat_w.iter().filter(|w| w.phase == P_ALLOC).cloned());
     writes.extend(fat_w.iter().filter(|w| w.phase == P_LINK).cloned());
     // directories
+    // A set placed, edited or removed across two sectors, or padding written in `link` (its
+    // sector shared with another write there), needs VolumeDirty: a crash can leave half of
+    // it (a set torn across non-adjacent clusters, a set after the end-of-directory entry the
+    // padding was to replace).
+    let mut heavy_dirs = false;
     let mut dirs_out: Vec<(Ino, DirData)> = Vec::new();
     let mut dir_ids: Vec<Ino> = p.dws.keys().copied().collect();
     dir_ids.sort();
@@ -1038,12 +1068,14 @@ fn finish(mut p: Planner<'_>, n_inodes: usize, full: bool, plan_seq: u64) -> Res
             // padding goes in `alloc` (before the set after it), unless something in `link`
             // writes the same sector: then it is part of that write
             let mut touched = w.touched.clone();
+            heavy_dirs |= w.touched.iter().any(|&(a, b)| b > a && a / 512 != (b - 1) / 512);
             let mut early = Vec::new();
             let linked = sectors(&w.touched);
             for &(a, b) in &w.pad {
                 let (sa, sb) = (a / 512 * 512, b.div_ceil(512) * 512);
                 if linked.iter().any(|&(x, y)| x < sb && sa < y) {
                     touched.push((a, b));
+                    heavy_dirs = true;
                 } else {
                     early.push((a, b));
                 }
@@ -1091,6 +1123,7 @@ fn finish(mut p: Planner<'_>, n_inodes: usize, full: bool, plan_seq: u64) -> Res
     // (ClearToZero must be cleared before anything is modified: that takes a full commit)
     let light = s0[112] == pct
         && flags & (crate::volume::FLAG_CLEAR_TO_ZERO | crate::volume::FLAG_DIRTY) == 0
+        && !heavy_dirs
         && needs_no_dirty(&merged, fat_off, fat_end);
     let writes: Vec<JW> =
         if light { merged.into_iter().filter(|w| w.phase != P_DIRTY && w.phase != P_CLEAN).collect() } else { merged };
@@ -1125,6 +1158,7 @@ fn finish(mut p: Planner<'_>, n_inodes: usize, full: bool, plan_seq: u64) -> Res
         bytes: p.bytes,
         sector0: s0n,
         light,
+        deferred: std::mem::take(&mut p.deferred),
     })
 }
 
@@ -1134,21 +1168,30 @@ fn finish(mut p: Planner<'_>, n_inodes: usize, full: bool, plan_seq: u64) -> Res
 /// `link` before `free`), so every crash state is one of:
 /// - after `alloc`: bitmap bits of clusters nothing references yet (leaked, which fsck.exfat
 ///   accepts and the journal's replay completes);
-/// - inside `link`: any subset of its sector writes. That is a valid volume when every write
-///   is one whole directory sector (sectors are written atomically, so no set is ever torn:
-///   an in-place edit lies in one sector by construction, its checksum included), no FAT
-///   entry of a committed chain changes (a chain longer or shorter than its file), and no set
-///   is removed in one sector while another is written in a different sector (a move or a
-///   relocation, which could leave both or neither). New sets go into one sector at most:
-///   with two, the later one alone could land after an end-of-directory entry the earlier
-///   one was to replace. New sets into unused slots, in-place edits and pure removals
-///   (entries marked deleted, never end-of-directory) each stand alone;
+/// - inside `link`: any subset of its sector writes. That is a valid volume when
+///   - every write is one whole directory sector (sectors are written atomically);
+///   - no FAT entry of a committed chain changes (a chain longer or shorter than its file);
+///   - every set removed in a sector lies whole in it (a set across two sectors, even
+///     adjacent ones, could lose its primary or its secondaries alone);
+///   - sets appear in one sector at most: a new set, and an in-place edit that changes a
+///     name (its name entries, or NameLength/NameHash), which is a set appearing under a new
+///     name. With two such sectors, one alone could leave two sets of one name (a rename over
+///     a target, an exchange), or a new set after an end-of-directory entry the other one
+///     was to replace;
+///   - no set is removed in one sector while one appears in another (a move, a relocation,
+///     a rename over a target elsewhere: both or neither could be left).
+///
+///   In-place edits of other fields (times, size, attributes, a copy-on-write's new first
+///   cluster) and whole removals each stand alone: an edit lies in one sector by
+///   construction, its checksum included, and a removal marks entries deleted, never
+///   end-of-directory;
 /// - inside `free`: bits of clusters nothing references any more, some still set (leaked).
 ///
-/// PercentInUse must not change either (it is written in `clean`), and the volume flags must
-/// need no change (ClearToZero set takes a full commit, which clears it).
-fn needs_no_dirty(writes: &[JW], fat_a: u64, fat_b: u64) -> bool {
-    let (mut adds, mut clears) = (HashSet::new(), HashSet::new());
+/// The caller also requires: no set it placed or removed spans two sectors, no padding
+/// written in `link`, PercentInUse unchanged (it is written in `clean`), and volume flags
+/// that need no change (ClearToZero set takes a full commit, which clears it).
+pub(crate) fn needs_no_dirty(writes: &[JW], fat_a: u64, fat_b: u64) -> bool {
+    let (mut appear, mut clears) = (HashSet::new(), HashSet::new());
     for w in writes.iter().filter(|w| w.phase == P_LINK) {
         if w.off < fat_b && fat_a < w.off + w.post.len() as u64 {
             return false;
@@ -1157,21 +1200,43 @@ fn needs_no_dirty(writes: &[JW], fat_a: u64, fat_b: u64) -> bool {
             return false;
         }
         let sector = w.off / 512;
+        let ent = |b: &[u8], e: usize| b[e * 32..e * 32 + 32].to_vec();
+        // entries of sets removed whole inside this sector
+        let mut whole = [false; 16];
         for e in 0..16 {
+            let (a, b) = (w.pre[e * 32], w.post[e * 32]);
+            if a & 0xC0 == 0x80 && b & 0x80 == 0 {
+                let n = w.pre[e * 32 + 1] as usize;
+                if e + n >= 16 || (e..=e + n).any(|k| w.post[k * 32] & 0x80 != 0) {
+                    return false;
+                }
+                whole[e..=e + n].fill(true);
+            }
+        }
+        for (e, &whole) in whole.iter().enumerate() {
             let (a, b) = (w.pre[e * 32], w.post[e * 32]);
             match (a & 0x80 != 0, b & 0x80 != 0) {
                 (false, true) => {
-                    adds.insert(sector);
+                    appear.insert(sector);
                 }
                 (true, false) => {
+                    if !whole {
+                        return false;
+                    }
                     clears.insert(sector);
                 }
                 (true, true) if a != b => return false,
+                (true, true) => {
+                    let (x, y) = (ent(&w.pre, e), ent(&w.post, e));
+                    if x != y && (a == 0xC1 || (a == 0xC0 && x[3..6] != y[3..6])) {
+                        appear.insert(sector);
+                    }
+                }
                 _ => {}
             }
         }
     }
-    adds.len() <= 1 && !adds.iter().any(|s| clears.iter().any(|c| c != s))
+    appear.len() <= 1 && !appear.iter().any(|s| clears.iter().any(|c| c != s))
 }
 
 /// Journaled writes of bytes [a, a + post.len()) of an object stored in `clusters`.
@@ -1203,6 +1268,7 @@ fn object_writes(
 
 /// Applies a finished commit to the in-memory state (under the lock).
 pub(crate) fn finalize(c: &mut Core, p: Plan) {
+    let written: Vec<Ino> = p.fins.iter().map(|f| f.0).collect();
     for (d, dd) in p.dirs {
         if let Some(n) = c.inodes.get_mut(&d) {
             n.dd = Some(dd);
@@ -1264,6 +1330,12 @@ pub(crate) fn finalize(c: &mut Core, p: Plan) {
             c.gc(i);
         }
     }
+    for i in &written {
+        c.deferred.remove(i);
+    }
+    c.deferred.extend(p.deferred.iter().copied());
+    let dirty = &c.dirty;
+    c.deferred.retain(|i| dirty.contains(i));
     c.commits += 1;
     if p.full {
         c.durable_seq = c.durable_seq.max(p.seq);

@@ -640,7 +640,8 @@ fn readahead_serves_bulk_reads_and_never_stale_data() {
 /// Counts that would show a regression without timing anything: one fsync of a new small
 /// file costs 5 device writes and 5 syncs (data, journal, bitmap, entry set, journal IDLE: a
 /// light commit has no VolumeDirty), and from the commit thread, which leaves the IDLE header
-/// to a commit that does not follow, one write and one sync fewer; a commit onto a volume full of holes writes its
+/// to a commit that does not follow and a directory's times to the next commit, 4 + 4; a
+/// commit onto a volume full of holes writes its
 /// batch as one stream; a reader
 /// taking 64 KB heads of 2 MB files makes the readahead read heads, not whole files.
 #[test]
@@ -670,19 +671,33 @@ fn device_op_counts() {
     let opts = FsOpts { auto_commit: true, idle_header: std::time::Duration::from_secs(3600), ..manual() };
     let fs = open_with(&img.path, dev.clone(), opts).unwrap();
     let before = dev.ops();
-    // the first set of a directory: one sector (a set across two takes a full commit), and
-    // the directory's own set edited in place (its times): 5 writes, 4 syncs
+    // the first set of a directory: one sector (a set across two takes a full commit); the
+    // directory's own times wait for the next commit that is not an fsync's: data, journal,
+    // bitmap, entry set, 4 syncs, what the kernel driver writes per fsynced file
     let sub = fs.lookup(ROOT, OsStr::new("sub")).unwrap().ino;
+    let mt0 = fs.getattr(sub).unwrap().mtime;
     let b = fs.create(sub, OsStr::new("two.txt"), true, false).unwrap();
     fs.write(b.ino, 0, &[2u8; 8192]).unwrap();
     fs.fsync(b.ino).unwrap();
     let ops = dev.ops() - before;
     eprintln!("count: fsync of one small file, commit thread: {ops} device writes + syncs");
     assert_eq!(fs.light_commits(), 1, "the fsync's commit was not light");
-    assert!(ops <= 9, "one fsync took {ops} device writes and syncs (5 + 4 expected)");
+    assert!(ops <= 8, "one fsync took {ops} device writes and syncs (4 + 4 expected)");
+    assert_eq!(fs.status().dirty_files, 1, "the directory's times were not left for later");
+    let mt1 = fs.getattr(sub).unwrap().mtime;
+    assert_ne!(mt0, mt1);
+    // the close commit (after the linger) writes them
     fs.release(b.ino);
+    let t = std::time::Instant::now();
+    while fs.status().dirty_files > 0 {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "the directory's times stayed pending");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     fs.shutdown().unwrap();
     fsck(&img.path);
+    let again = open(&img.path);
+    assert_eq!(again.getattr(again.lookup(ROOT, OsStr::new("sub")).unwrap().ino).unwrap().mtime, mt1);
+    again.shutdown().unwrap();
     // a volume full of holes: 600 files, every other one deleted, then 300 new files
     let img = image("holes", 64, 4096);
     let fs = open(&img.path);
@@ -933,6 +948,31 @@ fn journal_active(path: &Path) -> bool {
     super::djournal::header_state(&v, &p) == Some(true)
 }
 
+/// The volume at `path` as another system reads it, when VolumeDirty is clear: fsck-clean,
+/// and no entry in use after a directory's end-of-directory entry (which fsck.exfat does not
+/// look at: a set there is silently lost, and the volume breaks the spec).
+fn foreign_check(path: &Path, at: &str) {
+    if volume_dirty(path) {
+        return; // the other system checks it
+    }
+    fsck(path);
+    let f = File::open(path).unwrap();
+    let len = f.metadata().unwrap().len();
+    let mut v = crate::volume::Vol::open(f, len, false, false).unwrap_or_else(|e| panic!("{at}: {e:#}"));
+    let check = |path: &str, data: &[u8], end: usize| {
+        let late = (end..data.len()).step_by(32).find(|&o| data[o] != 0);
+        assert!(late.is_none(), "{at}: directory {path:?}: an entry (type {:#x}) after its end", data[late.unwrap()]);
+    };
+    check("/", &v.dirs[0].data, v.dirs[0].end);
+    let mut stack: Vec<(String, crate::volume::Child)> =
+        v.dirs[0].children.values().filter(|c| c.is_dir).map(|c| (String::new(), c.clone())).collect();
+    while let Some((parent, ch)) = stack.pop() {
+        let d = v.read_child(0, &parent, &ch).unwrap_or_else(|e| panic!("{at}: {e:#}"));
+        check(&d.path, &d.data, d.end);
+        stack.extend(d.children.values().filter(|c| c.is_dir).map(|c| (d.path.clone(), c.clone())));
+    }
+}
+
 /// VolumeDirty of the image at `path`, as another system would read it.
 fn volume_dirty(path: &Path) -> bool {
     use std::os::unix::fs::FileExt;
@@ -1052,9 +1092,7 @@ fn crash_fsync_stream() {
                 drop(dev);
                 let at = format!("crash at op {k}/{total} ({loss:?}, cluster {cluster})");
                 // another system, before flashcp ever sees the volume again
-                if !volume_dirty(&img.path) {
-                    fsck(&img.path);
-                }
+                foreign_check(&img.path, &at);
                 let f = File::options().read(true).write(true).open(&img.path).unwrap();
                 let fs = open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), manual())
                     .unwrap_or_else(|e| panic!("{at}: recovery failed: {e:#}"));
@@ -1117,6 +1155,421 @@ fn deferred_idle_header() {
     fs.resume();
     fs.shutdown().unwrap();
     fsck(&img.path);
+}
+
+/// A volume with 512 B clusters whose only free space is single clusters between used ones,
+/// so every new directory of two clusters is FAT-chained across non-adjacent clusters.
+fn fragmented(name: &str) -> Img {
+    let img = image(name, 8, 512);
+    let fs = open(&img.path);
+    let fill = fs.mkdir(ROOT, OsStr::new("fill")).unwrap();
+    fs.flush().unwrap(); // the journal file
+    let free = |fs: &Fs| fs.statfs().bfree * fs.statfs().bsize as u64;
+    // leave room for 400 small files and the directory's growth
+    let mut k = 0;
+    while free(&fs) > (128 << 10) + (400 << 10) {
+        let f = fs.create(fill.ino, OsStr::new(&format!("big{k:03}")), true, false).unwrap();
+        fs.write(f.ino, 0, &vec![1u8; 128 << 10]).unwrap();
+        k += 1;
+        if k % 8 == 0 {
+            fs.flush().unwrap();
+        }
+    }
+    fs.flush().unwrap();
+    for k in 0..400 {
+        let f = fs.create(fill.ino, OsStr::new(&format!("s{k:03}")), true, false).unwrap();
+        fs.write(f.ino, 0, &[2u8; 500]).unwrap();
+    }
+    fs.flush().unwrap();
+    // the rest in one plug file, then every other small file goes
+    // what is left, but a few clusters (the plug's own set may grow the directory)
+    let left = free(&fs);
+    let plug = fs.create(fill.ino, OsStr::new("plug"), true, false).unwrap();
+    fs.write(plug.ino, 0, &vec![3u8; left.saturating_sub(4 << 10) as usize]).unwrap();
+    fs.flush().unwrap();
+    let left = free(&fs);
+    if left > 0 {
+        let plug2 = fs.create(fill.ino, OsStr::new("plug2"), true, false).unwrap();
+        fs.write(plug2.ino, 0, &vec![4u8; left.saturating_sub(512) as usize]).unwrap();
+        fs.flush().unwrap();
+    }
+    eprintln!("fragmented: {} bytes free before the holes", free(&fs));
+    for k in (0..400).step_by(2) {
+        fs.unlink(fill.ino, OsStr::new(&format!("s{k:03}"))).unwrap();
+    }
+    fs.flush().unwrap();
+    fs.shutdown().unwrap();
+    fsck(&img.path);
+    img
+}
+
+/// Sets that cross a sector boundary between non-adjacent clusters of a FAT-chained
+/// directory: removing one, and padding a directory's end in the sector another `link` write
+/// edits while the new set goes into a new non-adjacent cluster. Both take full commits. A
+/// crash at every device op under the three loss models: the raw volume is dirty or
+/// fsck-clean, the recovered tree the one before or after.
+#[test]
+fn crash_chained_directories() {
+    let img = fragmented("crash-chained");
+    let fs = open(&img.path);
+    // "chained": six 3-entry sets (576 B): two clusters, which the holes make non-adjacent
+    let ch = fs.mkdir(ROOT, OsStr::new("chained")).unwrap();
+    let mut inos = Vec::new();
+    for n in ["a", "b", "c", "d", "e", "f"] {
+        let f = fs.create(ch.ino, OsStr::new(n), true, false).unwrap();
+        fs.write(f.ino, 0, n.as_bytes()).unwrap();
+        inos.push((n, f.ino));
+    }
+    // "pad": 3 + 3 + 3 + 5 entries = 448 B, one cluster: a new set there crosses 512
+    let pd = fs.mkdir(ROOT, OsStr::new("pad")).unwrap();
+    for n in ["x", "y", "w", "a file name of forty characters, really"] {
+        let f = fs.create(pd.ino, OsStr::new(n), true, false).unwrap();
+        fs.write(f.ino, 0, b"pad").unwrap();
+    }
+    fs.flush().unwrap();
+    let cl = fs.dir_clusters(ch.ino).unwrap();
+    assert!(cl.len() == 2 && cl[1] != cl[0] + 1, "\"chained\" is not FAT-chained: {cl:?}");
+    let across = inos
+        .iter()
+        .find(|(_, i)| fs.set_place(*i).is_some_and(|(o, l)| o / 512 != (o + l - 1) / 512))
+        .map(|(n, _)| n.to_string())
+        .expect("a set across the clusters");
+    fs.shutdown().unwrap();
+    fsck(&img.path);
+    let template = img.dir.join("template.img");
+    std::fs::copy(&img.path, &template).unwrap();
+    let run = |fail_at: Option<u64>| {
+        let f = File::options().read(true).write(true).open(&img.path).unwrap();
+        let dev = Arc::new(CrashDev::new(f, fail_at));
+        let fs = open_with(&img.path, dev.clone(), manual()).unwrap();
+        let mut snaps = vec![snapshot(&fs)];
+        let ch = fs.lookup(ROOT, OsStr::new("chained")).unwrap().ino;
+        let pd = fs.lookup(ROOT, OsStr::new("pad")).unwrap().ino;
+        let steps: Vec<Box<dyn Fn() -> Result<(), i32>>> = vec![
+            Box::new(|| {
+                fs.unlink(ch, OsStr::new(&across))?;
+                fs.fsync(ROOT)
+            }),
+            Box::new(|| {
+                let x = fs.lookup(pd, OsStr::new("x"))?.ino;
+                fs.write(x, 3, b"+")?; // its set edited in the sector the padding goes into
+                let z = fs.create(pd, OsStr::new("z"), true, false)?;
+                fs.write(z.ino, 0, b"zz")?;
+                fs.fsync(z.ino)
+            }),
+        ];
+        let mut failed = false;
+        for s in &steps {
+            let r = s();
+            snaps.push(snapshot(&fs));
+            if r.is_err() {
+                failed = true;
+                break;
+            }
+        }
+        let (light, ops) = (fs.light_commits(), dev.ops());
+        drop(steps);
+        let _ = fs.shutdown();
+        (snaps, dev, failed, light, ops)
+    };
+    let (_, _, failed, light, total) = run(None);
+    assert!(!failed);
+    assert_eq!(light, 0, "a commit of these was light");
+    for k in 0..total {
+        // several random sector subsets per op: the states these commits must not leave lose
+        // one particular sector of three
+        let losses = [Loss::None, Loss::All].into_iter().chain((0..8).map(|r| Loss::Random(k * 131 + r * 17 + 5)));
+        for loss in losses {
+            std::fs::copy(&template, &img.path).unwrap();
+            let (snaps, dev, failed, _, ops) = run(Some(k));
+            if !failed {
+                assert!(ops <= k, "op {k} of {total} did not fail");
+                continue;
+            }
+            dev.crash(loss);
+            drop(dev);
+            let at = format!("crash at op {k}/{total} ({loss:?})");
+            foreign_check(&img.path, &at);
+            let f = File::options().read(true).write(true).open(&img.path).unwrap();
+            let fs = open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), manual())
+                .unwrap_or_else(|e| panic!("{at}: recovery failed: {e:#}"));
+            let got = snapshot(&fs);
+            let n = snaps.len();
+            assert!(got == snaps[n - 2] || got == snaps[n - 1], "{at}: neither the tree before nor after");
+            fs.shutdown().unwrap();
+            fsck(&img.path);
+        }
+    }
+}
+
+/// Renames inside one directory are edited in place: one over a target whose set is in
+/// another sector, or an exchange across sectors, takes a full commit (a crash could leave
+/// two sets of one name); a rename alone stays light.
+#[test]
+fn renames_across_sectors_take_full_commits() {
+    let img = image("renames", 32, 4096);
+    let fs = open(&img.path);
+    let d = fs.mkdir(ROOT, OsStr::new("d")).unwrap();
+    for k in 0..16 {
+        let f = fs.create(d.ino, OsStr::new(&format!("f{k:02}")), true, false).unwrap();
+        fs.write(f.ino, 0, &[k as u8; 10]).unwrap();
+    }
+    fs.flush().unwrap();
+    let sector = |n: &str| fs.set_place(fs.lookup(d.ino, OsStr::new(n)).unwrap().ino).map(|(o, _)| o / 512).unwrap();
+    assert_ne!(sector("f01"), sector("f11"));
+    assert_ne!(sector("f03"), sector("f13"));
+    let light = |f: &dyn Fn()| {
+        let before = fs.light_commits();
+        f();
+        fs.flush().unwrap();
+        fs.light_commits() > before
+    };
+    let rn = |a: &str, b: &str, fl: RenameFlags| fs.rename(d.ino, OsStr::new(a), d.ino, OsStr::new(b), fl).unwrap();
+    assert!(!light(&|| rn("f01", "f11", RenameFlags::default())), "rename over a target in another sector");
+    let ex = RenameFlags { exchange: true, ..Default::default() };
+    assert!(!light(&|| rn("f03", "f13", ex)), "exchange across sectors");
+    assert!(light(&|| rn("f04", "g04", RenameFlags::default())), "a rename alone");
+    let want = snapshot(&fs);
+    fs.shutdown().unwrap();
+    fsck(&img.path);
+    same!(snapshot(&open(&img.path)), want, "after the renames");
+}
+
+/// A yank mid-burst (the last fsync's header still ACTIVE), then another system changes a
+/// byte that commit journaled: the next mount abandons a light commit (every crash state of
+/// it is a valid volume) and mounts; a full commit is still refused.
+#[test]
+fn foreign_change_after_a_yank() {
+    use std::os::unix::fs::FileExt;
+    let img = image("foreign", 32, 4096);
+    let f = File::options().read(true).write(true).open(&img.path).unwrap();
+    let opts =
+        FsOpts { auto_commit: true, readahead: false, idle_header: std::time::Duration::from_secs(3600), ..manual() };
+    let fs = open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), opts).unwrap();
+    let d = fs.mkdir(ROOT, OsStr::new("d")).unwrap();
+    let e = fs.mkdir(ROOT, OsStr::new("e")).unwrap();
+    fs.flush().unwrap();
+    for n in ["a", "b"] {
+        let x = fs.create(d.ino, OsStr::new(n), true, false).unwrap();
+        fs.write(x.ino, 0, n.as_bytes()).unwrap();
+        fs.fsync(x.ino).unwrap();
+        fs.release(x.ino);
+    }
+    // the volume as another system finds it after a yank now, with one journaled byte changed
+    let yank = |name: &str, pick: &dyn Fn(&[super::commit::JW]) -> (u64, u8)| -> (PathBuf, bool) {
+        let copy = img.dir.join(name);
+        std::fs::copy(&img.path, &copy).unwrap();
+        let rw = File::options().read(true).write(true).open(&copy).unwrap();
+        let len = rw.metadata().unwrap().len();
+        let mut v = crate::volume::Vol::open_boot(rw.try_clone().unwrap(), len, false, false).unwrap();
+        let p = super::djournal::locate_raw(&mut v, crate::volume::MAX_DIR_BYTES).unwrap().unwrap();
+        let (light, writes) = super::djournal::pending(&v, &p).expect("an ACTIVE journal");
+        let (off, mask) = pick(&writes);
+        // the byte changed, and the checksum of the set it is in made right again
+        let at = off / 32 * 32;
+        let w = writes.iter().find(|w| w.off <= off && off < w.off + w.post.len() as u64).unwrap();
+        let k = (at - w.off) as usize;
+        let first = (0..=k / 32).rev().map(|e| e * 32).find(|&e| w.post[e] == 0x85).unwrap_or(k);
+        let n = (w.post[first + 1] as usize + 1) * 32;
+        let base = w.off + first as u64;
+        let mut set = vec![0u8; n];
+        rw.read_exact_at(&mut set, base).unwrap();
+        set[(off - base) as usize] ^= mask;
+        if set[0] == 0x85 {
+            let c = crate::exfat::checksum16(&set, true);
+            set[2..4].copy_from_slice(&c.to_le_bytes());
+        }
+        rw.write_all_at(&set, base).unwrap();
+        (copy, light)
+    };
+    fn new_set(w: &super::commit::JW) -> Option<usize> {
+        (0..w.post.len() / 32).map(|e| e * 32).find(|&e| w.post[e] == 0x85 && w.pre[e] & 0x80 == 0)
+    }
+    // light (a new file): its set retimed by the other system (checksum recomputed)
+    let (copy, light) = yank("light.img", &|ws| {
+        let w = ws.iter().find(|w| w.phase == super::commit::P_LINK && new_set(w).is_some()).expect("a new set");
+        (w.off + new_set(w).unwrap() as u64 + 12, 0x01) // LastModifiedTimestamp
+    });
+    assert!(light);
+    let f = File::options().read(true).write(true).open(&copy).unwrap();
+    let len = f.metadata().unwrap().len();
+    let (_, rec) = open_core(f.try_clone().unwrap(), len, &FileDev::new(Arc::new(f)), &manual()).unwrap();
+    assert_eq!(rec, super::djournal::Recovered::Abandoned);
+    let m = open(&copy);
+    let dd = m.lookup(ROOT, OsStr::new("d")).unwrap().ino;
+    assert_eq!(m.read(m.lookup(dd, OsStr::new("b")).unwrap().ino, 0, 8).unwrap(), b"b");
+    m.shutdown().unwrap();
+    fsck(&copy);
+    // full (a move to another directory): refused, nothing written
+    fs.rename(d.ino, OsStr::new("a"), e.ino, OsStr::new("a"), RenameFlags::default()).unwrap();
+    fs.fsync(e.ino).unwrap();
+    let (copy, light) = yank("full.img", &|ws| {
+        let w = ws.iter().find(|w| w.phase == super::commit::P_LINK && new_set(w).is_some()).expect("the moved set");
+        (w.off + new_set(w).unwrap() as u64 + 12, 0x01) // its LastModifiedTimestamp
+    });
+    assert!(!light);
+    let f = File::options().read(true).write(true).open(&copy).unwrap();
+    let len = f.metadata().unwrap().len();
+    let err = open_core(f.try_clone().unwrap(), len, &FileDev::new(Arc::new(f)), &manual()).err().expect("refused");
+    assert!(err.downcast_ref::<super::djournal::Refused>().is_some(), "{err:#}");
+    fs.shutdown().unwrap();
+}
+
+/// The deferred IDLE header and eject: fsyncs racing prepare-eject (their requests coalesce
+/// with eject's) never leave it ACTIVE once eject reports safe; a failed IDLE write stays
+/// pending, makes eject fail, and is retried.
+#[test]
+fn settle_header_on_eject_and_errors() {
+    let img = image("settle", 32, 4096);
+    let opts = || FsOpts {
+        auto_commit: true,
+        readahead: false,
+        idle_header: std::time::Duration::from_secs(3600),
+        ..manual()
+    };
+    // 1: an fsync storm while ejecting
+    let f = File::options().read(true).write(true).open(&img.path).unwrap();
+    let fs = open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), opts()).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (fs2, stop2) = (fs.clone(), stop.clone());
+    let storm = std::thread::spawn(move || {
+        let mut k = 0;
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            let Ok(x) = fs2.create(ROOT, OsStr::new(&format!("s{k}")), true, false) else { break };
+            if fs2.write(x.ino, 0, b"storm").is_ok() {
+                let _ = fs2.fsync(x.ino);
+            }
+            fs2.release(x.ino);
+            k += 1;
+        }
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    fs.prepare_eject().unwrap();
+    assert!(!journal_active(&img.path), "prepare-eject reported safe with the journal ACTIVE");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    storm.join().unwrap();
+    fs.resume();
+    fs.shutdown().unwrap();
+    assert!(!journal_active(&img.path));
+    fsck(&img.path);
+    // 2: the IDLE write fails
+    let f = File::options().read(true).write(true).open(&img.path).unwrap();
+    let dev = Arc::new(CrashDev::new(f, None));
+    let fs = open_with(&img.path, dev.clone(), FsOpts { idle_header: std::time::Duration::from_millis(50), ..opts() })
+        .unwrap();
+    let x = fs.create(ROOT, OsStr::new("x"), true, false).unwrap();
+    fs.write(x.ino, 0, b"x").unwrap();
+    fs.fsync(x.ino).unwrap();
+    {
+        let mut st = dev.st.lock().unwrap();
+        st.fail_at = Some(st.ops); // from now on every write fails
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(journal_active(&img.path), "the IDLE mark cannot have been written");
+    assert_ne!(fs.status().state, "read_only", "a failed IDLE mark is not fatal");
+    {
+        let mut st = dev.st.lock().unwrap();
+        (st.fail_at, st.failed) = (None, false);
+    }
+    let t = std::time::Instant::now();
+    while journal_active(&img.path) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "the IDLE mark was not retried");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // eject while it cannot be written: not safe
+    fs.write(x.ino, 1, b"y").unwrap();
+    fs.fsync(x.ino).unwrap();
+    {
+        let mut st = dev.st.lock().unwrap();
+        st.fail_at = Some(st.ops);
+    }
+    // (the 50 ms retry may get there first: either way the header cannot be written)
+    assert!(fs.prepare_eject().is_err(), "prepare-eject reported safe without the IDLE mark");
+    assert!(journal_active(&img.path));
+    fs.release(x.ino);
+    let _ = fs.shutdown();
+}
+
+/// The light-commit rule on hand-built `link` sectors (see `commit::needs_no_dirty`).
+#[test]
+fn light_commit_rule() {
+    use super::commit::{JW, P_LINK, needs_no_dirty};
+    // a 3-entry file set (primary, stream extension, one name entry) at entry `e` of `sec`
+    let put = |sec: &mut [u8], e: usize, name: u8| {
+        sec[e * 32] = 0x85;
+        sec[e * 32 + 1] = 2;
+        sec[e * 32 + 32] = 0xC0;
+        sec[e * 32 + 32 + 3] = 1; // NameLength
+        sec[e * 32 + 32 + 4] = name; // NameHash
+        sec[e * 32 + 64] = 0xC1;
+        sec[e * 32 + 64 + 2] = name;
+    };
+    let del = |sec: &mut [u8], e: usize, n: usize| {
+        for k in e..e + n {
+            sec[k * 32] &= 0x7F;
+        }
+    };
+    let jw = |sector: u64, pre: &[u8], post: &[u8]| JW {
+        phase: P_LINK,
+        off: sector * 512,
+        pre: pre.to_vec(),
+        post: post.to_vec(),
+    };
+    let fat = (512, 4096); // the FAT region: sectors 1-7
+    let blank = vec![0u8; 512];
+    // A: sector 100 holds a set "a" at 0 and "t" at 3; sector 200 holds "b" at 0
+    let mut a = blank.clone();
+    put(&mut a, 0, b'a');
+    put(&mut a, 3, b't');
+    let mut b = blank.clone();
+    put(&mut b, 0, b'b');
+    // a new set into unused slots, alone: light
+    let mut a2 = a.clone();
+    put(&mut a2, 6, b'n');
+    assert!(needs_no_dirty(&[jw(100, &a, &a2)], fat.0, fat.1));
+    // ... with an in-place times edit in another sector: light
+    let mut b2 = b.clone();
+    b2[8] = 0x55;
+    b2[2] = 0x66;
+    assert!(needs_no_dirty(&[jw(100, &a, &a2), jw(200, &b, &b2)], fat.0, fat.1));
+    // a whole set removed: light
+    let mut a3 = a.clone();
+    del(&mut a3, 3, 3);
+    assert!(needs_no_dirty(&[jw(100, &a, &a3)], fat.0, fat.1));
+    // rename "b" -> "t" in place (sector 200) over the target "t" removed in sector 100: full
+    let mut b3 = b.clone();
+    put(&mut b3, 0, b't');
+    assert!(!needs_no_dirty(&[jw(100, &a, &a3), jw(200, &b, &b3)], fat.0, fat.1), "rename over a target elsewhere");
+    // ... the same inside one sector: light
+    let mut a4 = a.clone();
+    put(&mut a4, 0, b't');
+    del(&mut a4, 3, 3);
+    assert!(needs_no_dirty(&[jw(100, &a, &a4)], fat.0, fat.1), "rename over a target in its sector");
+    // an exchange of names across two sectors: full
+    let mut a5 = a.clone();
+    put(&mut a5, 0, b'b');
+    let mut b5 = b.clone();
+    put(&mut b5, 0, b'a');
+    assert!(!needs_no_dirty(&[jw(100, &a, &a5), jw(200, &b, &b5)], fat.0, fat.1), "exchange across sectors");
+    // a set across two sectors (primary at entry 15 of sector 300, secondaries at 0-1 of 400,
+    // non-adjacent: a FAT-chained directory) removed: full
+    let mut c = blank.clone();
+    c[15 * 32] = 0x85;
+    c[15 * 32 + 1] = 2;
+    let mut d = blank.clone();
+    d[0] = 0xC0;
+    d[32] = 0xC1;
+    let mut c2 = c.clone();
+    del(&mut c2, 15, 1);
+    let mut d2 = d.clone();
+    del(&mut d2, 0, 2);
+    assert!(!needs_no_dirty(&[jw(300, &c, &c2), jw(400, &d, &d2)], fat.0, fat.1), "a removed set across sectors");
+    assert!(!needs_no_dirty(&[jw(400, &d, &d2)], fat.0, fat.1), "secondaries removed without their primary");
+    // two sectors with new sets: full; a FAT write in link: full
+    let mut b6 = b.clone();
+    put(&mut b6, 3, b'm');
+    assert!(!needs_no_dirty(&[jw(100, &a, &a2), jw(200, &b, &b6)], fat.0, fat.1));
+    assert!(!needs_no_dirty(&[JW { phase: P_LINK, off: 1024, pre: vec![0; 4], post: vec![1; 4] }], fat.0, fat.1));
 }
 
 /// The commit's word-at-a-time free-extent scan finds exactly what `add`'s byte scan finds.

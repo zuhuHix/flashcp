@@ -41,7 +41,7 @@ const MAX_SAMPLED: u64 = 32 << 20;
 /// Bytes the encoded (uncompressed) body of `writes` and `samples` takes.
 pub(crate) fn raw_len(v: &Vol, writes: &[JW], samples: usize) -> usize {
     let geom = ident(v).1.len();
-    4 + 4 + 2 + geom + 4 + writes.iter().map(|w| 13 + 2 * w.post.len()).sum::<usize>() + 4 + 20 * samples
+    4 + 4 + 2 + geom + 4 + writes.iter().map(|w| 13 + 2 * w.post.len()).sum::<usize>() + 4 + 20 * samples + 1
 }
 
 /// Test hook: the size of a journal file created now.
@@ -172,6 +172,16 @@ fn parse_header(h: &[u8]) -> Option<Header> {
 pub(crate) type Sample = (u64, u32, u64);
 
 pub(crate) fn encode_body(v: &Vol, writes: &[JW], samples: &[Sample]) -> Result<Vec<u8>> {
+    encode_body_light(v, writes, samples, false)
+}
+
+/// Bit 0 of the body's trailing flags byte: the commit is light (no VolumeDirty: every crash
+/// state of it is a valid volume). Bodies without the byte (0.4.0) are full commits; readers
+/// before it ignore trailing bytes.
+const FLAG_LIGHT: u8 = 1;
+
+/// [`encode_body`] of a commit that is light or not (see [`FLAG_LIGHT`]).
+pub(crate) fn encode_body_light(v: &Vol, writes: &[JW], samples: &[Sample], light: bool) -> Result<Vec<u8>> {
     let (serial, geom) = ident(v);
     let mut b = Vec::new();
     b.extend_from_slice(BODY_MAGIC);
@@ -192,6 +202,7 @@ pub(crate) fn encode_body(v: &Vol, writes: &[JW], samples: &[Sample]) -> Result<
         b.extend_from_slice(&s.1.to_le_bytes());
         b.extend_from_slice(&s.2.to_le_bytes());
     }
+    b.push(if light { FLAG_LIGHT } else { 0 });
     zstd::bulk::compress(&b, 3).context("compress the journal")
 }
 
@@ -200,6 +211,7 @@ struct Body {
     geometry: String,
     writes: Vec<JW>,
     samples: Vec<Sample>,
+    light: bool,
 }
 
 fn decode_body(z: &[u8], max: usize) -> Result<Body> {
@@ -238,7 +250,8 @@ fn decode_body(z: &[u8], max: usize) -> Result<Body> {
         let h = u64::from_le_bytes(take(8)?.try_into()?);
         samples.push((off, len, h));
     }
-    Ok(Body { serial, geometry, writes, samples })
+    let light = take(1).is_ok_and(|f| f[0] & FLAG_LIGHT != 0);
+    Ok(Body { serial, geometry, writes, samples, light })
 }
 
 /// Device offset of the journal file's first byte.
@@ -341,6 +354,9 @@ pub enum Recovered {
     Nothing,
     /// An interrupted commit was replayed (writes of it).
     Replayed(usize),
+    /// An interrupted light commit could not be replayed (the volume changed since) and was
+    /// left as it was: every crash state of a light commit is a valid volume.
+    Abandoned,
 }
 
 /// Why recovery refused to write anything.
@@ -381,6 +397,12 @@ fn load(v: &Vol, p: &Place) -> Result<Option<(Header, Body)>> {
     Ok(Some((h, body)))
 }
 
+/// The pending commit of an ACTIVE journal: whether it is light, and its writes (tests).
+#[cfg(test)]
+pub(crate) fn pending(v: &Vol, p: &Place) -> Option<(bool, Vec<JW>)> {
+    load(v, p).ok().flatten().map(|(_, b)| (b.light, b.writes))
+}
+
 /// Replays an interrupted commit (see the module doc). Err([`Refused`]) when the volume
 /// changed since; nothing is written then.
 pub(crate) fn recover(v: &Vol, dev: &dyn Dev, p: &Place) -> Result<Recovered> {
@@ -401,6 +423,26 @@ pub(crate) fn recover(v: &Vol, dev: &dyn Dev, p: &Place) -> Result<Recovered> {
         write_idle(dev, v, p, h.seq)?;
         return Ok(Recovered::Nothing);
     }
+    match check_replayable(v, &body) {
+        Ok(()) => {}
+        // A light commit's every crash state is a valid volume (`commit::needs_no_dirty`), and
+        // the fsync that wanted it never returned (or it finished, and only its IDLE mark was
+        // missing). When the volume changed since (another system wrote to it after a yank
+        // mid-burst), it is left as it is: marked IDLE, nothing replayed.
+        Err(_) if body.light => {
+            write_idle(dev, v, p, h.seq)?;
+            return Ok(Recovered::Abandoned);
+        }
+        Err(e) => return Err(e),
+    }
+    apply(dev, &body.writes, |_| {})?;
+    write_idle(dev, v, p, h.seq)?;
+    Ok(Recovered::Replayed(body.writes.len()))
+}
+
+/// The checks before a replay: data samples, the writes' regions, every touched sector in one
+/// of its journaled states. Err([`Refused`]) when the volume changed since.
+fn check_replayable(v: &Vol, body: &Body) -> Result<()> {
     let sampled: u64 = body.samples.iter().map(|s| s.1 as u64).sum();
     if sampled > MAX_SAMPLED || body.samples.iter().any(|s| s.0.checked_add(s.1 as u64).is_none_or(|e| e > v.vol_bytes))
     {
@@ -443,9 +485,7 @@ pub(crate) fn recover(v: &Vol, dev: &dyn Dev, p: &Place) -> Result<Recovered> {
         }
         bail!(Refused(format!("{e:#}. Run fsck.exfat.")));
     }
-    apply(dev, &body.writes, |_| {})?;
-    write_idle(dev, v, p, h.seq)?;
-    Ok(Recovered::Replayed(body.writes.len()))
+    Ok(())
 }
 
 /// Checks that every journaled write is one a commit can make, before anything is replayed:

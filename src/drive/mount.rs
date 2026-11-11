@@ -400,8 +400,10 @@ pub fn run_mount(a: MountArgs) -> i32 {
         let (dirty, tx) = (dirty.clone(), tx.clone());
         fs.on_note(move |n| match n {
             Note::Dirty { bytes, files } => dirty.lock().unwrap().dirty(bytes, files),
-            Note::Committing { bytes, files, reason } => {
-                emit(format!(r#"{{"event":"committing","bytes":{bytes},"files":{files},"reason":"{reason}"}}"#))
+            Note::Committing { bytes, files, reason, by } => {
+                // `by` (fsync only, best effort) is new in 0.4.1: consumers ignore unknown keys
+                let by = by.map(|b| format!(r#","by":{}"#, json_str(&b))).unwrap_or_default();
+                emit(format!(r#"{{"event":"committing","bytes":{bytes},"files":{files},"reason":"{reason}"{by}}}"#))
             }
             Note::Committed { bytes, files, secs } => {
                 emit(format!(r#"{{"event":"committed","bytes":{bytes},"files":{files},"secs":{secs:.3}}}"#))
@@ -457,6 +459,7 @@ pub fn run_mount(a: MountArgs) -> i32 {
     let recovered = match rec {
         Recovered::Nothing => "null",
         Recovered::Replayed(_) => "\"replayed\"",
+        Recovered::Abandoned => "\"abandoned\"",
     };
     emit(format!(
         r#"{{"event":"mounted","proto":1,"device":{},"mountpoint":{},"label":{},"serial":"{serial:08x}","size":{},"free":{},"cluster":{cluster},"pid":{},"recovered":{recovered}}}"#,
