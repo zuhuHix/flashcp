@@ -1338,8 +1338,8 @@ pub(crate) fn finalize(c: &mut Core, p: Plan) {
         }
     }
     for i in &written {
+        // (times_set goes with `dirty` below: a utimensat during the commit keeps it)
         c.deferred.remove(i);
-        c.times_set.remove(i);
     }
     let now = std::time::Instant::now();
     for &i in &p.deferred {

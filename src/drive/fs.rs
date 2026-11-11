@@ -1004,7 +1004,7 @@ impl Fs {
     /// is reported (a write-protected or dying stick would otherwise notify every second).
     fn settle_or_retry(&self) {
         match self.settle_header() {
-            Ok(()) => self.sh.st.lock().unwrap().settle_fails = 0,
+            Ok(()) => {}
             Err(e) => {
                 let mut st = self.sh.st.lock().unwrap();
                 st.settle_fails += 1;
@@ -1027,7 +1027,8 @@ impl Fs {
         let Some((off, seq, _)) = self.sh.st.lock().unwrap().idle_header else { return Ok(()) };
         djournal::write_idle_at(&*self.sh.dev, off, seq).context("marking the drive journal idle")?;
         // under `serial` no commit replaced it meanwhile
-        self.sh.st.lock().unwrap().idle_header = None;
+        let mut st = self.sh.st.lock().unwrap();
+        (st.idle_header, st.settle_fails) = (None, 0);
         Ok(())
     }
 
@@ -1100,7 +1101,9 @@ impl Fs {
         execute(&*self.sh.dev, &vol_view, &plan, &place, seq, self.sh.opts.part_off_bytes, !defer)?;
         if defer {
             let due = Instant::now() + self.sh.opts.idle_header;
-            self.sh.st.lock().unwrap().idle_header = Some((djournal::header_off(&vol_view, &place), seq, due));
+            let mut st = self.sh.st.lock().unwrap();
+            st.idle_header = Some((djournal::header_off(&vol_view, &place), seq, due));
+            st.settle_fails = 0; // a new header: a new run of attempts
         }
         let (bytes, files) = (plan.bytes, plan.files);
         if plan.light {

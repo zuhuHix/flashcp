@@ -44,8 +44,12 @@ pub(crate) fn raw_len(v: &Vol, writes: &[JW], samples: usize) -> usize {
     4 + 4 + 2 + geom + 4 + writes.iter().map(|w| 13 + 2 * w.post.len()).sum::<usize>() + 4 + 20 * samples + 1
 }
 
-/// Test hook: the size of a journal file created now.
-pub(crate) const JOURNAL_BYTES_ENV: &str = "FLASHCP_TEST_JOURNAL_BYTES";
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the size of a journal file this thread creates (a thread-local, not the
+    /// environment: tests run in parallel, and another test's journal must keep its size).
+    pub(crate) static TEST_JOURNAL_BYTES: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
 const MAGIC: &[u8; 16] = b"FLASHCP-DRIVEJ1\0";
 const STATE_IDLE: u8 = 0;
 const STATE_ACTIVE: u8 = 1;
@@ -127,7 +131,8 @@ pub(crate) fn locate_raw(v: &mut Vol, max_root: u64) -> Result<Option<Place>> {
 /// The journal's size for a volume of `vol_bytes` with clusters of `cs`.
 pub(crate) fn capacity(vol_bytes: u64, cs: u64) -> u64 {
     // test hook: a small journal file, to exercise split commits
-    if let Some(b) = std::env::var(JOURNAL_BYTES_ENV).ok().and_then(|v| v.parse::<u64>().ok()) {
+    #[cfg(test)]
+    if let Some(b) = TEST_JOURNAL_BYTES.with(|c| c.get()) {
         return b.max(4096).div_ceil(cs) * cs;
     }
     (vol_bytes / 512).clamp(1 << 20, 8 << 20).div_ceil(cs) * cs
@@ -432,13 +437,17 @@ pub(crate) fn recover(v: &Vol, dev: &dyn Dev, p: &Place) -> Result<Recovered> {
         // Only when the volume as it is now holds valid directories and bitmap where the
         // commit wrote: the validating walk `validate` makes of the post-replay image, made
         // of the current one (a sector torn or garbled by someone else is refused).
-        Err(e) if body.light => {
+        // (a refusal only: an I/O error while checking is an I/O error)
+        Err(e) if body.light && e.downcast_ref::<Refused>().is_some() => {
             let now: Result<Vec<JW>> = body
                 .writes
                 .iter()
                 .map(|w| Ok(JW { post: v.read_at(w.off, w.post.len() as u64)?, ..w.clone() }))
                 .collect();
-            if let Err(bad) = now.and_then(|now| validate(v, &now)) {
+            if let Err(bad) = now.and_then(|now| {
+                ended_entries(&body.writes, &now)?;
+                validate(v, &now)
+            }) {
                 return Err(e.context(format!("the volume where the commit wrote is not valid now: {bad:#}")));
             }
             write_idle(dev, v, p, h.seq)?;
@@ -449,6 +458,26 @@ pub(crate) fn recover(v: &Vol, dev: &dyn Dev, p: &Place) -> Result<Recovered> {
     apply(dev, &body.writes, |_| {})?;
     write_idle(dev, v, p, h.seq)?;
     Ok(Recovered::Replayed(body.writes.len()))
+}
+
+/// Refuses when a directory entry the commit wrote or found (non-zero type in `pre` or
+/// `post`) now reads as an end-of-directory entry (type 0x00): a torn sector read back as
+/// zeros, which the parser takes for the end of the directory, hiding entries earlier fsyncs
+/// made durable. Another system deletes an entry by clearing its InUse bit, never like that.
+fn ended_entries(writes: &[JW], now: &[JW]) -> Result<()> {
+    for (w, n) in writes.iter().zip(now) {
+        if w.phase != super::commit::P_LINK || !w.off.is_multiple_of(32) {
+            continue;
+        }
+        for k in (0..w.post.len()).step_by(32) {
+            ensure!(
+                n.post[k] != 0 || (w.pre[k] == 0 && w.post[k] == 0),
+                "the directory entry at byte {} reads as an end of directory",
+                w.off + k as u64
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The checks before a replay: data samples, the writes' regions, every touched sector in one

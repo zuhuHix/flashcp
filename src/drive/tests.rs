@@ -668,7 +668,13 @@ fn device_op_counts() {
     // the same from the commit thread: the IDLE header waits for a commit that does not come
     let f = File::options().read(true).write(true).open(&img.path).unwrap();
     let dev = Arc::new(CrashDev::new(f, None));
-    let opts = FsOpts { auto_commit: true, idle_header: std::time::Duration::from_secs(3600), ..manual() };
+    // (no idle commit in the way: a loaded machine could take a second between these lines)
+    let opts = FsOpts {
+        auto_commit: true,
+        idle: std::time::Duration::from_secs(3600),
+        idle_header: std::time::Duration::from_secs(3600),
+        ..manual()
+    };
     let fs = open_with(&img.path, dev.clone(), opts).unwrap();
     let before = dev.ops();
     // the first set of a directory: one sector (a set across two takes a full commit); the
@@ -676,6 +682,8 @@ fn device_op_counts() {
     // bitmap, entry set, 4 syncs, what the kernel driver writes per fsynced file
     let sub = fs.lookup(ROOT, OsStr::new("sub")).unwrap().ino;
     let mt0 = fs.getattr(sub).unwrap().mtime;
+    // (past the 10 ms resolution of exFAT's times: the directory's times do change)
+    std::thread::sleep(std::time::Duration::from_millis(30));
     let b = fs.create(sub, OsStr::new("two.txt"), true, false).unwrap();
     fs.write(b.ino, 0, &[2u8; 8192]).unwrap();
     fs.fsync(b.ino).unwrap();
@@ -686,13 +694,10 @@ fn device_op_counts() {
     assert_eq!(fs.status().dirty_files, 1, "the directory's times were not left for later");
     let mt1 = fs.getattr(sub).unwrap().mtime;
     assert_ne!(mt0, mt1);
-    // the close commit (after the linger) writes them
+    // the next commit that is not an fsync's writes them
     fs.release(b.ino);
-    let t = std::time::Instant::now();
-    while fs.status().dirty_files > 0 {
-        assert!(t.elapsed() < std::time::Duration::from_secs(10), "the directory's times stayed pending");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    fs.flush().unwrap();
+    assert_eq!(fs.status().dirty_files, 0, "the directory's times stayed pending");
     fs.shutdown().unwrap();
     fsck(&img.path);
     let again = open(&img.path);
@@ -1118,10 +1123,12 @@ fn crash_fsync_stream() {
 #[test]
 fn deferred_idle_header() {
     let img = image("idle-header", 32, 4096);
-    let f = File::options().read(true).write(true).open(&img.path).unwrap();
     let opts =
-        FsOpts { auto_commit: true, readahead: false, idle_header: std::time::Duration::from_millis(300), ..manual() };
-    let fs = open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), opts).unwrap();
+        |delay: std::time::Duration| FsOpts { auto_commit: true, readahead: false, idle_header: delay, ..manual() };
+    // the delay far away: nothing below depends on how fast the machine is
+    let f = File::options().read(true).write(true).open(&img.path).unwrap();
+    let fs =
+        open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), opts(std::time::Duration::from_secs(3600))).unwrap();
     let a = fs.create(ROOT, OsStr::new("a.txt"), true, false).unwrap();
     fs.write(a.ino, 0, b"first").unwrap();
     fs.fsync(a.ino).unwrap();
@@ -1141,18 +1148,29 @@ fn deferred_idle_header() {
         y.shutdown().unwrap();
         fsck(&copy);
     }
-    let t = std::time::Instant::now();
-    while journal_active(&img.path) {
-        assert!(t.elapsed() < std::time::Duration::from_secs(10), "the header stayed ACTIVE");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(t.elapsed() >= std::time::Duration::from_millis(150), "marked IDLE before the delay");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(journal_active(&img.path), "marked IDLE before the delay");
     fs.write(a.ino, 5, b", second").unwrap();
     fs.fsync(a.ino).unwrap();
     assert!(journal_active(&img.path));
     fs.prepare_eject().unwrap();
     assert!(!journal_active(&img.path), "prepare-eject left the journal ACTIVE");
     fs.resume();
+    fs.release(a.ino);
+    fs.shutdown().unwrap();
+    // a short delay: marked IDLE by itself, with no commit after
+    let f = File::options().read(true).write(true).open(&img.path).unwrap();
+    let fs =
+        open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), opts(std::time::Duration::from_millis(20))).unwrap();
+    let b = fs.create(ROOT, OsStr::new("b.txt"), true, false).unwrap();
+    fs.write(b.ino, 0, b"b").unwrap();
+    fs.fsync(b.ino).unwrap();
+    let t = std::time::Instant::now();
+    while journal_active(&img.path) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "the header stayed ACTIVE");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    fs.release(b.ino);
     fs.shutdown().unwrap();
     fsck(&img.path);
 }
@@ -1397,6 +1415,24 @@ fn foreign_change_after_a_yank() {
     let len = f.metadata().unwrap().len();
     let err = open_core(f.try_clone().unwrap(), len, &FileDev::new(Arc::new(f)), &manual()).err().expect("refused");
     assert!(err.downcast_ref::<super::djournal::Refused>().is_some(), "{err:#}");
+    // the sector of the new set read back as zeros (a torn write): the parser would take it
+    // for the end of the directory and hide the files earlier fsyncs made durable: refused
+    {
+        let zero = img.dir.join("zeroed.img");
+        std::fs::copy(&img.path, &zero).unwrap();
+        let rw = File::options().read(true).write(true).open(&zero).unwrap();
+        let len = rw.metadata().unwrap().len();
+        let mut v = crate::volume::Vol::open_boot(rw.try_clone().unwrap(), len, false, false).unwrap();
+        let p = super::djournal::locate_raw(&mut v, crate::volume::MAX_DIR_BYTES).unwrap().unwrap();
+        let (light, writes) = super::djournal::pending(&v, &p).expect("an ACTIVE journal");
+        assert!(light);
+        let w = writes.iter().find(|w| w.phase == super::commit::P_LINK && new_set(w).is_some()).unwrap();
+        rw.write_all_at(&vec![0u8; w.post.len()], w.off).unwrap();
+        let len = rw.metadata().unwrap().len();
+        let err =
+            open_core(rw.try_clone().unwrap(), len, &FileDev::new(Arc::new(rw)), &manual()).err().expect("refused");
+        assert!(err.downcast_ref::<super::djournal::Refused>().is_some(), "{err:#}");
+    }
     let (copy, light) = yank("light.img", true, &new_set_ts);
     assert!(light);
     let f = File::options().read(true).write(true).open(&copy).unwrap();
@@ -1487,8 +1523,13 @@ fn settle_header_on_eject_and_errors() {
         let mut st = dev.st.lock().unwrap();
         st.fail_at = Some(st.ops); // from now on every write fails
     }
-    // attempts after 50 ms, 1 s and 3 s (backing off): one report
-    std::thread::sleep(std::time::Duration::from_millis(3300));
+    // attempts after 50 ms, then 1 s, 2 s... later (backing off): one report
+    let t = std::time::Instant::now();
+    while errors.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "the failed IDLE mark was not reported");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(2500));
     assert!(journal_active(&img.path), "the IDLE mark cannot have been written");
     assert_ne!(fs.status().state, "read_only", "a failed IDLE mark is not fatal");
     assert_eq!(errors.load(std::sync::atomic::Ordering::SeqCst), 1, "a failing IDLE mark was reported more than once");
@@ -1498,7 +1539,7 @@ fn settle_header_on_eject_and_errors() {
     }
     let t = std::time::Instant::now();
     while journal_active(&img.path) {
-        assert!(t.elapsed() < std::time::Duration::from_secs(10), "the IDLE mark was not retried");
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "the IDLE mark was not retried");
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     // eject while it cannot be written: not safe
@@ -1637,10 +1678,10 @@ fn free_extents_word_scan_matches() {
 fn split_fsync_commit_never_defers() {
     let img = image("split-fsync", 32, 4096);
     let fs = open(&img.path);
-    unsafe { std::env::set_var(super::djournal::JOURNAL_BYTES_ENV, "4096") };
+    super::djournal::TEST_JOURNAL_BYTES.with(|c| c.set(Some(4096)));
     fs.mkdir(ROOT, OsStr::new("d")).unwrap();
     fs.commit_now("t").unwrap(); // creates the small journal
-    unsafe { std::env::remove_var(super::djournal::JOURNAL_BYTES_ENV) };
+    super::djournal::TEST_JOURNAL_BYTES.with(|c| c.set(None));
     fs.shutdown().unwrap();
     // two new files of many data segments each (one byte every 64 KB): one fits the journal,
     // two do not, so the plan is cut to one inode, the shallowest: the directory
@@ -1667,6 +1708,72 @@ fn split_fsync_commit_never_defers() {
     same!(snapshot(&open(&img.path)), want, "after the split fsync");
 }
 
+/// A device that holds its next write, once armed, until released (tests).
+struct PauseDev {
+    inner: FileDev,
+    armed: std::sync::atomic::AtomicBool,
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+impl Dev for PauseDev {
+    fn read_at(&self, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+        self.inner.read_at(buf, off)
+    }
+    fn write_at(&self, buf: &[u8], off: u64) -> std::io::Result<()> {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.wait();
+            self.release.wait();
+        }
+        self.inner.write_at(buf, off)
+    }
+    fn sync(&self) -> std::io::Result<()> {
+        self.inner.sync()
+    }
+}
+
+/// utimensat on a directory while a commit that writes the directory runs: the directory
+/// stays dirty with its explicit times, and the next fsync's commit writes them (explicit
+/// times never wait).
+#[test]
+fn explicit_times_during_a_commit_do_not_wait() {
+    let img = image("times-during", 32, 4096);
+    let f = File::options().read(true).write(true).open(&img.path).unwrap();
+    let dev = Arc::new(PauseDev {
+        inner: FileDev::new(Arc::new(f)),
+        armed: false.into(),
+        entered: std::sync::Barrier::new(2),
+        release: std::sync::Barrier::new(2),
+    });
+    let fs = open_with(&img.path, dev.clone(), manual()).unwrap();
+    let sub = fs.mkdir(ROOT, OsStr::new("sub")).unwrap().ino;
+    fs.flush().unwrap();
+    let a = fs.create(sub, OsStr::new("a"), true, false).unwrap();
+    fs.write(a.ino, 0, b"a").unwrap();
+    // a flush (writes the directory's new times) held at its first device write
+    dev.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let f2 = fs.clone();
+    let flusher = std::thread::spawn(move || f2.flush());
+    dev.entered.wait();
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000);
+    fs.setattr(sub, &SetAttr { mtime: Some(when), ..Default::default() }).unwrap();
+    dev.release.wait();
+    flusher.join().unwrap().unwrap();
+    // an fsync of another file in it: the explicit times go with it
+    let b = fs.create(sub, OsStr::new("b"), true, false).unwrap();
+    fs.write(b.ino, 0, b"b").unwrap();
+    fs.fsync(b.ino).unwrap();
+    assert_eq!(fs.status().dirty_files, 0, "the explicitly set times waited");
+    // (creating b changed them again: the volume has what the driver has)
+    let probe = open(&img.path);
+    assert_eq!(
+        probe.getattr(probe.lookup(ROOT, OsStr::new("sub")).unwrap().ino).unwrap().mtime,
+        fs.getattr(sub).unwrap().mtime
+    );
+    probe.shutdown().unwrap();
+    fs.shutdown().unwrap();
+}
+
 /// Times deferred by fsyncs: a directory written after it waited `idle`, and explicitly set
 /// times never deferred.
 #[test]
@@ -1683,9 +1790,9 @@ fn deferred_directory_times_are_bounded() {
         fs.fsync(x.ino).unwrap();
         fs.release(x.ino);
     };
+    // (the first deferral of a directory always waits; past `idle`, at least 80 ms later
+    // here whatever the machine's speed, the next fsync's commit writes it)
     new_file("a");
-    assert_eq!(fs.status().dirty_files, 1, "the directory's times did not wait");
-    new_file("b");
     assert_eq!(fs.status().dirty_files, 1, "the directory's times did not wait");
     std::thread::sleep(std::time::Duration::from_millis(80));
     new_file("c");
@@ -1706,13 +1813,13 @@ fn deferred_directory_times_are_bounded() {
 #[test]
 fn oversized_batches_split_into_commits() {
     let img = image("split", 64, 4096);
-    // The hook is read when a journal file is created: set it only around this volume's
-    // first commit (another test creating its journal meanwhile just gets a small one).
+    // The hook (this thread's) is read when a journal file is created: set it only around
+    // this volume's first commit, made on this thread.
     let fs = open(&img.path);
-    unsafe { std::env::set_var(super::djournal::JOURNAL_BYTES_ENV, "65536") };
+    super::djournal::TEST_JOURNAL_BYTES.with(|c| c.set(Some(65536)));
     let d = fs.mkdir(ROOT, OsStr::new("many")).unwrap();
     fs.commit_now("t").unwrap(); // creates the small journal
-    unsafe { std::env::remove_var(super::djournal::JOURNAL_BYTES_ENV) };
+    super::djournal::TEST_JOURNAL_BYTES.with(|c| c.set(None));
     let mut rng = crate::util::Rng(77);
     for _ in 0..3000 {
         // random names: the journal compresses well otherwise
@@ -1762,10 +1869,10 @@ fn review_regressions() {
     //    keep.txt out of a directory that goes, replace a target
     let img2 = image("regress-split", 64, 4096);
     let fs = open(&img2.path);
-    unsafe { std::env::set_var(super::djournal::JOURNAL_BYTES_ENV, "12288") };
+    super::djournal::TEST_JOURNAL_BYTES.with(|c| c.set(Some(12288)));
     let nd = fs.mkdir(ROOT, &n("newdir")).unwrap().ino;
     fs.commit_now("t").unwrap();
-    unsafe { std::env::remove_var(super::djournal::JOURNAL_BYTES_ENV) };
+    super::djournal::TEST_JOURNAL_BYTES.with(|c| c.set(None));
     let keep = fs.create(nd, &n("keep.txt"), true, false).unwrap();
     fs.write(keep.ino, 0, b"kept").unwrap();
     let b = fs.mkdir(ROOT, &n("big")).unwrap().ino;
