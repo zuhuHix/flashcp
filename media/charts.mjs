@@ -333,9 +333,10 @@ function size(c) {
 // `small` written to a blank drive, against the time the drive needs for 169 MB at its measured
 // sequential write rate (8 MB writes): MSI 999 MB/s (`flashcp probe`), Kingston 82.7 MB/s (the
 // probe; it sustains less, see the README), SanDisk 6.5 MB/s. 169 / rate = 0.17, 2.0, 26 s.
-// Kernel = mkfs.exfat + mount + cp + unmount: MSI 2.80 s [#6]; Kingston with 4 KB clusters
-// 52.2–74.0 s [K][K2]; SanDisk on its default 32 KB format 86.3–179.6 s [#9][#6].
-// flashcp build: MSI 0.42 s [#6]; Kingston 2.72–9.02 s [K][#18]; SanDisk 33.6–34.6 s [#9][#6].
+// Kernel = mkfs.exfat + mount + cp + unmount: MSI 2.80 s on its default format [#6]; Kingston
+// with 4 KB clusters 52.2–74.0 s [K][K2]; SanDisk on its default 32 KB format 86.3–179.6 s [#9][#6].
+// flashcp build (4 KB clusters on all three): MSI 0.42 s [#6]; Kingston 2.72–9.02 s [K][#18];
+// SanDisk 33.6–34.6 s [#9][#6].
 
 const LIMIT = [
   ['USB SSD', 'MSI DATAMAG', {v: 0.17, label: '0.17 s'}, {lo: 0.42, hi: 0.42, label: '0.42 s'}, {lo: 2.8, hi: 2.8, label: '2.80 s'}],
@@ -352,7 +353,7 @@ function limit(c) {
   const ROW = 62;
   const top = 108;
   const bottom = top + LIMIT.length * ROW;
-  const height = bottom + 78;
+  const height = bottom + 95;
 
   let b = legend(c, PAD, 82, [
     ['diamond', c.amber, 'the drive itself: 169 MB at its sequential write speed (computed)'],
@@ -388,35 +389,37 @@ function limit(c) {
     b,
     [
       'Logarithmic axis. The drive itself = 169 MB ÷ its measured sequential write rate (999, 82.7 and 6.5 MB/s).',
-      'Kernel driver = mkfs.exfat + cp + unmount; on the Kingston it also got 4 KB clusters (default format: 259–371 s).',
+      'flashcp build used 4 KB clusters. Kernel driver = mkfs.exfat + cp + unmount: its default format on the SSD (128 KB',
+      'clusters) and the SanDisk (32 KB clusters); 4 KB clusters on the Kingston (259–371 s on its default 128 KB format).',
     ],
   );
 }
 
 // ------------------------------------------------------------------------ 5. release by release
-// One job across the releases: 20,000 small files onto a Kingston stick that was formatted the
-// usual way (128 KB clusters), until the data is on the stick. All timed on 2026-11-10 with the
-// builds of that day; the release is the one the feature first shipped in.
+// The same kind of copy across the releases: 20,000 small files onto the Kingston stick, until
+// the data is on it. These are NOT one job run four times; each row says what it was. All timed
+// on 2026-11-10 with the builds of that day; the release is the one the feature first shipped in.
 
 const RELEASES = [
-  // kernel: 258.8 [K] and 288.7 [K2] ending with an unmount, 315.5 (sync -f), 370.7 (sync) [K]
-  ['Without flashcp', 'the Linux kernel driver', 'coral', 258.8, 370.7, '259–371 s'],
-  // flashcp add: 89.7 [K], 93.3 [#18], 98.0 [#26]
-  ['0.1.0 · flashcp add', 'a command, on an unmounted stick', 'teal', 89.7, 98.0, '90–98 s'],
+  // whole runs on a freshly formatted stick: 258.8 [K] and 288.7 [K2] ending with an unmount,
+  // 315.5 (sync -f) and 370.7 (sync) [K]. PR 22's own kernel run, 315.1 s, is inside this range.
+  ['Without flashcp', 'the Linux kernel driver', '128 KB clusters, freshly formatted stick', 'coral', 258.8, 370.7, '259–371 s'],
+  // flashcp add onto a stick that already held files: 89.7 [K], 93.3 [#18], 98.0 [#26]
+  ['0.1.0 · flashcp add', 'a command, on an unmounted stick', '128 KB clusters, stick already holding files', 'teal', 89.7, 98.0, '90–98 s'],
   // drive mode: 73.8 (median of 3) [#22], 93.8 and 94.7 [K]
-  ['0.3.0 · drive mode', 'automatic, from any app', 'teal', 73.8, 94.7, '74–95 s'],
-  // after the in-place conversion (6.35 s once): add 5.48 [#26]; drive mode on a 4 KB stick 5.31 [K]
-  ['0.4.0 · after “Make faster”', 'a one-time 6.35 s conversion to 4 KB clusters', 'teal', 5.31, 5.48, '5.3–5.5 s'],
+  ['0.3.0 · drive mode', 'automatic, from any app', '128 KB clusters', 'teal', 73.8, 94.7, '74–95 s'],
+  // [#26]: the same stick after `recluster` (6.35 s, not in the bar), 40,000 files on it
+  ['0.4.0 · after “Make faster”', 'flashcp add onto the converted stick, 4 KB clusters', 'the one-time 6.35 s conversion is not in the bar', 'teal', 5.48, 5.48, '5.48 s'],
 ];
 
 function releases(c) {
-  const x0 = 318;
-  const x1 = 704;
+  const x0 = 356;
+  const x1 = 712;
   const max = 400;
   const X = (v) => x0 + ((x1 - x0) * v) / max;
-  const ROW = 46;
-  const top = 80;
-  const bottom = top + RELEASES.length * ROW + 6;
+  const ROW = 62;
+  const top = 78;
+  const bottom = top + RELEASES.length * ROW + 4;
   const height = bottom + 78;
 
   let b = '';
@@ -424,13 +427,18 @@ function releases(c) {
     b += vline(X(t), top, bottom, t === 0 ? c.muted : c.grid);
     b += text(X(t), bottom + 17, `${t} s`, {size: 12, fill: c.muted, anchor: 'middle'});
   }
-  RELEASES.forEach(([name, sub, col, lo, hi, label], i) => {
-    const cy = top + i * ROW + ROW / 2 + 3;
-    b += text(x0 - 12, cy - 2, name, {size: 13, weight: 600, fill: c.text, anchor: 'end'});
-    b += text(x0 - 12, cy + 14, sub, {size: 12, fill: c.muted, anchor: 'end'});
+  RELEASES.forEach(([name, sub, cond, col, lo, hi, label], i) => {
+    const cy = top + i * ROW + ROW / 2 + 2;
+    b += text(x0 - 12, cy - 11, name, {size: 13, weight: 600, fill: c.text, anchor: 'end'});
+    b += text(x0 - 12, cy + 5, sub, {size: 12, fill: c.muted, anchor: 'end'});
+    b += text(x0 - 12, cy + 21, cond, {size: 12, fill: c.muted, anchor: 'end'});
     // the faster run solid, the spread up to the slower run fainter
-    b += hbar(X(0), cy - 9, X(hi) - X(0), 18, c[col], 0.4);
-    b += hbar(X(0), cy - 9, X(lo) - X(0), 18, c[col], 1, false);
+    if (hi > lo) {
+      b += hbar(X(0), cy - 9, X(hi) - X(0), 18, c[col], 0.4);
+      b += hbar(X(0), cy - 9, X(lo) - X(0), 18, c[col], 1, false);
+    } else {
+      b += hbar(X(0), cy - 9, X(lo) - X(0), 18, c[col]);
+    }
     b += text(X(hi) + 9, cy + 4.5, label, {size: 13, weight: 600, fill: c.text});
   });
   b += vline(X(0), top, bottom, c.muted);
@@ -438,15 +446,15 @@ function releases(c) {
     c,
     height,
     {
-      title: 'One job, release by release',
-      subtitle: '20,000 small files (169 MB) onto a normally formatted Kingston USB 3 stick, until the data is on it',
+      title: '20,000 small files onto a Kingston stick, release by release',
+      subtitle: 'Seconds until the data is on the stick · each figure under the release its feature first shipped in',
       desc: 'Bar chart in seconds; the solid part is the fastest run and the fainter part reaches the slowest. ' +
-        RELEASES.map(([name, sub, , , , label]) => `${name} (${sub}): ${label}.`).join(' '),
+        RELEASES.map(([name, sub, cond, , , , label]) => `${name} (${sub}; ${cond}): ${label}.`).join(' '),
     },
     b,
     [
-      'Solid = the fastest run, fainter = up to the slowest. All timed on 2026-11-10 with that day’s builds;',
-      'the version is the release the feature first shipped in. 0.4.0: add 5.48 s after the conversion, drive mode 5.31 s on 4 KB clusters.',
+      'Solid = the fastest run, fainter = up to the slowest. Not one job run four times: the rows differ in what was',
+      'on the stick, and all were timed on 2026-11-10 with that day’s builds, not with each release’s binary.',
     ],
   );
 }

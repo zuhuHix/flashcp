@@ -734,18 +734,20 @@ one. Treat single numbers on cheap sticks as rough: they are noisy.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/chart-drive-limit-dark.svg">
-  <img alt="Dot plot on a logarithmic seconds axis: writing 20,000 small files (169 MB) to a blank drive, formatting included, against the time the drive itself needs for 169 MB at its measured sequential write speed (computed). USB SSD, MSI DATAMAG: the drive itself 0.17 s, flashcp build 0.42 s, Linux kernel driver 2.80 s. USB 3 stick, Kingston DataTraveler 3.0: the drive itself 2.0 s, flashcp build 2.72–9.02 s, Linux kernel driver 52–74 s with 4 KB clusters (259–371 s on the default format). USB 2.0 stick, SanDisk Cruzer Blade: the drive itself 26 s, flashcp build 33.6–34.6 s, Linux kernel driver 86–180 s. The sequential write rates are 999, 82.7 and 6.5 MB/s." src="assets/chart-drive-limit-light.svg" width="800">
+  <img alt="Dot plot on a logarithmic seconds axis: writing 20,000 small files (169 MB) to a blank drive, formatting included, against the time the drive itself needs for 169 MB at its measured sequential write speed (computed). flashcp build used 4 KB clusters on all three. USB SSD, MSI DATAMAG: the drive itself 0.17 s, flashcp build 0.42 s, Linux kernel driver 2.80 s on its default format (128 KB clusters). USB 3 stick, Kingston DataTraveler 3.0: the drive itself 2.0 s, flashcp build 2.72–9.02 s, Linux kernel driver 52–74 s with 4 KB clusters (259–371 s on the default format). USB 2.0 stick, SanDisk Cruzer Blade: the drive itself 26 s, flashcp build 33.6–34.6 s with 4 KB clusters, Linux kernel driver 86–180 s on its default format (32 KB clusters). The sequential write rates are 999, 82.7 and 6.5 MB/s." src="assets/chart-drive-limit-light.svg" width="800">
 </picture>
 
 No software writes 169 MB faster than the drive can write 169 MB. Dividing the dataset by each
 drive's measured sequential write rate gives that floor. It is computed, not timed, and it
-leaves out formatting, the file tables and reading the source files.
+leaves out formatting, the file tables and reading the source files. Only the Kingston row is
+like for like in cluster size; on the SSD and the SanDisk the kernel driver ran on its default
+format, so part of its distance from the floor there is the format.
 
-| Drive | The drive itself (computed) | `flashcp build` | Linux kernel driver (`mkfs.exfat` + `cp` + unmount) |
+| Drive | The drive itself (computed) | `flashcp build` (4 KB clusters) | Linux kernel driver (`mkfs.exfat` + `cp` + unmount) |
 |---|---:|---:|---:|
-| MSI DATAMAG USB SSD (999 MB/s) | 0.17 s | **0.42 s**, 2.5× the floor | 2.80 s, about 17× |
-| Kingston USB 3 stick (82.7 MB/s) | 2.0 s | **2.72–9.02 s**, 1.3–4.4× | 52–74 s with 4 KB clusters, 26–36× (259–371 s on its default format) |
-| SanDisk USB 2.0 stick (6.5 MB/s) | 26 s | **33.6–34.6 s**, 1.3× | 86–180 s on its default format, 3.3–6.9× |
+| MSI DATAMAG USB SSD (999 MB/s) | 0.17 s | **0.42 s**, 2.5× the floor | 2.80 s on its default format (128 KB clusters), about 17× |
+| Kingston USB 3 stick (82.7 MB/s) | 2.0 s | **2.72–9.02 s**, 1.3–4.4× | 52–74 s with 4 KB clusters, 26–36× (259–371 s on its default format, 128 KB clusters) |
+| SanDisk USB 2.0 stick (6.5 MB/s) | 26 s | **33.6–34.6 s**, 1.3× | 86–180 s on its default format (32 KB clusters), 3.3–6.9× |
 
 - **On both sticks a build runs at about 1.3× the flash chip's own pace** (on the Kingston in
   its fast phase; its slower builds are the stick slowing down, see
@@ -824,35 +826,47 @@ pairs and 2/2 Kingston pairs. Real drives remain the final judge. See [SIMULATIO
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/chart-releases-dark.svg">
-  <img alt="Bar chart: one job release by release, 20,000 small files (169 MB) onto a normally formatted Kingston USB 3 stick (128 KB clusters), seconds until the data is on it; the solid part of a bar is the fastest run and the fainter part reaches the slowest. Without flashcp, the Linux kernel driver: 259–371 s. 0.1.0, flashcp add, a command on an unmounted stick: 90–98 s. 0.3.0, drive mode, automatic from any app: 74–95 s. 0.4.0, after Make faster, a one-time 6.35 s conversion to 4 KB clusters: 5.3–5.5 s (add 5.48 s after the conversion, drive mode 5.31 s on 4 KB clusters). All timed on 2026-11-10 with that day's builds; the version is the release the feature first shipped in." src="assets/chart-releases-light.svg" width="800">
+  <img alt="Bar chart: 20,000 small files (169 MB) onto a Kingston USB 3 stick, release by release, seconds until the data is on the stick; the solid part of a bar is the fastest run and the fainter part reaches the slowest. Without flashcp, the Linux kernel driver, 128 KB clusters, freshly formatted stick: 259–371 s. 0.1.0, flashcp add, a command on an unmounted stick, 128 KB clusters, stick already holding files: 90–98 s. 0.3.0, drive mode, automatic from any app, 128 KB clusters: 74–95 s. 0.4.0, after Make faster, flashcp add onto the converted stick with 4 KB clusters: 5.48 s; the one-time 6.35 s conversion is not in the bar. This is not one job run four times: the rows differ in what was on the stick, and all were timed on 2026-11-10 with that day's builds, not with each release's binary." src="assets/chart-releases-light.svg" width="800">
 </picture>
 
-The chart follows one job through the releases: 20,000 small files onto a Kingston stick
-formatted the usual way. The numbers are the measurements from [Benchmarks](#benchmarks), filed
-under the release each feature first shipped in. They were timed on 2026-11-09 and 2026-11-10
-with the builds of those days, not re-timed with each release's binary, and the runs differ in
-what was already on the stick (empty, or 20,000 files).
+The chart puts four measurements of the same kind of copy side by side: 20,000 small files
+(169 MB) onto the Kingston stick, until the data is on it. It is not one job run four times.
+Each figure is filed under the release its feature first shipped in, all were timed on
+2026-11-10 with the builds of that day (not re-timed with each release's binary), and the rows
+differ in what was on the stick:
+
+- **Kernel driver:** whole runs on a freshly formatted stick (128 KB clusters) with three
+  endings: 258.8 s and 288.7 s (unmount), 315.5 s (`sync -f`), 370.7 s (`sync`).
+- **`flashcp add`:** onto a 128 KB-cluster stick that already held files, in three sessions:
+  89.7 s, 93.3 s (the kernel's copy onto that stick took 527 s) and 98.0 s.
+- **Drive mode:** 128 KB clusters. 73.8 s is a median of 3 from the morning session, where the
+  kernel run took 315.1 s; 93.8 s and 94.7 s are single runs from the afternoon, next to the
+  259–371 s kernel runs.
+- **After "Make faster":** the 98.0 s stick, converted to 4 KB clusters with 40,000 files on
+  it. The same `add` then took 5.48 s. The 6.35 s conversion happens once and is not in the bar.
+  Drive mode on a 4 KB-cluster stick took 5.31 s.
 
 | Release | Date | What it added | What it measured |
 |---|---|---|---|
 | **0.4.0** | 2026-11-10 | Smaller clusters in place: [`recluster`](#make-a-normally-formatted-stick-fast) and the **Make faster** offer | Kingston: adding 20,000 small files took 98.0 s before and **5.48 s** after a 6.35 s conversion (17.9×). Drive mode on 4 KB clusters: 5.31 s, against 93.8 s on 128 KB |
 | 0.3.1 | 2026-11-10 | Fix: an upgrade from a version before 0.3.0 left drive mode off | No speed change |
-| **0.3.0** | 2026-11-10 | [Drive mode](#drive-mode): copies from any app go through flashcp's driver | 20,000 small files until safe to remove: Kingston (128 KB clusters) **73.8–94.7 s** against 259–371 s, MSI SSD **1.26 s** against 1.80 s. 20,000 empty files in one folder: 0.49 s against 22.9 s (MSI), 0.83 s against 24.8 s (Kingston) |
+| **0.3.0** | 2026-11-10 | [Drive mode](#drive-mode): copies from any app go through flashcp's driver | 20,000 small files until safe to remove. Kingston (128 KB clusters): **73.8 s** against 315.1 s in one session (median of 3 against 1 run), 93.8–94.7 s against 259–371 s in another (single runs). MSI SSD: **1.26 s** against 1.80 s (medians of 3). 20,000 empty files in one folder: 0.49 s against 22.9 s (MSI), 0.83 s against 24.8 s (Kingston) |
 | **0.2.0** | 2026-11-10 | [`sync`](#sync-copy-only-what-changed) and `pull --update`: write only what changed | Kingston, the 20,000 files already on the stick: nothing changed **0.21 s**, 200 files changed 1.17 s, 1,800 changed 2.67 s. An `add` of the whole set took 4.0–8.2 s |
 | **0.1.0** | 2026-11-09 | `build`, `add`, `pull`, `optimize`, automatic cluster size | MSI SSD, 20,000 small files: build **6.7×**, add 3.6×, pull 9.1–14.6×; with 100,000 files build 10.3× and pull up to 26.8×. SanDisk: build 2.5–5.3×. Kingston: add onto 128 KB clusters 5.7× (527 s → 93.3 s) |
 
-Changes inside flashcp that moved a number, each measured before and after:
+Changes inside flashcp that moved a number, each measured before and after. Except for the
+first row, every row is the small dataset (20,000 files, 169 MB):
 
 | Change | Drive | Before | After |
 |---|---|---:|---:|
-| `add` skips cluster slack instead of zero-filling it (`many`, 100,000 files; `cp` took 9.5 s, later 9.01 s) | MSI SSD | 13.3 s | **1.75 s** |
-| `pull` adapts to sticks that run one command at a time (kernel-filled stick; `cp` took 35.2 s, later 30.86 s) | SanDisk | 62.9 s | **29.52 s** |
-| `pull` merges adjacent files into one read (1 KB-cluster layout) | SanDisk | 39.5 s | **15.9 s** |
-| `pull` reads are capped at the stick's maximum request size (4 KB-cluster layout) | SanDisk | 22.1 s | **16.6 s** |
-| The first copy onto an empty, freshly formatted stick is written as a build | SanDisk | 104.3 s | **34.9 s** |
-| `pull` from a stick after `optimize` | SanDisk | 28.9 s | **16.0 s** |
-| Drive mode saves when files are closed ([#24](https://github.com/zuhuHix/flashcp/pull/24)) | Kingston | 93.8 s | 94.7 s (no cost) |
-| Small clusters in place ([#26](https://github.com/zuhuHix/flashcp/pull/26)), `add` of 20,000 small files | Kingston | 98.0 s | **5.48 s** |
+| `add` skips cluster slack instead of zero-filling it (the `many` dataset: 100,000 files, 413 MB, 128 KB clusters; `cp` took 9.5 s, later 9.01 s) | MSI SSD | 13.3 s | **1.75 s** |
+| `pull` adapts to sticks that run one command at a time (from a kernel-filled stick; `cp` took 35.2 s, later 30.86 s) | SanDisk | 62.9 s | **29.52 s** |
+| `pull` merges adjacent files into one read (from a stick laid out with 1 KB clusters) | SanDisk | 39.5 s | **15.9 s** |
+| `pull` reads are capped at the stick's maximum request size (from a stick laid out with 4 KB clusters) | SanDisk | 22.1 s | **16.6 s** |
+| The first `add` onto an empty, freshly formatted stick (32 KB clusters) is written as a build | SanDisk | 104.3 s | **34.9 s** |
+| `pull` from a kernel-filled stick, before and after `optimize` | SanDisk | 28.9 s | **16.0 s** |
+| Drive mode saves when files are closed ([#24](https://github.com/zuhuHix/flashcp/pull/24)); copy until safe to remove, 128 KB clusters | Kingston | 93.8 s | 94.7 s (no cost) |
+| Small clusters in place ([#26](https://github.com/zuhuHix/flashcp/pull/26)); `add` onto the stick, 128 KB clusters before and 4 KB after | Kingston | 98.0 s | **5.48 s** |
 
 The stories behind these are in [The journey](#the-journey).
 

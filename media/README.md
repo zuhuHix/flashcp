@@ -55,7 +55,7 @@ npm run charts      # or: node charts.mjs
 | `cp` returns vs safe to remove | `chart-safe-to-remove` | the Kingston copy until the stick can be removed, both drivers, both cluster sizes |
 | file size and the gain | `chart-file-size` | the SSD speed-ups by dataset (mixed, small, many) |
 | the drive's own limit | `chart-drive-limit` | a build and a kernel copy against 169 MB at each drive's sequential write rate |
-| release by release | `chart-releases` | one job on a default-format Kingston stick, by the release each feature shipped in |
+| release by release | `chart-releases` | the small-file copy onto the Kingston stick, each measurement under the release its feature shipped in |
 
 The numbers are in the data blocks of `charts.mjs`, each with its source, under the same rules
 as the animations' numbers below. The script only places text by character count, so after a
