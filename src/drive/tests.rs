@@ -1821,7 +1821,9 @@ fn deferred_directory_times_are_bounded() {
         fs.release(x.ino);
     };
     // (the first deferral of a directory always waits; past `idle`, at least 80 ms later
-    // here whatever the machine's speed, the next fsync's commit writes it)
+    // here whatever the machine's speed, the next fsync's commit writes it. The gap first:
+    // past the 10 ms resolution of exFAT's times, the directory's times do change)
+    std::thread::sleep(std::time::Duration::from_millis(30));
     new_file("a");
     assert_eq!(fs.status().dirty_files, 1, "the directory's times did not wait");
     std::thread::sleep(std::time::Duration::from_millis(80));
