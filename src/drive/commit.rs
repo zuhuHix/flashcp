@@ -36,6 +36,12 @@ pub(crate) const P_LINK: u8 = 2;
 pub(crate) const P_FREE: u8 = 3;
 pub(crate) const P_CLEAN: u8 = 4;
 
+/// A commit with at most this much data writes it through the device handle (buffered, one
+/// request per run) instead of `add`'s O_DIRECT stream, whose setup (three 8 MB aligned
+/// buffers and an I/O thread) cost 15-25 ms of every small commit: what an application that
+/// fsyncs each file it writes pays per file.
+pub(crate) const SMALL_DATA: u64 = 1 << 20;
+
 /// Files up to this size are rewritten whole into fresh contiguous clusters when changed.
 const REWRITE_WHOLE: u64 = 4 << 20;
 
@@ -83,7 +89,9 @@ pub(crate) struct Plan {
     pub(crate) fins: Vec<(Ino, InoFin)>,
     pub(crate) dirs: Vec<(Ino, DirData)>,
     pub(crate) alloc_runs: Vec<(u64, u64)>,
-    /// The bitmap before this commit (which gaps between data writes may be zero-filled).
+    /// The bitmap before this commit (which gaps between data writes may be zero-filled), for
+    /// a commit of more than [`SMALL_DATA`] (empty otherwise: a small commit writes its data
+    /// without gaps, see `fs::pad_runs`).
     pub(crate) pre_bm: Arc<Vec<u8>>,
     /// Inodes planned.
     pub(crate) inodes: usize,
@@ -95,6 +103,8 @@ pub(crate) struct Plan {
     pub(crate) files: u64,
     pub(crate) bytes: u64,
     pub(crate) sector0: Vec<u8>,
+    /// No VolumeDirty: every crash state is a valid volume (see `needs_no_dirty`).
+    pub(crate) light: bool,
 }
 
 /// A directory's working copy during planning.
@@ -111,6 +121,9 @@ struct DW {
     touched: Vec<(usize, usize)>,
     /// Reusable slot runs (offset, bytes) of entries nobody uses, before `end`.
     holes: Vec<(usize, usize)>,
+    /// Deleted entries written past the committed end so that a set placed after them starts
+    /// a sector (offset ranges; written in `alloc`, see [`Planner::place`]).
+    pad: Vec<(usize, usize)>,
 }
 
 struct Planner<'a> {
@@ -213,6 +226,7 @@ impl Planner<'_> {
                     old_clusters: dd.clusters.len(),
                     touched: Vec::new(),
                     holes: holes_of(&dd.data, dd.end),
+                    pad: Vec::new(),
                 },
                 None => {
                     ensure!(n.disk.is_none(), "internal error: committed directory {} not loaded", self.c.path(d));
@@ -226,6 +240,7 @@ impl Planner<'_> {
                         old_clusters: 0,
                         touched: Vec::new(),
                         holes: Vec::new(),
+                        pad: Vec::new(),
                     }
                 }
             };
@@ -249,22 +264,44 @@ impl Planner<'_> {
 
     /// Writes `set` into directory `d` (a reused hole, else at the end, extending it). Returns
     /// its offset; queues `d` when its own layout changed.
+    ///
+    /// A set goes inside one 512-byte sector where it can (any set up to 16 entries): first a
+    /// hole position that keeps it in one sector, else the first hole that fits, else the end.
+    /// At the end of a committed directory, a set that would cross a sector boundary starts at
+    /// the next sector, the entries before it marked deleted in `alloc`. A set written in one
+    /// sector is never torn by a crash, which lets a commit of one new file go without
+    /// VolumeDirty (see `needs_no_dirty`).
     fn place(&mut self, d: Ino, set: &[u8], grown: &mut Vec<Ino>) -> Result<usize> {
         let cs = self.cs() as usize;
         let need = set.len();
+        let one = |x: usize| need > 512 || x % 512 + need <= 512;
         let w = self.dw(d)?;
-        if let Some(k) = w.holes.iter().position(|h| h.1 >= need) {
-            let (o, l) = w.holes[k];
-            if l == need {
-                w.holes.remove(k);
-            } else {
-                w.holes[k] = (o + need, l - need);
+        let fits: Vec<usize> = (0..w.holes.len()).filter(|&k| w.holes[k].1 >= need).collect();
+        let pick = fits
+            .iter()
+            .find_map(|&k| {
+                let (ho, hl) = w.holes[k];
+                (ho..=ho + hl - need).step_by(32).find(|&x| one(x)).map(|x| (k, x))
+            })
+            .or_else(|| fits.first().map(|&k| (k, w.holes[k].0)));
+        if let Some((k, o)) = pick {
+            let (ho, hl) = w.holes.remove(k);
+            if o + need < ho + hl {
+                w.holes.insert(k, (o + need, ho + hl - o - need));
+            }
+            if o > ho {
+                w.holes.insert(k, (ho, o - ho));
             }
             w.data[o..o + need].copy_from_slice(set);
             w.touched.push((o, o + need));
             return Ok(o);
         }
-        let o = w.end;
+        let mut o = w.end;
+        let mut pad = None;
+        if !w.new && !one(o) {
+            pad = Some(o);
+            o = o.div_ceil(512) * 512;
+        }
         if o + need > w.data.len() {
             let grow_to = (o + need).div_ceil(cs) * cs;
             ensure!(grow_to as u64 <= crate::volume::MAX_DIR_BYTES, "directory would exceed 256 MB");
@@ -305,6 +342,13 @@ impl Planner<'_> {
             }
         }
         let w = self.dws.get_mut(&d).unwrap();
+        if let Some(p) = pad {
+            for e in (p..o).step_by(32) {
+                w.data[e..e + 32].fill(0);
+                w.data[e] = 0x05; // a deleted file entry: unused, not end-of-directory
+            }
+            w.pad.push((p, o));
+        }
         w.data[o..o + need].copy_from_slice(set);
         w.end = o + need;
         w.touched.push((o, o + need));
@@ -590,6 +634,47 @@ fn materialize(c: &mut Core, i: Ino) -> Result<()> {
 /// With `limit`, at most that many inodes go into this commit (the rest stays dirty for the
 /// next one): unlinked ones first (a replaced target must go with its replacement), then by
 /// depth, so a new directory is always committed with or before its entries.
+/// Free extents (start cluster, length) of the bitmap, ascending: [`crate::add::free_extents`]
+/// a 64-bit word at a time. Every commit plans from the whole bitmap, and byte by byte it took
+/// 10 ms of each small commit on a 128 GB stick with 4 KB clusters (a 3.8 MB bitmap).
+pub(crate) fn free_extents(bm: &[u8], cc: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut run: Option<u64> = None;
+    let mut i = 0u64;
+    while i < cc {
+        if i.is_multiple_of(64) && i + 64 <= cc {
+            let at = (i / 8) as usize;
+            let w = u64::from_le_bytes(bm[at..at + 8].try_into().unwrap());
+            if w == 0 {
+                run.get_or_insert(i);
+                i += 64;
+                continue;
+            }
+            if w == u64::MAX {
+                if let Some(s) = run.take() {
+                    out.push((s + 2, i - s));
+                }
+                i += 64;
+                continue;
+            }
+        }
+        let used = (bm[(i / 8) as usize] >> (i % 8)) & 1 == 1;
+        match (used, run) {
+            (false, None) => run = Some(i),
+            (true, Some(s)) => {
+                out.push((s + 2, i - s));
+                run = None;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if let Some(s) = run {
+        out.push((s + 2, cc - s));
+    }
+    out
+}
+
 pub(crate) fn plan(c: &mut Core, limit: Option<usize>) -> Result<Option<Plan>> {
     if c.dirty.is_empty() {
         return Ok(None);
@@ -631,7 +716,7 @@ pub(crate) fn plan(c: &mut Core, limit: Option<usize>) -> Result<Option<Plan>> {
             c.load(i).map_err(|e| anyhow::anyhow!("load {}: errno {e}", c.path(i)))?;
         }
     }
-    let free = crate::add::free_extents(&c.bm, c.vol.cc);
+    let free = free_extents(&c.bm, c.vol.cc);
     let mut p = Planner {
         c,
         free,
@@ -840,6 +925,21 @@ pub(crate) fn plan(c: &mut Core, limit: Option<usize>) -> Result<Option<Plan>> {
     finish(p, n_inodes, full, seq).map(Some)
 }
 
+/// Bitmap bytes changed by a plan, over the committed bitmap.
+struct Overlay<'a> {
+    base: &'a [u8],
+    over: HashMap<usize, u8>,
+}
+
+impl Overlay<'_> {
+    fn get(&self, i: usize) -> u8 {
+        self.over.get(&i).copied().unwrap_or(self.base[i])
+    }
+    fn range(&self, a: usize, b: usize) -> Vec<u8> {
+        (a..b).map(|i| self.get(i)).collect()
+    }
+}
+
 /// Turns the planner's state into the journaled writes.
 fn finish(mut p: Planner<'_>, n_inodes: usize, full: bool, plan_seq: u64) -> Result<Plan> {
     let mut writes: Vec<JW> = Vec::new();
@@ -848,10 +948,11 @@ fn finish(mut p: Planner<'_>, n_inodes: usize, full: bool, plan_seq: u64) -> Res
     let flags = crate::volume::le16(&s0, 106);
     let wf = crate::add::working_flags(flags);
     writes.push(JW { phase: P_DIRTY, off: 106, pre: s0[106..108].to_vec(), post: wf.to_le_bytes().to_vec() });
-    // bitmap: alloc, then free
-    let mut bm = p.c.bm.clone();
+    // bitmap: alloc, then free (the bytes they change, over the committed bitmap: a copy of
+    // the whole bitmap is 3.8 MB on a 128 GB stick)
+    let mut bm = Overlay { base: &p.c.bm, over: HashMap::new() };
     let bm_patch =
-        |bm: &mut Vec<u8>, runs: &[(u64, u64)], set: bool, phase: u8, out: &mut Vec<JW>, v: &crate::volume::Vol| {
+        |bm: &mut Overlay<'_>, runs: &[(u64, u64)], set: bool, phase: u8, out: &mut Vec<JW>, v: &crate::volume::Vol| {
             let mut bytes: Vec<usize> = Vec::new();
             for &(s, n) in runs {
                 for c in s..s + n {
@@ -868,20 +969,17 @@ fn finish(mut p: Planner<'_>, n_inodes: usize, full: bool, plan_seq: u64) -> Res
                     j += 1;
                 }
                 let (a, b) = (bytes[k], bytes[j - 1] + 1);
-                let pre = bm[a..b].to_vec();
+                let pre = bm.range(a, b);
                 for &(s, n) in runs {
                     for c in s..s + n {
                         let i = (c - 2) as usize;
                         if i / 8 >= a && i / 8 < b {
-                            if set {
-                                bm[i / 8] |= 1 << (i % 8);
-                            } else {
-                                bm[i / 8] &= !(1 << (i % 8));
-                            }
+                            let x = bm.get(i / 8);
+                            bm.over.insert(i / 8, if set { x | 1 << (i % 8) } else { x & !(1 << (i % 8)) });
                         }
                     }
                 }
-                let post = bm[a..b].to_vec();
+                let post = bm.range(a, b);
                 if pre != post {
                     object_writes(v, &v.bitmap_clusters, a, &pre, &post, phase, out);
                 }
@@ -924,21 +1022,39 @@ fn finish(mut p: Planner<'_>, n_inodes: usize, full: bool, plan_seq: u64) -> Res
         }
         if !w.new {
             let old = &p.c.inodes[&d].dd.as_ref().unwrap().data;
-            let mut ranges = w.touched.clone();
-            ranges.sort();
-            let mut merged: Vec<(usize, usize)> = Vec::new();
-            for (a, b) in ranges {
-                let (a, b) = (a / 512 * 512, (b.div_ceil(512) * 512).min(w.data.len()));
-                match merged.last_mut() {
-                    Some(l) if a <= l.1 => l.1 = l.1.max(b),
-                    _ => merged.push((a, b)),
+            let sectors = |r: &[(usize, usize)]| -> Vec<(usize, usize)> {
+                let mut r = r.to_vec();
+                r.sort();
+                let mut merged: Vec<(usize, usize)> = Vec::new();
+                for (a, b) in r {
+                    let (a, b) = (a / 512 * 512, (b.div_ceil(512) * 512).min(w.data.len()));
+                    match merged.last_mut() {
+                        Some(l) if a <= l.1 => l.1 = l.1.max(b),
+                        _ => merged.push((a, b)),
+                    }
+                }
+                merged
+            };
+            // padding goes in `alloc` (before the set after it), unless something in `link`
+            // writes the same sector: then it is part of that write
+            let mut touched = w.touched.clone();
+            let mut early = Vec::new();
+            let linked = sectors(&w.touched);
+            for &(a, b) in &w.pad {
+                let (sa, sb) = (a / 512 * 512, b.div_ceil(512) * 512);
+                if linked.iter().any(|&(x, y)| x < sb && sa < y) {
+                    touched.push((a, b));
+                } else {
+                    early.push((a, b));
                 }
             }
-            for (a, b) in merged {
-                let pre: Vec<u8> = (a..b).map(|k| if k < w.old_len { old[k] } else { 0 }).collect();
-                let post = w.data[a..b].to_vec();
-                if pre != post {
-                    object_writes(&p.c.vol, &w.clusters, a, &pre, &post, P_LINK, &mut writes);
+            for (phase, ranges) in [(P_ALLOC, sectors(&early)), (P_LINK, sectors(&touched))] {
+                for (a, b) in ranges {
+                    let pre: Vec<u8> = (a..b).map(|k| if k < w.old_len { old[k] } else { 0 }).collect();
+                    let post = w.data[a..b].to_vec();
+                    if pre != post {
+                        object_writes(&p.c.vol, &w.clusters, a, &pre, &post, phase, &mut writes);
+                    }
                 }
             }
             let _ = w.old_clusters;
@@ -969,7 +1085,16 @@ fn finish(mut p: Planner<'_>, n_inodes: usize, full: bool, plan_seq: u64) -> Res
             _ => merged.push(w),
         }
     }
-    let writes = merged;
+    // A commit whose every intermediate state is a valid volume needs no VolumeDirty: no
+    // other system ever needs to check it after a crash (see `needs_no_dirty`).
+    let fat_end = fat_off + crate::volume::le32(&s0, 84) as u64 * p.c.vol.bps;
+    // (ClearToZero must be cleared before anything is modified: that takes a full commit)
+    let light = s0[112] == pct
+        && flags & (crate::volume::FLAG_CLEAR_TO_ZERO | crate::volume::FLAG_DIRTY) == 0
+        && needs_no_dirty(&merged, fat_off, fat_end);
+    let writes: Vec<JW> =
+        if light { merged.into_iter().filter(|w| w.phase != P_DIRTY && w.phase != P_CLEAN).collect() } else { merged };
+    drop(bm);
     let mut segs = std::mem::take(&mut p.segs);
     segs.retain(|s| s.len > 0);
     segs.sort_by_key(|s| s.dev);
@@ -978,16 +1103,20 @@ fn finish(mut p: Planner<'_>, n_inodes: usize, full: bool, plan_seq: u64) -> Res
             bail!("internal error: overlapping data segments at {}", w[1].dev);
         }
     }
+    let payload: u64 = segs.iter().map(|s| s.len).sum();
+    let pre_bm = Arc::new(if payload > SMALL_DATA { p.c.bm.clone() } else { Vec::new() });
     let mut s0n = s0.clone();
-    s0n[106..108].copy_from_slice(&cf.to_le_bytes());
-    s0n[112] = pct;
+    if !light {
+        s0n[106..108].copy_from_slice(&cf.to_le_bytes());
+        s0n[112] = pct;
+    }
     Ok(Plan {
         segs,
         writes,
         fins: p.fins.into_iter().collect(),
         dirs: dirs_out,
         alloc_runs,
-        pre_bm: Arc::new(p.c.bm.clone()),
+        pre_bm,
         inodes: n_inodes,
         full,
         seq: plan_seq,
@@ -995,7 +1124,54 @@ fn finish(mut p: Planner<'_>, n_inodes: usize, full: bool, plan_seq: u64) -> Res
         files: p.files,
         bytes: p.bytes,
         sector0: s0n,
+        light,
     })
+}
+
+/// Whether a commit's metadata writes leave a valid volume after ANY crash, without replay:
+/// then it needs no VolumeDirty (two writes of sector 0 and two syncs fewer, the bulk of a
+/// small commit's cost after its data). The phases stay ordered by syncs (`alloc` before
+/// `link` before `free`), so every crash state is one of:
+/// - after `alloc`: bitmap bits of clusters nothing references yet (leaked, which fsck.exfat
+///   accepts and the journal's replay completes);
+/// - inside `link`: any subset of its sector writes. That is a valid volume when every write
+///   is one whole directory sector (sectors are written atomically, so no set is ever torn:
+///   an in-place edit lies in one sector by construction, its checksum included), no FAT
+///   entry of a committed chain changes (a chain longer or shorter than its file), and no set
+///   is removed in one sector while another is written in a different sector (a move or a
+///   relocation, which could leave both or neither). New sets go into one sector at most:
+///   with two, the later one alone could land after an end-of-directory entry the earlier
+///   one was to replace. New sets into unused slots, in-place edits and pure removals
+///   (entries marked deleted, never end-of-directory) each stand alone;
+/// - inside `free`: bits of clusters nothing references any more, some still set (leaked).
+///
+/// PercentInUse must not change either (it is written in `clean`), and the volume flags must
+/// need no change (ClearToZero set takes a full commit, which clears it).
+fn needs_no_dirty(writes: &[JW], fat_a: u64, fat_b: u64) -> bool {
+    let (mut adds, mut clears) = (HashSet::new(), HashSet::new());
+    for w in writes.iter().filter(|w| w.phase == P_LINK) {
+        if w.off < fat_b && fat_a < w.off + w.post.len() as u64 {
+            return false;
+        }
+        if !w.off.is_multiple_of(512) || w.post.len() != 512 {
+            return false;
+        }
+        let sector = w.off / 512;
+        for e in 0..16 {
+            let (a, b) = (w.pre[e * 32], w.post[e * 32]);
+            match (a & 0x80 != 0, b & 0x80 != 0) {
+                (false, true) => {
+                    adds.insert(sector);
+                }
+                (true, false) => {
+                    clears.insert(sector);
+                }
+                (true, true) if a != b => return false,
+                _ => {}
+            }
+        }
+    }
+    adds.len() <= 1 && !adds.iter().any(|s| clears.iter().any(|c| c != s))
 }
 
 /// Journaled writes of bytes [a, a + post.len()) of an object stored in `clusters`.

@@ -263,8 +263,52 @@ pub(crate) fn write_active(dev: &dyn Dev, v: &Vol, p: &Place, seq: u64, body: &[
 }
 
 pub(crate) fn write_idle(dev: &dyn Dev, v: &Vol, p: &Place, seq: u64) -> Result<()> {
-    dev.write_at(&header(seq, STATE_IDLE, &[]), base(v, p)).context("write the journal header")?;
+    write_idle_at(dev, header_off(v, p), seq)
+}
+
+/// Marks the journal whose header is at byte `off` IDLE, and syncs.
+pub(crate) fn write_idle_at(dev: &dyn Dev, off: u64, seq: u64) -> Result<()> {
+    dev.write_at(&header(seq, STATE_IDLE, &[]), off).context("write the journal header")?;
     dev.sync().context("sync")
+}
+
+/// Device offset of the journal's header.
+pub(crate) fn header_off(v: &Vol, p: &Place) -> u64 {
+    base(v, p)
+}
+
+/// Whether every byte `writes` touch already holds its final state (the last write's `post`):
+/// the commit finished, and only its IDLE header may be missing. Bounded like [`validate`]
+/// before anything is read.
+fn completed(v: &Vol, writes: &[JW]) -> Result<bool> {
+    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(writes.len());
+    for w in writes {
+        let end = w.off.checked_add(w.post.len() as u64).context("a journaled write overflows")?;
+        ensure!(end <= v.vol_bytes && w.pre.len() == w.post.len(), "a journaled write is malformed");
+        spans.push((w.off, end));
+    }
+    spans.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (a, z) in spans {
+        match merged.last_mut() {
+            Some(l) if a <= l.1 => l.1 = l.1.max(z),
+            _ => merged.push((a, z)),
+        }
+    }
+    let total: u64 = merged.iter().map(|r| r.1 - r.0).sum();
+    ensure!(total <= 2 * MAX_RAW as u64, "the journal touches {total} bytes, more than a commit writes");
+    for (a, z) in merged {
+        let now = v.read_at(a, z - a)?;
+        let mut want = now.clone();
+        for w in writes.iter().filter(|w| w.off < z && a < w.off + w.post.len() as u64) {
+            let o = (w.off - a) as usize;
+            want[o..o + w.post.len()].copy_from_slice(&w.post);
+        }
+        if want != now {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Applies `writes` phase by phase, a sync after each phase that wrote something.
@@ -349,6 +393,14 @@ pub(crate) fn recover(v: &Vol, dev: &dyn Dev, p: &Place) -> Result<Recovered> {
             body.serial, body.geometry
         )));
     }
+    // A commit that finished but was not marked IDLE yet (a crash right after its last sync,
+    // or the header a commit leaves ACTIVE while the next one may follow, see `fs.rs`):
+    // nothing to replay. Its data samples are not checked: a later commit may have written
+    // into a sampled run's own slack since (an append), which is no reason to refuse.
+    if completed(v, &body.writes).map_err(|e| Refused(format!("{NAME}: {e:#}")))? {
+        write_idle(dev, v, p, h.seq)?;
+        return Ok(Recovered::Nothing);
+    }
     let sampled: u64 = body.samples.iter().map(|s| s.1 as u64).sum();
     if sampled > MAX_SAMPLED || body.samples.iter().any(|s| s.0.checked_add(s.1 as u64).is_none_or(|e| e > v.vol_bytes))
     {
@@ -400,7 +452,8 @@ pub(crate) fn recover(v: &Vol, dev: &dyn Dev, p: &Place) -> Result<Recovered> {
 /// - inside the volume, `pre` and `post` of one length;
 /// - `dirty` / `clean`: VolumeFlags (bytes 106–107) and PercentInUse (112) of sector 0 only;
 /// - `alloc` / `link`: FAT entries (whole, aligned), or bitmap clusters (`alloc`, `free`);
-/// - `link`: directory clusters.
+/// - `alloc` / `link`: directory clusters (`alloc` writes deleted entries past a
+///   directory's end, so that a set placed after them starts a sector).
 ///
 /// Which clusters hold the bitmap and the directories comes from the tree as it will be after
 /// the replay: the device's bytes with every write's `post` applied, walked from the root with
@@ -558,7 +611,7 @@ pub(crate) fn validate(v: &Vol, writes: &[JW]) -> Result<()> {
         let phase = PHASES[w.phase as usize];
         for c in cluster_of(a)..=cluster_of(z - 1) {
             match (allowed.get(&c).copied(), phase) {
-                (Some("bitmap"), "alloc" | "free") | (Some("dir"), "link") => {}
+                (Some("bitmap"), "alloc" | "free") | (Some("dir"), "alloc" | "link") => {}
                 (what, _) => bail!(
                     "the journal writes cluster {c:#x} ({}) in phase {phase}: not a commit's write",
                     what.unwrap_or("file data or free space")

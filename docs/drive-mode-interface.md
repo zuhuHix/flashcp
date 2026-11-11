@@ -136,7 +136,12 @@ On failure: `{"ok":false,"error":"..."}`. Unknown commands get `{"ok":false,"err
 - **SIGKILL / power loss / yank**: the on-volume + host journal makes the next `flashcp mount`
   (and `flashcp sync`) replay or roll back the interrupted commit. The volume is fsck-clean
   after recovery, and before it is at worst "dirty with leaked clusters" (`fsck.exfat -y` also
-  fixes that).
+  fixes that). Most commits (one new file, an append, a delete) never set VolumeDirty: every
+  crash state of theirs is a clean volume with at most leaked clusters. A commit leaves its
+  journal header ACTIVE for up to 100 ms after it finished (the next commit replaces it), so
+  a kill or yank right after a commit can leave `pending_journal: true` / `pending-commit` on
+  a volume whose commit is complete: the next `flashcp mount` marks it idle and replays
+  nothing. `prepare-eject` and unmount always leave it idle.
 - `fusermount3 -u` from outside: the FUSE session ends; the driver commits what is pending
   before exiting (it cannot delay the unmount itself: use `prepare-eject` before unmounting).
   The integration should always do `prepare-eject` → `unmount` and only then power off.
