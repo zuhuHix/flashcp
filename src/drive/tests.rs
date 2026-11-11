@@ -1356,7 +1356,7 @@ fn foreign_change_after_a_yank() {
         fs.release(x.ino);
     }
     // the volume as another system finds it after a yank now, with one journaled byte changed
-    let yank = |name: &str, pick: &dyn Fn(&[super::commit::JW]) -> (u64, u8)| -> (PathBuf, bool) {
+    let yank = |name: &str, fix: bool, pick: &dyn Fn(&[super::commit::JW]) -> (u64, u8)| -> (PathBuf, bool) {
         let copy = img.dir.join(name);
         std::fs::copy(&img.path, &copy).unwrap();
         let rw = File::options().read(true).write(true).open(&copy).unwrap();
@@ -1375,7 +1375,7 @@ fn foreign_change_after_a_yank() {
         let mut set = vec![0u8; n];
         rw.read_exact_at(&mut set, base).unwrap();
         set[(off - base) as usize] ^= mask;
-        if set[0] == 0x85 {
+        if fix && set[0] == 0x85 {
             let c = crate::exfat::checksum16(&set, true);
             set[2..4].copy_from_slice(&c.to_le_bytes());
         }
@@ -1386,10 +1386,18 @@ fn foreign_change_after_a_yank() {
         (0..w.post.len() / 32).map(|e| e * 32).find(|&e| w.post[e] == 0x85 && w.pre[e] & 0x80 == 0)
     }
     // light (a new file): its set retimed by the other system (checksum recomputed)
-    let (copy, light) = yank("light.img", &|ws| {
+    let new_set_ts = |ws: &[super::commit::JW]| {
         let w = ws.iter().find(|w| w.phase == super::commit::P_LINK && new_set(w).is_some()).expect("a new set");
         (w.off + new_set(w).unwrap() as u64 + 12, 0x01) // LastModifiedTimestamp
-    });
+    };
+    // the same byte changed without its checksum (what a torn or broken write leaves): the
+    // volume is not valid where the commit wrote, so it is refused, not abandoned
+    let (bad, _) = yank("garbled.img", false, &new_set_ts);
+    let f = File::options().read(true).write(true).open(&bad).unwrap();
+    let len = f.metadata().unwrap().len();
+    let err = open_core(f.try_clone().unwrap(), len, &FileDev::new(Arc::new(f)), &manual()).err().expect("refused");
+    assert!(err.downcast_ref::<super::djournal::Refused>().is_some(), "{err:#}");
+    let (copy, light) = yank("light.img", true, &new_set_ts);
     assert!(light);
     let f = File::options().read(true).write(true).open(&copy).unwrap();
     let len = f.metadata().unwrap().len();
@@ -1403,7 +1411,7 @@ fn foreign_change_after_a_yank() {
     // full (a move to another directory): refused, nothing written
     fs.rename(d.ino, OsStr::new("a"), e.ino, OsStr::new("a"), RenameFlags::default()).unwrap();
     fs.fsync(e.ino).unwrap();
-    let (copy, light) = yank("full.img", &|ws| {
+    let (copy, light) = yank("full.img", true, &|ws| {
         let w = ws.iter().find(|w| w.phase == super::commit::P_LINK && new_set(w).is_some()).expect("the moved set");
         (w.off + new_set(w).unwrap() as u64 + 12, 0x01) // its LastModifiedTimestamp
     });
@@ -1416,8 +1424,9 @@ fn foreign_change_after_a_yank() {
 }
 
 /// The deferred IDLE header and eject: fsyncs racing prepare-eject (their requests coalesce
-/// with eject's) never leave it ACTIVE once eject reports safe; a failed IDLE write stays
-/// pending, makes eject fail, and is retried.
+/// with eject's) never leave it ACTIVE, nor a directory's times pending, once eject reports
+/// safe; a failed IDLE write stays pending (not fatal, reported once), is retried, and makes
+/// eject fail.
 #[test]
 fn settle_header_on_eject_and_errors() {
     let img = image("settle", 32, 4096);
@@ -1430,12 +1439,15 @@ fn settle_header_on_eject_and_errors() {
     // 1: an fsync storm while ejecting
     let f = File::options().read(true).write(true).open(&img.path).unwrap();
     let fs = open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), opts()).unwrap();
+    let dir = fs.mkdir(ROOT, OsStr::new("storm")).unwrap().ino;
+    fs.flush().unwrap();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (fs2, stop2) = (fs.clone(), stop.clone());
     let storm = std::thread::spawn(move || {
         let mut k = 0;
         while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
-            let Ok(x) = fs2.create(ROOT, OsStr::new(&format!("s{k}")), true, false) else { break };
+            // files in a directory: every fsync's commit leaves its times
+            let Ok(x) = fs2.create(dir, OsStr::new(&format!("s{k}")), true, false) else { break };
             if fs2.write(x.ino, 0, b"storm").is_ok() {
                 let _ = fs2.fsync(x.ino);
             }
@@ -1446,6 +1458,10 @@ fn settle_header_on_eject_and_errors() {
     std::thread::sleep(std::time::Duration::from_millis(100));
     fs.prepare_eject().unwrap();
     assert!(!journal_active(&img.path), "prepare-eject reported safe with the journal ACTIVE");
+    let probe = open(&img.path);
+    let mt = probe.getattr(probe.lookup(ROOT, OsStr::new("storm")).unwrap().ino).unwrap().mtime;
+    assert_eq!(mt, fs.getattr(dir).unwrap().mtime, "the directory's times are not on the volume");
+    probe.shutdown().unwrap();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     storm.join().unwrap();
     fs.resume();
@@ -1457,6 +1473,13 @@ fn settle_header_on_eject_and_errors() {
     let dev = Arc::new(CrashDev::new(f, None));
     let fs = open_with(&img.path, dev.clone(), FsOpts { idle_header: std::time::Duration::from_millis(50), ..opts() })
         .unwrap();
+    let errors = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let e2 = errors.clone();
+    fs.on_note(move |n| {
+        if matches!(n, super::fs::Note::Error { fatal: false, .. }) {
+            e2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
     let x = fs.create(ROOT, OsStr::new("x"), true, false).unwrap();
     fs.write(x.ino, 0, b"x").unwrap();
     fs.fsync(x.ino).unwrap();
@@ -1464,9 +1487,11 @@ fn settle_header_on_eject_and_errors() {
         let mut st = dev.st.lock().unwrap();
         st.fail_at = Some(st.ops); // from now on every write fails
     }
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // attempts after 50 ms, 1 s and 3 s (backing off): one report
+    std::thread::sleep(std::time::Duration::from_millis(3300));
     assert!(journal_active(&img.path), "the IDLE mark cannot have been written");
     assert_ne!(fs.status().state, "read_only", "a failed IDLE mark is not fatal");
+    assert_eq!(errors.load(std::sync::atomic::Ordering::SeqCst), 1, "a failing IDLE mark was reported more than once");
     {
         let mut st = dev.st.lock().unwrap();
         (st.fail_at, st.failed) = (None, false);
@@ -1486,6 +1511,8 @@ fn settle_header_on_eject_and_errors() {
     // (the 50 ms retry may get there first: either way the header cannot be written)
     assert!(fs.prepare_eject().is_err(), "prepare-eject reported safe without the IDLE mark");
     assert!(journal_active(&img.path));
+    // the commit thread's own attempt (for eject's request) is not fatal either
+    assert_ne!(fs.status().state, "read_only");
     fs.release(x.ino);
     let _ = fs.shutdown();
 }
@@ -1601,6 +1628,77 @@ fn free_extents_word_scan_matches() {
         }
         assert_eq!(super::commit::free_extents(&bm, cc), crate::add::free_extents(&bm, cc), "case {case}, cc {cc}");
     }
+}
+
+/// An fsync whose commit must be split (a small journal file): the first part is the
+/// directory whose only change is its times. It is written then (a split part never defers),
+/// and the fsync returns instead of planning an empty part forever.
+#[test]
+fn split_fsync_commit_never_defers() {
+    let img = image("split-fsync", 32, 4096);
+    let fs = open(&img.path);
+    unsafe { std::env::set_var(super::djournal::JOURNAL_BYTES_ENV, "4096") };
+    fs.mkdir(ROOT, OsStr::new("d")).unwrap();
+    fs.commit_now("t").unwrap(); // creates the small journal
+    unsafe { std::env::remove_var(super::djournal::JOURNAL_BYTES_ENV) };
+    fs.shutdown().unwrap();
+    // two new files of many data segments each (one byte every 64 KB): one fits the journal,
+    // two do not, so the plan is cut to one inode, the shallowest: the directory
+    let fs = open(&img.path);
+    let d = fs.lookup(ROOT, OsStr::new("d")).unwrap().ino;
+    let mut last = 0;
+    for n in ["one", "two"] {
+        let f = fs.create(d, OsStr::new(n), true, false).unwrap();
+        for k in 0..32u64 {
+            fs.write(f.ino, k << 16, b"x").unwrap();
+        }
+        last = f.ino;
+    }
+    let before = fs.commits();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let f2 = fs.clone();
+    std::thread::spawn(move || tx.send(f2.fsync(last)).unwrap());
+    let r = rx.recv_timeout(std::time::Duration::from_secs(60)).expect("fsync hung (split livelock)");
+    assert_eq!(r, Ok(()));
+    assert!(fs.commits() > before + 1, "expected a split commit");
+    let want = snapshot(&fs);
+    fs.shutdown().unwrap();
+    fsck(&img.path);
+    same!(snapshot(&open(&img.path)), want, "after the split fsync");
+}
+
+/// Times deferred by fsyncs: a directory written after it waited `idle`, and explicitly set
+/// times never deferred.
+#[test]
+fn deferred_directory_times_are_bounded() {
+    let img = image("defer-bound", 32, 4096);
+    let f = File::options().read(true).write(true).open(&img.path).unwrap();
+    let opts = FsOpts { idle: std::time::Duration::from_millis(40), ..manual() };
+    let fs = open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), opts).unwrap();
+    let sub = fs.mkdir(ROOT, OsStr::new("sub")).unwrap().ino;
+    fs.flush().unwrap();
+    let new_file = |n: &str| {
+        let x = fs.create(sub, OsStr::new(n), true, false).unwrap();
+        fs.write(x.ino, 0, b"x").unwrap();
+        fs.fsync(x.ino).unwrap();
+        fs.release(x.ino);
+    };
+    new_file("a");
+    assert_eq!(fs.status().dirty_files, 1, "the directory's times did not wait");
+    new_file("b");
+    assert_eq!(fs.status().dirty_files, 1, "the directory's times did not wait");
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    new_file("c");
+    assert_eq!(fs.status().dirty_files, 0, "the directory waited longer than idle");
+    // explicit times on the directory, then fsync of it: written now
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    fs.setattr(sub, &SetAttr { mtime: Some(when), ..Default::default() }).unwrap();
+    fs.fsync(sub).unwrap();
+    assert_eq!(fs.status().dirty_files, 0, "explicitly set times waited");
+    let probe = open(&img.path);
+    assert_eq!(probe.getattr(probe.lookup(ROOT, OsStr::new("sub")).unwrap().ino).unwrap().mtime, when);
+    probe.shutdown().unwrap();
+    fs.shutdown().unwrap();
 }
 
 /// A batch whose journal would not fit the journal file is committed in parts, each one

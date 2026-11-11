@@ -680,10 +680,15 @@ pub(crate) fn free_extents(bm: &[u8], cc: u64) -> Vec<(u64, u64)> {
 }
 
 /// Plans a commit of every dirty inode (`limit`: of at most that many). With `defer_times`
-/// (an fsync's commit), a committed directory whose set would change only in its times keeps
-/// its set and stays dirty: the next commit that is not an fsync's writes it (see
-/// [`times_only`]).
-pub(crate) fn plan(c: &mut Core, limit: Option<usize>, defer_times: bool) -> Result<Option<Plan>> {
+/// (a commit for fsyncs only, not split), a committed directory whose set would change only
+/// in its times keeps its set and stays dirty: the next commit that is not an fsync's writes
+/// it, or the first fsync's after it waited `defer_times` (see [`times_only`]). Times set
+/// explicitly (utimensat) never wait.
+pub(crate) fn plan(
+    c: &mut Core,
+    limit: Option<usize>,
+    defer_times: Option<std::time::Duration>,
+) -> Result<Option<Plan>> {
     if c.dirty.is_empty() {
         return Ok(None);
     }
@@ -879,8 +884,10 @@ pub(crate) fn plan(c: &mut Core, limit: Option<usize>, defer_times: bool) -> Res
             dd.data[d.off..d.off + d.len].to_vec()
         });
         let new = set::encode(&f, &p.c.vol.upc, old.as_deref());
-        if defer_times
+        if let Some(max) = defer_times
             && is_dir
+            && !p.c.times_set.contains(&i)
+            && p.c.deferred.get(&i).is_none_or(|t| t.elapsed() < max)
             && disk.is_some_and(|d| d.dir == parent)
             && old.as_deref().is_some_and(|o| o != new && times_only(o, &new))
         {
@@ -1332,10 +1339,15 @@ pub(crate) fn finalize(c: &mut Core, p: Plan) {
     }
     for i in &written {
         c.deferred.remove(i);
+        c.times_set.remove(i);
     }
-    c.deferred.extend(p.deferred.iter().copied());
+    let now = std::time::Instant::now();
+    for &i in &p.deferred {
+        c.deferred.entry(i).or_insert(now);
+    }
     let dirty = &c.dirty;
-    c.deferred.retain(|i| dirty.contains(i));
+    c.deferred.retain(|i, _| dirty.contains(i));
+    c.times_set.retain(|i| dirty.contains(i));
     c.commits += 1;
     if p.full {
         c.durable_seq = c.durable_seq.max(p.seq);

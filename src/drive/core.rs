@@ -146,8 +146,11 @@ pub(crate) struct Core {
     /// the times of the directories in `deferred`.
     pub(crate) durable_seq: u64,
     /// Committed directories whose new times an fsync's commit left for the next commit that
-    /// is not an fsync's (see `commit::plan`).
-    pub(crate) deferred: BTreeSet<Ino>,
+    /// is not an fsync's, with when they first did (see `commit::plan`).
+    pub(crate) deferred: std::collections::BTreeMap<Ino, std::time::Instant>,
+    /// Inodes whose times were set explicitly (utimensat) since their last commit: never
+    /// deferred.
+    pub(crate) times_set: BTreeSet<Ino>,
 }
 
 /// Clusters a bitmap marks used (padding bits past ClusterCount ignored).
@@ -288,7 +291,8 @@ impl Core {
             opened: 0,
             writers: 0,
             durable_seq: 0,
-            deferred: BTreeSet::new(),
+            deferred: Default::default(),
+            times_set: BTreeSet::new(),
         };
         c.inodes.insert(ROOT, root);
         let children: Vec<Child> = root_dir.children.into_values().collect();
@@ -638,6 +642,9 @@ impl Core {
         }
         if a.mtime.is_some() || a.atime.is_some() || a.crtime.is_some() || a.mode.is_some() {
             self.writable()?;
+            if a.mtime.is_some() || a.atime.is_some() || a.crtime.is_some() {
+                self.times_set.insert(i);
+            }
             let n = self.ino_mut(i)?;
             if let Some(t) = a.mtime {
                 n.mtime = set::raw_ts(to_unix(t));
