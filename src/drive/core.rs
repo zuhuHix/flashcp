@@ -142,8 +142,12 @@ pub(crate) struct Core {
     pub(crate) opened: u64,
     /// Open handles with write access.
     pub(crate) writers: u64,
-    /// Every change up to this `seq` is durable (a full commit planned at it finished).
+    /// Every change up to this `seq` is durable (a full commit planned at it finished), but
+    /// the times of the directories in `deferred`.
     pub(crate) durable_seq: u64,
+    /// Committed directories whose new times an fsync's commit left for the next commit that
+    /// is not an fsync's (see `commit::plan`).
+    pub(crate) deferred: BTreeSet<Ino>,
 }
 
 /// Clusters a bitmap marks used (padding bits past ClusterCount ignored).
@@ -284,6 +288,7 @@ impl Core {
             opened: 0,
             writers: 0,
             durable_seq: 0,
+            deferred: BTreeSet::new(),
         };
         c.inodes.insert(ROOT, root);
         let children: Vec<Child> = root_dir.children.into_values().collect();

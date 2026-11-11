@@ -429,6 +429,10 @@ fn fsync_per_file_then_sigkill() {
     }
     let n = m.events.lock().unwrap().iter().filter(|l| l.contains("\"reason\":\"fsync\"")).count();
     assert!(n >= 40, "{n} fsync commits for 40 fsyncs");
+    // the committing event names the process that fsynced (this test binary)
+    let me = std::fs::read_to_string("/proc/self/comm").unwrap().trim().to_owned();
+    let by = format!("\"by\":\"{me}");
+    assert!(m.has_event(&by), "no {by} in {:?}", m.events.lock().unwrap().iter().find(|l| l.contains("fsync")));
     unsafe { libc::kill(m.child.id() as i32, libc::SIGKILL) };
     m.wait_exit(30);
     let _ = Command::new("fusermount3").args(["-u", "-z"]).arg(&m.mnt).status();

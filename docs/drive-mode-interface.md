@@ -90,10 +90,13 @@ One object per line, flushed after each. Human-readable messages go to stderr re
 
 ```text
 {"event":"mounted","proto":1,"device":"/dev/sdb1","mountpoint":"/media/u/KINGSTON","label":"KINGSTON",
- "serial":"1a2b3c4d","size":N,"free":N,"cluster":N,"pid":N,"recovered":null|"replayed"|"dirty_cleared"}
+ "serial":"1a2b3c4d","size":N,"free":N,"cluster":N,"pid":N,"recovered":null|"replayed"|"abandoned"|"dirty_cleared"}
 {"event":"dirty_bytes","bytes":N,"files":N}        pending (not durable) data; at most ~4 per second,
                                                    and always once when it drops to 0
-{"event":"committing","bytes":N,"files":N,"reason":"close"|"idle"|"fsync"|"flush"|"eject"|"pressure"|"unmount"}
+{"event":"committing","bytes":N,"files":N,"reason":"close"|"idle"|"fsync"|"flush"|"eject"|"pressure"|"unmount"[,"by":"PROC[/THREAD]"]}
+                                                   "by" (from 0.4.1, fsync only, best effort): the process
+                                                   name (/proc/<tgid>/comm) of the fsync's caller, then
+                                                   its thread's when that differs; absent when unknown
 {"event":"committed","bytes":N,"files":N,"secs":F}   everything up to here is durable on the medium
 {"event":"error","message":"...","fatal":B}          fatal=true: the mount is going away (exit 1)
 {"event":"unmounted","clean":B}                      last line; clean=false only after a forced exit
@@ -141,7 +144,10 @@ On failure: `{"ok":false,"error":"..."}`. Unknown commands get `{"ok":false,"err
   journal header ACTIVE for up to 100 ms after it finished (the next commit replaces it), so
   a kill or yank right after a commit can leave `pending_journal: true` / `pending-commit` on
   a volume whose commit is complete: the next `flashcp mount` marks it idle and replays
-  nothing. `prepare-eject` and unmount always leave it idle.
+  nothing. `prepare-eject` and unmount always leave it idle. When another system changed the
+  volume after such a yank, a light commit's journal is abandoned (marked idle, nothing
+  replayed, `"recovered":"abandoned"`: every crash state of it is a valid volume); a full
+  commit's still refuses the mount (exit 6).
 - `fusermount3 -u` from outside: the FUSE session ends; the driver commits what is pending
   before exiting (it cannot delay the unmount itself: use `prepare-eject` before unmounting).
   The integration should always do `prepare-eject` → `unmount` and only then power off.

@@ -161,13 +161,30 @@ impl DevInfo {
 /// A JSON event from `flashcp mount --json`, reduced to what the daemon uses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DriverEvent {
-    Mounted { recovered: Option<String> },
-    DirtyBytes { bytes: u64, files: u64 },
-    Committing { bytes: u64, reason: String },
+    Mounted {
+        recovered: Option<String>,
+    },
+    DirtyBytes {
+        bytes: u64,
+        files: u64,
+    },
+    /// `by`: the process behind an fsync's commit (from 0.4.1, best effort).
+    Committing {
+        bytes: u64,
+        reason: String,
+        by: Option<String>,
+    },
     Committed,
-    Error { message: String, fatal: bool },
-    Unmounted { clean: bool },
-    Refused { reason: String },
+    Error {
+        message: String,
+        fatal: bool,
+    },
+    Unmounted {
+        clean: bool,
+    },
+    Refused {
+        reason: String,
+    },
     Other,
 }
 
@@ -180,7 +197,9 @@ impl DriverEvent {
         match o.get("event").map(String::as_str) {
             Some("mounted") => DriverEvent::Mounted { recovered: o.get("recovered").cloned().filter(|r| r != "null") },
             Some("dirty_bytes") => DriverEvent::DirtyBytes { bytes: num("bytes"), files: num("files") },
-            Some("committing") => DriverEvent::Committing { bytes: num("bytes"), reason: text("reason") },
+            Some("committing") => {
+                DriverEvent::Committing { bytes: num("bytes"), reason: text("reason"), by: o.get("by").cloned() }
+            }
             Some("committed") => DriverEvent::Committed,
             Some("error") => DriverEvent::Error { message: text("message"), fatal: text("fatal") == "true" },
             Some("unmounted") => DriverEvent::Unmounted { clean: text("clean") == "true" },
@@ -1140,7 +1159,7 @@ impl Core {
                     out.push(saving(d));
                 }
             }
-            DriverEvent::Committing { bytes, reason } => {
+            DriverEvent::Committing { bytes, reason, .. } => {
                 d.committing = true;
                 d.dirty_bytes = d.dirty_bytes.max(bytes);
                 if reason == "unmount" && d.state == State::Mounted {

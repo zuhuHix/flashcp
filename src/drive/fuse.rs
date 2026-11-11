@@ -278,9 +278,9 @@ impl Filesystem for Adapter {
         reply.ok();
     }
 
-    fn fsync(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(&self, req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
         count("fsync");
-        tri!(self.fs.fsync(ino.0), reply);
+        tri!(self.fs.fsync_by(ino.0, caller_name(req.pid())), reply);
         reply.ok();
     }
 
@@ -456,5 +456,35 @@ impl Filesystem for Adapter {
     fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
         count("removexattr");
         reply.error(err(libc::ENOSYS));
+    }
+}
+
+/// The process behind a request, for the commit's event: `/proc/<tgid>/comm` of the thread
+/// `tid` (a FUSE request carries the calling thread's id), followed by `/thread` when the
+/// thread is named differently (GLib's worker pools). Best effort: None when /proc says
+/// nothing (the caller is gone, another pid namespace).
+pub(crate) fn caller_name(tid: u32) -> Option<String> {
+    if tid == 0 {
+        return None;
+    }
+    let read = |p: String| std::fs::read_to_string(p).ok();
+    let clean = |s: &str| -> String { s.trim().chars().filter(|c| !c.is_control()).take(32).collect() };
+    let thread = clean(&read(format!("/proc/{tid}/comm"))?);
+    let tgid = read(format!("/proc/{tid}/status"))
+        .and_then(|st| st.lines().find_map(|l| l.strip_prefix("Tgid:").map(|v| v.trim().to_owned())))
+        .unwrap_or_else(|| tid.to_string());
+    let proc = read(format!("/proc/{tgid}/comm")).map(|s| clean(&s)).unwrap_or_else(|| thread.clone());
+    Some(if proc == thread || thread.is_empty() { proc } else { format!("{proc}/{thread}") })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn caller_name_of_this_thread() {
+        let tid = unsafe { libc::gettid() } as u32;
+        let me = std::fs::read_to_string("/proc/self/comm").unwrap().trim().to_owned();
+        let got = super::caller_name(tid).unwrap();
+        assert!(got.starts_with(&me), "{got} vs {me}");
+        assert_eq!(super::caller_name(0), None);
     }
 }

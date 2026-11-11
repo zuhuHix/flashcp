@@ -61,10 +61,26 @@ impl Default for FsOpts {
 /// What a commit reports (for events).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Note {
-    Dirty { bytes: u64, files: u64 },
-    Committing { bytes: u64, files: u64, reason: &'static str },
-    Committed { bytes: u64, files: u64, secs: f64 },
-    Error { message: String, fatal: bool },
+    Dirty {
+        bytes: u64,
+        files: u64,
+    },
+    /// `by`: for an fsync, the process that asked (best effort, see `fuse::caller_name`).
+    Committing {
+        bytes: u64,
+        files: u64,
+        reason: &'static str,
+        by: Option<String>,
+    },
+    Committed {
+        bytes: u64,
+        files: u64,
+        secs: f64,
+    },
+    Error {
+        message: String,
+        fatal: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -219,6 +235,11 @@ struct Ctl {
     /// A finished commit's journal header still ACTIVE: (device offset, seq, when to mark it
     /// IDLE). The next commit's journal write replaces it.
     idle_header: Option<(u64, u64, Instant)>,
+    /// A request coalesced into the next commit wants the volume settled (eject, unmount):
+    /// kept until a commit takes it, whatever reason a later request records.
+    settle: bool,
+    /// The process behind the last fsync request (for the commit's event).
+    by: Option<String>,
 }
 
 #[derive(Clone)]
@@ -745,18 +766,32 @@ impl Fs {
         self.flush_why("flush")
     }
 
-    pub fn fsync(&self, _ino: Ino) -> R<()> {
-        self.flush_why("fsync").map_err(|_| libc::EIO)
+    pub fn fsync(&self, ino: Ino) -> R<()> {
+        self.fsync_by(ino, None)
+    }
+
+    /// [`Fs::fsync`] asked by process `by` (shown in the commit's event).
+    pub fn fsync_by(&self, _ino: Ino, by: Option<String>) -> R<()> {
+        self.flush_req("fsync", by).map_err(|_| libc::EIO)
     }
 
     fn flush_why(&self, why: &'static str) -> Result<()> {
+        self.flush_req(why, None)
+    }
+
+    fn flush_req(&self, why: &'static str, by: Option<String>) -> Result<()> {
+        let settle = matches!(why, "eject" | "unmount");
         if !self.sh.opts.auto_commit {
-            commit_all(self, why)?;
+            commit_all(self, why, settle, by.as_deref())?;
             return Ok(());
         }
         let mut st = self.sh.st.lock().unwrap();
         st.want += 1;
         st.reason = why;
+        st.settle |= settle;
+        if by.is_some() {
+            st.by = by;
+        }
         let target = st.want;
         self.sh.cv.notify_all();
         loop {
@@ -780,6 +815,8 @@ impl Fs {
             self.sh.ejecting.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         self.flush_why("eject")?;
+        // the journal IDLE before "safe", whatever reason the commit thread recorded
+        self.settle_header()?;
         let c = self.core();
         ensure!(c.dirty.is_empty() && c.stager.staged == 0, "changes are still pending");
         Ok(())
@@ -791,7 +828,7 @@ impl Fs {
 
     /// Final commit and stop of the commit thread.
     pub fn shutdown(&self) -> Result<()> {
-        let r = self.flush_why("unmount");
+        let r = self.flush_why("unmount").and_then(|_| self.settle_header());
         {
             let mut st = self.sh.st.lock().unwrap();
             st.stop = true;
@@ -821,6 +858,20 @@ impl Fs {
     /// Commits completed so far.
     pub fn commits(&self) -> u64 {
         self.core().commits
+    }
+
+    /// Where `ino`'s entry set is in its directory: (offset, length) (tests).
+    #[cfg(test)]
+    pub(crate) fn set_place(&self, ino: Ino) -> Option<(usize, usize)> {
+        self.core().inodes.get(&ino)?.disk.map(|d| (d.off, d.len))
+    }
+
+    /// The clusters of directory `ino` (tests).
+    #[cfg(test)]
+    pub(crate) fn dir_clusters(&self, ino: Ino) -> Option<Vec<u32>> {
+        let mut c = self.core();
+        c.load(ino).ok()?;
+        c.inodes.get(&ino)?.dd.as_ref().map(|d| d.clusters.clone())
     }
 
     /// Commits made without VolumeDirty so far (tests).
@@ -863,7 +914,14 @@ impl Fs {
                 }
                 if st.idle_header.is_some_and(|h| Instant::now() >= h.2) {
                     drop(st);
-                    self.settle_header();
+                    if let Err(e) = self.settle_header() {
+                        // nothing durable depends on it (recovery finds the commit finished);
+                        // it stays pending, retried a second later and before eject/unmount
+                        self.note(Note::Error { message: format!("{e:#}"), fatal: false });
+                        if let Some(h) = self.sh.st.lock().unwrap().idle_header.as_mut() {
+                            h.2 = Instant::now() + Duration::from_secs(1);
+                        }
+                    }
                     st = self.sh.st.lock().unwrap();
                     continue;
                 }
@@ -910,13 +968,15 @@ impl Fs {
             }
             let target = st.want;
             let why = st.reason;
+            let settle = std::mem::take(&mut st.settle) || matches!(why, "eject" | "unmount");
+            let by = st.by.take();
             st.committing = true;
             drop(st);
             let r = (|| -> Result<()> {
-                commit_all(self, why)?;
-                if matches!(why, "eject" | "unmount") {
+                commit_all(self, why, settle, by.as_deref())?;
+                if settle {
                     // nothing pending, and the journal IDLE: the volume is settled
-                    self.settle_header();
+                    self.settle_header()?;
                 }
                 Ok(())
             })();
@@ -941,18 +1001,25 @@ impl Fs {
         }
     }
 
-    /// Marks a finished commit's journal header IDLE (see [`FsOpts::idle_header`]). A failure
-    /// costs nothing durable (recovery finds the commit finished), so it is reported, not fatal.
-    fn settle_header(&self) {
+    /// Marks a finished commit's journal header IDLE (see [`FsOpts::idle_header`]). On failure
+    /// it stays pending (eject and unmount then fail: the volume is not settled).
+    fn settle_header(&self) -> Result<()> {
         let _one = self.sh.serial.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((off, seq, _)) = self.sh.st.lock().unwrap().idle_header.take() else { return };
-        if let Err(e) = djournal::write_idle_at(&*self.sh.dev, off, seq) {
-            self.note(Note::Error { message: format!("marking the drive journal idle: {e:#}"), fatal: false });
-        }
+        let Some((off, seq, _)) = self.sh.st.lock().unwrap().idle_header else { return Ok(()) };
+        djournal::write_idle_at(&*self.sh.dev, off, seq).context("marking the drive journal idle")?;
+        // under `serial` no commit replaced it meanwhile
+        self.sh.st.lock().unwrap().idle_header = None;
+        Ok(())
     }
 
     /// Plans, executes and finalizes one commit. Ok(false) when there was nothing to do.
     pub(crate) fn commit_now(&self, why: &'static str) -> Result<bool> {
+        self.commit_req(why, false, None)
+    }
+
+    /// One commit for request `why` (`settle`: eject or unmount, which want the journal IDLE
+    /// at its end; `by`: who asked, for the event).
+    fn commit_req(&self, why: &'static str, settle: bool, by: Option<&str>) -> Result<bool> {
         let _one = self.sh.serial.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(m) = &self.sh.st.lock().unwrap().fatal {
             anyhow::bail!("an earlier commit failed: {m}");
@@ -961,6 +1028,7 @@ impl Fs {
         let (plan, place, seq) = {
             let mut c = self.core();
             if c.dirty.is_empty() {
+                c.deferred.clear();
                 return Ok(false);
             }
             if c.journal.is_none() {
@@ -972,7 +1040,7 @@ impl Fs {
             let cap = c.journal.as_ref().map_or(0, |p| p.len);
             let mut limit = None;
             let plan = loop {
-                let Some(plan) = commit::plan(&mut c, limit)? else { return Ok(false) };
+                let Some(plan) = commit::plan(&mut c, limit, why == "fsync")? else { return Ok(false) };
                 let est = djournal::encode_body(&c.vol, &plan.writes, &[])?.len() as u64
                     + 2 * 20 * plan.segs.len() as u64
                     + 1024;
@@ -984,6 +1052,12 @@ impl Fs {
                 anyhow::ensure!(next >= 1, "one change needs more journal than the volume's journal file holds");
                 limit = Some(next);
             };
+            if plan.writes.is_empty() && plan.segs.is_empty() {
+                // nothing changes on the volume (a directory whose times wait, see `plan`)
+                commit::begin(&mut c, &plan);
+                commit::finalize(&mut c, plan);
+                return Ok(true);
+            }
             if let Some(ra) = &self.sh.ra {
                 let r: Vec<(u64, u64)> = plan.segs.iter().map(|s| (s.dev, s.len)).collect();
                 ra.invalidate(&r);
@@ -991,13 +1065,12 @@ impl Fs {
             commit::begin(&mut c, &plan);
             (plan, c.journal.clone().unwrap(), c.commits + 1)
         };
-        self.note(Note::Committing { bytes: plan.bytes, files: plan.files, reason: why });
+        self.note(Note::Committing { bytes: plan.bytes, files: plan.files, reason: why, by: by.map(str::to_owned) });
         // The executor reads the volume through its own handle on the same file.
         let vol_view = { self.core().vol.view()? };
         // The header is left ACTIVE when the commit thread can mark it IDLE later, unless
         // eject or unmount wants the volume settled now.
-        let defer =
-            self.sh.opts.auto_commit && !self.sh.opts.idle_header.is_zero() && !matches!(why, "eject" | "unmount");
+        let defer = self.sh.opts.auto_commit && !self.sh.opts.idle_header.is_zero() && !settle;
         // this commit's journal write replaces any header still ACTIVE
         self.sh.st.lock().unwrap().idle_header = None;
         execute(&*self.sh.dev, &vol_view, &plan, &place, seq, self.sh.opts.part_off_bytes, !defer)?;
@@ -1024,14 +1097,18 @@ impl Fs {
 
 /// Commits until every change made before the call is durable (a split batch takes several
 /// commits; changes made meanwhile may wait for the next request).
-fn commit_all(fs: &Fs, why: &'static str) -> Result<()> {
+fn commit_all(fs: &Fs, why: &'static str, settle: bool, by: Option<&str>) -> Result<()> {
     let target = fs.core().seq;
-    while fs.core().durable_seq < target {
-        if !fs.commit_now(why)? {
+    loop {
+        // an fsync's commit leaves directories' times; any other commit takes them along
+        let done = {
+            let c = fs.core();
+            c.durable_seq >= target && (why == "fsync" || c.deferred.is_empty())
+        };
+        if done || !fs.commit_req(why, settle, by)? {
             return Ok(());
         }
     }
-    Ok(())
 }
 
 /// Device ranges of committed bytes [a, b) of `ino` (clamped to what is still content).
@@ -1122,7 +1199,7 @@ pub(crate) fn execute(
     samples.retain(|&(off, len, _)| {
         len > 0 && !plan.writes.iter().any(|w| w.off < off + len as u64 && off < w.off + w.post.len() as u64)
     });
-    let body = djournal::encode_body(v, &plan.writes, &samples)?;
+    let body = djournal::encode_body_light(v, &plan.writes, &samples, plan.light)?;
     crate::sim::trace::phase("journal");
     djournal::write_active(dev, v, place, seq, &body)?;
     djournal::apply(dev, &plan.writes, |_| {})?;
