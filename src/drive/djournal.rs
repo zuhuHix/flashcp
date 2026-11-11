@@ -460,10 +460,11 @@ pub(crate) fn recover(v: &Vol, dev: &dyn Dev, p: &Place) -> Result<Recovered> {
     Ok(Recovered::Replayed(body.writes.len()))
 }
 
-/// Refuses when a directory entry the commit wrote or found (non-zero type in `pre` or
-/// `post`) now reads as an end-of-directory entry (type 0x00): a torn sector read back as
-/// zeros, which the parser takes for the end of the directory, hiding entries earlier fsyncs
-/// made durable. Another system deletes an entry by clearing its InUse bit, never like that.
+/// Refuses when a directory entry that existed before the commit (non-zero type in `pre`)
+/// now reads as an end-of-directory entry (type 0x00): a torn sector read back as zeros,
+/// which the parser takes for the end of the directory, hiding entries earlier fsyncs made
+/// durable. Another system deletes an entry by clearing its InUse bit, never like that. A
+/// slot the commit was filling (`pre` 0x00) still reading 0x00 is its `link` never landing.
 fn ended_entries(writes: &[JW], now: &[JW]) -> Result<()> {
     for (w, n) in writes.iter().zip(now) {
         if w.phase != super::commit::P_LINK || !w.off.is_multiple_of(32) {
@@ -471,7 +472,7 @@ fn ended_entries(writes: &[JW], now: &[JW]) -> Result<()> {
         }
         for k in (0..w.post.len()).step_by(32) {
             ensure!(
-                n.post[k] != 0 || (w.pre[k] == 0 && w.post[k] == 0),
+                n.post[k] != 0 || w.pre[k] == 0,
                 "the directory entry at byte {} reads as an end of directory",
                 w.off + k as u64
             );
