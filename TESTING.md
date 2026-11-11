@@ -345,3 +345,5 @@ Unicode names (from `nfc_probe.py`; identical on flashcp volumes and on `control
   returns) fails with ENOENT. Because the control volume behaves the same, this is the macOS
   driver, not flashcp. Other non-ASCII names (CJK, emoji, names with no decomposition) were not
   probed. Whether Finder is affected was not checked either.
+
+<!-- trigger check for the Cross-OS path filter; this branch is not meant to merge -->
