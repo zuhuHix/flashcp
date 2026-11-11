@@ -75,8 +75,8 @@ syncfs callback either. So what bounds the loss is when commits happen, not `syn
 
 - `fsync`/`fdatasync`/`fsyncdir`, the control socket's `flush` and `prepare-eject`, and SIGTERM
   wait until everything written before them is durable (fsync and fdatasync: except the times
-  of the directories the changes were in, which follow within the linger or the idle, see
-  *An application that fsyncs every file*);
+  of the directories the changes were in, which follow within about a second, see *An
+  application that fsyncs every file*);
 - **after the last write handle is closed** (`cp`, `rsync`, a saved document): durable within
   the 150 ms linger plus one commit;
 - **a file kept open for writing**: durable within the 1 s idle after its last write plus one
@@ -248,7 +248,10 @@ to check). A light commit is different: its journal body says it is light (a fla
 the samples, which readers before it ignore), every crash state of it is a valid volume, and
 the fsync that wanted it never returned (or it had finished, and only its IDLE mark was
 missing). So a light journal that fails the samples, the validation or the sector check is
-**abandoned**: marked IDLE, nothing replayed, the mount goes on (`"recovered":"abandoned"`).
+**abandoned**: marked IDLE, nothing replayed, the mount goes on (`"recovered":"abandoned"`),
+provided the volume as it is now passes the same validating walk replay would make (valid
+directories and bitmap wherever the commit wrote); a sector torn or garbled by someone else
+is refused (exit 6).
 `add`, `sync` and `recluster` still refuse any ACTIVE journal until a flashcp mount has
 recovered it.
 
@@ -261,9 +264,13 @@ its fixed cost decides the copy's speed.
 times, which costs one more sector write per fsync (the directory's set, in its parent). An
 fsync's commit leaves a committed directory whose set would change only in its times
 (timestamps, 10 ms fields, UTC offsets, checksum) dirty, and the next commit that is not an
-fsync's (the close linger, idle, flush, eject, unmount) writes it. fsync's guarantee is
-otherwise unchanged: everything written before it is durable when it returns, except the
-times of the directories it changed, which are durable within the linger or the 1 s idle.
+fsync's (the close linger, idle, flush, fsyncdir, eject, unmount; also when such a request
+was merged into the same commit as an fsync), or the first fsync's commit after it waited 1 s
+(`idle`), whichever comes first. A part of a split commit never defers (a part of only waiting
+directories would write nothing), times set explicitly (utimensat) never wait, and a commit
+that makes no progress is an error, not a loop. fsync's guarantee is otherwise unchanged:
+everything written before it is durable when it returns, except the times of the directories
+it changed, which are durable within about a second (the idle, or the next fsync after it).
 After a yank, only a parent directory's timestamp can be older than its contents. One fsync
 of a new file is then data, journal, bitmap and entry set: 4 writes and 4 syncs, the
 kernel driver's 4.1 per fsynced file on the Kingston (`device_op_counts` checks the count).

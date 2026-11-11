@@ -429,7 +429,18 @@ pub(crate) fn recover(v: &Vol, dev: &dyn Dev, p: &Place) -> Result<Recovered> {
         // the fsync that wanted it never returned (or it finished, and only its IDLE mark was
         // missing). When the volume changed since (another system wrote to it after a yank
         // mid-burst), it is left as it is: marked IDLE, nothing replayed.
-        Err(_) if body.light => {
+        // Only when the volume as it is now holds valid directories and bitmap where the
+        // commit wrote: the validating walk `validate` makes of the post-replay image, made
+        // of the current one (a sector torn or garbled by someone else is refused).
+        Err(e) if body.light => {
+            let now: Result<Vec<JW>> = body
+                .writes
+                .iter()
+                .map(|w| Ok(JW { post: v.read_at(w.off, w.post.len() as u64)?, ..w.clone() }))
+                .collect();
+            if let Err(bad) = now.and_then(|now| validate(v, &now)) {
+                return Err(e.context(format!("the volume where the commit wrote is not valid now: {bad:#}")));
+            }
             write_idle(dev, v, p, h.seq)?;
             return Ok(Recovered::Abandoned);
         }

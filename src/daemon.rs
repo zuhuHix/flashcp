@@ -1137,6 +1137,9 @@ impl Core {
                 if let Some(r) = recovered {
                     let body = if r == "replayed" {
                         "An interrupted save was completed: the files copied before it was unplugged are there."
+                    } else if r == "abandoned" {
+                        "The last save before it was unplugged was not completed (the drive was changed elsewhere \
+                         since); the files saved before that are there."
                     } else {
                         "It was not unmounted cleanly last time; the volume was checked and is consistent."
                     };

@@ -238,8 +238,14 @@ struct Ctl {
     /// A request coalesced into the next commit wants the volume settled (eject, unmount):
     /// kept until a commit takes it, whatever reason a later request records.
     settle: bool,
+    /// A request other than an fsync was coalesced into the next commit (flush, fsyncdir,
+    /// close, idle, eject...): it wants directories' times too, whatever reason a later fsync
+    /// records (see `commit::plan`'s `defer_times`).
+    strict: bool,
     /// The process behind the last fsync request (for the commit's event).
     by: Option<String>,
+    /// Consecutive failures to mark the journal IDLE (one notification, then back off).
+    settle_fails: u32,
 }
 
 #[derive(Clone)]
@@ -782,16 +788,15 @@ impl Fs {
     fn flush_req(&self, why: &'static str, by: Option<String>) -> Result<()> {
         let settle = matches!(why, "eject" | "unmount");
         if !self.sh.opts.auto_commit {
-            commit_all(self, why, settle, by.as_deref())?;
+            commit_all(self, why, settle, why == "fsync", by.as_deref())?;
             return Ok(());
         }
         let mut st = self.sh.st.lock().unwrap();
         st.want += 1;
         st.reason = why;
         st.settle |= settle;
-        if by.is_some() {
-            st.by = by;
-        }
+        st.strict |= why != "fsync";
+        st.by = if why == "fsync" { by.or(st.by.take()) } else { None };
         let target = st.want;
         self.sh.cv.notify_all();
         loop {
@@ -912,16 +917,9 @@ impl Fs {
                 if st.want > st.done {
                     break;
                 }
-                if st.idle_header.is_some_and(|h| Instant::now() >= h.2) {
+                if st.fatal.is_none() && st.idle_header.is_some_and(|h| Instant::now() >= h.2) {
                     drop(st);
-                    if let Err(e) = self.settle_header() {
-                        // nothing durable depends on it (recovery finds the commit finished);
-                        // it stays pending, retried a second later and before eject/unmount
-                        self.note(Note::Error { message: format!("{e:#}"), fatal: false });
-                        if let Some(h) = self.sh.st.lock().unwrap().idle_header.as_mut() {
-                            h.2 = Instant::now() + Duration::from_secs(1);
-                        }
-                    }
+                    self.settle_or_retry();
                     st = self.sh.st.lock().unwrap();
                     continue;
                 }
@@ -969,17 +967,17 @@ impl Fs {
             let target = st.want;
             let why = st.reason;
             let settle = std::mem::take(&mut st.settle) || matches!(why, "eject" | "unmount");
-            let by = st.by.take();
+            // directories' times wait only when every request merged here was an fsync
+            let defer = !std::mem::take(&mut st.strict) && why == "fsync" && !settle;
+            let by = st.by.take().filter(|_| why == "fsync");
             st.committing = true;
             drop(st);
-            let r = (|| -> Result<()> {
-                commit_all(self, why, settle, by.as_deref())?;
-                if settle {
-                    // nothing pending, and the journal IDLE: the volume is settled
-                    self.settle_header()?;
-                }
-                Ok(())
-            })();
+            let r = commit_all(self, why, settle, defer, by.as_deref());
+            if r.is_ok() && settle {
+                // nothing pending: the journal IDLE settles the volume. A failure is not fatal
+                // here (nothing durable depends on it): eject and unmount report it themselves
+                self.settle_or_retry();
+            }
             let mut st = self.sh.st.lock().unwrap();
             st.committing = false;
             if let Err(e) = r {
@@ -1001,6 +999,27 @@ impl Fs {
         }
     }
 
+    /// [`Fs::settle_header`] from the commit thread: on failure the header stays pending and
+    /// is retried later, 1 s, 2 s, 4 s... up to 30 s apart; only the first failure of a run
+    /// is reported (a write-protected or dying stick would otherwise notify every second).
+    fn settle_or_retry(&self) {
+        match self.settle_header() {
+            Ok(()) => self.sh.st.lock().unwrap().settle_fails = 0,
+            Err(e) => {
+                let mut st = self.sh.st.lock().unwrap();
+                st.settle_fails += 1;
+                let n = st.settle_fails;
+                if let Some(h) = st.idle_header.as_mut() {
+                    h.2 = Instant::now() + Duration::from_secs(1u64 << (n - 1).min(5)).min(Duration::from_secs(30));
+                }
+                drop(st);
+                if n == 1 {
+                    self.note(Note::Error { message: format!("{e:#}"), fatal: false });
+                }
+            }
+        }
+    }
+
     /// Marks a finished commit's journal header IDLE (see [`FsOpts::idle_header`]). On failure
     /// it stays pending (eject and unmount then fail: the volume is not settled).
     fn settle_header(&self) -> Result<()> {
@@ -1014,12 +1033,14 @@ impl Fs {
 
     /// Plans, executes and finalizes one commit. Ok(false) when there was nothing to do.
     pub(crate) fn commit_now(&self, why: &'static str) -> Result<bool> {
-        self.commit_req(why, false, None)
+        self.commit_req(why, false, false, None).map(|r| r.is_some())
     }
 
     /// One commit for request `why` (`settle`: eject or unmount, which want the journal IDLE
-    /// at its end; `by`: who asked, for the event).
-    fn commit_req(&self, why: &'static str, settle: bool, by: Option<&str>) -> Result<bool> {
+    /// at its end; `defer`: only fsyncs asked, directories' times may wait; `by`: who asked,
+    /// for the event). None: nothing to do; Some(false): a commit that changed nothing (no
+    /// inode written, not full), which [`commit_all`] refuses to repeat.
+    fn commit_req(&self, why: &'static str, settle: bool, defer: bool, by: Option<&str>) -> Result<Option<bool>> {
         let _one = self.sh.serial.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(m) = &self.sh.st.lock().unwrap().fatal {
             anyhow::bail!("an earlier commit failed: {m}");
@@ -1029,7 +1050,7 @@ impl Fs {
             let mut c = self.core();
             if c.dirty.is_empty() {
                 c.deferred.clear();
-                return Ok(false);
+                return Ok(None);
             }
             if c.journal.is_none() {
                 bootstrap(&mut c, &*self.sh.dev)?;
@@ -1040,7 +1061,9 @@ impl Fs {
             let cap = c.journal.as_ref().map_or(0, |p| p.len);
             let mut limit = None;
             let plan = loop {
-                let Some(plan) = commit::plan(&mut c, limit, why == "fsync")? else { return Ok(false) };
+                // a split plan never defers: a part of only waiting directories would be empty
+                let wait = (defer && limit.is_none()).then_some(self.sh.opts.idle);
+                let Some(plan) = commit::plan(&mut c, limit, wait)? else { return Ok(None) };
                 let est = djournal::encode_body(&c.vol, &plan.writes, &[])?.len() as u64
                     + 2 * 20 * plan.segs.len() as u64
                     + 1024;
@@ -1054,9 +1077,10 @@ impl Fs {
             };
             if plan.writes.is_empty() && plan.segs.is_empty() {
                 // nothing changes on the volume (a directory whose times wait, see `plan`)
+                let progress = plan.full || !plan.fins.is_empty();
                 commit::begin(&mut c, &plan);
                 commit::finalize(&mut c, plan);
-                return Ok(true);
+                return Ok(Some(progress));
             }
             if let Some(ra) = &self.sh.ra {
                 let r: Vec<(u64, u64)> = plan.segs.iter().map(|s| (s.dev, s.len)).collect();
@@ -1091,22 +1115,27 @@ impl Fs {
         commit::finalize(&mut c, plan);
         drop(c);
         self.note(Note::Committed { bytes, files, secs: t0.elapsed().as_secs_f64() });
-        Ok(true)
+        Ok(Some(true))
     }
 }
 
 /// Commits until every change made before the call is durable (a split batch takes several
 /// commits; changes made meanwhile may wait for the next request).
-fn commit_all(fs: &Fs, why: &'static str, settle: bool, by: Option<&str>) -> Result<()> {
+fn commit_all(fs: &Fs, why: &'static str, settle: bool, defer: bool, by: Option<&str>) -> Result<()> {
     let target = fs.core().seq;
     loop {
-        // an fsync's commit leaves directories' times; any other commit takes them along
+        // a commit for fsyncs only leaves directories' times; any other takes them along
         let done = {
             let c = fs.core();
-            c.durable_seq >= target && (why == "fsync" || c.deferred.is_empty())
+            c.durable_seq >= target && (defer || c.deferred.is_empty())
         };
-        if done || !fs.commit_req(why, settle, by)? {
+        if done {
             return Ok(());
+        }
+        match fs.commit_req(why, settle, defer, by)? {
+            None => return Ok(()),
+            Some(true) => {}
+            Some(false) => anyhow::bail!("internal error: a commit made no progress ({why})"),
         }
     }
 }
