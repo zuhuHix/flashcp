@@ -82,9 +82,9 @@ syncfs callback either. So what bounds the loss is when commits happen, not `syn
 - `dirty_bytes` reaches 0 when that commit finishes; nothing stays pending on an idle mount.
 
 The commit after the linger is what `cp … && sync && pull the stick` relies on: the worst case
-is 150 ms + one commit after `cp` returns (one small commit simulates to 0.27 s on the SanDisk
-USB 2 model, 0.39 s on the Kingston, 0.05 s on the MSI; a big one is the device's sequential
-write time). Unplugging inside that window can lose what was not committed yet. That is the
+is 150 ms + one commit after `cp` returns (one small commit simulates to 0.07 s on the SanDisk
+USB 2 model, 0.12 s on the Kingston, 3 ms on the MSI, see *An application that fsyncs every
+file*; a big one is the device's sequential write time). Unplugging inside that window can lose what was not committed yet. That is the
 same class of risk as the kernel's own write-back, but much shorter. Eject (prepare-eject)
 remains the safe way. During a copy, the linger adds no commits: every close restarts it, so
 it fires once, after the last file (measured: the same commits as without it, the last one
@@ -129,9 +129,13 @@ Entry sets:
 
 - An edit whose changed bytes all lie in one 512-byte sector is written in place. Otherwise
   the set is relocated: a new set is written (vendor secondaries and creation time kept), and
-  every entry of the old one is marked unused. A set goes into the first run of unused entries
-  that fits (slots freed by the same commit excluded), else at the end of the directory, which
-  grows by whole clusters.
+  every entry of the old one is marked unused. A set goes into a run of unused entries that
+  holds it (slots freed by the same commit excluded), else at the end of the directory, which
+  grows by whole clusters. Inside one 512-byte sector wherever it can (any set of up to 16
+  entries): the first run position that keeps it in one sector, else the first run that fits.
+  At the end of a committed directory, a set that would cross a sector boundary starts at the
+  next sector, and the entries before it are marked deleted in `alloc`. A set in one sector is
+  never torn by a crash, which is what lets most commits go without VolumeDirty (below).
 - A move writes the set in the new directory and clears it in the old one. A replaced target
   is cleared in the same phase.
 
@@ -141,12 +145,18 @@ Entry sets:
 |---|---|---|
 | data | file data, new directories' content, directory extensions (zeros): free clusters, plus in-place slack past a committed ValidDataLength | yes |
 | journal | body + header ACTIVE into `/.flashcp-drive-journal` | yes |
-| `dirty` | VolumeDirty | yes |
-| `alloc` | bitmap bits of new clusters; FAT entries no committed chain uses | yes |
+| `dirty` | VolumeDirty (full commits only) | yes |
+| `alloc` | bitmap bits of new clusters; FAT entries no committed chain uses; deleted entries padding a directory's end up to a sector | yes |
 | `link` | entry sets (new, edited, relocated, cleared); FAT entries of committed chains; directory lengths | yes |
 | `free` | bitmap bits of freed clusters | yes (if any) |
-| `clean` | VolumeDirty cleared, PercentInUse | yes |
-| idle | header IDLE (one sector) | yes |
+| `clean` | VolumeDirty cleared, PercentInUse (full commits only) | yes |
+| idle | header IDLE (one sector); deferred, see below | yes |
+
+A commit's data is written through the device handle (buffered, each run padded with zeros
+inside its own last cluster up to 4 KB, runs that meet at a cluster boundary joined into one
+write) when it is at most 1 MB, and through `add`'s O_DIRECT stream otherwise. The stream's
+setup (three 8 MB aligned buffers and an I/O thread) cost 15-25 ms of host time per commit,
+more than a small file's data takes to write.
 
 Every write from `dirty` to `clean` is journaled with the bytes before and after it. All of
 those "before" bytes come from the in-memory mirrors, so planning needs no reads for them.
@@ -164,6 +174,86 @@ accepts that). After that the file is never rewritten except its content. Size:
 volume / 512, clamped to 1–8 MB. `add`, `sync`, `pull`, `info` and `verify` skip it. `sync
 --delete` never deletes it. `add` and `sync` refuse while it is ACTIVE.
 
+### Light commits: no VolumeDirty when no crash state needs it
+
+VolumeDirty tells another system (Windows, macOS, the kernel driver) that the metadata may be
+half-written and must be checked. A commit needs it only if some crash state, read without
+flashcp's journal, would not be a valid volume. For most commits there is none, and those
+**light** commits skip `dirty` and `clean`: two writes of sector 0 and two syncs, most of what a
+small commit cost after its data. The syncs between `alloc`, `link` and `free` stay, so a crash
+leaves one of these states (sectors are written whole, the assumption the crash harness and
+`flashcp sync`'s journal already make):
+
+- inside or after `alloc`: bitmap bits (and FAT entries, deleted padding entries) that nothing
+  references yet: leaked clusters, which `fsck.exfat` accepts and the journal's replay
+  completes;
+- inside `link`: any subset of its sector writes. That is a valid volume when every `link`
+  write is one whole directory sector (a set in it is whole: an in-place edit lies in one
+  sector by construction, its checksum included), no FAT entry of a committed chain changes
+  (a chain longer or shorter than its file), new sets go into one sector at most (with two,
+  the later one alone could land after an end-of-directory entry the earlier one replaces),
+  and no set is removed in one sector while one is written in another (a move or a
+  relocation, which could leave both or neither). A new set into unused slots, an in-place
+  edit (times, size, a copy-on-write's new first cluster) and a removal (entries marked
+  deleted, never end-of-directory) each stand alone;
+- inside `free`: bits of clusters nothing references any more, some still set (leaked).
+
+PercentInUse must not change and the volume flags must need no change either (ClearToZero set
+takes a full commit, which clears it). The planner decides from the commit's own writes
+(`commit::needs_no_dirty`). An fsync of a new file, an append, a delete, utimens and chmod
+are light; a move, a rename into another sector, a commit of many new files in one directory,
+a directory growing a FAT chain are full. In the fsync-every-file trace below, 18,610 of
+18,738 commits are light. flashcp's own guarantees are unchanged: the journal is written and
+replayed the same way, without the two phases.
+
+### The IDLE header is deferred
+
+A commit for anything but eject and unmount leaves its journal header ACTIVE, and the commit
+thread marks it IDLE 100 ms later if no commit followed (`FsOpts::idle_header`). The next
+commit's journal write replaces the header anyway, so an application that fsyncs file after
+file saves one write and one sync per file. fsync returns once the last metadata phase is
+synced, as before; the IDLE mark was never part of durability. prepare-eject and unmount
+mark the header IDLE before they report, so an ejected stick never carries an ACTIVE journal.
+
+Recovery treats an ACTIVE journal whose writes are all on the volume (every touched byte holds
+its final state) as finished: it marks it IDLE and replays nothing, without checking the data
+samples. That matters for the deferred header: the next commit may write into a sampled run's
+own slack (in-place past a committed ValidDataLength) before its own journal lands, and a
+crash then must not refuse the mount. It also covers a crash between `clean` and the IDLE
+write, which was replayed (as a no-op) before. A yank while a stale header is ACTIVE, followed
+by changes from another system and then a flashcp mount, behaves as a yank during a commit
+always did: the sector check refuses the mount (exit 6). The window is at most 100 ms after
+the last commit of a burst, instead of the length of each commit.
+
+### An application that fsyncs every file
+
+Some file managers fsync each file they copy. Every fsync is then a commit of one file, and
+its fixed cost decides the copy's speed. The ignored `wr_fsync_bench_trace` harness replays
+that pattern (create, 128 KB writes, fsync, close, one file after the other) from a shape
+file of sizes and name lengths. Recorded for the Kingston (`FLASHCP_SIM_DEVICE`) on an empty
+image of its size (124 GB, 4 KB clusters), with the shape of a real 787 MB folder (18,737
+files, 17,714 under 64 KB, one of 229 MB, 2,071 directories), replayed on the Kingston model:
+
+| | simulated | MB/s | writes / syncs per commit | host per commit |
+|---|---:|---:|---:|---:|
+| 0.4.0 | 5,665 s | 0.14 | 8.0 / 7.0 | 37.7 ms |
+| light commits, deferred IDLE, small-commit data path | 2,480 s | 0.32 | 4.9 / 4.0 | 2.5 ms |
+
+Where one small file's commit went in 0.4.0 (Kingston model, 0.30 s): 9 writes in 5 places
+(data, journal, sector 0, bitmap, entry sets, sector 0 again, journal header), each
+switching the stick's open allocation unit (the model's 30 ms per switch dominates; syncs cost
+about 1 ms on this write-through stick), plus host time: 10 ms for a byte-by-byte scan of the
+3.8 MB bitmap for free extents (now a 64-bit word at a time), 15-25 ms setting up the O_DIRECT
+stream (now only for commits over 1 MB), 2 ms of bitmap copies (now only the changed bytes).
+Now: data, journal, bitmap, entry sets (4 places, 5 writes, 4 syncs). Per small commit on the
+other models: SanDisk 0.166 → 0.070 s, MSI 21 → 3 ms.
+
+The model's absolute cost of a small random write on the Kingston is a guess (its FTL
+parameters are the generic preset): the same model puts a kernel-like pattern (data, bitmap,
+entry sets, one sync per file) at 1,917 s for this folder, while the real kernel driver
+copied it at 4-5 MB/s (about 180 s). Ratios between strategies are what the model supports;
+hardware decides the absolute numbers.
+
 ### Crash guarantees
 
 Whatever happens (SIGKILL, power loss, a yank at any write or sync), the next mount shows
@@ -174,12 +264,13 @@ whole tree, byte for byte, and the volume is `fsck.exfat`-clean:
 |---|---|---|
 | data | old tree; garbage in free clusters | nothing to do (journal IDLE) |
 | journal | old tree; header IDLE, or ACTIVE with a body that fails its hash | treated as IDLE: old tree |
-| dirty … clean | a mix of old and new metadata; dirty | check and replay: new tree |
-| idle | new tree, header still ACTIVE | replay (every sector is already in its final state): new tree |
+| dirty … clean (full commit) | a mix of old and new metadata; dirty | check and replay: new tree |
+| alloc … free (light commit) | a mix of old and new metadata, a valid volume (not dirty) | check and replay: new tree |
+| after the last phase, until the deferred IDLE | new tree, header still ACTIVE | finished (every touched byte final): marked IDLE, nothing replayed |
 
 Recovery runs before the volume is parsed: the journal's own entry set is located by a raw
-scan of the root, because a torn set elsewhere would fail the full parse. It then checks
-three things:
+scan of the root, because a torn set elsewhere would fail the full parse. A journal whose
+writes are all on the volume is finished (above). Otherwise recovery checks three things:
 - the serial and the geometry;
 - every data sample still hashes the same;
 - every 512-byte sector the writes touch holds one of the states they take it through (the
@@ -271,13 +362,21 @@ transaction.
     the unsynced writes (all reached the medium, none did, a random prefix per sector), at two
     cluster sizes. The remounted tree must equal the tree before or after the interrupted
     commit, with fsck;
+  - one fsync-stream crash harness (`crash_fsync_stream`): five fsyncs from the commit thread
+    with the journal header left ACTIVE between them (a new file, an append to the file the
+    previous commit wrote, a new directory with a long-named file, a move, a delete; light and
+    full commits), crashed the same way. Before recovery, the volume must be marked dirty or
+    pass `fsck.exfat` (what another system sees); after it, the tree before or after the
+    interrupted fsync, with fsck;
+  - the deferred IDLE header: marked after the delay, at once by prepare-eject, and a mount
+    while it is ACTIVE finds the commit finished;
   - readahead under commits that reuse clusters;
   - interop with `add`, `sync`, `pull` and `info`.
 - **Tier 2** (`tests/drive_fuse.rs`, the CI job `fuse`): real FUSE mounts of image files
   exercised with `cp`, `mv`, `rm`, `rsync`, `dd`, the control socket, SIGTERM, a lazy unmount
-  while dirty, and `--check` exit codes.
+  while dirty, `--check` exit codes, and 40 fsynced files followed by SIGKILL.
 - **Tier 3**: `flashcp sim` on traces of the driver's own reads and commits (the ignored
-  `ra_bench_trace` / `wr_bench_trace` harnesses), then hardware once for the final numbers
+  `ra_bench_trace` / `wr_bench_trace` / `wr_fsync_bench_trace` harnesses), then hardware once for the final numbers
   (the PR has the tables).
 
 ## Known limits

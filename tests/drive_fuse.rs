@@ -409,6 +409,39 @@ fn sigterm_while_dirty_commits() {
     remount(&d, &img, |mnt| diff(&src, &mnt.join("t")));
 }
 
+/// An application that fsyncs every file it writes (a file manager's copy): every fsync is
+/// a commit; the driver killed right after the last one (its journal header is left ACTIVE
+/// for the next commit, see DESIGN.md) loses nothing: the next mount finds the commit
+/// finished and shows every file.
+#[test]
+fn fsync_per_file_then_sigkill() {
+    if !gate() {
+        return;
+    }
+    let d = Dir::new("fsync-kill");
+    let img = image(&d, 64);
+    let mut m = Mount::start(&d, &img, &["--idle-ms", "60000", "--close-ms", "0"]);
+    std::fs::create_dir(m.mnt.join("docs")).unwrap();
+    for k in 0..40u32 {
+        let mut f = std::fs::File::create(m.mnt.join(format!("docs/file {k:02} with a longer name.txt"))).unwrap();
+        f.write_all(&vec![k as u8; 100 + 997 * k as usize]).unwrap();
+        f.sync_all().unwrap();
+    }
+    let n = m.events.lock().unwrap().iter().filter(|l| l.contains("\"reason\":\"fsync\"")).count();
+    assert!(n >= 40, "{n} fsync commits for 40 fsyncs");
+    unsafe { libc::kill(m.child.id() as i32, libc::SIGKILL) };
+    m.wait_exit(30);
+    let _ = Command::new("fusermount3").args(["-u", "-z"]).arg(&m.mnt).status();
+    drop(m);
+    remount(&d, &img, |mnt| {
+        for k in 0..40u32 {
+            let got = std::fs::read(mnt.join(format!("docs/file {k:02} with a longer name.txt"))).unwrap();
+            assert_eq!(got, vec![k as u8; 100 + 997 * k as usize], "file {k}");
+        }
+    });
+    fsck(&img);
+}
+
 #[test]
 fn lazy_detach_while_dirty_still_commits() {
     if !gate() {

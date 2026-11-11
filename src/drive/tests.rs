@@ -637,9 +637,11 @@ fn readahead_serves_bulk_reads_and_never_stale_data() {
     fs.shutdown().unwrap();
 }
 
-/// Counts that would show a regression without timing anything: one fsync of a small file
-/// costs 7 device writes (data, journal, VolumeDirty, bitmap, entry set, clean, journal
-/// IDLE); a commit onto a volume full of holes writes its batch as one stream; a reader
+/// Counts that would show a regression without timing anything: one fsync of a new small
+/// file costs 5 device writes and 5 syncs (data, journal, bitmap, entry set, journal IDLE: a
+/// light commit has no VolumeDirty), and from the commit thread, which leaves the IDLE header
+/// to a commit that does not follow, one write and one sync fewer; a commit onto a volume full of holes writes its
+/// batch as one stream; a reader
 /// taking 64 KB heads of 2 MB files makes the readahead read heads, not whole files.
 #[test]
 fn device_op_counts() {
@@ -650,15 +652,37 @@ fn device_op_counts() {
     let fs = open_with(&img.path, dev.clone(), manual()).unwrap();
     let a = fs.create(ROOT, OsStr::new("warm"), true, false).unwrap();
     fs.write(a.ino, 0, b"journal file created").unwrap();
+    fs.mkdir(ROOT, OsStr::new("sub")).unwrap();
     fs.flush().unwrap();
-    let before = dev.ops();
+    let (before, light) = (dev.ops(), fs.light_commits());
     let b = fs.create(ROOT, OsStr::new("one.txt"), true, false).unwrap();
     fs.write(b.ino, 0, &[1u8; 8192]).unwrap();
     fs.fsync(b.ino).unwrap();
     let ops = dev.ops() - before; // writes + syncs
     eprintln!("count: fsync of one small file: {ops} device writes + syncs");
-    assert!(ops <= 14, "one fsync took {ops} device writes and syncs (7 + 7 expected)");
+    // (+1 write: this set would cross a sector, so deleted entries pad up to the next one)
+    assert!(ops <= 11, "one fsync took {ops} device writes and syncs (6 + 5 expected)");
+    assert_eq!(fs.light_commits(), light + 1, "the fsync's commit was not light");
     fs.shutdown().unwrap();
+    // the same from the commit thread: the IDLE header waits for a commit that does not come
+    let f = File::options().read(true).write(true).open(&img.path).unwrap();
+    let dev = Arc::new(CrashDev::new(f, None));
+    let opts = FsOpts { auto_commit: true, idle_header: std::time::Duration::from_secs(3600), ..manual() };
+    let fs = open_with(&img.path, dev.clone(), opts).unwrap();
+    let before = dev.ops();
+    // the first set of a directory: one sector (a set across two takes a full commit), and
+    // the directory's own set edited in place (its times): 5 writes, 4 syncs
+    let sub = fs.lookup(ROOT, OsStr::new("sub")).unwrap().ino;
+    let b = fs.create(sub, OsStr::new("two.txt"), true, false).unwrap();
+    fs.write(b.ino, 0, &[2u8; 8192]).unwrap();
+    fs.fsync(b.ino).unwrap();
+    let ops = dev.ops() - before;
+    eprintln!("count: fsync of one small file, commit thread: {ops} device writes + syncs");
+    assert_eq!(fs.light_commits(), 1, "the fsync's commit was not light");
+    assert!(ops <= 9, "one fsync took {ops} device writes and syncs (5 + 4 expected)");
+    fs.release(b.ino);
+    fs.shutdown().unwrap();
+    fsck(&img.path);
     // a volume full of holes: 600 files, every other one deleted, then 300 new files
     let img = image("holes", 64, 4096);
     let fs = open(&img.path);
@@ -834,6 +858,296 @@ fn wr_bench_trace() {
     eprintln!("staged in {staged:.3} s, durable at {:.3} s", t.elapsed().as_secs_f64());
     fs.shutdown().unwrap();
     crate::sim::trace::finish();
+}
+
+/// Benchmark harness (ignored): an application that fsyncs every file it writes (a file
+/// manager's copy), serially: per file create, 128 KB writes, fsync, close. The tree comes
+/// from the shape file FLASHCP_WR_BENCH_SHAPE (one line per entry in copy order: `d DEPTH
+/// NAMELEN` or `f DEPTH NAMELEN SIZE`, no names), with generated content, into the volume in
+/// FLASHCP_RA_BENCH_IMG, under FLASHCP_TRACE. The commit thread runs (default options), so
+/// fsyncs take the path a mount takes.
+#[test]
+#[ignore]
+fn wr_fsync_bench_trace() {
+    let (Some(img), Some(shape)) =
+        (std::env::var_os("FLASHCP_RA_BENCH_IMG"), std::env::var_os("FLASHCP_WR_BENCH_SHAPE"))
+    else {
+        return;
+    };
+    let path = PathBuf::from(img);
+    let shape = std::fs::read_to_string(shape).unwrap();
+    crate::sim::trace::init_from_env("mount-write-fsync").unwrap();
+    let f = File::options().read(true).write(true).open(&path).unwrap();
+    let opts = FsOpts { readahead: false, ..Default::default() };
+    let fs = open_with(&path, Arc::new(FileDev::new(Arc::new(f))), opts).unwrap();
+    let t = std::time::Instant::now();
+    let mut stack = vec![ROOT];
+    let (mut files, mut bytes, mut k) = (0u64, 0u64, 0u64);
+    let mut rng = crate::util::Rng(0x5eed);
+    let mut buf = vec![0u8; 128 << 10];
+    for l in shape.lines() {
+        let w: Vec<&str> = l.split_whitespace().collect();
+        let depth: usize = w[1].parse().unwrap();
+        let nl: usize = w[2].parse().unwrap();
+        stack.truncate(depth + 1);
+        k += 1;
+        let mut name = format!("{k:x}-");
+        while name.len() < nl.max(name.len()) {
+            name.push('n');
+        }
+        let parent = *stack.last().unwrap();
+        if w[0] == "d" {
+            let d = fs.mkdir(parent, OsStr::new(&name)).unwrap();
+            stack.push(d.ino);
+            continue;
+        }
+        let size: u64 = w[3].parse().unwrap();
+        let a = fs.create(parent, OsStr::new(&name), true, false).unwrap();
+        let mut off = 0u64;
+        while off < size {
+            let n = (size - off).min(buf.len() as u64) as usize;
+            for c in buf[..n].chunks_mut(8) {
+                let x = rng.next().to_le_bytes();
+                c.copy_from_slice(&x[..c.len()]);
+            }
+            fs.write(a.ino, off, &buf[..n]).unwrap();
+            off += n as u64;
+        }
+        fs.fsync(a.ino).unwrap();
+        fs.release(a.ino);
+        files += 1;
+        bytes += size;
+    }
+    let secs = t.elapsed().as_secs_f64();
+    eprintln!("{files} files, {bytes} bytes, fsync each: {secs:.3} s on the host, {} commits", fs.commits());
+    fs.shutdown().unwrap();
+    crate::sim::trace::finish();
+}
+
+/// Whether the journal header on the image at `path` is ACTIVE.
+fn journal_active(path: &Path) -> bool {
+    let f = File::open(path).unwrap();
+    let len = f.metadata().unwrap().len();
+    let mut v = crate::volume::Vol::open_boot(f, len, false, false).unwrap();
+    let p = super::djournal::locate_raw(&mut v, crate::volume::MAX_DIR_BYTES).unwrap().unwrap();
+    super::djournal::header_state(&v, &p) == Some(true)
+}
+
+/// VolumeDirty of the image at `path`, as another system would read it.
+fn volume_dirty(path: &Path) -> bool {
+    use std::os::unix::fs::FileExt;
+    let mut b = [0u8; 2];
+    File::open(path).unwrap().read_exact_at(&mut b, 106).unwrap();
+    u16::from_le_bytes(b) & crate::volume::FLAG_DIRTY != 0
+}
+
+/// An application that fsyncs each file (the commit thread running, the journal header left
+/// ACTIVE between commits), steps that make light commits (a new file, an append to the file
+/// the previous commit wrote, a removal) and full ones (a move). A crash at
+/// every device op, under the three loss models: before any recovery, the volume as another
+/// system sees it is either marked dirty or fsck-clean; after flashcp's recovery it shows the
+/// tree before or after the interrupted fsync.
+#[test]
+fn crash_fsync_stream() {
+    type FStep = fn(&Fs) -> Result<(), i32>;
+    let steps: Vec<FStep> = vec![
+        |fs| {
+            let d = fs.lookup(ROOT, OsStr::new("docs"))?.ino;
+            let f = fs.create(d, OsStr::new("f1.txt"), true, false)?;
+            // over 4 MB: not rewritten whole when changed
+            fs.write(f.ino, 0, &vec![1u8; (4 << 20) + 1000])?;
+            fs.fsync(f.ino)?;
+            fs.release(f.ino);
+            Ok(())
+        },
+        // an append to the file the previous commit wrote (its journal still ACTIVE): copy-on-
+        // write of the last cluster, the file's new FAT chain in `alloc`
+        |fs| {
+            let d = fs.lookup(ROOT, OsStr::new("docs"))?.ino;
+            let f = fs.lookup(d, OsStr::new("f1.txt"))?.ino;
+            fs.open(f, true, false)?;
+            fs.write(f, (4 << 20) + 1000, &[2u8; 500])?;
+            fs.fsync(f)?;
+            fs.release(f);
+            Ok(())
+        },
+        |fs| {
+            let d = fs.mkdir(ROOT, OsStr::new("new dir"))?;
+            let f = fs.create(d.ino, OsStr::new("a file with a name longer than fifteen.txt"), true, false)?;
+            fs.write(f.ino, 0, &[3u8; 9000])?;
+            fs.fsync(f.ino)?;
+            fs.release(f.ino);
+            Ok(())
+        },
+        |fs| {
+            let d = fs.lookup(ROOT, OsStr::new("docs"))?.ino;
+            fs.rename(d, OsStr::new("old.txt"), ROOT, OsStr::new("moved.txt"), RenameFlags::default())?;
+            fs.fsync(ROOT)?;
+            Ok(())
+        },
+        |fs| {
+            let d = fs.lookup(ROOT, OsStr::new("docs"))?.ino;
+            fs.unlink(d, OsStr::new("f1.txt"))?;
+            fs.fsync(ROOT)?;
+            Ok(())
+        },
+    ];
+    let opts = || FsOpts {
+        auto_commit: true,
+        readahead: false,
+        idle: std::time::Duration::from_secs(3600),
+        close_linger: std::time::Duration::ZERO,
+        idle_header: std::time::Duration::from_secs(3600),
+        ..manual()
+    };
+    let run = |path: &Path, fail_at: Option<u64>| {
+        let f = File::options().read(true).write(true).open(path).unwrap();
+        let dev = Arc::new(CrashDev::new(f, fail_at));
+        let fs = open_with(path, dev.clone(), opts()).unwrap();
+        let mut snaps = vec![snapshot(&fs)];
+        let mut failed = false;
+        for s in &steps {
+            let r = s(&fs);
+            snaps.push(snapshot(&fs));
+            if r.is_err() {
+                failed = true;
+                break;
+            }
+        }
+        let (light, ops) = (fs.light_commits(), dev.ops());
+        if !failed {
+            assert!(journal_active(path), "the last fsync's journal header was not left ACTIVE");
+        }
+        let _ = fs.shutdown();
+        (snaps, dev, failed, light, ops)
+    };
+    for cluster in [4096u32, 512] {
+        let img = image(&format!("crash-fsync-{cluster}"), 32, cluster);
+        {
+            let fs = open(&img.path);
+            let d = fs.mkdir(ROOT, OsStr::new("docs")).unwrap();
+            let f = fs.create(d.ino, OsStr::new("old.txt"), true, false).unwrap();
+            fs.write(f.ino, 0, b"committed before").unwrap();
+            fs.shutdown().unwrap();
+        }
+        let template = img.dir.join("template.img");
+        std::fs::copy(&img.path, &template).unwrap();
+        let (_, dev, failed, light, total) = run(&img.path, None);
+        assert!(!failed);
+        // light: the append and the new file (the 4 MB file moves PercentInUse of this small
+        // volume, and the move needs VolumeDirty: those three are full commits)
+        assert!(light >= 2, "only {light} of the 5 fsyncs made light commits");
+        drop(dev);
+        for k in 0..total {
+            for loss in [Loss::None, Loss::All, Loss::Random(k * 17 + 3)] {
+                std::fs::copy(&template, &img.path).unwrap();
+                let (snaps, dev, failed, _, ops) = run(&img.path, Some(k));
+                if !failed {
+                    // a directory's times change or not within the clock's 10 ms: a run can take
+                    // a write fewer than the first
+                    assert!(ops <= k, "op {k} of {total} did not fail");
+                    continue;
+                }
+                dev.crash(loss);
+                drop(dev);
+                let at = format!("crash at op {k}/{total} ({loss:?}, cluster {cluster})");
+                // another system, before flashcp ever sees the volume again
+                if !volume_dirty(&img.path) {
+                    fsck(&img.path);
+                }
+                let f = File::options().read(true).write(true).open(&img.path).unwrap();
+                let fs = open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), manual())
+                    .unwrap_or_else(|e| panic!("{at}: recovery failed: {e:#}"));
+                let got = snapshot(&fs);
+                let n = snaps.len();
+                assert!(
+                    got == snaps[n - 2] || got == snaps[n - 1],
+                    "{at}: neither the tree before nor after fsync {}:\nvs before: {}\nvs after: {}",
+                    n - 1,
+                    diff(&got, &snaps[n - 2]),
+                    diff(&got, &snaps[n - 1])
+                );
+                fs.shutdown().unwrap();
+                fsck(&img.path);
+            }
+        }
+    }
+}
+
+/// The journal header a commit leaves ACTIVE: marked IDLE after `idle_header` without
+/// commits, at once by prepare-eject; and a mount while it is ACTIVE finds the commit
+/// finished (nothing replayed, nothing refused).
+#[test]
+fn deferred_idle_header() {
+    let img = image("idle-header", 32, 4096);
+    let f = File::options().read(true).write(true).open(&img.path).unwrap();
+    let opts =
+        FsOpts { auto_commit: true, readahead: false, idle_header: std::time::Duration::from_millis(300), ..manual() };
+    let fs = open_with(&img.path, Arc::new(FileDev::new(Arc::new(f))), opts).unwrap();
+    let a = fs.create(ROOT, OsStr::new("a.txt"), true, false).unwrap();
+    fs.write(a.ino, 0, b"first").unwrap();
+    fs.fsync(a.ino).unwrap();
+    assert!(journal_active(&img.path), "the header was marked IDLE at once");
+    // a copy of the volume as it is now (as if yanked): mounts, nothing to replay
+    let copy = img.dir.join("yanked.img");
+    std::fs::copy(&img.path, &copy).unwrap();
+    {
+        let f = File::options().read(true).write(true).open(&copy).unwrap();
+        let len = f.metadata().unwrap().len();
+        let dev = FileDev::new(Arc::new(f.try_clone().unwrap()));
+        let (_, rec) = open_core(f, len, &dev, &manual()).unwrap();
+        assert_eq!(rec, super::djournal::Recovered::Nothing);
+        assert!(!journal_active(&copy), "recovery left the finished commit's header ACTIVE");
+        let y = open(&copy);
+        assert_eq!(y.read(y.lookup(ROOT, OsStr::new("a.txt")).unwrap().ino, 0, 64).unwrap(), b"first");
+        y.shutdown().unwrap();
+        fsck(&copy);
+    }
+    let t = std::time::Instant::now();
+    while journal_active(&img.path) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "the header stayed ACTIVE");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(t.elapsed() >= std::time::Duration::from_millis(150), "marked IDLE before the delay");
+    fs.write(a.ino, 5, b", second").unwrap();
+    fs.fsync(a.ino).unwrap();
+    assert!(journal_active(&img.path));
+    fs.prepare_eject().unwrap();
+    assert!(!journal_active(&img.path), "prepare-eject left the journal ACTIVE");
+    fs.resume();
+    fs.shutdown().unwrap();
+    fsck(&img.path);
+}
+
+/// The commit's word-at-a-time free-extent scan finds exactly what `add`'s byte scan finds.
+#[test]
+fn free_extents_word_scan_matches() {
+    let mut rng = crate::util::Rng(31);
+    for case in 0..400u64 {
+        let cc = 1 + rng.next() % 3000;
+        let mut bm = vec![0u8; (cc.div_ceil(8) as usize).div_ceil(8) * 8 + 8];
+        // runs of free and used clusters, long and short, so whole words and partial ones mix
+        let mut c = 0u64;
+        while c < cc {
+            let len = 1 + rng.next() % if case % 3 == 0 { 7 } else { 300 };
+            let used = rng.next().is_multiple_of(2);
+            for k in c..(c + len).min(cc) {
+                if used {
+                    bm[(k / 8) as usize] |= 1 << (k % 8);
+                }
+            }
+            c += len;
+        }
+        // garbage past the cluster count must be ignored
+        let last = cc.div_ceil(8) as usize;
+        for b in &mut bm[last..] {
+            *b = rng.next() as u8;
+        }
+        if !cc.is_multiple_of(8) {
+            bm[last - 1] |= 0xFFu8 << (cc % 8);
+        }
+        assert_eq!(super::commit::free_extents(&bm, cc), crate::add::free_extents(&bm, cc), "case {case}, cc {cc}");
+    }
 }
 
 /// A batch whose journal would not fit the journal file is committed in parts, each one

@@ -30,6 +30,12 @@ pub struct FsOpts {
     pub readahead: bool,
     /// Readahead cache, bytes.
     pub ra_cap: u64,
+    /// A commit (other than eject's and unmount's) leaves its journal header ACTIVE and marks
+    /// it IDLE only after this long without another commit: a commit that follows overwrites
+    /// the header anyway, so an application that fsyncs file after file saves one write and
+    /// one sync per file. Recovery treats a journal whose writes all reached the volume as
+    /// finished (see `djournal::recover`). Zero: mark it IDLE at the end of every commit.
+    pub idle_header: Duration,
     /// The volume's offset on its disk, in BYTES (a `Target`'s `part_off` is in sectors:
     /// convert with `exfat::device_offset`): the write probe aligns its windows to it.
     pub part_off_bytes: u64,
@@ -46,6 +52,7 @@ impl Default for FsOpts {
             spill_dir: None,
             readahead: true,
             ra_cap: 64 << 20,
+            idle_header: Duration::from_millis(100),
             part_off_bytes: 0,
         }
     }
@@ -85,6 +92,11 @@ struct Shared {
     /// The admission gate of mutations (see [`Fs::mutate`]) and the eject state it guards.
     admit: std::sync::RwLock<()>,
     ejecting: std::sync::atomic::AtomicBool,
+    /// Held by a commit and by marking a journal header IDLE: never both at once, so an IDLE
+    /// mark can never land on a newer commit's ACTIVE header.
+    serial: Mutex<()>,
+    /// Commits made without VolumeDirty (see `commit::needs_no_dirty`).
+    light: std::sync::atomic::AtomicU64,
     /// Test hook: runs inside every mutation, after admission.
     #[cfg(test)]
     hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -204,6 +216,9 @@ struct Ctl {
     stop: bool,
     reason: &'static str,
     fatal: Option<String>,
+    /// A finished commit's journal header still ACTIVE: (device offset, seq, when to mark it
+    /// IDLE). The next commit's journal write replaces it.
+    idle_header: Option<(u64, u64, Instant)>,
 }
 
 #[derive(Clone)]
@@ -314,6 +329,8 @@ impl Fs {
             gate: std::sync::RwLock::new(()),
             admit: std::sync::RwLock::new(()),
             ejecting: std::sync::atomic::AtomicBool::new(false),
+            serial: Mutex::new(()),
+            light: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             hook: Mutex::new(None),
             ra,
@@ -806,6 +823,12 @@ impl Fs {
         self.core().commits
     }
 
+    /// Commits made without VolumeDirty so far (tests).
+    #[cfg(test)]
+    pub(crate) fn light_commits(&self) -> u64 {
+        self.sh.light.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Bytes the readahead read from the device (tests).
     #[cfg(test)]
     pub(crate) fn ra_bytes(&self) -> u64 {
@@ -838,6 +861,12 @@ impl Fs {
                 if st.want > st.done {
                     break;
                 }
+                if st.idle_header.is_some_and(|h| Instant::now() >= h.2) {
+                    drop(st);
+                    self.settle_header();
+                    st = self.sh.st.lock().unwrap();
+                    continue;
+                }
                 let idle_due = st.last_write.map(|t| t.elapsed() >= self.sh.opts.idle).unwrap_or(false);
                 if idle_due {
                     st.last_write = None;
@@ -867,6 +896,9 @@ impl Fs {
                 if let Some(t) = st.closed {
                     wait = wait.min(linger.saturating_sub(t.elapsed()).max(Duration::from_millis(1)));
                 }
+                if let Some(h) = st.idle_header {
+                    wait = wait.min(h.2.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)));
+                }
                 st = self.sh.cv.wait_timeout(st, wait.min(Duration::from_millis(250))).unwrap().0;
                 drop(st);
                 let s = self.status();
@@ -882,6 +914,10 @@ impl Fs {
             drop(st);
             let r = (|| -> Result<()> {
                 commit_all(self, why)?;
+                if matches!(why, "eject" | "unmount") {
+                    // nothing pending, and the journal IDLE: the volume is settled
+                    self.settle_header();
+                }
                 Ok(())
             })();
             let mut st = self.sh.st.lock().unwrap();
@@ -905,8 +941,19 @@ impl Fs {
         }
     }
 
+    /// Marks a finished commit's journal header IDLE (see [`FsOpts::idle_header`]). A failure
+    /// costs nothing durable (recovery finds the commit finished), so it is reported, not fatal.
+    fn settle_header(&self) {
+        let _one = self.sh.serial.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((off, seq, _)) = self.sh.st.lock().unwrap().idle_header.take() else { return };
+        if let Err(e) = djournal::write_idle_at(&*self.sh.dev, off, seq) {
+            self.note(Note::Error { message: format!("marking the drive journal idle: {e:#}"), fatal: false });
+        }
+    }
+
     /// Plans, executes and finalizes one commit. Ok(false) when there was nothing to do.
     pub(crate) fn commit_now(&self, why: &'static str) -> Result<bool> {
+        let _one = self.sh.serial.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(m) = &self.sh.st.lock().unwrap().fatal {
             anyhow::bail!("an earlier commit failed: {m}");
         }
@@ -947,8 +994,21 @@ impl Fs {
         self.note(Note::Committing { bytes: plan.bytes, files: plan.files, reason: why });
         // The executor reads the volume through its own handle on the same file.
         let vol_view = { self.core().vol.view()? };
-        execute(&*self.sh.dev, &vol_view, &plan, &place, seq, self.sh.opts.part_off_bytes)?;
+        // The header is left ACTIVE when the commit thread can mark it IDLE later, unless
+        // eject or unmount wants the volume settled now.
+        let defer =
+            self.sh.opts.auto_commit && !self.sh.opts.idle_header.is_zero() && !matches!(why, "eject" | "unmount");
+        // this commit's journal write replaces any header still ACTIVE
+        self.sh.st.lock().unwrap().idle_header = None;
+        execute(&*self.sh.dev, &vol_view, &plan, &place, seq, self.sh.opts.part_off_bytes, !defer)?;
+        if defer {
+            let due = Instant::now() + self.sh.opts.idle_header;
+            self.sh.st.lock().unwrap().idle_header = Some((djournal::header_off(&vol_view, &place), seq, due));
+        }
         let (bytes, files) = (plan.bytes, plan.files);
+        if plan.light {
+            self.sh.light.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut c = self.core();
         if let Some(ra) = &self.sh.ra {
             // chunks read or queued while the commit ran may hold what was there before
@@ -999,11 +1059,20 @@ fn base_ranges(c: &mut Core, ino: Ino, a: u64, b: u64) -> Vec<(u64, u64)> {
     out
 }
 
-/// Writes a commit: data, journal, the journaled phases, the idle header.
-pub(crate) fn execute(dev: &dyn Dev, v: &Vol, plan: &Plan, place: &Place, seq: u64, dev_off: u64) -> Result<()> {
+/// Writes a commit: data, journal, the journaled phases, and (when `idle`) the IDLE header.
+pub(crate) fn execute(
+    dev: &dyn Dev,
+    v: &Vol,
+    plan: &Plan,
+    place: &Place,
+    seq: u64,
+    dev_off: u64,
+    idle: bool,
+) -> Result<()> {
     crate::sim::trace::phase("data");
+    let payload: u64 = plan.segs.iter().map(|s| s.len).sum();
     let mut samples = match dev.file() {
-        Some(f) if !plan.segs.is_empty() => {
+        Some(f) if !plan.segs.is_empty() && payload > commit::SMALL_DATA => {
             let cs = v.cs;
             let direct_ok = cs.is_multiple_of(4096) && v.heap_off.is_multiple_of(4096);
             // one probe segment per contiguous run (whole clusters)
@@ -1047,7 +1116,7 @@ pub(crate) fn execute(dev: &dyn Dev, v: &Vol, plan: &Plan, place: &Place, seq: u
             }
             r?
         }
-        _ => write_data(dev, &plan.segs, &mut Out::Dev)?,
+        _ => write_data(dev, &pad_runs(&plan.segs, v.heap_off, v.cs), &mut Out::Dev)?,
     };
     // Data that later metadata lands on (a directory's extension) is checked by the journal.
     samples.retain(|&(off, len, _)| {
@@ -1057,8 +1126,42 @@ pub(crate) fn execute(dev: &dyn Dev, v: &Vol, plan: &Plan, place: &Place, seq: u
     crate::sim::trace::phase("journal");
     djournal::write_active(dev, v, place, seq, &body)?;
     djournal::apply(dev, &plan.writes, |_| {})?;
+    if !idle {
+        return Ok(());
+    }
     crate::sim::trace::phase("idle");
     djournal::write_idle(dev, v, place, seq)
+}
+
+/// `segs` (ascending) with zeros added in their own clusters' slack: a run that ends inside a
+/// cluster is extended to the next 4 KB (or the cluster's end), and up to the next run when
+/// that starts right at its cluster's end, so the runs of small files allocated back to back
+/// become one write, and no write ends inside a page (which the kernel would read first).
+/// Bytes past a run's end in its last cluster are never content (the data step pads the same
+/// way, see `Out::end_run`).
+fn pad_runs(segs: &[Seg], heap: u64, cs: u64) -> Vec<Seg> {
+    let mut out: Vec<Seg> = Vec::with_capacity(segs.len() + 1);
+    for (k, s) in segs.iter().enumerate() {
+        out.push(s.clone());
+        let end = s.dev + s.len;
+        if end <= heap {
+            continue;
+        }
+        let cluster_end = heap + (end - heap).div_ceil(cs) * cs;
+        let next = segs.get(k + 1).map(|n| n.dev);
+        if next == Some(end) {
+            continue;
+        }
+        let to = if next == Some(cluster_end) {
+            cluster_end
+        } else {
+            end.div_ceil(4096).saturating_mul(4096).min(cluster_end)
+        };
+        if to > end && next.is_none_or(|n| n >= to) {
+            out.push(Seg { dev: end, len: to - end, src: Src::Zero });
+        }
+    }
+    out
 }
 
 /// Writes the data segments (ascending) in buffers of up to 4 MB per contiguous run, then
